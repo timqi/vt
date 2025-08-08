@@ -12,3 +12,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 aes-gcm = "0.10"
 rand = "0.8"
 anyhow = "1.0.98"
+security-framework = "3.3.0"
+base64 = "0.22.1"
+sha2 = "0.10.9"
+
+[dev-dependencies]
+tracing-test = "0.2.5"

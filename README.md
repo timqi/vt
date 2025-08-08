@@ -9,7 +9,7 @@ this program will have several subcommands as below:
 
 # Secret management
 
-It'll create two secrets when do initialize, called `passcode` and `passphrase`. The `passcode` is a random string which will derive a secret used for encrypting the `passphrase`. The `passphrase` is the real cipher key used in production to do the encryption and decryption. The plain `passcode` and encrypted `passphrase` will be created and saved in macOS keychain when run `vt init`.
+It'll create two secrets when do initialize, called `passcode` and `passphrase`. The `passcode` is a random string which will derive a secret used for encrypting the `passphrase`. The `passphrase` is the real cipher key used in production to do the encryption and decryption. The plain `passcode` and encrypted `passphrase` will be created and saved in macOS keychain when run `vt init`. The `auth_token` is also created when run `vt init`. `VT_AUTH` environment variable as auth_token will be read by `vt` and set in http header for authorization and body encrypt usage.
 
 The `vt` command is managing user interface which provide encrypt/decrypt and run command. The process do the real work is a server run by `vt serve`. `vt` command is communicating with this server to provide vault abilities. Vault server has restrict permission limitations, you should ensure these environment to keep vault server running well.
 

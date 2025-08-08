@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 mod cli;
-mod crypto;
 mod serve;
+mod security;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]

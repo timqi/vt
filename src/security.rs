@@ -3,14 +3,86 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use anyhow::{ensure, Result};
+use base64::{prelude::BASE64_STANDARD, Engine};
 use rand::RngCore;
+use security_framework::passwords::{get_generic_password, set_generic_password};
+use sha2::{Digest, Sha256};
+use std::env;
+
+pub fn derive_passphrase_secret(passcode: &[u8; 32]) -> Result<[u8; 32]> {
+    let passcode = BASE64_STANDARD.encode(&passcode);
+    let derived_str = format!(
+        "{}:{}:{}",
+        passcode,
+        env::var("USER")?,
+        env::current_exe()?.to_string_lossy(),
+    );
+    tracing::debug!("derived_str: {}", derived_str);
+    let hash = Sha256::digest(&Sha256::digest(derived_str.as_bytes()));
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&hash[..32]);
+    Ok(key)
+}
+
+pub fn create_and_save_auth_token() -> Result<()> {
+    let random_key = AesGcmCrypto::generate_key();
+    let hash = Sha256::digest(&Sha256::digest(random_key));
+    let mut auth_token = [0u8; 32];
+    auth_token.copy_from_slice(&hash[..32]);
+    set_generic_password(
+        &"rusty.vault".to_string(),
+        &"auth_token".to_string(),
+        &auth_token,
+    )
+    .expect("set auth_token");
+    tracing::info!("auth_token set!");
+    tracing::info!("export VT_AUTH={};", BASE64_STANDARD.encode(random_key));
+    Ok(())
+}
+
+pub fn create_and_save_passcode_passphrase() -> Result<()> {
+    let passcode = AesGcmCrypto::generate_key();
+    set_generic_password(
+        &"rusty.vault".to_string(),
+        &"passcode".to_string(),
+        &passcode,
+    )
+    .expect("set passcode");
+    tracing::info!("passcode set!");
+
+    let passphrase_secret = derive_passphrase_secret(&passcode)?;
+    let aes = AesGcmCrypto::new(&passphrase_secret)?;
+    let real_passphrase = AesGcmCrypto::generate_key();
+    let encrypted_passphrase = aes.encrypt(&real_passphrase)?;
+
+    set_generic_password(
+        &"rusty.vault".to_string(),
+        &"passphrase".to_string(),
+        &encrypted_passphrase,
+    )
+    .expect("set passphrase");
+    tracing::info!("passphrase set!");
+
+    create_and_save_auth_token()?;
+
+    Ok(())
+}
+
+pub fn load_passphrase_decipher() -> Result<AesGcmCrypto> {
+    let passcode = get_generic_password(&"rusty.vault".to_string(), &"passcode".to_string())?;
+    let passcode: [u8; 32] = passcode
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("Passcode length is {}, expected 32", v.len()))?;
+    let passphrase_secret = derive_passphrase_secret(&passcode)?;
+    Ok(AesGcmCrypto::new(&passphrase_secret)?)
+}
 
 pub struct AesGcmCrypto {
     cipher: Aes256Gcm,
 }
 
 impl AesGcmCrypto {
-    pub fn new(key: &[u8]) -> Result<Self> {
+    pub fn new(key: &[u8; 32]) -> Result<Self> {
         ensure!(key.len() == 32, "Invalid key length, expected 32 bytes");
         let cipher = Aes256Gcm::new_from_slice(key)
             .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
@@ -62,6 +134,48 @@ impl AesGcmCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use security_framework::passwords::delete_generic_password;
+    use tracing_test::traced_test;
+
+    #[test]
+    fn test_base64_encode() {
+        let text = b"to be encoded".to_vec();
+        assert_eq!(BASE64_STANDARD.encode(&text), "dG8gYmUgZW5jb2RlZA==");
+    }
+
+    #[test]
+    fn test_clear_secrets() {
+        let service = "rusty.vault";
+        delete_generic_password(&service, &"passcode".to_string()).expect("delete passcode");
+        delete_generic_password(&service, &"passphrase".to_string()).expect("delete passphrase");
+        delete_generic_password(&service, &"auth_token".to_string()).expect("delete auth_token");
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_create_and_save_passcode_passphrase() {
+        let result = create_and_save_passcode_passphrase();
+        assert!(result.is_ok())
+    }
+
+    #[test]
+    fn test_store_and_get_keychain() {
+        let service = "rusty.vault";
+        let acct = "acct_test";
+        let passwd = b"test passwd".to_vec();
+        set_generic_password(&service, &acct, &passwd).expect("set passwd");
+
+        let retrived_pass = get_generic_password(&service, &acct).expect("get passwd");
+        assert_eq!(passwd, retrived_pass);
+
+        delete_generic_password(&service, &acct).expect("delete passwd");
+
+        let result = get_generic_password(&service, &acct);
+        assert!(
+            result.is_err(),
+            "Expected error when getting deleted password"
+        );
+    }
 
     #[test]
     fn test_generation() {
