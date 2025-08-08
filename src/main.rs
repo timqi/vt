@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 mod cli;
-mod serve;
 mod security;
+mod serve;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -26,9 +26,12 @@ enum Commands {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
+    let log_level = if cfg!(debug_assertions) {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
+    tracing_subscriber::fmt().with_max_level(log_level).init();
     let cli = Cli::parse();
 
     match &cli.command {
