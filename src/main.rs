@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod cli;
+mod crypto;
 mod serve;
 
 #[derive(Parser)]
@@ -18,7 +19,7 @@ enum Commands {
         #[clap(short, long, default_value = "5757")]
         port: u16,
     },
-    /// Initialize a gpg keypair, a passphrase which will be used by server
+    /// Initialize passcode, passphrase which will be used by server
     Init,
     /// Will read plain text and output encrypted message for you
     Encrypt,
