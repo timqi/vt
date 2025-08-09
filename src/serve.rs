@@ -1,5 +1,5 @@
-use crate::security::{load_auth_cipher, AesGcmCrypto};
-use aes_gcm::aead::rand_core::le;
+use crate::security::{decode_auth_cipher_from_b64, load_auth_cipher, AesGcmCrypto};
+
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
@@ -51,11 +51,8 @@ async fn auth_middleware_impl(
     }
 
     match parts.next() {
-        Some(token) => match BASE64_STANDARD.decode(token) {
-            Ok(token_bytes) => {
-                let hash = Sha256::digest(&Sha256::digest(token_bytes));
-                let mut req_token = [0u8; 32];
-                req_token.copy_from_slice(&hash[..32]);
+        Some(token) => match decode_auth_cipher_from_b64(token) {
+            Ok(req_token) => {
                 if req_token != auth_token {
                     return (StatusCode::FORBIDDEN, "invalid auth token").into_response();
                 }
@@ -151,7 +148,6 @@ async fn log_middleware(request: Request, next: Next) -> Response {
     response
 }
 
-#[tokio::main]
 pub async fn serve(host: String, port: u16) {
     let addr = format!("{}:{}", host, port).parse::<SocketAddr>().unwrap();
     tracing::info!("Starting server on {}", addr);
@@ -159,6 +155,7 @@ pub async fn serve(host: String, port: u16) {
     let (auth_token, auth_cipher) = load_auth_cipher().expect("load auth");
     let app = Router::new()
         .route("/decrypt", post(do_decrypt))
+        .route("/encrypt", post(do_encrypt))
         .layer(middleware::from_fn(create_auth_middleware(
             auth_token,
             Arc::new(auth_cipher),
@@ -170,15 +167,15 @@ pub async fn serve(host: String, port: u16) {
 }
 
 #[derive(Deserialize)]
-struct DecryptReq {
-    items: Vec<String>,
+pub struct DecryptReq {
+    pub items: Vec<String>,
 }
 
 #[derive(Serialize)]
-struct DecryptRes {
-    success: bool,
-    message: String,
-    decrypted_items: HashMap<String, String>,
+pub struct DecryptRes {
+    pub success: bool,
+    pub message: String,
+    pub decrypted_items: HashMap<String, String>,
 }
 
 async fn do_decrypt(Json(payload): Json<DecryptReq>) -> Json<DecryptRes> {
@@ -192,6 +189,40 @@ async fn do_decrypt(Json(payload): Json<DecryptReq>) -> Json<DecryptRes> {
         success: true,
         message: "Decryption completed".to_string(),
         decrypted_items,
+    };
+
+    Json(response)
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct EncryptItem {
+    pub plain: String,
+    pub t: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct EncryptReq {
+    pub items: Vec<EncryptItem>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct EncryptRes {
+    pub success: bool,
+    pub message: String,
+    pub encrypted_items: Vec<String>,
+}
+
+async fn do_encrypt(Json(payload): Json<EncryptReq>) -> Json<EncryptRes> {
+    let mut encrypted_items = Vec::new();
+    for item in payload.items {
+        let encrypted_value = format!("encrypted_{}", item.plain);
+        encrypted_items.push(encrypted_value);
+    }
+
+    let response = EncryptRes {
+        success: true,
+        message: "Encryption completed".to_string(),
+        encrypted_items,
     };
 
     Json(response)

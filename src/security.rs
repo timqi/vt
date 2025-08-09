@@ -87,6 +87,14 @@ pub fn load_auth_cipher() -> Result<([u8; 32], AesGcmCrypto)> {
     Ok((auth_token, AesGcmCrypto::new(&auth_token)?))
 }
 
+pub fn decode_auth_cipher_from_b64(b64_token: &str) -> Result<[u8; 32]> {
+    let token_bytes = BASE64_STANDARD.decode(b64_token)?;
+    let hash = Sha256::digest(&Sha256::digest(token_bytes));
+    let mut token = [0u8; 32];
+    token.copy_from_slice(&hash[..32]);
+    Ok(token)
+}
+
 pub struct AesGcmCrypto {
     cipher: Aes256Gcm,
 }

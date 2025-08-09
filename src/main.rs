@@ -25,7 +25,8 @@ enum Commands {
     Encrypt,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let log_level = if cfg!(debug_assertions) {
         tracing::Level::DEBUG
     } else {
@@ -36,13 +37,13 @@ fn main() {
 
     match &cli.command {
         Commands::Serve { host, port } => {
-            serve::serve(host.to_string(), *port);
+            serve::serve(host.to_string(), *port).await;
         }
         Commands::Init => {
             cli::init();
         }
         Commands::Encrypt => {
-            cli::encrypt();
+            cli::encrypt().await;
         }
     }
 }

@@ -15,3 +15,11 @@ The `vt` command is managing user interface which provide encrypt/decrypt and ru
 
 1. run `vt serve` from the same user which do the `vt init`
 2. keep `vt` executable binary located in the same absolute path when do the `vt init`
+
+# vt protocol
+
+`vt://{location}/{data}?t={type}`
+
+- location: mac/1p/yubikey which location will the secrets be stored, only mac supported for mac
+- data: encrypted data
+- type: raw(default), totp which will decrypt as a totp token
