@@ -77,6 +77,16 @@ pub fn load_passphrase_decipher() -> Result<AesGcmCrypto> {
     Ok(AesGcmCrypto::new(&passphrase_secret)?)
 }
 
+pub fn load_auth_cipher() -> Result<([u8; 32], AesGcmCrypto)> {
+    let auth_token = get_generic_password(&"rusty.vault".to_string(), &"auth_token".to_string())
+        .expect("get auth_token");
+    let auth_token: [u8; 32] = auth_token
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("Passcode length is {}, expected 32", v.len()))?;
+
+    Ok((auth_token, AesGcmCrypto::new(&auth_token)?))
+}
+
 pub struct AesGcmCrypto {
     cipher: Aes256Gcm,
 }
@@ -274,5 +284,14 @@ mod tests {
 
         let decrypted_str = String::from_utf8(decrypted).unwrap();
         assert_eq!(decrypted_str, "Hello, 世界! 🌍");
+    }
+
+    #[test]
+    fn test_encrypt_body() {
+        let body = r#"{"items":[]}"#.to_string();
+        let (_, cipher) = load_auth_cipher().expect("load auth cipher");
+        let encrypted = cipher.encrypt(body.as_bytes()).expect("encrypt body");
+        let decrypted = cipher.decrypt(&encrypted).expect("decrypt body");
+        assert_eq!(decrypted, body.as_bytes());
     }
 }

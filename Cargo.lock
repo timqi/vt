@@ -1211,6 +1211,7 @@ dependencies = [
  "clap",
  "rand",
  "security-framework",
+ "serde",
  "sha2",
  "tokio",
  "tracing",

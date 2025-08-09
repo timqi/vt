@@ -36,7 +36,7 @@ fn main() {
 
     match &cli.command {
         Commands::Serve { host, port } => {
-            serve::run(host.to_string(), *port);
+            serve::serve(host.to_string(), *port);
         }
         Commands::Init => {
             cli::init();
