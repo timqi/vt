@@ -33,8 +33,10 @@ struct Cli {
 
 #[derive(Subcommand, PartialEq)]
 enum Commands {
+    #[cfg(target_os = "macos")]
     Serve,
     /// Initialize passcode, passphrase which will be used by server
+    #[cfg(target_os = "macos")]
     Init,
     /// Will read plain text and output encrypted message for you
     Create,
@@ -42,6 +44,29 @@ enum Commands {
     Read {
         #[arg(help = "A string in vt protocol format, e.g. vt://mac/0xxxx")]
         vt: String,
+    },
+
+    /// Read file and decrypt vt protocol, output to output-file or standard output
+    Inject {
+        #[arg(short = 'i', long = "input-file", help = "Path to the input file")]
+        input_file: String,
+
+        #[arg(short = 'o', long = "output-file", help = "Path to the output file")]
+        output_file: Option<String>,
+
+        #[arg(
+            short = 't',
+            long,
+            default_value = "2",
+            help = "Timeout for deleting output_file after the spawned process in seconds"
+        )]
+        timeout: u32,
+
+        #[arg(
+            trailing_var_arg = true,
+            help = "Additional arguments to pass to the spawned process"
+        )]
+        args: Vec<String>,
     },
 }
 
@@ -64,19 +89,31 @@ async fn main() {
         .compact()
         .init();
     let cli = Cli::parse();
-    if cli.command == Commands::Serve {
-        serve::serve(&cli.addr)
-            .await
-            .expect("Failed to start server");
-        return;
-    }
 
-    let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
     let command_result = match &cli.command {
-        Commands::Serve => unreachable!(),
-        Commands::Init => cli::init(),
-        Commands::Create => cli::create(vt_client).await,
-        Commands::Read { vt } => cli::read(vt_client, vt.to_string()).await,
+        #[cfg(target_os = "macos")]
+        Commands::Serve | Commands::Init => match &cli.command {
+            Commands::Serve => serve::serve(&cli.addr).await,
+            Commands::Init => cli::init(),
+            _ => unreachable!(),
+        },
+        Commands::Create => {
+            let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
+            cli::create(vt_client).await
+        }
+        Commands::Read { vt } => {
+            let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
+            cli::read(vt_client, vt.to_string()).await
+        }
+        Commands::Inject {
+            input_file,
+            output_file,
+            timeout,
+            args,
+        } => {
+            let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
+            cli::inject(vt_client, input_file, output_file.clone(), timeout, args.clone()).await
+        }
     };
     if command_result.is_err() {
         tracing::error!("Command failed: {:?}", command_result);

@@ -5,15 +5,15 @@ use aes_gcm::{
 use anyhow::{ensure, Result};
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
-use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
 use std::env;
 
 pub fn set_keychain(name: &str, _value: &[u8]) -> Result<()> {
     #[cfg(all(not(debug_assertions), target_os = "macos"))]
     {
+        use security_framework::passwords::set_generic_password;
         let service = "rusty.vault.".to_string() + name;
-        set_generic_password(&service, &"prod".to_string(), &value)?;
+        set_generic_password(&service, &"prod".to_string(), &_value)?;
         // debug!("set keychain {}: {}", name, BASE64_URL_SAFE_NO_PAD.encode(value));
     }
     #[cfg(any(debug_assertions, not(target_os = "macos")))]
@@ -26,6 +26,7 @@ pub fn set_keychain(name: &str, _value: &[u8]) -> Result<()> {
 pub fn get_keychain(name: &str) -> Result<Vec<u8>> {
     #[cfg(all(not(debug_assertions), target_os = "macos"))]
     {
+        use security_framework::passwords::get_generic_password;
         let service = "rusty.vault.".to_string() + name;
         get_generic_password(&service, &"prod".to_string())
             .map_err(|e| anyhow::anyhow!("Failed to get keychain {}: {}", name, e))
@@ -38,6 +39,20 @@ pub fn get_keychain(name: &str) -> Result<Vec<u8>> {
             "passphrase" => Ok(BASE64_URL_SAFE_NO_PAD.decode("XihANpKGERcXzYQvCHVB1VAh50nIt8pyEFjqC_N5Bpkta55AI1HqUGKipR2MVjaYNJN3j4SWw4KCNCTe")?),
             _ => Err(anyhow::anyhow!("Unsupported keychain name: {}", name)),
         }
+    }
+}
+
+pub fn local_authentication(reason: &str) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        tracing::warn!("local authentication is not supported on this platform");
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use localauthentication_rs::{LAPolicy, LocalAuthentication};
+        let local_authentication = LocalAuthentication::new();
+        local_authentication.evaluate_policy(LAPolicy::DeviceOwnerAuthentication, reason)
     }
 }
 
@@ -115,12 +130,6 @@ pub fn decode_auth_cipher_from_b64(b64_token: &str) -> Result<[u8; 32]> {
     let mut token = [0u8; 32];
     token.copy_from_slice(&hash[..32]);
     Ok(token)
-}
-
-pub fn local_authentication(reason: &str) -> bool {
-    use localauthentication_rs::{LAPolicy, LocalAuthentication};
-    let local_authentication = LocalAuthentication::new();
-    local_authentication.evaluate_policy(LAPolicy::DeviceOwnerAuthentication, reason)
 }
 
 pub struct AesGcmCrypto {
