@@ -376,7 +376,7 @@ pub async fn rotate_passcode(bin_absolute_path: Option<String>) -> Result<()> {
     let encrypted_passphrase = get_keychain("passphrase")?;
     let decrypted_passphrase = passphrase_cipher
         .decrypt(&encrypted_passphrase)
-        .context("Failed to decrypt passphrase")?;
+        .context("Failed to decrypt passphrase. Wrong bin path?")?;
     let passphrase_array: [u8; 32] = decrypted_passphrase
         .try_into()
         .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;
