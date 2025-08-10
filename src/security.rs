@@ -8,9 +8,8 @@ use rand::RngCore;
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
 use std::env;
-use tracing::{debug, info};
 
-pub fn set_keychain(name: &str, value: &[u8]) -> Result<()> {
+pub fn set_keychain(name: &str, _value: &[u8]) -> Result<()> {
     #[cfg(all(not(debug_assertions), target_os = "macos"))]
     {
         let service = "rusty.vault.".to_string() + name;

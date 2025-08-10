@@ -31,7 +31,7 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, PartialEq)]
 enum Commands {
     Serve,
     /// Initialize passcode, passphrase which will be used by server
@@ -47,17 +47,33 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
-    let log_level = if cfg!(debug_assertions) {
-        tracing::Level::DEBUG
-    } else {
-        tracing::Level::INFO
-    };
-    tracing_subscriber::fmt().with_max_level(log_level).init();
+    let log_level = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| {
+            if cfg!(debug_assertions) {
+                "debug".to_string()
+            } else {
+                "info".to_string()
+            }
+        })
+        .parse::<tracing::Level>()
+        .unwrap_or(tracing::Level::INFO);
+    tracing_subscriber::fmt()
+        .with_max_level(log_level)
+        .with_target(true)
+        .with_line_number(true)
+        .compact()
+        .init();
     let cli = Cli::parse();
-    let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
+    if cli.command == Commands::Serve {
+        serve::serve(&cli.addr)
+            .await
+            .expect("Failed to start server");
+        return;
+    }
 
+    let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
     let command_result = match &cli.command {
-        Commands::Serve => serve::serve(&cli.addr).await,
+        Commands::Serve => unreachable!(),
         Commands::Init => cli::init(),
         Commands::Create => cli::create(vt_client).await,
         Commands::Read { vt } => cli::read(vt_client, vt.to_string()).await,

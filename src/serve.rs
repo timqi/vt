@@ -186,8 +186,8 @@ pub async fn serve(addr: &str) -> Result<()> {
         )))
         .layer(middleware::from_fn(log_middleware));
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

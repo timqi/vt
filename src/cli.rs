@@ -5,10 +5,10 @@ use crate::security::{
     AesGcmCrypto,
 };
 use crate::serve::{CryptoResItem, EncryptItem, SecretType};
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, Write};
-use tracing::{debug, info};
+use tracing::{debug};
 
 pub fn init() -> Result<()> {
     let passphrase_result = load_passcode_ciphers();
@@ -61,7 +61,6 @@ impl VTClient {
             .context("Failed to send request")?;
 
         let status = res.status();
-        info!("Status: {}", status);
         let res_bytes = res.bytes().await.context("Failed to read response body")?;
         if status.is_success() {
             let decrypted_body = cipher.decrypt(&res_bytes)?;
@@ -120,14 +119,13 @@ pub async fn create(vt_client: VTClient) -> Result<()> {
 }
 
 pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {
-    // authed_request("/decrypt", req_body)
-    println!("Received vt: {}", vt);
     let vt = vec![vt];
     let res = vt_client
         .authed_request::<Vec<String>, Vec<CryptoResItem>>("/decrypt", &vt)
         .await?;
-
-    println!("Items: {:?}", res);
+    ensure!(res.len() == 1, "Expected exactly one item in response");
+    ensure!(res[0].err_message.is_empty(), "Error decrypting item: {}", res[0].err_message);
+    println!("{}", res[0].result);
     Ok(())
 }
 
