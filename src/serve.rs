@@ -243,18 +243,33 @@ async fn handler_decrypt(
     if !local_authentication(&format!("decrypt {} items", payload.len())) {
         return (StatusCode::FORBIDDEN, "User Rejected").into_response();
     }
-    Json(do_decrypt(&state.passphrase_cipher, payload)).into_response()
+    if let Ok(cipher) = load_mac_cipher(&state.passphrase_cipher) {
+        Json(do_decrypt(&cipher, payload)).into_response()
+    } else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load passphrase cipher",
+        )
+            .into_response();
+    }
 }
 
 async fn handler_encrypt(
     State(state): State<AppState>,
     Json(payload): Json<Vec<EncryptItem>>,
-) -> Json<Vec<CryptoResItem>> {
-    Json(do_encrypt(&state.passphrase_cipher, payload))
+) -> impl IntoResponse {
+    if let Ok(cipher) = load_mac_cipher(&state.passphrase_cipher) {
+        Json(do_encrypt(&cipher, payload)).into_response()
+    } else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load passphrase cipher",
+        )
+            .into_response();
+    }
 }
 
-pub fn do_encrypt(passphrase_cipher: &AesGcmCrypto, items: Vec<EncryptItem>) -> Vec<CryptoResItem> {
-    let cipher = load_mac_cipher(passphrase_cipher).expect("load mac cipher");
+pub fn do_encrypt(cipher: &AesGcmCrypto, items: Vec<EncryptItem>) -> Vec<CryptoResItem> {
     let mut encrypted_items = Vec::<CryptoResItem>::new();
     for item in items {
         let item = match cipher.encrypt(item.plaintext.as_bytes()) {
@@ -276,8 +291,7 @@ pub fn do_encrypt(passphrase_cipher: &AesGcmCrypto, items: Vec<EncryptItem>) -> 
     encrypted_items
 }
 
-pub fn do_decrypt(passphrase_cipher: &AesGcmCrypto, items: Vec<String>) -> Vec<CryptoResItem> {
-    let cipher = load_mac_cipher(passphrase_cipher).expect("load mac cipher");
+pub fn do_decrypt(cipher: &AesGcmCrypto, items: Vec<String>) -> Vec<CryptoResItem> {
     let mut decrypted_items = Vec::<CryptoResItem>::new();
     let b64_to_decrypted = |b64_str: &str| -> anyhow::Result<String> {
         let raw_bytes = BASE64_URL_SAFE_NO_PAD

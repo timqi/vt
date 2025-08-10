@@ -58,7 +58,7 @@ enum Commands {
             short = 't',
             long,
             default_value = "2",
-            help = "Timeout for deleting output_file after the spawned process in seconds"
+            help = "Timeout for deleting output-file after the spawned process in seconds"
         )]
         timeout: u32,
 
