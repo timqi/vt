@@ -23,3 +23,10 @@ The `vt` command is managing user interface which provide encrypt/decrypt and ru
 
 - location: mac/1p/yubikey which location will the secrets be stored, only mac supported for mac
 - data: encrypted data. the first char of data is the type, 0 for raw & 1 for totp
+
+# Usage
+
+1. run `vt init` in mac
+2. run `vt serve` to start kms
+3. export VT_AUTH= created in client console
+4. enjoy `vt read` & `vt inject`
