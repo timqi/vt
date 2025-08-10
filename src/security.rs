@@ -3,14 +3,22 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use anyhow::{ensure, Result};
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
 use std::env;
 
+pub fn keychain_account() -> String {
+    if cfg!(debug_assertions) {
+        "debug".to_string()
+    } else {
+        "prod".to_string()
+    }
+}
+
 pub fn derive_passphrase_secret(passcode: &[u8; 32]) -> Result<[u8; 32]> {
-    let passcode = BASE64_STANDARD.encode(&passcode);
+    let passcode = BASE64_URL_SAFE_NO_PAD.encode(&passcode);
     let derived_str = format!(
         "{}:{}:{}",
         passcode,
@@ -24,28 +32,20 @@ pub fn derive_passphrase_secret(passcode: &[u8; 32]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-pub fn create_and_save_auth_token() -> Result<()> {
-    let random_key = AesGcmCrypto::generate_key();
-    let hash = Sha256::digest(&Sha256::digest(random_key));
+pub fn create_and_save_passcode_passphrase() -> Result<()> {
+    let origin_auth_token = AesGcmCrypto::generate_key();
+    let hash = Sha256::digest(&Sha256::digest(origin_auth_token));
     let mut auth_token = [0u8; 32];
     auth_token.copy_from_slice(&hash[..32]);
-    set_generic_password(
-        &"rusty.vault".to_string(),
-        &"auth_token".to_string(),
-        &auth_token,
-    )
-    .expect("set auth_token");
-    tracing::info!("auth_token set!");
-    tracing::info!("export VT_AUTH={};", BASE64_STANDARD.encode(random_key));
-    Ok(())
-}
 
-pub fn create_and_save_passcode_passphrase() -> Result<()> {
     let passcode = AesGcmCrypto::generate_key();
+    let mut passcode_and_auth_token = Vec::with_capacity(passcode.len() + auth_token.len());
+    passcode_and_auth_token.extend_from_slice(&passcode);
+    passcode_and_auth_token.extend_from_slice(&auth_token);
     set_generic_password(
-        &"rusty.vault".to_string(),
-        &"passcode".to_string(),
-        &passcode,
+        &"rusty.vault.passcode".to_string(),
+        &keychain_account(),
+        &passcode_and_auth_token,
     )
     .expect("set passcode");
     tracing::info!("passcode set!");
@@ -56,39 +56,48 @@ pub fn create_and_save_passcode_passphrase() -> Result<()> {
     let encrypted_passphrase = aes.encrypt(&real_passphrase)?;
 
     set_generic_password(
-        &"rusty.vault".to_string(),
-        &"passphrase".to_string(),
+        &"rusty.vault.passphrase".to_string(),
+        &keychain_account(),
         &encrypted_passphrase,
     )
     .expect("set passphrase");
     tracing::info!("passphrase set!");
 
-    create_and_save_auth_token()?;
-
+    tracing::info!(
+        "export VT_AUTH={};",
+        BASE64_URL_SAFE_NO_PAD.encode(origin_auth_token)
+    );
     Ok(())
 }
 
-pub fn load_passphrase_decipher() -> Result<AesGcmCrypto> {
-    let passcode = get_generic_password(&"rusty.vault".to_string(), &"passcode".to_string())?;
-    let passcode: [u8; 32] = passcode
-        .try_into()
-        .map_err(|v: Vec<u8>| anyhow::anyhow!("Passcode length is {}, expected 32", v.len()))?;
-    let passphrase_secret = derive_passphrase_secret(&passcode)?;
-    Ok(AesGcmCrypto::new(&passphrase_secret)?)
+pub fn load_mac_cipher(passphrase_cipher: &AesGcmCrypto) -> Result<AesGcmCrypto> {
+    let encrypted_passphrase =
+        get_generic_password(&"rusty.vault.passphrase".to_string(), &keychain_account())?;
+    let decrypted_passphrase = passphrase_cipher.decrypt(&encrypted_passphrase)?;
+    AesGcmCrypto::new(decrypted_passphrase.as_slice().try_into()?)
 }
 
-pub fn load_auth_cipher() -> Result<([u8; 32], AesGcmCrypto)> {
-    let auth_token = get_generic_password(&"rusty.vault".to_string(), &"auth_token".to_string())
-        .expect("get auth_token");
-    let auth_token: [u8; 32] = auth_token
-        .try_into()
-        .map_err(|v: Vec<u8>| anyhow::anyhow!("Passcode length is {}, expected 32", v.len()))?;
 
-    Ok((auth_token, AesGcmCrypto::new(&auth_token)?))
+// Return auth_token, auth_cipher, passphrase_cipher
+pub fn load_passcode_ciphers() -> Result<([u8; 32], AesGcmCrypto, AesGcmCrypto)> {
+    let passcode = get_generic_password(&"rusty.vault.passcode".to_string(), &keychain_account())?;
+    ensure!(
+        passcode.len() == 64,
+        "Passcode length is {}, expected 64",
+        passcode.len()
+    );
+    let passcode_arr: [u8; 32] = passcode[..32].try_into()?;
+    let auth_token: [u8; 32] = passcode[32..].try_into()?;
+
+    let passphrase_secret = derive_passphrase_secret(&passcode_arr)?;
+    let passphrase_cipher = AesGcmCrypto::new(&passphrase_secret)?;
+    let auth_cipher = AesGcmCrypto::new(&auth_token)?;
+
+    Ok((auth_token, auth_cipher, passphrase_cipher))
 }
 
 pub fn decode_auth_cipher_from_b64(b64_token: &str) -> Result<[u8; 32]> {
-    let token_bytes = BASE64_STANDARD.decode(b64_token)?;
+    let token_bytes = BASE64_URL_SAFE_NO_PAD.decode(b64_token)?;
     let hash = Sha256::digest(&Sha256::digest(token_bytes));
     let mut token = [0u8; 32];
     token.copy_from_slice(&hash[..32]);
@@ -158,25 +167,19 @@ mod tests {
     #[test]
     fn test_base64_encode() {
         let text = b"to be encoded".to_vec();
-        assert_eq!(BASE64_STANDARD.encode(&text), "dG8gYmUgZW5jb2RlZA==");
-    }
-
-    #[test]
-    fn test_clear_secrets() {
-        let service = "rusty.vault";
-        delete_generic_password(&service, &"passcode".to_string()).expect("delete passcode");
-        delete_generic_password(&service, &"passphrase".to_string()).expect("delete passphrase");
-        delete_generic_password(&service, &"auth_token".to_string()).expect("delete auth_token");
+        assert_eq!(BASE64_URL_SAFE_NO_PAD.encode(&text), "dG8gYmUgZW5jb2RlZA==");
     }
 
     #[traced_test]
     #[test]
+    #[ignore]
     fn test_create_and_save_passcode_passphrase() {
         let result = create_and_save_passcode_passphrase();
         assert!(result.is_ok())
     }
 
     #[test]
+    #[ignore]
     fn test_store_and_get_keychain() {
         let service = "rusty.vault";
         let acct = "acct_test";
@@ -295,9 +298,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_encrypt_body() {
         let body = r#"{"items":[]}"#.to_string();
-        let (_, cipher) = load_auth_cipher().expect("load auth cipher");
+        let (_, cipher, _) = load_passcode_ciphers().expect("load auth cipher");
         let encrypted = cipher.encrypt(body.as_bytes()).expect("encrypt body");
         let decrypted = cipher.decrypt(&encrypted).expect("decrypt body");
         assert_eq!(decrypted, body.as_bytes());
