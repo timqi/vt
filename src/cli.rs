@@ -194,7 +194,7 @@ pub async fn inject(
     vt_client: VTClient,
     input_file: &str,
     output_file: Option<String>,
-    timeout: &u32,
+    timeout: u32,
     mut args: Vec<String>,
 ) -> Result<()> {
     let input_file_content = std::fs::read_to_string(input_file)
@@ -203,12 +203,44 @@ pub async fn inject(
 
     let mut decrypted_args = decrypt_from_multi_str(vt_client, args).await?;
     let output_file_content = decrypted_args.pop().unwrap();
-    if let Some(output_file) = output_file {
-        std::fs::write(&output_file, &output_file_content)
-            .with_context(|| format!("Failed to write to output file: {}", output_file))?;
-        debug!("Content written to: {}", output_file);
+    if let Some(output_file_path) = &output_file {
+        std::fs::write(output_file_path, &output_file_content)
+            .with_context(|| format!("Failed to write to output file: {}", output_file_path))?;
+        debug!("Content written to: {}", output_file_path);
     } else {
         print!("{}", output_file_content);
+    }
+
+    if timeout > 0 {
+        if let Some(file_to_delete) = output_file {
+            // Fork the process to handle file deletion in the background.
+            // This is `unsafe` because it can violate Rust's memory safety guarantees,
+            // especially in a multi-threaded context. However, for our simple case
+            // where the child process only sleeps and deletes a file, it's acceptable.
+            let pid = unsafe { libc::fork() };
+
+            if pid > 0 {
+                // Parent process: Continue to the exec call.
+                debug!("Spawned cleanup process with PID: {}", pid);
+            } else if pid == 0 {
+                // Child process: Sleep, delete the file, and exit.
+                // Using std::thread::sleep instead of tokio::time::sleep is safer after a fork.
+                std::thread::sleep(std::time::Duration::from_secs(timeout as u64));
+                if let Err(e) = std::fs::remove_file(&file_to_delete) {
+                    // The child is detached, so logging might not be visible.
+                    // For now, we'll just note that the deletion failed.
+                    eprintln!("Child process failed to delete output file: {}", e);
+                }
+                // The child's work is done, it must exit.
+                std::process::exit(0);
+            } else {
+                // Fork failed.
+                return Err(anyhow::anyhow!(
+                    "Failed to fork cleanup process: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
     }
 
     if decrypted_args.is_empty() {
@@ -222,57 +254,9 @@ pub async fn inject(
 
     debug!("Executing command: {} with args: {:?}", command, args);
 
-    let mut cmd = std::process::Command::new(command);
-    cmd.args(args);
+    let err = exec::Command::new(command).args(args).exec();
 
-    // Set timeout if specified
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to execute command: {}", command))?;
-
-    let output = if *timeout > 0 {
-        // Wait with timeout
-        let timeout_duration = std::time::Duration::from_secs(*timeout as u64);
-        match tokio::time::timeout(
-            timeout_duration,
-            tokio::task::spawn_blocking(move || child.wait_with_output()),
-        )
-        .await
-        {
-            Ok(Ok(Ok(output))) => output,
-            Ok(Ok(Err(e))) => return Err(anyhow::anyhow!("Command execution failed: {}", e)),
-            Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to join task: {}", e)),
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "Command timed out after {} seconds",
-                    timeout
-                ))
-            }
-        }
-    } else {
-        // Wait without timeout
-        tokio::task::spawn_blocking(move || child.wait_with_output())
-            .await
-            .context("Failed to join task")??
-    };
-
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "Command failed with exit code: {:?}\nStderr: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    // Print command output
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-
-    debug!("Arguments:");
-    for (i, arg) in decrypted_args.iter().enumerate() {
-        debug!("  [{}]: {}", i, arg);
-    }
-
-    Ok(())
+    Err(anyhow::anyhow!("Failed to execute command: {}", err))
 }
 
 #[cfg(test)]

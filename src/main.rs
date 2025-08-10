@@ -112,7 +112,14 @@ async fn main() {
             args,
         } => {
             let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
-            cli::inject(vt_client, input_file, output_file.clone(), timeout, args.clone()).await
+            cli::inject(
+                vt_client,
+                input_file,
+                output_file.clone(),
+                *timeout,
+                args.clone(),
+            )
+            .await
         }
     };
     if command_result.is_err() {
