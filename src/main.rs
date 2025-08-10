@@ -7,7 +7,7 @@ mod security;
 mod serve;
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about="a simple kms. no plain, explicit auth everywhere")]
 struct Cli {
     #[arg(
         long,
@@ -43,7 +43,7 @@ enum Commands {
     /// Read file and decrypt vt protocol, output to output-file or standard output
     Inject {
         #[arg(short = 'i', long = "input-file", help = "Path to the input file")]
-        input_file: String,
+        input_file: Option<String>,
 
         #[arg(short = 'o', long = "output-file", help = "Path to the output file")]
         output_file: Option<String>,
@@ -141,7 +141,7 @@ async fn main() {
             let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
             cli::inject(
                 vt_client,
-                input_file,
+                input_file.clone(),
                 output_file.clone(),
                 *timeout,
                 args.clone(),

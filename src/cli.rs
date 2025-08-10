@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::{env, vec};
 
 use crate::security::{
@@ -201,16 +202,37 @@ async fn decrypt_from_multi_str(
 
 pub async fn inject(
     vt_client: VTClient,
-    input_file: &str,
+    input_file: Option<String>,
     output_file: Option<String>,
     timeout: u32,
     mut args: Vec<String>,
 ) -> Result<()> {
-    let input_file_content = std::fs::read_to_string(input_file)
-        .with_context(|| format!("Failed to read input file: {}", input_file))?;
+    let input_file_content = if let Some(input_file) = input_file {
+        debug!("Reading input file: {}", input_file);
+        if !std::path::Path::new(&input_file).exists() {
+            return Err(anyhow::anyhow!("Input file does not exist: {}", input_file));
+        }
+        std::fs::read_to_string(&input_file)
+            .with_context(|| format!("Failed to read input file: {}", input_file))?
+    } else {
+        debug!("No input file provided, using empty content");
+        String::new()
+    };
     args.push(input_file_content);
 
+    let env_vars: HashMap<String, String> = env::vars().collect();
+    let env_json_str = serde_json::to_string(&env_vars)?;
+    debug!("Environment variables JSON: {}", env_json_str);
+    args.push(env_json_str);
+
     let mut decrypted_args = decrypt_from_multi_str(vt_client, args).await?;
+
+    let decrypted_env_json_str = decrypted_args.pop().unwrap();
+    let env_map: HashMap<String, String> = serde_json::from_str(&decrypted_env_json_str).unwrap();
+    for (key, value) in env_map {
+        env::set_var(key, value);
+    }
+
     let output_file_content = decrypted_args.pop().unwrap();
     if let Some(output_file_path) = &output_file {
         std::fs::write(output_file_path, &output_file_content)
