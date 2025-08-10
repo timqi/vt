@@ -6,7 +6,7 @@ this program will have several subcommands as below:
 - init: initialize a gpg keypair, a passphrase which will be used by server
 - create: will read plain text and output encrypted message for you
 - read: decrypted a vt protocol
-- run: replace environment variables, which are using vt protocol with plaintext and run program
+- inject: read env/file and decrypt vt protocol
 
 # Secret management
 

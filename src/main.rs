@@ -40,7 +40,7 @@ enum Commands {
         #[arg(help = "A string in vt protocol format, e.g. vt://mac/0xxxx")]
         vt: String,
     },
-    /// Read file and decrypt vt protocol, output to output-file or standard output
+    /// Read env/file and decrypt vt protocol, output to output-file or standard output
     Inject {
         #[arg(short = 'i', long = "input-file", help = "Path to the input file")]
         input_file: Option<String>,
