@@ -8,12 +8,37 @@ use rand::RngCore;
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
 use std::env;
+use tracing::{debug, info};
 
-pub fn keychain_account() -> String {
-    if cfg!(debug_assertions) {
-        "debug".to_string()
-    } else {
-        "prod".to_string()
+pub fn set_keychain(name: &str, value: &[u8]) -> Result<()> {
+    #[cfg(all(not(debug_assertions), target_os = "macos"))]
+    {
+        let service = "rusty.vault.".to_string() + name;
+        set_generic_password(&service, &"prod".to_string(), &value)?;
+        // debug!("set keychain {}: {}", name, BASE64_URL_SAFE_NO_PAD.encode(value));
+    }
+    #[cfg(any(debug_assertions, not(target_os = "macos")))]
+    {
+        tracing::warn!("setting keychain {}, but not support for this build", name);
+    }
+    Ok(())
+}
+
+pub fn get_keychain(name: &str) -> Result<Vec<u8>> {
+    #[cfg(all(not(debug_assertions), target_os = "macos"))]
+    {
+        let service = "rusty.vault.".to_string() + name;
+        get_generic_password(&service, &"prod".to_string())
+            .map_err(|e| anyhow::anyhow!("Failed to get keychain {}: {}", name, e))
+    }
+    #[cfg(any(debug_assertions, not(target_os = "macos")))]
+    {
+        tracing::warn!("getting keychain {}, but not support for this build", name);
+        match name {
+            "passcode" => Ok(BASE64_URL_SAFE_NO_PAD.decode("w2AzjSZPSGk6Nw0ktvhiQS-EW7H_r2UIkwg5J1ThobnXv0Q4-NTSuHKC9H0-pZRhhjWV2LYzJ05BNeymxywaRw")?),
+            "passphrase" => Ok(BASE64_URL_SAFE_NO_PAD.decode("XihANpKGERcXzYQvCHVB1VAh50nIt8pyEFjqC_N5Bpkta55AI1HqUGKipR2MVjaYNJN3j4SWw4KCNCTe")?),
+            _ => Err(anyhow::anyhow!("Unsupported keychain name: {}", name)),
+        }
     }
 }
 
@@ -42,12 +67,8 @@ pub fn create_and_save_passcode_passphrase() -> Result<()> {
     let mut passcode_and_auth_token = Vec::with_capacity(passcode.len() + auth_token.len());
     passcode_and_auth_token.extend_from_slice(&passcode);
     passcode_and_auth_token.extend_from_slice(&auth_token);
-    set_generic_password(
-        &"rusty.vault.passcode".to_string(),
-        &keychain_account(),
-        &passcode_and_auth_token,
-    )
-    .expect("set passcode");
+
+    set_keychain("passcode", &passcode_and_auth_token).expect("set keychain passcode");
     tracing::info!("passcode set!");
 
     let passphrase_secret = derive_passphrase_secret(&passcode)?;
@@ -55,12 +76,7 @@ pub fn create_and_save_passcode_passphrase() -> Result<()> {
     let real_passphrase = AesGcmCrypto::generate_key();
     let encrypted_passphrase = aes.encrypt(&real_passphrase)?;
 
-    set_generic_password(
-        &"rusty.vault.passphrase".to_string(),
-        &keychain_account(),
-        &encrypted_passphrase,
-    )
-    .expect("set passphrase");
+    set_keychain("passphrase", &encrypted_passphrase).expect("set keychain passphrase");
     tracing::info!("passphrase set!");
 
     tracing::info!(
@@ -71,15 +87,14 @@ pub fn create_and_save_passcode_passphrase() -> Result<()> {
 }
 
 pub fn load_mac_cipher(passphrase_cipher: &AesGcmCrypto) -> Result<AesGcmCrypto> {
-    let encrypted_passphrase =
-        get_generic_password(&"rusty.vault.passphrase".to_string(), &keychain_account())?;
+    let encrypted_passphrase = get_keychain("passphrase")?;
     let decrypted_passphrase = passphrase_cipher.decrypt(&encrypted_passphrase)?;
     AesGcmCrypto::new(decrypted_passphrase.as_slice().try_into()?)
 }
 
 // Return auth_token, auth_cipher, passphrase_cipher
 pub fn load_passcode_ciphers() -> Result<([u8; 32], AesGcmCrypto, AesGcmCrypto)> {
-    let passcode = get_generic_password(&"rusty.vault.passcode".to_string(), &keychain_account())?;
+    let passcode = get_keychain("passcode")?;
     ensure!(
         passcode.len() == 64,
         "Passcode length is {}, expected 64",

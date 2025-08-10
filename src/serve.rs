@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use totp_rs::{Algorithm, Secret, TOTP};
-use tracing::info;
+use tracing::{info, warn};
 
 fn create_auth_middleware(
     auth_token: [u8; 32],
@@ -40,6 +40,7 @@ async fn auth_middleware_impl(
     auth_token: [u8; 32],
     auth_cipher: Arc<AesGcmCrypto>,
 ) -> Response {
+    let request_path = request.uri().path().to_string();
     let auth_header = match request.headers().get(axum::http::header::AUTHORIZATION) {
         Some(header) => match header.to_str() {
             Ok(s) => s,
@@ -87,12 +88,25 @@ async fn auth_middleware_impl(
     };
 
     let response = next.run(decrypted_req).await;
+    if !response.status().is_success() {
+        return response;
+    }
 
     let (parts, body) = response.into_parts();
     match to_bytes(body, usize::MAX).await {
         Ok(raw_bytes) => {
             match std::str::from_utf8(&raw_bytes) {
-                Ok(s) => info!("response body: {}", s),
+                Ok(s) => {
+                    if request_path == "/decrypt" {
+                        let modified_s = regex::Regex::new(r#""result":"[^"]*""#)
+                            .unwrap()
+                            .replace_all(s, r#""result":"****""#)
+                            .to_string();
+                        info!("response body: {}", modified_s);
+                    } else {
+                        info!("response body: {}", s);
+                    }
+                }
                 Err(_) => info!("raw response body: <non-UTF8 data>"),
             }
             match auth_cipher.encrypt(&raw_bytes) {
@@ -103,11 +117,8 @@ async fn auth_middleware_impl(
             }
         }
         Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to read response body",
-            )
-                .into_response()
+            warn!("Failed to read response body in auth middleware");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "auth middleware").into_response();
         }
     }
 }
@@ -156,11 +167,11 @@ struct AppState {
     passphrase_cipher: Arc<AesGcmCrypto>,
 }
 
-pub async fn serve(host: String, port: u16) -> Result<()> {
+pub async fn serve(addr: &str) -> Result<()> {
     let (auth_token, auth_cipher, passphrase_cipher) =
         load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
 
-    let addr = format!("{}:{}", host, port).parse::<SocketAddr>().unwrap();
+    let addr = addr.parse::<SocketAddr>()?;
     tracing::info!("Starting server on {}", addr);
 
     let app = Router::new()
