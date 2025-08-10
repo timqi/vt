@@ -77,7 +77,6 @@ pub fn load_mac_cipher(passphrase_cipher: &AesGcmCrypto) -> Result<AesGcmCrypto>
     AesGcmCrypto::new(decrypted_passphrase.as_slice().try_into()?)
 }
 
-
 // Return auth_token, auth_cipher, passphrase_cipher
 pub fn load_passcode_ciphers() -> Result<([u8; 32], AesGcmCrypto, AesGcmCrypto)> {
     let passcode = get_generic_password(&"rusty.vault.passcode".to_string(), &keychain_account())?;
@@ -102,6 +101,12 @@ pub fn decode_auth_cipher_from_b64(b64_token: &str) -> Result<[u8; 32]> {
     let mut token = [0u8; 32];
     token.copy_from_slice(&hash[..32]);
     Ok(token)
+}
+
+pub fn local_authentication(reason: &str) -> bool {
+    use localauthentication_rs::{LAPolicy, LocalAuthentication};
+    let local_authentication = LocalAuthentication::new();
+    local_authentication.evaluate_policy(LAPolicy::DeviceOwnerAuthentication, reason)
 }
 
 pub struct AesGcmCrypto {
@@ -305,5 +310,11 @@ mod tests {
         let encrypted = cipher.encrypt(body.as_bytes()).expect("encrypt body");
         let decrypted = cipher.decrypt(&encrypted).expect("decrypt body");
         assert_eq!(decrypted, body.as_bytes());
+    }
+
+    #[test]
+    #[ignore]
+    fn test_biometric_authentication() {
+        assert!(local_authentication(&"test biometric authentication"));
     }
 }

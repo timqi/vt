@@ -1,5 +1,6 @@
 use crate::security::{
-    decode_auth_cipher_from_b64, load_mac_cipher, load_passcode_ciphers, AesGcmCrypto,
+    decode_auth_cipher_from_b64, load_mac_cipher, load_passcode_ciphers, local_authentication,
+    AesGcmCrypto,
 };
 
 use anyhow::Result;
@@ -227,8 +228,11 @@ impl std::fmt::Display for SecretType {
 async fn handler_decrypt(
     State(state): State<AppState>,
     Json(payload): Json<Vec<String>>,
-) -> Json<Vec<CryptoResItem>> {
-    Json(do_decrypt(&state.passphrase_cipher, payload))
+) -> impl IntoResponse {
+    if !local_authentication(&format!("decrypt {} items", payload.len())) {
+        return (StatusCode::FORBIDDEN, "User Rejected").into_response();
+    }
+    Json(do_decrypt(&state.passphrase_cipher, payload)).into_response()
 }
 
 async fn handler_encrypt(
