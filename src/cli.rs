@@ -1,22 +1,27 @@
-use std::vec;
+use std::{env, vec};
 
 use crate::security::{
-    create_and_save_passcode_passphrase, decode_auth_cipher_from_b64, load_passcode_ciphers,
-    AesGcmCrypto,
+    create_and_save_passcode_passphrase, decode_auth_cipher_from_b64, get_keychain,
+    load_passcode_ciphers, local_authentication, AesGcmCrypto,
 };
 use crate::serve::{CryptoResItem, EncryptItem, SecretType};
 use anyhow::{ensure, Context, Result};
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{de::DeserializeOwned, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use tracing::debug;
 
 pub fn init() -> Result<()> {
     let passphrase_result = load_passcode_ciphers();
     if passphrase_result.is_ok() {
-        eprintln!("Error: already initialized");
+        Err(anyhow::anyhow!(
+            "Error: already initialized? Please delete keys in keychain of 'rusty.vault' first"
+        ))?;
         std::process::exit(1);
     }
-    create_and_save_passcode_passphrase().expect("create passcode & passphrase");
+    create_and_save_passcode_passphrase(&AesGcmCrypto::generate_key(), None)?;
     Ok(())
 }
 
@@ -74,10 +79,24 @@ impl VTClient {
     }
 }
 
+fn prompt_input_password(prompt_before: &str, prompt_after: &str) -> Result<String> {
+    let secret = rpassword::prompt_password(prompt_before).context("Failed to read password")?;
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return Err(anyhow::anyhow!("Secret cannot be empty"));
+    }
+    println!(
+        "{}{}****{}",
+        prompt_after,
+        &secret[..2],
+        &secret[secret.len() - 2..]
+    );
+    Ok(secret.to_string())
+}
+
 pub async fn create(vt_client: VTClient) -> Result<()> {
     print!("Enter secret type (raw/totp) [default: raw]: ");
     io::stdout().flush()?;
-
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     if input.trim().is_empty() {
@@ -89,17 +108,7 @@ pub async fn create(vt_client: VTClient) -> Result<()> {
         return Err(anyhow::anyhow!("Invalid secret type: {}", input));
     }
 
-    let secret = rpassword::prompt_password("Enter secret: ").context("Failed to read password")?;
-    let secret = secret.trim();
-    if secret.is_empty() {
-        return Err(anyhow::anyhow!("Secret cannot be empty"));
-    }
-    println!(
-        "Secret entered: {}****{}",
-        &secret[..2],
-        &secret[secret.len() - 2..]
-    );
-
+    let secret = prompt_input_password("Enter secret: ", "Secret entered: ")?;
     debug!("User input for secret: '{}'", secret);
 
     let res = vt_client
@@ -257,6 +266,100 @@ pub async fn inject(
     let err = exec::Command::new(command).args(args).exec();
 
     Err(anyhow::anyhow!("Failed to execute command: {}", err))
+}
+
+pub async fn export_secret() -> Result<()> {
+    if !local_authentication("export master secret") {
+        Err(anyhow::anyhow!(
+            "Local authentication failed for export master secret"
+        ))?;
+    }
+    let (_, _, passphrase_cipher) = load_passcode_ciphers()?;
+    let encrypted_passphrase = get_keychain("passphrase")?;
+    let decrypted_passphrase = passphrase_cipher
+        .decrypt(&encrypted_passphrase)
+        .context("Failed to decrypt passphrase")?;
+
+    let master_secret_passphrase = prompt_input_password(
+        "Enter master secret passphrase: ",
+        "Master secret passphrase entered: ",
+    )?;
+    let hash = Sha256::digest(&Sha256::digest(master_secret_passphrase.as_bytes()));
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&hash[..32]);
+    let export_cipher =
+        AesGcmCrypto::new(&key).context("Failed to create AES-GCM cipher for master secret")?;
+
+    let new_encrypted_passphrase_bytes = export_cipher
+        .encrypt(&decrypted_passphrase)
+        .context("Failed to encrypt master secret passphrase")?;
+    println!(
+        "Encrypted master secret passphrase (base64): {}",
+        BASE64_URL_SAFE_NO_PAD.encode(new_encrypted_passphrase_bytes)
+    );
+
+    Ok(())
+}
+
+pub async fn import_secret() -> Result<()> {
+    let passphrase_result = load_passcode_ciphers();
+    if passphrase_result.is_ok() {
+        Err(anyhow::anyhow!(
+            "Error: already imported? Please delete keys in keychain of 'rusty.vault' first"
+        ))?;
+        std::process::exit(1);
+    }
+    let master_secret = prompt_input_password("Enter master secret: ", "Master secret entered: ")?;
+    let encrypted_passphrase_bytes = BASE64_URL_SAFE_NO_PAD.decode(master_secret)?;
+
+    let master_secret_passphrase = prompt_input_password(
+        "Enter master secret passphrase: ",
+        "Master secret passphrase entered: ",
+    )?;
+    let hash = Sha256::digest(&Sha256::digest(master_secret_passphrase.as_bytes()));
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&hash[..32]);
+    let import_cipher =
+        AesGcmCrypto::new(&key).context("Failed to create AES-GCM cipher for master secret")?;
+
+    let vt_path = env::current_exe().unwrap().to_string_lossy().to_string();
+    print!("Enter absolute path of vt (Default: {}): ", vt_path);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    if input.trim().is_empty() {
+        input = vt_path;
+    } else {
+        input = input.trim().to_string();
+    }
+
+    let real_passphrase = import_cipher.decrypt(&encrypted_passphrase_bytes)?;
+    let passphrase_array: [u8; 32] = real_passphrase
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;
+
+    create_and_save_passcode_passphrase(&passphrase_array, Some(&input))
+        .context("Failed to create and save passcode passphrase")?;
+
+    Ok(())
+}
+
+pub async fn rotate_passcode(bin_absolute_path: Option<String>) -> Result<()> {
+    if !local_authentication("rotate passcode") {
+        Err(anyhow::anyhow!(
+            "Local authentication failed for rotate passcode"
+        ))?;
+    }
+    let (_, _, passphrase_cipher) = load_passcode_ciphers()?;
+    let encrypted_passphrase = get_keychain("passphrase")?;
+    let decrypted_passphrase = passphrase_cipher
+        .decrypt(&encrypted_passphrase)
+        .context("Failed to decrypt passphrase")?;
+    let passphrase_array: [u8; 32] = decrypted_passphrase
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;
+    create_and_save_passcode_passphrase(&passphrase_array, bin_absolute_path.as_deref())?;
+    Ok(())
 }
 
 #[cfg(test)]

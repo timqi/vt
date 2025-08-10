@@ -33,11 +33,6 @@ struct Cli {
 
 #[derive(Subcommand, PartialEq)]
 enum Commands {
-    #[cfg(target_os = "macos")]
-    Serve,
-    /// Initialize passcode, passphrase which will be used by server
-    #[cfg(target_os = "macos")]
-    Init,
     /// Will read plain text and output encrypted message for you
     Create,
     /// Decrypt an existing vt protocol as plaintext
@@ -45,7 +40,6 @@ enum Commands {
         #[arg(help = "A string in vt protocol format, e.g. vt://mac/0xxxx")]
         vt: String,
     },
-
     /// Read file and decrypt vt protocol, output to output-file or standard output
     Inject {
         #[arg(short = 'i', long = "input-file", help = "Path to the input file")]
@@ -58,7 +52,7 @@ enum Commands {
             short = 't',
             long,
             default_value = "2",
-            help = "Timeout for deleting output-file after the spawned process in seconds"
+            help = "Timeout for deleting output_file after the spawned process in seconds"
         )]
         timeout: u32,
 
@@ -67,6 +61,31 @@ enum Commands {
             help = "Additional arguments to pass to the spawned process"
         )]
         args: Vec<String>,
+    },
+
+    #[cfg(target_os = "macos")]
+    /// (Mac only) Run vt server
+    Serve,
+    /// (Mac only) Initialize passcode, passphrase which will be used by server
+    #[cfg(target_os = "macos")]
+    Init,
+    /// (Mac only) Manage master secret
+    #[cfg(target_os = "macos")]
+    #[command(subcommand)]
+    Secret(SecretCommands),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Subcommand, PartialEq)]
+pub enum SecretCommands {
+    /// Export the encrypted master secret
+    Export,
+    /// Import an encrypted master secret
+    Import,
+    /// Rotate the passcode for the master secret
+    RotatePasscode {
+        #[arg(long, help = "Absolute path to the new vt binary")]
+        bin_absolute_path: Option<String>,
     },
 }
 
@@ -96,6 +115,14 @@ async fn main() {
             Commands::Serve => serve::serve(&cli.addr).await,
             Commands::Init => cli::init(),
             _ => unreachable!(),
+        },
+        #[cfg(target_os = "macos")]
+        Commands::Secret(secret_command) => match secret_command {
+            SecretCommands::Export => cli::export_secret().await,
+            SecretCommands::Import => cli::import_secret().await,
+            SecretCommands::RotatePasscode { bin_absolute_path } => {
+                cli::rotate_passcode(bin_absolute_path.clone()).await
+            }
         },
         Commands::Create => {
             let vt_client = VTClient::new(cli.addr.clone(), cli.auth);

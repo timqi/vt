@@ -56,14 +56,12 @@ pub fn local_authentication(reason: &str) -> bool {
     }
 }
 
-pub fn derive_passphrase_secret(passcode: &[u8; 32]) -> Result<[u8; 32]> {
+pub fn derive_passphrase_secret(passcode: &[u8; 32], bin_path: Option<&str>) -> Result<[u8; 32]> {
     let passcode = BASE64_URL_SAFE_NO_PAD.encode(&passcode);
-    let derived_str = format!(
-        "{}:{}:{}",
-        passcode,
-        env::var("USER")?,
-        env::current_exe()?.to_string_lossy(),
-    );
+    let bin_path = bin_path
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| env::current_exe().unwrap().to_string_lossy().to_string());
+    let derived_str = format!("{}:{}:{}", passcode, env::var("USER")?, bin_path,);
     tracing::debug!("derived_str: {}", derived_str);
     let hash = Sha256::digest(&Sha256::digest(derived_str.as_bytes()));
     let mut key = [0u8; 32];
@@ -71,7 +69,10 @@ pub fn derive_passphrase_secret(passcode: &[u8; 32]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-pub fn create_and_save_passcode_passphrase() -> Result<()> {
+pub fn create_and_save_passcode_passphrase(
+    real_passphrase: &[u8; 32],
+    bin_path: Option<&str>,
+) -> Result<()> {
     let origin_auth_token = AesGcmCrypto::generate_key();
     let hash = Sha256::digest(&Sha256::digest(origin_auth_token));
     let mut auth_token = [0u8; 32];
@@ -85,10 +86,10 @@ pub fn create_and_save_passcode_passphrase() -> Result<()> {
     set_keychain("passcode", &passcode_and_auth_token).expect("set keychain passcode");
     tracing::info!("passcode set!");
 
-    let passphrase_secret = derive_passphrase_secret(&passcode)?;
+    let passphrase_secret = derive_passphrase_secret(&passcode, bin_path)?;
     let aes = AesGcmCrypto::new(&passphrase_secret)?;
-    let real_passphrase = AesGcmCrypto::generate_key();
-    let encrypted_passphrase = aes.encrypt(&real_passphrase)?;
+    // let real_passphrase = AesGcmCrypto::generate_key();
+    let encrypted_passphrase = aes.encrypt(real_passphrase)?;
 
     set_keychain("passphrase", &encrypted_passphrase).expect("set keychain passphrase");
     tracing::info!("passphrase set!");
@@ -117,7 +118,7 @@ pub fn load_passcode_ciphers() -> Result<([u8; 32], AesGcmCrypto, AesGcmCrypto)>
     let passcode_arr: [u8; 32] = passcode[..32].try_into()?;
     let auth_token: [u8; 32] = passcode[32..].try_into()?;
 
-    let passphrase_secret = derive_passphrase_secret(&passcode_arr)?;
+    let passphrase_secret = derive_passphrase_secret(&passcode_arr, None)?;
     let passphrase_cipher = AesGcmCrypto::new(&passphrase_secret)?;
     let auth_cipher = AesGcmCrypto::new(&auth_token)?;
 
@@ -202,7 +203,8 @@ mod tests {
     #[test]
     #[ignore]
     fn test_create_and_save_passcode_passphrase() {
-        let result = create_and_save_passcode_passphrase();
+        let real_passphrase = AesGcmCrypto::generate_key();
+        let result = create_and_save_passcode_passphrase(&real_passphrase, None);
         assert!(result.is_ok())
     }
 
