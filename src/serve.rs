@@ -1,13 +1,10 @@
-use crate::security::{
-    decode_auth_cipher_from_b64, load_mac_cipher, load_passcode_ciphers, local_authentication,
-    AesGcmCrypto,
-};
+use crate::security::{load_mac_cipher, load_passcode_ciphers, local_authentication, AesGcmCrypto};
 
 use anyhow::Result;
 use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
@@ -22,49 +19,22 @@ use totp_rs::{Algorithm, Secret, TOTP};
 use tracing::{info, warn};
 
 fn create_auth_middleware(
-    auth_token: [u8; 32],
     auth_cipher: Arc<AesGcmCrypto>,
 ) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>
        + Clone {
     move |request: Request, next: Next| {
-        let auth_token = auth_token;
         let auth_cipher = Arc::clone(&auth_cipher);
 
-        Box::pin(async move { auth_middleware_impl(request, next, auth_token, auth_cipher).await })
+        Box::pin(async move { auth_middleware_impl(request, next, auth_cipher).await })
     }
 }
 
 async fn auth_middleware_impl(
     request: Request,
     next: Next,
-    auth_token: [u8; 32],
     auth_cipher: Arc<AesGcmCrypto>,
 ) -> Response {
     let request_path = request.uri().path().to_string();
-    let auth_header = match request.headers().get(axum::http::header::AUTHORIZATION) {
-        Some(header) => match header.to_str() {
-            Ok(s) => s,
-            Err(_) => return (StatusCode::FORBIDDEN, "invalid auth header").into_response(),
-        },
-        None => return (StatusCode::FORBIDDEN, "missing auth header").into_response(),
-    };
-    let mut parts = auth_header.split_whitespace();
-    match parts.next() {
-        Some("vault") => {}
-        _ => return (StatusCode::FORBIDDEN, "invalid auth scheme").into_response(),
-    }
-
-    match parts.next() {
-        Some(token) => match decode_auth_cipher_from_b64(token) {
-            Ok(req_token) => {
-                if req_token != auth_token {
-                    return (StatusCode::FORBIDDEN, "invalid auth token").into_response();
-                }
-            }
-            Err(_) => return (StatusCode::FORBIDDEN, "can't decode auth token").into_response(),
-        },
-        None => return (StatusCode::FORBIDDEN, "missing auth token").into_response(),
-    };
 
     let (parts, body) = request.into_parts();
     let decrypted_req = match to_bytes(body, usize::MAX).await {
@@ -76,7 +46,13 @@ async fn auth_middleware_impl(
                 }
                 Request::from_parts(parts, Body::from(decrypted_bytes))
             }
-            Err(_) => return (StatusCode::FORBIDDEN, "decryption failed").into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "Decryption req failed, Wrong VT_AUTH ?",
+                )
+                    .into_response()
+            }
         },
         Err(_) => {
             return (
@@ -168,7 +144,7 @@ struct AppState {
 }
 
 pub async fn serve(addr: &str) -> Result<()> {
-    let (auth_token, auth_cipher, passphrase_cipher) =
+    let (auth_cipher, passphrase_cipher) =
         load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
 
     let addr = addr.parse::<SocketAddr>()?;
@@ -180,10 +156,9 @@ pub async fn serve(addr: &str) -> Result<()> {
         .with_state(AppState {
             passphrase_cipher: Arc::new(passphrase_cipher),
         })
-        .layer(middleware::from_fn(create_auth_middleware(
-            auth_token,
-            Arc::new(auth_cipher),
-        )))
+        .layer(middleware::from_fn(create_auth_middleware(Arc::new(
+            auth_cipher,
+        ))))
         .layer(middleware::from_fn(log_middleware));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -238,9 +213,18 @@ impl std::fmt::Display for SecretType {
 
 async fn handler_decrypt(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<Vec<String>>,
 ) -> impl IntoResponse {
-    if !local_authentication(&format!("decrypt {} items", payload.len())) {
+    let client_host = headers
+        .get("client-host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("no host");
+    if !local_authentication(&format!(
+        "decrypt {} items from {}",
+        payload.len(),
+        client_host
+    )) {
         return (StatusCode::FORBIDDEN, "User Rejected").into_response();
     }
     if let Ok(cipher) = load_mac_cipher(&state.passphrase_cipher) {

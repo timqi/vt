@@ -49,8 +49,6 @@ impl VTClient {
         req_body: &T,
     ) -> Result<R> {
         let url = format!("{}{}", self.base_url, path);
-        let auth_header = format!("vault {}", self.auth_token);
-
         let req_body = serde_json::to_vec(req_body)?;
         let cipher = AesGcmCrypto::new(&decode_auth_cipher_from_b64(&self.auth_token)?)?;
         let encrypted_body = cipher.encrypt(&req_body)?;
@@ -59,7 +57,13 @@ impl VTClient {
         let client = reqwest::Client::new();
         let res = client
             .post(&url)
-            .header("Authorization", auth_header)
+            .header(
+                "client-host",
+                hostname::get()
+                    .unwrap_or_else(|_| "unknown".into())
+                    .to_string_lossy()
+                    .to_string(),
+            )
             .header("Content-Type", "application/json")
             .body(encrypted_body)
             .send()
@@ -296,7 +300,7 @@ pub async fn export_secret() -> Result<()> {
             "Local authentication failed for export master secret"
         ))?;
     }
-    let (_, _, passphrase_cipher) = load_passcode_ciphers()?;
+    let (_, passphrase_cipher) = load_passcode_ciphers()?;
     let encrypted_passphrase = get_keychain("passphrase")?;
     let decrypted_passphrase = passphrase_cipher
         .decrypt(&encrypted_passphrase)
@@ -372,7 +376,7 @@ pub async fn rotate_passcode(bin_absolute_path: Option<String>) -> Result<()> {
             "Local authentication failed for rotate passcode"
         ))?;
     }
-    let (_, _, passphrase_cipher) = load_passcode_ciphers()?;
+    let (_, passphrase_cipher) = load_passcode_ciphers()?;
     let encrypted_passphrase = get_keychain("passphrase")?;
     let decrypted_passphrase = passphrase_cipher
         .decrypt(&encrypted_passphrase)

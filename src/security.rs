@@ -108,7 +108,7 @@ pub fn load_mac_cipher(passphrase_cipher: &AesGcmCrypto) -> Result<AesGcmCrypto>
 }
 
 // Return auth_token, auth_cipher, passphrase_cipher
-pub fn load_passcode_ciphers() -> Result<([u8; 32], AesGcmCrypto, AesGcmCrypto)> {
+pub fn load_passcode_ciphers() -> Result<(AesGcmCrypto, AesGcmCrypto)> {
     let passcode = get_keychain("passcode")?;
     ensure!(
         passcode.len() == 64,
@@ -122,7 +122,7 @@ pub fn load_passcode_ciphers() -> Result<([u8; 32], AesGcmCrypto, AesGcmCrypto)>
     let passphrase_cipher = AesGcmCrypto::new(&passphrase_secret)?;
     let auth_cipher = AesGcmCrypto::new(&auth_token)?;
 
-    Ok((auth_token, auth_cipher, passphrase_cipher))
+    Ok((auth_cipher, passphrase_cipher))
 }
 
 pub fn decode_auth_cipher_from_b64(b64_token: &str) -> Result<[u8; 32]> {
@@ -331,7 +331,7 @@ mod tests {
     #[ignore]
     fn test_encrypt_body() {
         let body = r#"{"items":[]}"#.to_string();
-        let (_, cipher, _) = load_passcode_ciphers().expect("load auth cipher");
+        let (cipher, _) = load_passcode_ciphers().expect("load auth cipher");
         let encrypted = cipher.encrypt(body.as_bytes()).expect("encrypt body");
         let decrypted = cipher.decrypt(&encrypted).expect("decrypt body");
         assert_eq!(decrypted, body.as_bytes());
