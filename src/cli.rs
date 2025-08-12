@@ -5,7 +5,7 @@ use crate::security::{
     create_and_save_passcode_passphrase, decode_auth_cipher_from_b64, get_keychain,
     load_passcode_ciphers, local_authentication, AesGcmCrypto,
 };
-use crate::serve::{CryptoResItem, EncryptItem, SecretType};
+use crate::serve::{CryptoResItem, DecryptReq, EncryptItem, SecretType};
 use anyhow::{ensure, Context, Result};
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -57,13 +57,6 @@ impl VTClient {
         let client = reqwest::Client::new();
         let res = client
             .post(&url)
-            .header(
-                "client-host",
-                hostname::get()
-                    .unwrap_or_else(|_| "unknown".into())
-                    .to_string_lossy()
-                    .to_string(),
-            )
             .header("Content-Type", "application/json")
             .body(encrypted_body)
             .send()
@@ -135,10 +128,21 @@ pub async fn create(vt_client: VTClient) -> Result<()> {
     Ok(())
 }
 
+pub fn get_hostname() -> String {
+    hostname::get()
+        .unwrap_or_else(|_| "unknown".into())
+        .to_string_lossy()
+        .to_string()
+}
+
 pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {
-    let vt = vec![vt];
+    let req = DecryptReq {
+        host: get_hostname(),
+        command: "[read]".to_string(),
+        items: vec![vt],
+    };
     let res = vt_client
-        .authed_request::<Vec<String>, Vec<CryptoResItem>>("/decrypt", &vt)
+        .authed_request::<DecryptReq, Vec<CryptoResItem>>("/decrypt", &req)
         .await?;
     ensure!(res.len() == 1, "Expected exactly one item in response");
     ensure!(
@@ -153,6 +157,7 @@ pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {
 async fn decrypt_from_multi_str(
     vt_client: VTClient,
     original_str_vec: Vec<String>,
+    command: String,
 ) -> Result<Vec<String>> {
     let mut encrypted_vec = Vec::<String>::new();
     // Extract 'vt://xxx/urlsafebase64encoded' patterns from the string
@@ -165,7 +170,14 @@ async fn decrypt_from_multi_str(
     }
 
     let res = vt_client
-        .authed_request::<Vec<String>, Vec<CryptoResItem>>("/decrypt", &encrypted_vec)
+        .authed_request::<DecryptReq, Vec<CryptoResItem>>(
+            "/decrypt",
+            &DecryptReq {
+                host: get_hostname(),
+                command: command,
+                items: encrypted_vec.clone(),
+            },
+        )
         .await?;
     ensure!(
         res.len() == encrypted_vec.len(),
@@ -211,6 +223,20 @@ pub async fn inject(
     timeout: u32,
     mut args: Vec<String>,
 ) -> Result<()> {
+    let original_command = args.join(" ");
+    debug!("Original command: {}", original_command);
+    let original_command = if original_command.is_empty() {
+        "[inject]".to_string()
+    } else {
+        format!(
+            "[inject] {}",
+            regex::Regex::new(r"vt://[^/]+/[A-Za-z0-9_-]+")
+                .unwrap()
+                .replace_all(&original_command, "vt://xxxx")
+                .to_string()
+        )
+    };
+
     let input_file_content = if let Some(input_file) = input_file {
         debug!("Reading input file: {}", input_file);
         if !std::path::Path::new(&input_file).exists() {
@@ -229,7 +255,7 @@ pub async fn inject(
     debug!("Environment variables JSON: {}", env_json_str);
     args.push(env_json_str);
 
-    let mut decrypted_args = decrypt_from_multi_str(vt_client, args).await?;
+    let mut decrypted_args = decrypt_from_multi_str(vt_client, args, original_command).await?;
 
     let decrypted_env_json_str = decrypted_args.pop().unwrap();
     let env_map: HashMap<String, String> = serde_json::from_str(&decrypted_env_json_str).unwrap();

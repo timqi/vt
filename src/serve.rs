@@ -4,7 +4,7 @@ use anyhow::Result;
 use axum::{
     body::{to_bytes, Body},
     extract::{Request, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
@@ -46,7 +46,7 @@ async fn auth_middleware_impl(
                 }
                 Request::from_parts(parts, Body::from(decrypted_bytes))
             }
-            Err(e) => {
+            Err(_) => {
                 return (
                     StatusCode::FORBIDDEN,
                     "Decryption req failed, Wrong VT_AUTH ?",
@@ -172,6 +172,13 @@ pub struct EncryptItem {
     pub t: SecretType,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct DecryptReq {
+    pub host: String,
+    pub command: String,
+    pub items: Vec<String>,
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 pub struct CryptoResItem {
     pub result: String,
@@ -213,22 +220,19 @@ impl std::fmt::Display for SecretType {
 
 async fn handler_decrypt(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(payload): Json<Vec<String>>,
+    Json(payload): Json<DecryptReq>,
 ) -> impl IntoResponse {
-    let client_host = headers
-        .get("client-host")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("no host");
-    if !local_authentication(&format!(
-        "decrypt {} items from {}",
-        payload.len(),
-        client_host
-    )) {
+    let local_auth_message = format!(
+        "decrypt {} items from {} to run `{}`",
+        payload.items.len(),
+        payload.host,
+        payload.command,
+    );
+    if !local_authentication(&local_auth_message) {
         return (StatusCode::FORBIDDEN, "User Rejected").into_response();
     }
     if let Ok(cipher) = load_mac_cipher(&state.passphrase_cipher) {
-        Json(do_decrypt(&cipher, payload)).into_response()
+        Json(do_decrypt(&cipher, payload.items)).into_response()
     } else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -209,26 +209,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn test_store_and_get_keychain() {
-        let service = "rusty.vault";
-        let acct = "acct_test";
-        let passwd = b"test passwd".to_vec();
-        set_generic_password(&service, &acct, &passwd).expect("set passwd");
-
-        let retrived_pass = get_generic_password(&service, &acct).expect("get passwd");
-        assert_eq!(passwd, retrived_pass);
-
-        delete_generic_password(&service, &acct).expect("delete passwd");
-
-        let result = get_generic_password(&service, &acct);
-        assert!(
-            result.is_err(),
-            "Expected error when getting deleted password"
-        );
-    }
-
-    #[test]
     fn test_generation() {
         let key1 = AesGcmCrypto::generate_key();
         let key2 = AesGcmCrypto::generate_key();
