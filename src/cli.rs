@@ -32,11 +32,8 @@ pub struct VTClient {
 }
 
 impl VTClient {
-    pub fn new(mut base_url: String, auth_token: String) -> Self {
+    pub fn new(base_url: String, auth_token: String) -> Self {
         debug!("Using auth token: {}", auth_token);
-        if !base_url.starts_with("http://") {
-            base_url = format!("http://{}", base_url);
-        }
         VTClient {
             base_url,
             auth_token,
@@ -48,7 +45,17 @@ impl VTClient {
         path: &str,
         req_body: &T,
     ) -> Result<R> {
-        let url = format!("{}{}", self.base_url, path);
+        let mut base_url = self.base_url;
+        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+            let protocol = if is_ip_address(&base_url) {
+                "http://"
+            } else {
+                "https://"
+            };
+            base_url = format!("{}{}", protocol, base_url);
+        }
+
+        let url = format!("{}{}", base_url, path);
         let req_body = serde_json::to_vec(req_body)?;
         let cipher = AesGcmCrypto::new(&decode_auth_cipher_from_b64(&self.auth_token)?)?;
         let encrypted_body = cipher.encrypt(&req_body)?;
@@ -133,6 +140,13 @@ pub fn get_hostname() -> String {
         .unwrap_or_else(|_| "unknown".into())
         .to_string_lossy()
         .to_string()
+}
+
+pub fn is_ip_address(addr: &str) -> bool {
+    let host = addr.split(':').next().unwrap_or(addr);
+    host.split('.').count() == 4 && host.split('.').all(|num| {
+        num.parse::<u8>().is_ok()
+    })
 }
 
 pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {
