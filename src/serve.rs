@@ -41,7 +41,13 @@ async fn auth_middleware_impl(
         Ok(body_bytes) => match auth_cipher.decrypt(&body_bytes) {
             Ok(decrypted_bytes) => {
                 match std::str::from_utf8(&decrypted_bytes) {
-                    Ok(s) => info!("request body: {}", s),
+                    Ok(s) => {
+                        let modified_s = regex::Regex::new(r#""plaintext":"[^"]*""#)
+                            .unwrap()
+                            .replace_all(s, r#""plaintext":"****""#)
+                            .to_string();
+                        info!("request body: {}", modified_s)
+                    },
                     Err(_) => info!("Decrypted request body: <non-UTF8 data>"),
                 }
                 Request::from_parts(parts, Body::from(decrypted_bytes))
