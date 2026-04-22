@@ -48,18 +48,14 @@ async fn auth_middleware_impl(
                             .replace_all(s, r#""plaintext":"****""#)
                             .to_string();
                         info!("request body: {}", modified_s)
-                    },
+                    }
                     Err(_) => info!("Decrypted request body: <non-UTF8 data>"),
                 }
                 Request::from_parts(parts, Body::from(decrypted_bytes))
             }
-            Err(_) => {
-                return (StatusCode::FORBIDDEN, "Request failed").into_response()
-            }
+            Err(_) => return (StatusCode::FORBIDDEN, "Request failed").into_response(),
         },
-        Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Request failed").into_response()
-        }
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Request failed").into_response(),
     };
 
     let response = next.run(decrypted_req).await;
@@ -145,7 +141,6 @@ pub async fn serve(
     ssh_idle_timeout: u64,
     auth_cache_mode: crate::ssh_agent::AuthCacheMode,
     auth_cache_duration: u64,
-    decrypt_cache_duration: u64,
 ) -> Result<()> {
     let (auth_cipher, passphrase_cipher) =
         load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
@@ -157,7 +152,6 @@ pub async fn serve(
             ssh_idle_timeout,
             auth_cache_mode,
             auth_cache_duration,
-            decrypt_cache_duration,
         )
         .await
         {

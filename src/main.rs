@@ -4,13 +4,16 @@ use clap::{Parser, Subcommand};
 use crate::cli::VTClient;
 
 fn require_auth(auth: &Option<String>) -> Result<String> {
-    auth.clone().ok_or_else(|| {
-        anyhow::anyhow!("VT_AUTH not set — run `vt init` and export the token")
-    })
+    auth.clone()
+        .ok_or_else(|| anyhow::anyhow!("VT_AUTH not set — run `vt init` and export the token"))
 }
 
 mod cli;
 mod core;
+#[cfg(target_os = "macos")]
+mod fido2;
+#[cfg(target_os = "macos")]
+mod fido2_cli;
 mod security;
 #[cfg(target_os = "macos")]
 mod serve;
@@ -20,7 +23,11 @@ mod ssh_agent;
 mod ssh_cli;
 
 #[derive(Parser)]
-#[command(author, version, about="a simple kms. no plain, explicit auth everywhere")]
+#[command(
+    author,
+    version,
+    about = "a simple kms. no plain, explicit auth everywhere"
+)]
 struct Cli {
     #[arg(
         long,
@@ -118,12 +125,6 @@ enum Commands {
             help = "Auth cache duration in seconds for sign operations"
         )]
         auth_cache_duration: u64,
-        #[arg(
-            long = "ssh-decrypt-cache-duration",
-            default_value_t = ssh_agent::DEFAULT_DECRYPT_CACHE_DURATION_SECS,
-            help = "Auth cache duration in seconds for decrypt operations"
-        )]
-        decrypt_cache_duration: u64,
     },
     /// (Mac only) Initialize passcode, passphrase which will be used by server
     #[cfg(target_os = "macos")]
@@ -136,6 +137,29 @@ enum Commands {
     #[cfg(target_os = "macos")]
     #[command(subcommand)]
     Ssh(SshCommands),
+    /// (Mac only) Manage FIDO2 (YubiKey) credentials for Touch ID fallback
+    #[cfg(target_os = "macos")]
+    #[command(subcommand)]
+    Fido2(Fido2Commands),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Subcommand, PartialEq)]
+pub enum Fido2Commands {
+    /// Register a new YubiKey. Requires Touch ID or password first.
+    Register {
+        #[arg(short = 'l', long = "label", help = "Human label for this credential")]
+        label: Option<String>,
+    },
+    /// List registered YubiKey credentials
+    List,
+    /// Remove a credential by short-id prefix
+    Remove {
+        #[arg(help = "Short-id prefix (shown in `vt fido2 list`)")]
+        short_id: String,
+    },
+    /// Remove all credentials
+    RemoveAll,
 }
 
 #[cfg(target_os = "macos")]
@@ -176,18 +200,16 @@ pub enum SshCommands {
             help = "Auth cache duration in seconds for sign operations"
         )]
         auth_cache_duration: u64,
-        #[arg(
-            long = "ssh-decrypt-cache-duration",
-            default_value_t = ssh_agent::DEFAULT_DECRYPT_CACHE_DURATION_SECS,
-            help = "Auth cache duration in seconds for decrypt operations"
-        )]
-        decrypt_cache_duration: u64,
     },
     /// Add an SSH private key to the keychain
     Add {
         #[arg(short = 'f', long = "file", help = "Path to the SSH private key file")]
         file: Option<String>,
-        #[arg(short = 'c', long = "comment", help = "Comment for the key (overrides key's embedded comment)")]
+        #[arg(
+            short = 'c',
+            long = "comment",
+            help = "Comment for the key (overrides key's embedded comment)"
+        )]
         comment: Option<String>,
     },
     /// List stored SSH keys
@@ -226,7 +248,6 @@ async fn run(cli: Cli) -> Result<()> {
                 ssh_idle_timeout,
                 auth_cache_mode,
                 auth_cache_duration,
-                decrypt_cache_duration,
             } => {
                 serve::serve(
                     cli.addr.as_deref().unwrap_or("127.0.0.1:5757"),
@@ -234,7 +255,6 @@ async fn run(cli: Cli) -> Result<()> {
                     *ssh_idle_timeout,
                     *auth_cache_mode,
                     *auth_cache_duration,
-                    *decrypt_cache_duration,
                 )
                 .await
             }
@@ -255,22 +275,23 @@ async fn run(cli: Cli) -> Result<()> {
                 timeout,
                 auth_cache_mode,
                 auth_cache_duration,
-                decrypt_cache_duration,
-            } => {
-                ssh_agent::start_ssh_agent(
-                    *timeout,
-                    *auth_cache_mode,
-                    *auth_cache_duration,
-                    *decrypt_cache_duration,
-                )
-                .await
-            }
+            } => ssh_agent::start_ssh_agent(*timeout, *auth_cache_mode, *auth_cache_duration).await,
             SshCommands::Add { file, comment } => ssh_cli::ssh_add(file.clone(), comment.clone()),
             SshCommands::List => ssh_cli::ssh_list(),
             SshCommands::Remove { fingerprint } => ssh_cli::ssh_remove(fingerprint),
             SshCommands::RemoveAll => ssh_cli::ssh_remove_all(),
-            SshCommands::Comment { fingerprint, comment } => ssh_cli::ssh_comment(fingerprint, comment),
+            SshCommands::Comment {
+                fingerprint,
+                comment,
+            } => ssh_cli::ssh_comment(fingerprint, comment),
             SshCommands::Show { fingerprint } => ssh_cli::ssh_show(fingerprint),
+        },
+        #[cfg(target_os = "macos")]
+        Commands::Fido2(cmd) => match cmd {
+            Fido2Commands::Register { label } => fido2_cli::fido2_register(label.clone()),
+            Fido2Commands::List => fido2_cli::fido2_list(),
+            Fido2Commands::Remove { short_id } => fido2_cli::fido2_remove(short_id),
+            Fido2Commands::RemoveAll => fido2_cli::fido2_remove_all(),
         },
         Commands::Create => {
             let auth = require_auth(&cli.auth)?;
@@ -285,11 +306,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Auth { reason } => {
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(cli.addr.clone(), auth);
-            cli::auth(
-                vt_client,
-                reason.as_deref().unwrap_or("bio auth requested"),
-            )
-            .await
+            cli::auth(vt_client, reason.as_deref().unwrap_or("bio auth requested")).await
         }
         Commands::Inject {
             replace_file,

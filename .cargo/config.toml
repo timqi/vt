@@ -1,0 +1,4 @@
+[target.'cfg(target_os = "macos")']
+rustflags = [
+    "-L", "/Library/Developer/CommandLineTools/usr/lib/clang/21/lib/darwin",
+]

@@ -43,6 +43,7 @@ p384 = { version = "0.13", features = ["ecdsa"] }
 async-trait = "0.1"
 subtle = "2"
 zeroize = "1"
+ctap-hid-fido2 = "3.5.9"
 
 [dev-dependencies]
 tracing-test = "0.2.5"

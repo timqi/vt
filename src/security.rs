@@ -57,18 +57,79 @@ pub fn delete_keychain(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Which method satisfied the auth request. Useful for callers that want to
+/// treat factor strength differently (e.g. the SSH agent cache doesn't cache
+/// FIDO2 since touch-only is weaker than Touch ID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    Biometric,
+    Fido2,
+    Password,
+}
+
+/// Authentication chain: biometric → FIDO2 (YubiKey) → system password.
+///
+/// Step 1 uses `DeviceOwnerAuthenticationWithBiometrics` (no built-in password
+/// fallback) so we control the boundary and can slot FIDO2 between biometric
+/// and password. `can_evaluate_policy` is checked first so we skip biometric
+/// cleanly on hardware without Touch ID.
+///
+/// FIDO2 returns a three-way outcome: a `Rejected` result (user clicked the
+/// dialog's Reject button, or a sign-counter regression was detected) aborts
+/// the entire chain — we do NOT silently fall back to password, because the
+/// user explicitly said no, or a security invariant was violated.
+///
+/// Limitation: `localauthentication-rs` only exposes a `bool` — we cannot
+/// distinguish user-cancel from biometric failure. A canceled Touch ID prompt
+/// therefore falls through to FIDO2/password rather than aborting. If that
+/// becomes a problem, switch to direct `objc2-local-authentication` FFI to
+/// inspect `LAError` codes.
+#[cfg(target_os = "macos")]
+pub fn authenticate(reason: &str) -> Option<AuthMethod> {
+    use crate::fido2::FidoOutcome;
+
+    if touch_id_authentication(reason) {
+        return Some(AuthMethod::Biometric);
+    }
+
+    match crate::fido2::authenticate(reason) {
+        FidoOutcome::Success => return Some(AuthMethod::Fido2),
+        FidoOutcome::Rejected => return None,
+        FidoOutcome::Skip => {}
+    }
+
+    use localauthentication_rs::{LAPolicy, LocalAuthentication};
+    let la = LocalAuthentication::new();
+    if la.evaluate_policy(LAPolicy::DeviceOwnerAuthentication, reason) {
+        return Some(AuthMethod::Password);
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn authenticate(_reason: &str) -> Option<AuthMethod> {
+    tracing::warn!("local authentication is not supported on this platform");
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub fn touch_id_authentication(reason: &str) -> bool {
+    use localauthentication_rs::{LAPolicy, LocalAuthentication};
+
+    let la = LocalAuthentication::new();
+    la.can_evaluate_policy(LAPolicy::DeviceOwnerAuthenticationWithBiometrics)
+        && la.evaluate_policy(LAPolicy::DeviceOwnerAuthenticationWithBiometrics, reason)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn touch_id_authentication(_reason: &str) -> bool {
+    tracing::warn!("Touch ID authentication is not supported on this platform");
+    false
+}
+
 pub fn local_authentication(reason: &str) -> bool {
-    #[cfg(not(target_os = "macos"))]
-    {
-        tracing::warn!("local authentication is not supported on this platform");
-        return false;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use localauthentication_rs::{LAPolicy, LocalAuthentication};
-        let local_authentication = LocalAuthentication::new();
-        local_authentication.evaluate_policy(LAPolicy::DeviceOwnerAuthentication, reason)
-    }
+    authenticate(reason).is_some()
 }
 
 pub fn derive_passphrase_secret(passcode: &[u8; 32], bin_path: Option<&str>) -> Result<[u8; 32]> {
@@ -119,6 +180,13 @@ pub fn load_mac_cipher(passphrase_cipher: &AesGcmCrypto) -> Result<AesGcmCrypto>
     let encrypted_passphrase = get_keychain("passphrase")?;
     let decrypted_passphrase = passphrase_cipher.decrypt(&encrypted_passphrase)?;
     AesGcmCrypto::new(decrypted_passphrase.as_slice().try_into()?)
+}
+
+/// Load the mac_cipher directly from the keychain in one call. The passphrase
+/// cipher is dropped immediately so the master key doesn't linger in memory.
+pub fn load_mac_cipher_from_keychain() -> Result<AesGcmCrypto> {
+    let (_, passphrase_cipher) = load_passcode_ciphers()?;
+    load_mac_cipher(&passphrase_cipher)
 }
 
 // Return auth_token, auth_cipher, passphrase_cipher
