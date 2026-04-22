@@ -99,9 +99,17 @@ impl std::fmt::Display for AuthCacheMode {
     }
 }
 
+/// Auth cache context: `(context_id, context_start_tvsec)`.
+///
+/// Including the process start time defeats PID/TTY-device reuse: if the
+/// original context process (app or TTY owner) exits and its PID or tdev is
+/// recycled, the new process has a different start time and won't match a
+/// cached grant.
+pub type CacheContext = (u64, u64);
+
 pub struct AuthCache {
     /// Each entry stores when it expires (computed at grant time).
-    entries: HashMap<(u64, String), Instant>,
+    entries: HashMap<(CacheContext, String), Instant>,
     sign_duration: Duration,
 }
 
@@ -113,17 +121,17 @@ impl AuthCache {
         }
     }
 
-    pub fn is_authorized(&self, context_id: u64, fingerprint: &str) -> bool {
-        if let Some(expires_at) = self.entries.get(&(context_id, fingerprint.to_string())) {
+    pub fn is_authorized(&self, context: CacheContext, fingerprint: &str) -> bool {
+        if let Some(expires_at) = self.entries.get(&(context, fingerprint.to_string())) {
             Instant::now() < *expires_at
         } else {
             false
         }
     }
 
-    pub fn grant(&mut self, context_id: u64, fingerprint: &str) {
+    pub fn grant(&mut self, context: CacheContext, fingerprint: &str) {
         self.entries.insert(
-            (context_id, fingerprint.to_string()),
+            (context, fingerprint.to_string()),
             Instant::now() + self.sign_duration,
         );
     }
@@ -186,8 +194,8 @@ mod proc_info {
         ) -> libc::c_int;
     }
 
-    /// Get process BSD info: returns (ppid, tdev) or None.
-    pub fn get_proc_bsdinfo(pid: i32) -> Option<(u32, u32)> {
+    /// Get process BSD info: returns (ppid, tdev, start_tvsec) or None.
+    pub fn get_proc_bsdinfo(pid: i32) -> Option<(u32, u32, u64)> {
         let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<ProcBsdInfo>() as libc::c_int;
         let ret = unsafe {
@@ -200,7 +208,7 @@ mod proc_info {
             )
         };
         if ret == size {
-            Some((info.pbi_ppid, info.e_tdev))
+            Some((info.pbi_ppid, info.e_tdev, info.pbi_start_tvsec))
         } else {
             None
         }
@@ -218,16 +226,29 @@ mod proc_info {
         }
     }
 
-    /// Get the controlling TTY device number for a process.
-    pub fn get_tty_dev(pid: i32) -> u64 {
-        get_proc_bsdinfo(pid)
-            .map(|(_, tdev)| tdev as u64)
-            .unwrap_or(0)
+    /// Get the controlling TTY device number for a process. Returns None
+    /// for processes with no controlling terminal (`tdev == 0`) so the
+    /// caller can treat them as uncacheable — otherwise every daemon
+    /// without a TTY would share a single cache slot keyed on 0.
+    pub fn get_tty_dev(pid: i32) -> Option<u32> {
+        let (_, tdev, _) = get_proc_bsdinfo(pid)?;
+        if tdev == 0 {
+            None
+        } else {
+            Some(tdev)
+        }
+    }
+
+    /// Get the process start time (seconds since epoch).
+    pub fn get_start_tvsec(pid: i32) -> Option<u64> {
+        get_proc_bsdinfo(pid).map(|(_, _, s)| s)
     }
 
     /// Walk the process tree upward to find a `.app/Contents/` ancestor.
-    /// Returns the PID of the app process, or the direct parent as fallback.
-    pub fn find_app_pid(peer_pid: i32) -> u64 {
+    /// Returns the PID of the app process, or `peer_pid` itself if no app
+    /// ancestor is found — never falls back to the parent, which would
+    /// conflate sibling CLI tools sharing a shell.
+    pub fn find_app_pid(peer_pid: i32) -> i32 {
         let mut current_pid = peer_pid;
         // Limit traversal to prevent infinite loops
         for _ in 0..64 {
@@ -236,20 +257,17 @@ mod proc_info {
             }
             if let Some(path) = get_proc_path(current_pid) {
                 if path.contains(".app/Contents/") {
-                    return current_pid as u64;
+                    return current_pid;
                 }
             }
             match get_proc_bsdinfo(current_pid) {
-                Some((ppid, _)) if ppid > 0 && ppid as i32 != current_pid => {
+                Some((ppid, _, _)) if ppid > 0 && ppid as i32 != current_pid => {
                     current_pid = ppid as i32;
                 }
                 _ => break,
             }
         }
-        // Fallback: return the immediate parent of the peer
-        get_proc_bsdinfo(peer_pid)
-            .map(|(ppid, _)| ppid as u64)
-            .unwrap_or(peer_pid as u64)
+        peer_pid
     }
 }
 
@@ -348,12 +366,40 @@ impl VtSshAgentFactory {
     }
 }
 
+/// Resolve the auth-cache context for this session.
+///
+/// Returns `None` when the session must not be cached (no peer PID,
+/// `tdev == 0` for per-session, or missing proc info). The context is
+/// captured once at session creation — not recomputed per request — so a
+/// cache lookup can never race proc-tree state between connection and the
+/// actual `sign` call.
+fn resolve_cache_context(
+    peer_pid: Option<i32>,
+    mode: AuthCacheMode,
+) -> Option<CacheContext> {
+    let pid = peer_pid?;
+    match mode {
+        AuthCacheMode::None => None,
+        AuthCacheMode::PerSession => {
+            let tdev = proc_info::get_tty_dev(pid)?;
+            let start = proc_info::get_start_tvsec(pid)?;
+            Some((tdev as u64, start))
+        }
+        AuthCacheMode::PerApp => {
+            let app_pid = proc_info::find_app_pid(pid);
+            let start = proc_info::get_start_tvsec(app_pid)?;
+            Some((app_pid as u64, start))
+        }
+    }
+}
+
 impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
     fn new_session(&mut self, socket: &tokio::net::UnixStream) -> impl Session {
         let peer_pid = get_peer_pid(socket);
         if let Some(pid) = peer_pid {
             tracing::debug!("New session from PID {}", pid);
         }
+        let cache_context = resolve_cache_context(peer_pid, self.cache_mode);
         VtSshSession {
             keys: Arc::clone(&self.keys),
             last_activity: Arc::clone(&self.last_activity),
@@ -362,7 +408,7 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             idle_cleared: Arc::clone(&self.idle_cleared),
             auth_cache: Arc::clone(&self.auth_cache),
             peer_pid,
-            cache_mode: self.cache_mode,
+            cache_context,
         }
     }
 }
@@ -377,7 +423,8 @@ struct VtSshSession {
     idle_cleared: Arc<RwLock<bool>>,
     auth_cache: Arc<RwLock<AuthCache>>,
     peer_pid: Option<i32>,
-    cache_mode: AuthCacheMode,
+    /// Resolved once at session creation. `None` = always prompt.
+    cache_context: Option<CacheContext>,
 }
 
 impl VtSshSession {
@@ -425,27 +472,19 @@ impl VtSshSession {
     /// factor than Touch ID, and a YubiKey tap is fast enough that caching
     /// adds little value. Biometric and password results are cached normally.
     async fn check_or_prompt_auth(&self, fingerprint: &str, auth_message: &str) -> bool {
-        let context_id = match self.cache_mode {
-            AuthCacheMode::None => {
-                return local_authentication(auth_message);
-            }
-            AuthCacheMode::PerSession => match self.peer_pid {
-                Some(pid) => proc_info::get_tty_dev(pid),
-                None => return local_authentication(auth_message),
-            },
-            AuthCacheMode::PerApp => match self.peer_pid {
-                Some(pid) => proc_info::find_app_pid(pid),
-                None => return local_authentication(auth_message),
-            },
+        // If we couldn't resolve a cache context at session creation (no
+        // peer PID, no TTY, missing proc info), always prompt.
+        let Some(context) = self.cache_context else {
+            return local_authentication(auth_message);
         };
 
         // Check cache (read lock, released before auth prompt)
         {
             let cache = self.auth_cache.read().await;
-            if cache.is_authorized(context_id, fingerprint) {
+            if cache.is_authorized(context, fingerprint) {
                 tracing::debug!(
-                    "Auth cache hit for context={} fingerprint={}",
-                    context_id,
+                    "Auth cache hit for context={:?} fingerprint={}",
+                    context,
                     fingerprint
                 );
                 return true;
@@ -460,10 +499,10 @@ impl VtSshSession {
         // Cache Biometric and Password; skip FIDO2 (weaker factor).
         if matches!(method, AuthMethod::Biometric | AuthMethod::Password) {
             let mut cache = self.auth_cache.write().await;
-            cache.grant(context_id, fingerprint);
+            cache.grant(context, fingerprint);
             tracing::debug!(
-                "Auth cache grant for context={} fingerprint={} method={:?}",
-                context_id,
+                "Auth cache grant for context={:?} fingerprint={} method={:?}",
+                context,
                 fingerprint,
                 method
             );
@@ -1097,50 +1136,68 @@ mod tests {
     #[test]
     fn test_auth_cache_grant_and_hit() {
         let mut cache = AuthCache::new(300);
-        assert!(!cache.is_authorized(1, "fp1"));
+        let ctx = (1u64, 100u64);
+        assert!(!cache.is_authorized(ctx, "fp1"));
 
-        cache.grant(1, "fp1");
-        assert!(cache.is_authorized(1, "fp1"));
+        cache.grant(ctx, "fp1");
+        assert!(cache.is_authorized(ctx, "fp1"));
     }
 
     #[test]
     fn test_auth_cache_different_context_misses() {
         let mut cache = AuthCache::new(300);
-        cache.grant(1, "fp1");
+        let ctx1 = (1u64, 100u64);
+        let ctx2 = (2u64, 100u64);
+        cache.grant(ctx1, "fp1");
 
         // Same fingerprint, different context
-        assert!(!cache.is_authorized(2, "fp1"));
+        assert!(!cache.is_authorized(ctx2, "fp1"));
         // Same context, different fingerprint
-        assert!(!cache.is_authorized(1, "fp2"));
+        assert!(!cache.is_authorized(ctx1, "fp2"));
+    }
+
+    #[test]
+    fn test_auth_cache_start_time_distinguishes_reused_pid() {
+        // Same PID, different start time → different context (PID reuse)
+        let mut cache = AuthCache::new(300);
+        let orig = (1234u64, 1_700_000_000u64);
+        let reused = (1234u64, 1_700_000_500u64);
+        cache.grant(orig, "fp1");
+
+        assert!(cache.is_authorized(orig, "fp1"));
+        assert!(!cache.is_authorized(reused, "fp1"));
     }
 
     #[test]
     fn test_auth_cache_expiry() {
         let mut cache = AuthCache::new(0); // 0 second duration = immediately expired
-        cache.grant(1, "fp1");
+        let ctx = (1u64, 100u64);
+        cache.grant(ctx, "fp1");
 
         // With 0 duration, entries expire immediately
         std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(!cache.is_authorized(1, "fp1"));
+        assert!(!cache.is_authorized(ctx, "fp1"));
     }
 
     #[test]
     fn test_auth_cache_clear() {
         let mut cache = AuthCache::new(300);
-        cache.grant(1, "fp1");
-        cache.grant(2, "fp2");
-        assert!(cache.is_authorized(1, "fp1"));
+        let ctx1 = (1u64, 100u64);
+        let ctx2 = (2u64, 100u64);
+        cache.grant(ctx1, "fp1");
+        cache.grant(ctx2, "fp2");
+        assert!(cache.is_authorized(ctx1, "fp1"));
 
         cache.clear();
-        assert!(!cache.is_authorized(1, "fp1"));
-        assert!(!cache.is_authorized(2, "fp2"));
+        assert!(!cache.is_authorized(ctx1, "fp1"));
+        assert!(!cache.is_authorized(ctx2, "fp2"));
     }
 
     #[test]
     fn test_auth_cache_sweep_expired() {
         let mut cache = AuthCache::new(0); // 0 second = immediately expired
-        cache.grant(1, "fp1");
-        cache.grant(2, "fp2");
+        cache.grant((1u64, 100u64), "fp1");
+        cache.grant((2u64, 100u64), "fp2");
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         cache.sweep_expired();
@@ -1155,8 +1212,9 @@ mod tests {
         let pid = std::process::id() as i32;
         let result = proc_info::get_proc_bsdinfo(pid);
         assert!(result.is_some(), "Should be able to query own process");
-        let (ppid, _tdev) = result.unwrap();
+        let (ppid, _tdev, start) = result.unwrap();
         assert!(ppid > 0, "Parent PID should be positive");
+        assert!(start > 0, "Start time should be positive");
     }
 
     #[test]
