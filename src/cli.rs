@@ -406,32 +406,135 @@ pub async fn inject(
         env::set_var(key, decrypted_value);
     }
 
-    if let Some(replace_file_path) = &replace_file {
-        // Create a backup of the original file
-        let backup_path = format!("{}.vt", replace_file_path);
-        std::fs::copy(replace_file_path, &backup_path)
-            .with_context(|| format!("Failed to backup file to: {}", backup_path))?;
-        debug!("Created backup at: {}", backup_path);
-    }
-
     let output_file_content = decrypted_args.pop().unwrap();
-    if let Some(replace_file_path) = &replace_file {
-        std::fs::write(replace_file_path, &output_file_content)
-            .with_context(|| format!("Failed to write to replace file: {}", replace_file_path))?;
+
+    // For `--replace-file` and `--output-file`, write the plaintext safely:
+    //   - open the original with `O_NOFOLLOW` so we refuse symlinks;
+    //   - create backup and temp files with `O_CREAT|O_EXCL|O_NOFOLLOW` and
+    //     mode copied from the original (or 0600 for new outputs), so a
+    //     squatted sibling can't be opened and the file is not world-readable;
+    //   - randomize backup/temp names so the target isn't predictable between
+    //     the write and the eventual restore;
+    //   - write the plaintext to a sibling temp file and atomically rename it
+    //     over the original, eliminating the mid-write symlink race.
+    // The backup path is then passed to the cleanup child, which renames it
+    // back over the original after the timeout.
+    let backup_path: Option<std::path::PathBuf> = if let Some(replace_file_path) = &replace_file {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let orig_path = std::path::Path::new(replace_file_path);
+        let dir = orig_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let file_name = orig_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Invalid replace file path: {}", replace_file_path))?
+            .to_string_lossy()
+            .into_owned();
+
+        let mut src = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(replace_file_path)
+            .with_context(|| {
+                format!(
+                    "Failed to open replace file (refuses symlinks): {}",
+                    replace_file_path
+                )
+            })?;
+        let meta = src
+            .metadata()
+            .with_context(|| format!("Failed to stat: {}", replace_file_path))?;
+        if !meta.is_file() {
+            return Err(anyhow::anyhow!(
+                "Refusing to replace non-regular file: {}",
+                replace_file_path
+            ));
+        }
+        let orig_mode = meta.mode() & 0o7777;
+
+        let mut rnd = [0u8; 8];
+        {
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut rnd);
+        }
+        let suffix: String = rnd.iter().map(|b| format!("{:02x}", b)).collect();
+        let backup_path = dir.join(format!(".{}.vt-backup-{}", file_name, suffix));
+        let tmp_path = dir.join(format!(".{}.vt-tmp-{}", file_name, suffix));
+
+        {
+            let mut backup_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(orig_mode)
+                .open(&backup_path)
+                .with_context(|| {
+                    format!("Failed to create backup file: {}", backup_path.display())
+                })?;
+            std::io::copy(&mut src, &mut backup_file).with_context(|| {
+                format!(
+                    "Failed to copy content to backup: {}",
+                    backup_path.display()
+                )
+            })?;
+            backup_file.sync_all().ok();
+        }
+        drop(src);
+        debug!("Created backup at: {}", backup_path.display());
+
+        {
+            let mut tmp_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(orig_mode)
+                .open(&tmp_path)
+                .with_context(|| format!("Failed to create temp file: {}", tmp_path.display()))?;
+            tmp_file
+                .write_all(output_file_content.as_bytes())
+                .with_context(|| format!("Failed to write temp file: {}", tmp_path.display()))?;
+            tmp_file.sync_all().ok();
+        }
+        std::fs::rename(&tmp_path, replace_file_path).with_context(|| {
+            format!("Failed to atomically replace file: {}", replace_file_path)
+        })?;
         debug!("Content written to replace file: {}", replace_file_path);
+
+        Some(backup_path)
     } else if let Some(output_file_path) = &output_file {
-        std::fs::write(output_file_path, &output_file_content)
-            .with_context(|| format!("Failed to write to output file: {}", output_file_path))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(output_file_path)
+            .with_context(|| {
+                format!(
+                    "Failed to create output file (refuses existing/symlink): {}",
+                    output_file_path
+                )
+            })?;
+        out.write_all(output_file_content.as_bytes())
+            .with_context(|| format!("Failed to write output file: {}", output_file_path))?;
+        out.sync_all().ok();
         debug!("Content written to output file: {}", output_file_path);
+        None
     } else {
         print!("{}", output_file_content);
-    }
+        None
+    };
 
-    // Helper function to restore backup or delete output file
-    let restore_backup = |replace_file_path: Option<&String>, output_file_path: Option<&String>| {
-        if let Some(replace_file_path) = replace_file_path {
-            let backup_path = format!("{}.vt", replace_file_path);
-            if let Err(e) = std::fs::rename(&backup_path, replace_file_path) {
+    // Restore the randomized backup over the original (replace mode) or
+    // delete the output file. Used by both the cleanup child after the
+    // timeout and the parent on exec failure.
+    let restore_backup = |replace_file_path: Option<&String>,
+                          output_file_path: Option<&String>,
+                          backup_path: Option<&std::path::PathBuf>| {
+        if let (Some(replace_file_path), Some(backup_path)) = (replace_file_path, backup_path) {
+            if let Err(e) = std::fs::rename(backup_path, replace_file_path) {
                 eprintln!("Failed to restore backup file: {}", e);
             } else {
                 debug!("Restored backup file: {}", replace_file_path);
@@ -461,14 +564,13 @@ pub async fn inject(
             // Using std::thread::sleep instead of tokio::time::sleep is safer after a fork.
             std::thread::sleep(std::time::Duration::from_secs(timeout as u64));
 
-            if let Some(replace_file_path) = replace_file.as_ref() {
-                // Restore the backup file
-                let backup_path = format!("{}.vt", replace_file_path);
-                if let Err(e) = std::fs::rename(&backup_path, replace_file_path) {
+            if let (Some(replace_file_path), Some(backup_path)) =
+                (replace_file.as_ref(), backup_path.as_ref())
+            {
+                if let Err(e) = std::fs::rename(backup_path, replace_file_path) {
                     eprintln!("Child process failed to restore backup file: {}", e);
                 }
             } else if let Some(output_file_path) = output_file.as_ref() {
-                // Delete the output file
                 if let Err(e) = std::fs::remove_file(output_file_path) {
                     eprintln!("Child process failed to delete output file: {}", e);
                 }
@@ -516,7 +618,11 @@ pub async fn inject(
     }
 
     // Immediately restore the backup since exec failed
-    restore_backup(replace_file.as_ref(), output_file.as_ref());
+    restore_backup(
+        replace_file.as_ref(),
+        output_file.as_ref(),
+        backup_path.as_ref(),
+    );
 
     Err(anyhow::anyhow!("Failed to execute command: {}", err))
 }
