@@ -67,29 +67,38 @@ pub enum AuthMethod {
     Password,
 }
 
-/// Authentication chain: biometric → FIDO2 (YubiKey) → system password.
+/// Authentication chain.
 ///
-/// Step 1 uses `DeviceOwnerAuthenticationWithBiometrics` (no built-in password
-/// fallback) so we control the boundary and can slot FIDO2 between biometric
-/// and password. `can_evaluate_policy` is checked first so we skip biometric
-/// cleanly on hardware without Touch ID.
+/// If Touch ID is *available* (`can_evaluate_policy` for biometrics = true), it
+/// is the only path: success → `Biometric`, failure (cancel / failed match) →
+/// `None`. We do NOT fall through to FIDO2 or password in that case — the user
+/// already saw a system auth dialog and rejected it; offering a second path
+/// would defeat the rejection.
 ///
-/// FIDO2 returns a three-way outcome: a `Rejected` result (user clicked the
-/// dialog's Reject button, or a sign-counter regression was detected) aborts
-/// the entire chain — we do NOT silently fall back to password, because the
-/// user explicitly said no, or a security invariant was violated.
-///
-/// Limitation: `localauthentication-rs` only exposes a `bool` — we cannot
-/// distinguish user-cancel from biometric failure. A canceled Touch ID prompt
-/// therefore falls through to FIDO2/password rather than aborting. If that
-/// becomes a problem, switch to direct `objc2-local-authentication` FFI to
-/// inspect `LAError` codes.
+/// If Touch ID is *unavailable* (no hardware, not enrolled, locked out),
+/// `can_evaluate_policy` returns false and we run the fallback chain:
+/// FIDO2 (YubiKey) → system password. FIDO2's `Rejected` outcome (user clicked
+/// Reject, or a sign-counter regression) aborts; only `Skip` continues to
+/// password.
 #[cfg(target_os = "macos")]
 pub fn authenticate(reason: &str) -> Option<AuthMethod> {
     use crate::fido2::FidoOutcome;
+    use localauthentication_rs::{LAPolicy, LocalAuthentication};
 
-    if touch_id_authentication(reason) {
-        return Some(AuthMethod::Biometric);
+    let la = LocalAuthentication::new();
+    let touch_id_available =
+        la.can_evaluate_policy(LAPolicy::DeviceOwnerAuthenticationWithBiometrics);
+
+    if touch_id_available {
+        if la.evaluate_policy(LAPolicy::DeviceOwnerAuthenticationWithBiometrics, reason) {
+            return Some(AuthMethod::Biometric);
+        }
+        // User rejected, biometric failed, or the dialog returned false without
+        // prompting (rare environmental issue). Notify so the user knows why
+        // their action failed instead of just hanging silently — especially
+        // important for background callers like the SSH agent.
+        notify_touch_id_rejected(reason);
+        return None;
     }
 
     match crate::fido2::authenticate(reason) {
@@ -98,13 +107,28 @@ pub fn authenticate(reason: &str) -> Option<AuthMethod> {
         FidoOutcome::Skip => {}
     }
 
-    use localauthentication_rs::{LAPolicy, LocalAuthentication};
-    let la = LocalAuthentication::new();
     if la.evaluate_policy(LAPolicy::DeviceOwnerAuthentication, reason) {
         return Some(AuthMethod::Password);
     }
 
     None
+}
+
+#[cfg(target_os = "macos")]
+fn notify_touch_id_rejected(reason: &str) {
+    let safe: String = reason
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+        .take(150)
+        .collect();
+    let script = format!(
+        r#"display notification "Touch ID rejected: {}" with title "vt""#,
+        safe
+    );
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status();
 }
 
 #[cfg(not(target_os = "macos"))]
