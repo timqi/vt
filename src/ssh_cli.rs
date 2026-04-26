@@ -2,17 +2,14 @@ use anyhow::{Context, Result};
 use ssh_key::private::PrivateKey;
 use ssh_key::HashAlg;
 
-use crate::security::{load_mac_cipher, load_passcode_ciphers, local_authentication};
-use crate::ssh_agent::{load_ssh_keys, save_ssh_keys, SshKeyEntry};
+use crate::security::{derive_passcode_ciphers, load_mac_cipher, local_authentication};
+use crate::ssh_agent::{decode_ssh_keys, encode_ssh_keys_into, SshKeyEntry};
+use crate::store::KeychainStore;
 
 pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
     if !local_authentication("add SSH key") {
         return Err(anyhow::anyhow!("Authentication failed"));
     }
-
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
 
     let interactive = file.is_none();
     let key_data = match file {
@@ -74,28 +71,35 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
         .to_openssh(ssh_key::LineEnding::LF)
         .context("Failed to serialize key")?;
 
-    // Load all keys, add the new one, save back as single item
-    let mut entries = load_ssh_keys(&mac_cipher)?;
-    if !entries.iter().any(|e| e.fingerprint == fp_str) {
-        entries.push(SshKeyEntry {
-            fingerprint: fp_str.clone(),
-            algorithm: algorithm.clone(),
-            comment: comment.clone(),
-            key_data: key_openssh.to_string(),
-        });
-        save_ssh_keys(&mac_cipher, &entries)?;
-    }
+    let fp_for_modify = fp_str.clone();
+    let algorithm_for_modify = algorithm.clone();
+    let comment_for_modify = comment.clone();
+    let key_openssh_str = key_openssh.to_string();
+    KeychainStore::modify(|store| {
+        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+        let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+        let mut entries = decode_ssh_keys(store, &mac_cipher)?;
+        if !entries.iter().any(|e| e.fingerprint == fp_for_modify) {
+            entries.push(SshKeyEntry {
+                fingerprint: fp_for_modify,
+                algorithm: algorithm_for_modify,
+                comment: comment_for_modify,
+                key_data: key_openssh_str,
+            });
+            encode_ssh_keys_into(store, &mac_cipher, &entries)?;
+        }
+        Ok(())
+    })?;
 
     println!("Added: {} {} {}", algorithm, fp_str, comment);
     Ok(())
 }
 
 pub fn ssh_list() -> Result<()> {
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
-
-    let entries = load_ssh_keys(&mac_cipher)?;
+    let store = KeychainStore::load().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
+    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let mac_cipher = load_mac_cipher(&store, &passphrase_cipher)?;
+    let entries = decode_ssh_keys(&store, &mac_cipher)?;
     if entries.is_empty() {
         println!("No SSH keys stored.");
         return Ok(());
@@ -119,41 +123,46 @@ pub fn ssh_remove(fingerprint: &str) -> Result<()> {
         return Err(anyhow::anyhow!("Authentication failed"));
     }
 
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
+    let needle = fingerprint.to_string();
+    let mut removed_info: Option<String> = None;
+    KeychainStore::modify(|store| {
+        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+        let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+        let mut entries = decode_ssh_keys(store, &mac_cipher)?;
 
-    let mut entries = load_ssh_keys(&mac_cipher)?;
+        let matches: Vec<_> = entries
+            .iter()
+            .filter(|e| e.fingerprint.contains(&needle))
+            .cloned()
+            .collect();
 
-    let matches: Vec<_> = entries
-        .iter()
-        .filter(|e| e.fingerprint.contains(fingerprint))
-        .cloned()
-        .collect();
-
-    if matches.is_empty() {
-        return Err(anyhow::anyhow!("No key found matching '{}'", fingerprint));
-    }
-    if matches.len() > 1 {
-        println!("Multiple keys match '{}':", fingerprint);
-        for m in &matches {
-            println!("  {} {} {}", m.algorithm, m.fingerprint, m.comment);
+        if matches.is_empty() {
+            return Err(anyhow::anyhow!("No key found matching '{}'", needle));
         }
-        return Err(anyhow::anyhow!(
-            "Ambiguous fingerprint, please be more specific"
+        if matches.len() > 1 {
+            println!("Multiple keys match '{}':", needle);
+            for m in &matches {
+                println!("  {} {} {}", m.algorithm, m.fingerprint, m.comment);
+            }
+            return Err(anyhow::anyhow!(
+                "Ambiguous fingerprint, please be more specific"
+            ));
+        }
+
+        let entry = &matches[0];
+        removed_info = Some(format!(
+            "{} {} {}",
+            entry.algorithm, entry.fingerprint, entry.comment
         ));
+
+        entries.retain(|e| e.fingerprint != entry.fingerprint);
+        encode_ssh_keys_into(store, &mac_cipher, &entries)?;
+        Ok(())
+    })?;
+
+    if let Some(info) = removed_info {
+        println!("Removed: {}", info);
     }
-
-    let entry = &matches[0];
-    let removed_info = format!(
-        "{} {} {}",
-        entry.algorithm, entry.fingerprint, entry.comment
-    );
-
-    entries.retain(|e| e.fingerprint != entry.fingerprint);
-    save_ssh_keys(&mac_cipher, &entries)?;
-
-    println!("Removed: {}", removed_info);
     Ok(())
 }
 
@@ -162,11 +171,12 @@ pub fn ssh_remove_all() -> Result<()> {
         return Err(anyhow::anyhow!("Authentication failed"));
     }
 
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
-
-    save_ssh_keys(&mac_cipher, &[])?;
+    KeychainStore::modify(|store| {
+        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+        let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+        encode_ssh_keys_into(store, &mac_cipher, &[])?;
+        Ok(())
+    })?;
 
     println!("Removed all SSH keys.");
     Ok(())
@@ -177,48 +187,55 @@ pub fn ssh_comment(fingerprint: &str, comment: &str) -> Result<()> {
         return Err(anyhow::anyhow!("Authentication failed"));
     }
 
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
+    let needle = fingerprint.to_string();
+    let new_comment = comment.to_string();
+    let mut updated_info: Option<(String, String)> = None;
+    KeychainStore::modify(|store| {
+        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+        let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+        let mut entries = decode_ssh_keys(store, &mac_cipher)?;
 
-    let mut entries = load_ssh_keys(&mac_cipher)?;
+        let matches: Vec<_> = entries
+            .iter()
+            .filter(|e| e.fingerprint.contains(&needle))
+            .collect();
 
-    let matches: Vec<_> = entries
-        .iter()
-        .filter(|e| e.fingerprint.contains(fingerprint))
-        .collect();
-
-    if matches.is_empty() {
-        return Err(anyhow::anyhow!("No key found matching '{}'", fingerprint));
-    }
-    if matches.len() > 1 {
-        println!("Multiple keys match '{}':", fingerprint);
-        for m in &matches {
-            println!("  {} {} {}", m.algorithm, m.fingerprint, m.comment);
+        if matches.is_empty() {
+            return Err(anyhow::anyhow!("No key found matching '{}'", needle));
         }
-        return Err(anyhow::anyhow!(
-            "Ambiguous fingerprint, please be more specific"
-        ));
+        if matches.len() > 1 {
+            println!("Multiple keys match '{}':", needle);
+            for m in &matches {
+                println!("  {} {} {}", m.algorithm, m.fingerprint, m.comment);
+            }
+            return Err(anyhow::anyhow!(
+                "Ambiguous fingerprint, please be more specific"
+            ));
+        }
+
+        let fp = matches[0].fingerprint.clone();
+        let algorithm = matches[0].algorithm.clone();
+        let entry = entries.iter_mut().find(|e| e.fingerprint == fp).unwrap();
+
+        let privkey = PrivateKey::from_openssh(entry.key_data.as_bytes())
+            .context("Failed to parse stored key")?;
+        let privkey = PrivateKey::new(privkey.key_data().clone(), &new_comment)
+            .context("Failed to set comment on key")?;
+        let key_openssh = privkey
+            .to_openssh(ssh_key::LineEnding::LF)
+            .context("Failed to serialize key")?;
+
+        entry.comment = new_comment.clone();
+        entry.key_data = key_openssh.to_string();
+        encode_ssh_keys_into(store, &mac_cipher, &entries)?;
+
+        updated_info = Some((algorithm, fp));
+        Ok(())
+    })?;
+
+    if let Some((algorithm, fp)) = updated_info {
+        println!("Updated: {} {} {}", algorithm, fp, comment);
     }
-
-    let fp = matches[0].fingerprint.clone();
-    let algorithm = matches[0].algorithm.clone();
-    let entry = entries.iter_mut().find(|e| e.fingerprint == fp).unwrap();
-
-    // Update comment in the stored OpenSSH key data
-    let privkey = PrivateKey::from_openssh(entry.key_data.as_bytes())
-        .context("Failed to parse stored key")?;
-    let privkey = PrivateKey::new(privkey.key_data().clone(), comment)
-        .context("Failed to set comment on key")?;
-    let key_openssh = privkey
-        .to_openssh(ssh_key::LineEnding::LF)
-        .context("Failed to serialize key")?;
-
-    entry.comment = comment.to_string();
-    entry.key_data = key_openssh.to_string();
-    save_ssh_keys(&mac_cipher, &entries)?;
-
-    println!("Updated: {} {} {}", algorithm, fp, comment);
     Ok(())
 }
 
@@ -227,11 +244,10 @@ pub fn ssh_show(fingerprint: &str) -> Result<()> {
         return Err(anyhow::anyhow!("Authentication failed"));
     }
 
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
-
-    let entries = load_ssh_keys(&mac_cipher)?;
+    let store = KeychainStore::load().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
+    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let mac_cipher = load_mac_cipher(&store, &passphrase_cipher)?;
+    let entries = decode_ssh_keys(&store, &mac_cipher)?;
 
     let matches: Vec<_> = entries
         .iter()

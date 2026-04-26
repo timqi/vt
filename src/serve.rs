@@ -1,5 +1,8 @@
 use crate::core::{do_decrypt, do_encrypt, DecryptReq, EncryptItem};
-use crate::security::{load_mac_cipher, load_passcode_ciphers, local_authentication, AesGcmCrypto};
+use crate::security::{
+    derive_passcode_ciphers, load_mac_cipher, local_authentication, AesGcmCrypto,
+};
+use crate::store::KeychainStore;
 
 use anyhow::Result;
 use axum::{
@@ -132,7 +135,16 @@ async fn log_middleware(request: Request, next: Next) -> Response {
 
 #[derive(Clone)]
 struct AppState {
+    /// Cached for the lifetime of the server. Holds the key needed to decrypt
+    /// the master passphrase blob inside the keychain store, but not the
+    /// master key itself — that's re-derived per request via `load_mac_cipher`
+    /// so the AES-GCM master key only lives across one operation.
+    ///
+    /// If `vt secret rotate-passcode` runs against a live server the cached
+    /// cipher will go stale and decrypt requests will start failing; the
+    /// rotate command prints a warning telling the operator to restart.
     passphrase_cipher: Arc<AesGcmCrypto>,
+    store: Arc<KeychainStore>,
 }
 
 pub async fn serve(
@@ -142,8 +154,11 @@ pub async fn serve(
     auth_cache_mode: crate::ssh_agent::AuthCacheMode,
     auth_cache_duration: u64,
 ) -> Result<()> {
-    let (auth_cipher, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
+    // Single keychain read: load the store once and derive both ciphers from
+    // it. Previously this was two reads (`passcode` + `passphrase` items),
+    // doubling the first-run prompt count.
+    let store = KeychainStore::load().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
+    let (auth_cipher, passphrase_cipher) = derive_passcode_ciphers(&store)?;
 
     // Start SSH agent
     let ssh_handle = tokio::spawn(async move {
@@ -168,6 +183,7 @@ pub async fn serve(
             .route("/encrypt", post(handler_encrypt))
             .with_state(AppState {
                 passphrase_cipher: Arc::new(passphrase_cipher),
+                store: Arc::new(store),
             })
             .layer(middleware::from_fn(create_auth_middleware(Arc::new(
                 auth_cipher,
@@ -198,7 +214,7 @@ async fn handler_decrypt(
     if !local_authentication(&local_auth_message) {
         return (StatusCode::FORBIDDEN, "User Rejected").into_response();
     }
-    if let Ok(cipher) = load_mac_cipher(&state.passphrase_cipher) {
+    if let Ok(cipher) = load_mac_cipher(&state.store, &state.passphrase_cipher) {
         Json(do_decrypt(&cipher, payload.items)).into_response()
     } else {
         return (
@@ -213,7 +229,7 @@ async fn handler_encrypt(
     State(state): State<AppState>,
     Json(payload): Json<Vec<EncryptItem>>,
 ) -> impl IntoResponse {
-    if let Ok(cipher) = load_mac_cipher(&state.passphrase_cipher) {
+    if let Ok(cipher) = load_mac_cipher(&state.store, &state.passphrase_cipher) {
         Json(do_encrypt(&cipher, payload)).into_response()
     } else {
         return (

@@ -1,9 +1,11 @@
 use std::{env, vec};
 
 use crate::security::{
-    create_and_save_passcode_passphrase, decode_auth_cipher_from_b64, get_keychain,
-    load_passcode_ciphers, local_authentication, AesGcmCrypto,
+    create_and_save_passcode_passphrase, decode_auth_cipher_from_b64, derive_passcode_ciphers,
+    local_authentication, AesGcmCrypto,
 };
+#[cfg(target_os = "macos")]
+use crate::store::KeychainStore;
 use crate::core::{AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem, SecretType};
 use anyhow::{ensure, Context, Result};
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -15,10 +17,9 @@ use std::io::{self, Write};
 use tracing::debug;
 
 pub fn init() -> Result<()> {
-    let passphrase_result = load_passcode_ciphers();
-    if passphrase_result.is_ok() {
+    if KeychainStore::load().is_ok() {
         Err(anyhow::anyhow!(
-            "Error: already initialized? Please delete keys in keychain of 'rusty.vault' first"
+            "Error: already initialized? Please delete 'rusty.vault.store' from the keychain first"
         ))?;
         std::process::exit(1);
     }
@@ -665,8 +666,9 @@ pub async fn export_secret() -> Result<()> {
             "Local authentication failed for export master secret"
         ))?;
     }
-    let (_, passphrase_cipher) = load_passcode_ciphers()?;
-    let encrypted_passphrase = get_keychain("passphrase")?;
+    let store = KeychainStore::load()?;
+    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
     let decrypted_passphrase = passphrase_cipher
         .decrypt(&encrypted_passphrase)
         .context("Failed to decrypt passphrase")?;
@@ -693,10 +695,9 @@ pub async fn export_secret() -> Result<()> {
 }
 
 pub async fn import_secret() -> Result<()> {
-    let passphrase_result = load_passcode_ciphers();
-    if passphrase_result.is_ok() {
+    if KeychainStore::load().is_ok() {
         Err(anyhow::anyhow!(
-            "Error: already imported? Please delete keys in keychain of 'rusty.vault' first"
+            "Error: already imported? Please delete 'rusty.vault.store' from the keychain first"
         ))?;
         std::process::exit(1);
     }
@@ -741,8 +742,9 @@ pub async fn rotate_passcode(bin_absolute_path: Option<String>) -> Result<()> {
             "Local authentication failed for rotate passcode"
         ))?;
     }
-    let (_, passphrase_cipher) = load_passcode_ciphers()?;
-    let encrypted_passphrase = get_keychain("passphrase")?;
+    let store = KeychainStore::load()?;
+    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
     let decrypted_passphrase = passphrase_cipher
         .decrypt(&encrypted_passphrase)
         .context("Failed to decrypt passphrase. Wrong bin path?")?;
@@ -750,6 +752,10 @@ pub async fn rotate_passcode(bin_absolute_path: Option<String>) -> Result<()> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;
     create_and_save_passcode_passphrase(&passphrase_array, bin_absolute_path.as_deref())?;
+    eprintln!(
+        "Passcode rotated. If `vt serve` is running, restart it — the cached passphrase cipher \
+        is now stale and decrypt requests will fail until a fresh process is started."
+    );
     Ok(())
 }
 

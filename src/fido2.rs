@@ -20,10 +20,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Assertion;
 
-use crate::security::{get_keychain, load_mac_cipher_from_keychain, set_keychain};
+use crate::security::{derive_passcode_ciphers, load_mac_cipher, AesGcmCrypto};
+use crate::store::KeychainStore;
 
 pub const RP_ID: &str = "com.timqi.vt";
-const KEYCHAIN_NAME: &str = "fido2_credentials";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PubkeyAlg {
@@ -52,23 +52,66 @@ impl FidoCredential {
     }
 }
 
-pub fn load_credentials() -> Result<Vec<FidoCredential>> {
-    match get_keychain(KEYCHAIN_NAME) {
-        Ok(encrypted) => {
-            let cipher = load_mac_cipher_from_keychain()?;
-            let plain = cipher.decrypt(&encrypted)?;
-            let creds: Vec<FidoCredential> = serde_json::from_slice(&plain)?;
-            Ok(creds)
-        }
-        Err(_) => Ok(Vec::new()),
-    }
+/// Decode the FIDO2 credentials blob from a loaded store. Empty when the
+/// `encrypted_fido2` field is absent.
+fn decode_credentials(
+    store: &KeychainStore,
+    cipher: &AesGcmCrypto,
+) -> Result<Vec<FidoCredential>> {
+    let Some(encrypted) = store.encrypted_fido2_bytes()? else {
+        return Ok(Vec::new());
+    };
+    let plain = cipher.decrypt(&encrypted)?;
+    let creds: Vec<FidoCredential> = serde_json::from_slice(&plain)?;
+    Ok(creds)
 }
 
-fn save_credentials(creds: &[FidoCredential]) -> Result<()> {
-    let cipher = load_mac_cipher_from_keychain()?;
+fn encode_credentials_into(
+    store: &mut KeychainStore,
+    cipher: &AesGcmCrypto,
+    creds: &[FidoCredential],
+) -> Result<()> {
     let json = serde_json::to_vec(creds)?;
     let encrypted = cipher.encrypt(&json)?;
-    set_keychain(KEYCHAIN_NAME, &encrypted)
+    store.set_encrypted_fido2(&encrypted);
+    Ok(())
+}
+
+pub fn load_credentials() -> Result<Vec<FidoCredential>> {
+    let Ok(store) = KeychainStore::load() else {
+        // Vault not initialized → no credentials. Matches the previous
+        // "missing keychain item ⇒ empty list" semantics.
+        return Ok(Vec::new());
+    };
+    if store.encrypted_fido2.is_none() {
+        return Ok(Vec::new());
+    }
+    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let mac_cipher = load_mac_cipher(&store, &passphrase_cipher)?;
+    decode_credentials(&store, &mac_cipher)
+}
+
+/// User-triggered credential save (register/remove). Holds the cross-process
+/// file lock across the read-modify-write so it can't race a concurrent
+/// `vt ssh add` writing a different field.
+fn save_credentials_locked(creds: &[FidoCredential]) -> Result<()> {
+    KeychainStore::modify(|store| {
+        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+        let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+        encode_credentials_into(store, &mac_cipher, creds)
+    })
+}
+
+/// Best-effort sign-counter persistence, called from the FIDO2 hot path
+/// inside the SSH `sign()` handler. Uses `try_modify` (non-blocking lock):
+/// if another vt process is currently inside its own write, we drop the
+/// counter update and warn rather than blocking the SSH session.
+fn save_credentials_best_effort(creds: &[FidoCredential]) -> Result<bool> {
+    KeychainStore::try_modify(|store| {
+        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+        let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+        encode_credentials_into(store, &mac_cipher, creds)
+    })
 }
 
 pub fn device_present() -> bool {
@@ -143,7 +186,7 @@ pub fn register(label: String) -> Result<FidoCredential> {
         bail!("this credential is already registered");
     }
     existing.push(cred.clone());
-    save_credentials(&existing)?;
+    save_credentials_locked(&existing)?;
     Ok(cred)
 }
 
@@ -246,8 +289,17 @@ pub fn authenticate(reason: &str) -> FidoOutcome {
     }
     if assertion.sign_count > creds[idx].sign_counter {
         creds[idx].sign_counter = assertion.sign_count;
-        if let Err(e) = save_credentials(&creds) {
-            tracing::warn!("FIDO2: failed to persist sign counter: {}", e);
+        // Best-effort: never block the SSH sign() path on a contended file
+        // lock. Losing one counter bump means at worst a regression-detection
+        // false positive on the next auth, which would log loudly and abort.
+        match save_credentials_best_effort(&creds) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "FIDO2: keychain store busy — skipped persisting sign counter"
+                );
+            }
+            Err(e) => tracing::warn!("FIDO2: failed to persist sign counter: {}", e),
         }
     }
 
@@ -284,14 +336,14 @@ pub fn remove(prefix: &str) -> Result<usize> {
     if drop.is_empty() {
         bail!("no FIDO2 credential matches '{}'", prefix);
     }
-    save_credentials(&keep)?;
+    save_credentials_locked(&keep)?;
     Ok(drop.len())
 }
 
 pub fn remove_all() -> Result<usize> {
     let creds = load_credentials()?;
     let n = creds.len();
-    save_credentials(&[])?;
+    save_credentials_locked(&[])?;
     Ok(n)
 }
 

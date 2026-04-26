@@ -21,6 +21,8 @@ mod serve;
 mod ssh_agent;
 #[cfg(target_os = "macos")]
 mod ssh_cli;
+#[cfg(target_os = "macos")]
+mod store;
 
 #[derive(Parser)]
 #[command(

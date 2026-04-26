@@ -20,9 +20,10 @@ use crate::core::{
     do_decrypt, do_encrypt, AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem,
 };
 use crate::security::{
-    authenticate, get_keychain, load_mac_cipher, load_mac_cipher_from_keychain,
-    load_passcode_ciphers, local_authentication, set_keychain, AesGcmCrypto, AuthMethod,
+    authenticate, derive_passcode_ciphers, load_mac_cipher, local_authentication, AesGcmCrypto,
+    AuthMethod,
 };
+use crate::store::KeychainStore;
 
 /// SSH agent extension names used by vt.
 pub const EXT_ENCRYPT: &str = "encrypt@vt";
@@ -36,7 +37,7 @@ fn agent_err(e: anyhow::Error) -> AgentError {
     )))
 }
 
-// --- Key storage (single keychain item: rusty.vault.ssh_keys) ---
+// --- Key storage (lives in `encrypted_ssh_keys` field of rusty.vault.store) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshKeyEntry {
@@ -47,21 +48,31 @@ pub struct SshKeyEntry {
     pub key_data: String,
 }
 
-pub fn load_ssh_keys(cipher: &AesGcmCrypto) -> Result<Vec<SshKeyEntry>> {
-    match get_keychain("ssh_keys") {
-        Ok(encrypted) => {
-            let decrypted = cipher.decrypt(&encrypted)?;
-            let entries: Vec<SshKeyEntry> = serde_json::from_slice(&decrypted)?;
-            Ok(entries)
-        }
-        Err(_) => Ok(Vec::new()),
-    }
+/// Decode the SSH-keys blob from a loaded store. Returns an empty vec when
+/// the store has no SSH keys yet.
+pub fn decode_ssh_keys(
+    store: &KeychainStore,
+    cipher: &AesGcmCrypto,
+) -> Result<Vec<SshKeyEntry>> {
+    let Some(encrypted) = store.encrypted_ssh_keys_bytes()? else {
+        return Ok(Vec::new());
+    };
+    let decrypted = cipher.decrypt(&encrypted)?;
+    let entries: Vec<SshKeyEntry> = serde_json::from_slice(&decrypted)?;
+    Ok(entries)
 }
 
-pub fn save_ssh_keys(cipher: &AesGcmCrypto, entries: &[SshKeyEntry]) -> Result<()> {
+/// Re-encrypt SSH key entries and stash them on the in-memory store. Caller
+/// is responsible for `store.save()` (or going through `KeychainStore::modify`).
+pub fn encode_ssh_keys_into(
+    store: &mut KeychainStore,
+    cipher: &AesGcmCrypto,
+    entries: &[SshKeyEntry],
+) -> Result<()> {
     let json = serde_json::to_vec(entries)?;
     let encrypted = cipher.encrypt(&json)?;
-    set_keychain("ssh_keys", &encrypted)
+    store.set_encrypted_ssh_keys(&encrypted);
+    Ok(())
 }
 
 // --- Auth Cache ---
@@ -287,11 +298,14 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 /// Default auth cache duration for sign: 2 minutes.
 pub const DEFAULT_AUTH_CACHE_DURATION_SECS: u64 = 120;
 
-/// Load all SSH keys from keychain into a HashMap. Cipher is dropped after use.
+/// Load all SSH keys from the keychain store into a HashMap. The store and
+/// derived ciphers are dropped after this returns so the master key does not
+/// linger in memory.
 fn load_all_keys() -> Result<HashMap<String, PrivateKey>> {
-    let mac_cipher = load_mac_cipher_from_keychain()?;
-    let entries = load_ssh_keys(&mac_cipher)?;
-    // mac_cipher dropped after this block
+    let store = KeychainStore::load()?;
+    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let mac_cipher = load_mac_cipher(&store, &passphrase_cipher)?;
+    let entries = decode_ssh_keys(&store, &mac_cipher)?;
     let mut keys = HashMap::new();
     for entry in &entries {
         match PrivateKey::from_openssh(entry.key_data.as_bytes()) {
@@ -669,8 +683,12 @@ impl Session for VtSshSession {
 
         self.touch_activity().await;
 
-        // Load auth cipher from keychain to verify VT_AUTH
-        let (auth_cipher, passphrase_cipher) = load_passcode_ciphers().map_err(agent_err)?;
+        // Load the store once, derive auth + passphrase ciphers, drop the
+        // store. Mac_cipher is loaded on demand inside the encrypt/decrypt
+        // arms so the decrypted master key only lives across that operation.
+        let store = KeychainStore::load().map_err(agent_err)?;
+        let (auth_cipher, passphrase_cipher) =
+            derive_passcode_ciphers(&store).map_err(agent_err)?;
 
         // Decrypt the extension details with auth cipher (verifies VT_AUTH)
         let decrypted = auth_cipher
@@ -684,7 +702,8 @@ impl Session for VtSshSession {
             EXT_ENCRYPT => {
                 let items: Vec<EncryptItem> =
                     serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
-                let mac_cipher = load_mac_cipher(&passphrase_cipher).map_err(agent_err)?;
+                let mac_cipher =
+                    load_mac_cipher(&store, &passphrase_cipher).map_err(agent_err)?;
                 let result: Vec<CryptoResItem> = do_encrypt(&mac_cipher, items);
                 serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
             }
@@ -702,7 +721,8 @@ impl Session for VtSshSession {
                 if !local_authentication(&local_auth_message) {
                     return Err(AgentError::Failure);
                 }
-                let mac_cipher = load_mac_cipher(&passphrase_cipher).map_err(agent_err)?;
+                let mac_cipher =
+                    load_mac_cipher(&store, &passphrase_cipher).map_err(agent_err)?;
                 let result: Vec<CryptoResItem> = do_decrypt(&mac_cipher, req.items);
                 serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
             }
@@ -759,18 +779,30 @@ impl Session for VtSshSession {
                     .to_openssh(ssh_key::LineEnding::LF)
                     .map_err(AgentError::other)?;
 
-                // Load cipher on demand, update single keychain item
-                let cipher = load_mac_cipher_from_keychain().map_err(agent_err)?;
-                let mut entries = load_ssh_keys(&cipher).unwrap_or_default();
-                if !entries.iter().any(|e| e.fingerprint == fp_str) {
-                    entries.push(SshKeyEntry {
-                        fingerprint: fp_str.clone(),
-                        algorithm: pubkey.algorithm().to_string(),
-                        comment,
-                        key_data: key_openssh.to_string(),
-                    });
-                    save_ssh_keys(&cipher, &entries).map_err(agent_err)?;
-                }
+                let algorithm = pubkey.algorithm().to_string();
+                let fp_for_modify = fp_str.clone();
+                let comment_for_modify = comment.clone();
+                let key_openssh_str = key_openssh.to_string();
+                tokio::task::spawn_blocking(move || {
+                    KeychainStore::modify(|store| {
+                        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+                        let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+                        let mut entries = decode_ssh_keys(store, &mac_cipher).unwrap_or_default();
+                        if !entries.iter().any(|e| e.fingerprint == fp_for_modify) {
+                            entries.push(SshKeyEntry {
+                                fingerprint: fp_for_modify.clone(),
+                                algorithm,
+                                comment: comment_for_modify,
+                                key_data: key_openssh_str,
+                            });
+                            encode_ssh_keys_into(store, &mac_cipher, &entries)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await
+                .map_err(|e| agent_err(anyhow::anyhow!("join error: {e}")))?
+                .map_err(agent_err)?;
 
                 let mut keys = self.keys.write().await;
                 keys.insert(fp_str.clone(), private_key);
@@ -786,10 +818,22 @@ impl Session for VtSshSession {
     async fn remove_identity(&mut self, identity: RemoveIdentity) -> Result<(), AgentError> {
         let fp_str = fingerprint_str(&identity.pubkey);
 
-        if let Ok(cipher) = load_mac_cipher_from_keychain() {
-            let mut entries = load_ssh_keys(&cipher).unwrap_or_default();
-            entries.retain(|e| e.fingerprint != fp_str);
-            let _ = save_ssh_keys(&cipher, &entries);
+        let fp_for_modify = fp_str.clone();
+        match tokio::task::spawn_blocking(move || {
+            KeychainStore::modify(|store| {
+                let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+                let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+                let mut entries = decode_ssh_keys(store, &mac_cipher).unwrap_or_default();
+                entries.retain(|e| e.fingerprint != fp_for_modify);
+                encode_ssh_keys_into(store, &mac_cipher, &entries)?;
+                Ok(())
+            })
+        })
+        .await
+        {
+            Err(e) => tracing::warn!("remove_identity join error: {}", e),
+            Ok(Err(e)) => tracing::warn!("remove_identity keychain update failed: {}", e),
+            Ok(Ok(())) => {}
         }
 
         let mut keys = self.keys.write().await;
@@ -800,8 +844,19 @@ impl Session for VtSshSession {
     }
 
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
-        if let Ok(cipher) = load_mac_cipher_from_keychain() {
-            let _ = save_ssh_keys(&cipher, &[]);
+        match tokio::task::spawn_blocking(|| {
+            KeychainStore::modify(|store| {
+                let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+                let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+                encode_ssh_keys_into(store, &mac_cipher, &[])?;
+                Ok(())
+            })
+        })
+        .await
+        {
+            Err(e) => tracing::warn!("remove_all_identities join error: {}", e),
+            Ok(Err(e)) => tracing::warn!("remove_all_identities keychain update failed: {}", e),
+            Ok(Ok(())) => {}
         }
 
         let mut keys = self.keys.write().await;
@@ -1050,17 +1105,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ssh_keys_empty_on_missing() {
+    fn test_decode_ssh_keys_returns_empty_when_field_missing() {
+        use crate::store::KeychainStore;
+        let store = KeychainStore::new(&[0u8; 64], &[1u8; 60]);
         let key = AesGcmCrypto::generate_key();
         let cipher = AesGcmCrypto::new(&key).unwrap();
-        let entries = load_ssh_keys(&cipher);
-        // If keychain item doesn't exist: Ok(empty vec).
-        // If it exists but decryption fails (wrong key): Err.
-        // Both are valid outcomes depending on keychain state.
-        match entries {
-            Ok(v) => assert!(v.is_empty()),
-            Err(_) => {} // keychain item exists but can't be decrypted with random key
-        }
+        let entries = decode_ssh_keys(&store, &cipher).unwrap();
+        assert!(entries.is_empty());
     }
 
     // --- AuthCacheMode tests ---

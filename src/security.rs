@@ -168,10 +168,18 @@ pub fn derive_passphrase_secret(passcode: &[u8; 32], bin_path: Option<&str>) -> 
     Ok(key)
 }
 
+/// Build the initial KeychainStore (passcode + auth_token + encrypted
+/// passphrase) and write it as a single keychain item. Used by `vt init`,
+/// `vt secret import`, and `vt secret rotate-passcode` — all three either
+/// create the store fresh (init/import) or replace it wholesale (rotate),
+/// so this single call is the only write.
+#[cfg(target_os = "macos")]
 pub fn create_and_save_passcode_passphrase(
     real_passphrase: &[u8; 32],
     bin_path: Option<&str>,
 ) -> Result<()> {
+    use crate::store::KeychainStore;
+
     let origin_auth_token = AesGcmCrypto::generate_key();
     let hash = Sha256::digest(&Sha256::digest(origin_auth_token));
     let mut auth_token = [0u8; 32];
@@ -182,16 +190,20 @@ pub fn create_and_save_passcode_passphrase(
     passcode_and_auth_token.extend_from_slice(&passcode);
     passcode_and_auth_token.extend_from_slice(&auth_token);
 
-    set_keychain("passcode", &passcode_and_auth_token).expect("set keychain passcode");
-    tracing::info!("passcode set!");
-
     let passphrase_secret = derive_passphrase_secret(&passcode, bin_path)?;
     let aes = AesGcmCrypto::new(&passphrase_secret)?;
-    // let real_passphrase = AesGcmCrypto::generate_key();
     let encrypted_passphrase = aes.encrypt(real_passphrase)?;
 
-    set_keychain("passphrase", &encrypted_passphrase).expect("set keychain passphrase");
-    tracing::info!("passphrase set!");
+    // Preserve any pre-existing SSH keys / FIDO2 credentials on rotate.
+    // The rotated passcode does not change `real_passphrase` (the master key
+    // for SSH/FIDO2 ciphertexts), so those blobs remain decryptable.
+    let mut store = KeychainStore::new(&passcode_and_auth_token, &encrypted_passphrase);
+    if let Ok(existing) = KeychainStore::load() {
+        store.encrypted_ssh_keys = existing.encrypted_ssh_keys;
+        store.encrypted_fido2 = existing.encrypted_fido2;
+    }
+    store.save()?;
+    tracing::info!("keychain store saved!");
 
     tracing::info!(
         "export VT_AUTH={};",
@@ -200,22 +212,26 @@ pub fn create_and_save_passcode_passphrase(
     Ok(())
 }
 
-pub fn load_mac_cipher(passphrase_cipher: &AesGcmCrypto) -> Result<AesGcmCrypto> {
-    let encrypted_passphrase = get_keychain("passphrase")?;
+/// Decrypt the master passphrase from the store and build the mac_cipher.
+/// The passphrase cipher is supplied separately so callers can hold it
+/// long-term (serve) without keeping the decrypted master key in memory.
+#[cfg(target_os = "macos")]
+pub fn load_mac_cipher(
+    store: &crate::store::KeychainStore,
+    passphrase_cipher: &AesGcmCrypto,
+) -> Result<AesGcmCrypto> {
+    let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
     let decrypted_passphrase = passphrase_cipher.decrypt(&encrypted_passphrase)?;
     AesGcmCrypto::new(decrypted_passphrase.as_slice().try_into()?)
 }
 
-/// Load the mac_cipher directly from the keychain in one call. The passphrase
-/// cipher is dropped immediately so the master key doesn't linger in memory.
-pub fn load_mac_cipher_from_keychain() -> Result<AesGcmCrypto> {
-    let (_, passphrase_cipher) = load_passcode_ciphers()?;
-    load_mac_cipher(&passphrase_cipher)
-}
-
-// Return auth_token, auth_cipher, passphrase_cipher
-pub fn load_passcode_ciphers() -> Result<(AesGcmCrypto, AesGcmCrypto)> {
-    let passcode = get_keychain("passcode")?;
+/// Derive `(auth_cipher, passphrase_cipher)` from the passcode bytes inside
+/// an already-loaded store. Pure CPU work; does not touch the keychain.
+#[cfg(target_os = "macos")]
+pub fn derive_passcode_ciphers(
+    store: &crate::store::KeychainStore,
+) -> Result<(AesGcmCrypto, AesGcmCrypto)> {
+    let passcode = store.passcode_and_auth_token_bytes()?;
     ensure!(
         passcode.len() == 64,
         "Passcode length is {}, expected 64",
@@ -230,6 +246,7 @@ pub fn load_passcode_ciphers() -> Result<(AesGcmCrypto, AesGcmCrypto)> {
 
     Ok((auth_cipher, passphrase_cipher))
 }
+
 
 pub fn decode_auth_cipher_from_b64(b64_token: &str) -> Result<[u8; 32]> {
     let token_bytes = BASE64_URL_SAFE_NO_PAD.decode(b64_token)?;
@@ -416,7 +433,8 @@ mod tests {
     #[ignore]
     fn test_encrypt_body() {
         let body = r#"{"items":[]}"#.to_string();
-        let (cipher, _) = load_passcode_ciphers().expect("load auth cipher");
+        let store = crate::store::KeychainStore::load().expect("load keychain store");
+        let (cipher, _) = derive_passcode_ciphers(&store).expect("derive auth cipher");
         let encrypted = cipher.encrypt(body.as_bytes()).expect("encrypt body");
         let decrypted = cipher.decrypt(&encrypted).expect("decrypt body");
         assert_eq!(decrypted, body.as_bytes());
