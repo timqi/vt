@@ -261,10 +261,25 @@ pub async fn auth(vt_client: VTClient, reason: &str) -> Result<()> {
     vt_client.auth(reason).await
 }
 
-pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {
+fn sanitize_prompt_field(s: &str, max_chars: usize) -> String {
+    let cleaned: String = s.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.chars().count() > max_chars {
+        let truncated: String = cleaned.chars().take(max_chars).collect();
+        format!("{}...", truncated)
+    } else {
+        cleaned
+    }
+}
+
+pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Result<()> {
+    let mut command = "[read]".to_string();
+    if let Some(r) = reason {
+        command.push_str(" reason: ");
+        command.push_str(&sanitize_prompt_field(r, 200));
+    }
     let req = DecryptReq {
         host: get_hostname(),
-        command: "[read]".to_string(),
+        command,
         items: vec![vt],
     };
     let res = vt_client.decrypt(&req).await?;
@@ -343,6 +358,7 @@ pub async fn inject(
     input_file: Option<String>,
     output_file: Option<String>,
     timeout: u32,
+    reason: Option<&str>,
     mut args: Vec<String>,
 ) -> Result<()> {
     if replace_file.is_some() {
@@ -353,21 +369,32 @@ pub async fn inject(
         }
     }
 
-    let original_command = args.join(" ");
-    debug!("Original command: {}", original_command);
-    let original_command = if original_command.is_empty() {
-        "[inject]".to_string()
+    let raw_command = args.join(" ");
+    debug!("Original command: {}", raw_command);
+    let mut original_command = String::from("[inject]");
+    if let Some(p) = replace_file.as_ref() {
+        original_command.push_str(" -r ");
+        original_command.push_str(&sanitize_prompt_field(p, 100));
+    }
+    if let Some(p) = input_file.as_ref() {
+        original_command.push_str(" -i ");
+        original_command.push_str(&sanitize_prompt_field(p, 100));
+    }
+    if let Some(p) = output_file.as_ref() {
+        original_command.push_str(" -o ");
+        original_command.push_str(&sanitize_prompt_field(p, 100));
+    }
+    if raw_command.is_empty() {
+        original_command.push_str(" [no shell command, output to stdout]");
     } else {
-        // Replace newlines and collapse whitespace for cleaner display
         let normalized = regex::Regex::new(r"\s+")
             .unwrap()
-            .replace_all(&original_command, " ")
+            .replace_all(&raw_command, " ")
             .to_string();
         let sanitized = regex::Regex::new(r"vt://[^/]+/[A-Za-z0-9_-]+")
             .unwrap()
             .replace_all(&normalized, "vt://***")
             .to_string();
-        // Truncate long commands to keep the display readable (UTF-8 safe)
         const MAX_CMD_LEN: usize = 60;
         let truncated = if sanitized.chars().count() > MAX_CMD_LEN {
             let s: String = sanitized.chars().take(MAX_CMD_LEN).collect();
@@ -375,8 +402,13 @@ pub async fn inject(
         } else {
             sanitized
         };
-        format!("[inject] {}", truncated)
-    };
+        original_command.push_str(" cmd: ");
+        original_command.push_str(&truncated);
+    }
+    if let Some(r) = reason {
+        original_command.push_str(" reason: ");
+        original_command.push_str(&sanitize_prompt_field(r, 200));
+    }
 
     let input_file_content = match replace_file.as_ref().or(input_file.as_ref()) {
         Some(file) => {

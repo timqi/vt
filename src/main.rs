@@ -61,6 +61,9 @@ enum Commands {
     Read {
         #[arg(help = "A string in vt protocol format, e.g. vt://mac/0xxxx")]
         vt: String,
+
+        #[arg(long, help = "Reason shown in the bio auth prompt")]
+        reason: Option<String>,
     },
     /// Read env/file and decrypt vt protocol, output to output-file or standard output
     Inject {
@@ -84,6 +87,9 @@ enum Commands {
             help = "Timeout for deleting output_file after the spawned process in seconds"
         )]
         timeout: u32,
+
+        #[arg(long, help = "Reason shown in the bio auth prompt")]
+        reason: Option<String>,
 
         #[arg(
             trailing_var_arg = true,
@@ -298,10 +304,10 @@ async fn run(cli: Cli) -> Result<()> {
             let vt_client = VTClient::new(cli.addr.clone(), auth);
             cli::create(vt_client).await
         }
-        Commands::Read { vt } => {
+        Commands::Read { vt, reason } => {
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(cli.addr.clone(), auth);
-            cli::read(vt_client, vt.to_string()).await
+            cli::read(vt_client, vt.to_string(), reason.as_deref()).await
         }
         Commands::Auth { reason } => {
             let auth = require_auth(&cli.auth)?;
@@ -313,6 +319,7 @@ async fn run(cli: Cli) -> Result<()> {
             input_file,
             output_file,
             timeout,
+            reason,
             args,
         } => {
             let auth = require_auth(&cli.auth)?;
@@ -323,6 +330,7 @@ async fn run(cli: Cli) -> Result<()> {
                 input_file.clone(),
                 output_file.clone(),
                 *timeout,
+                reason.as_deref(),
                 args.clone(),
             )
             .await
