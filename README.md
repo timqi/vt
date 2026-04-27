@@ -23,9 +23,13 @@ cargo build --release
 cp target/release/vt /usr/local/bin/
 ```
 
+## Upgrade Warning
+
+This release changes the keychain storage layout from four legacy items to the single `rusty.vault.store` item. This is a **breaking change** for existing installs. Before replacing an older `vt` binary, run `vt secret export` with the old version. After installing this version, run `vt secret import`, update `VT_AUTH`, then re-add SSH keys and FIDO2 credentials. See [Secret Management](#secret-management) for the full upgrade path.
+
 ## Quick Start
 
-1. Initialize the vault (creates keychain entries):
+1. Initialize the vault (creates the `rusty.vault.store` keychain item):
    ```bash
    vt init
    ```
@@ -239,37 +243,39 @@ VT stores all secrets in a **single keychain item**: `rusty.vault.store`. The bl
 
 One item means one keychain ACL. After the binary's first run is granted "Always Allow", subsequent rebuilds signed with the same code-signing identity reuse that grant — no repeated login-password prompts.
 
-### Migrating from the legacy 4-item layout
+### Breaking Change: Legacy Keychain Layout
 
-Earlier versions of vt used four separate keychain items: `rusty.vault.passcode`, `rusty.vault.passphrase`, `rusty.vault.ssh_keys`, and `rusty.vault.fido2_credentials`. If you're upgrading from one of those versions, run the **`vt-migrate`** one-shot tool to consolidate them into `rusty.vault.store`.
+Earlier versions of vt used four separate keychain items: `rusty.vault.passcode`, `rusty.vault.passphrase`, `rusty.vault.ssh_keys`, and `rusty.vault.fido2_credentials`. This version does **not** include an automatic migration tool for that layout.
 
-The migration tool ships as a separate binary so the main `vt` CLI doesn't carry one-time upgrade code. It's not needed on fresh installs.
+Before upgrading from a version that uses the four-item layout, export the master secret with the old binary:
 
 ```bash
-# Build the tool (not built by default)
-cargo build --release --bin vt-migrate
-
-# Run it. Use the same binary path / $USER you used at `vt init` time —
-# the tool decrypts the legacy passphrase as a sanity check before writing
-# anything, so a wrong path/user fails up front.
-./target/release/vt-migrate
+vt secret export
 ```
 
-What it does:
+After installing the new version, import that exported master secret:
 
-1. Reads the four legacy items.
-2. Decrypts the legacy passphrase to confirm it can be unwrapped on this host.
-3. Writes the consolidated `rusty.vault.store`.
-4. Re-reads the new store and verifies, by full decrypt, that it matches the legacy data.
+```bash
+vt secret import
+```
 
-It does **not** delete the legacy items. After it reports success, verify with `vt ssh list` / `vt fido2 list` / `vt read …`, then remove the four legacy items manually in Keychain Access:
+This preserves the ability to decrypt existing `vt://mac/...` secret values because those values are protected by the master secret. The import creates a fresh `rusty.vault.store`, fresh passcode, and fresh `VT_AUTH`; update your shell profile or secret manager with the new token printed by `vt secret import`.
+
+SSH keys and FIDO2 credentials are not part of `secret export`, so re-add them after the import:
+
+```bash
+vt ssh add -f ~/.ssh/id_ed25519
+vt fido2 register --label yubikey
+```
+
+After verifying `vt read`, `vt ssh list`, and `vt fido2 list`, remove the legacy keychain items manually in Keychain Access:
 
 - `rusty.vault.passcode`
 - `rusty.vault.passphrase`
 - `rusty.vault.ssh_keys`
 - `rusty.vault.fido2_credentials`
 
-If the new store already exists the tool refuses to overwrite — delete it via Keychain Access first if you really want to re-run.
+If `rusty.vault.store` already exists, `vt init` and `vt secret import` refuse to overwrite it. Delete `rusty.vault.store` in Keychain Access first if you need to re-import.
 
 ### Security Requirements
 
@@ -305,9 +311,8 @@ Removing it is net-negative LOC, fewer dependencies, and a single canonical path
 
 ### What was preserved
 
-- Keychain layout, key derivation, and crypto unchanged
+- Secret encryption format and existing `vt://mac/...` values remain usable after exporting/importing the master secret
 - `VT_AUTH` still keys the auth cipher (now used to encrypt SSH-agent extension payloads)
-- `vt-migrate` is unaffected
 - All `vt ssh agent` flags work identically: `--timeout`, `--ssh-auth-cache-mode`, `--ssh-auth-cache-duration`
 
 ### Steps to upgrade
@@ -339,7 +344,7 @@ If your local `SSH_AUTH_SOCK` points to a non-vt agent (e.g. forwarded from a ho
                               └─────────────┘
 ```
 
-All keychain access (passcode, passphrase, SSH keys, FIDO2) routes through a single `rusty.vault.store` item — see [Secret Management](#secret-management) for layout and migration from the legacy four-item layout.
+All keychain access (passcode, passphrase, SSH keys, FIDO2) routes through a single `rusty.vault.store` item — see [Secret Management](#secret-management) for the layout and the breaking-change upgrade path from the legacy four-item layout.
 
 ## License
 

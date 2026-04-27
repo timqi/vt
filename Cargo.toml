@@ -7,16 +7,6 @@ edition = "2021"
 name = "vt"
 path = "src/main.rs"
 
-# One-shot migration tool from the legacy 4-item keychain layout
-# (rusty.vault.{passcode,passphrase,ssh_keys,fido2_credentials}) to the
-# consolidated rusty.vault.store. Not built by default; only relevant for
-# users upgrading from a vt version that used the old layout.
-#   cargo build --release --bin vt-migrate
-#   ./target/release/vt-migrate
-[[bin]]
-name = "vt-migrate"
-path = "src/bin/vt-migrate.rs"
-
 [dependencies]
 clap = { version = "4.5.43", features = ["derive", "env"] }
 tokio = { version = "1.47.1", features = ["full"] }

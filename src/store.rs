@@ -59,7 +59,7 @@ impl KeychainStore {
     /// they need to.
     pub fn load() -> Result<Self> {
         let raw = get_keychain(STORE_NAME)
-            .context("failed to read rusty.vault.store from keychain (run `vt init` or `vt secret migrate`)")?;
+            .context("failed to read rusty.vault.store from keychain (run `vt init` or `vt secret import`)")?;
         let store: KeychainStore = serde_json::from_slice(&raw)
             .context("rusty.vault.store payload is not valid JSON — keychain item may be corrupted")?;
         ensure!(
