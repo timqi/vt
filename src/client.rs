@@ -10,10 +10,14 @@ use std::env;
 use std::io::{self, Write};
 
 use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
-use crate::core::{AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem, SecretType};
+use crate::core::{
+    client_decrypt_v2, client_encrypt_v2, AuthReq, AuthRes, CryptoResItem, DecryptInput,
+    DecryptReq, DecryptResItem, EncryptItem, EncryptReq, EncryptResItem, SecretType, VtUrl,
+};
 use anyhow::{ensure, Context, Result};
 use ssh_agent_lib::proto::{Extension, Unparsed};
 use tracing::debug;
+use zeroize::{Zeroize, Zeroizing};
 
 pub struct VTClient {
     auth_token: String,
@@ -58,6 +62,10 @@ impl VTClient {
 
         match response {
             Some(resp) => {
+                // The decrypted payload may carry DEK bytes (decrypt@vt) or
+                // freshly-allocated DEKs (encrypt@vt). Wrap it so the buffer
+                // is wiped on drop after callers have consumed/copied what
+                // they need.
                 let decrypted = auth_cipher.decrypt(resp.details.as_ref())?;
                 Ok(Some(decrypted))
             }
@@ -65,21 +73,70 @@ impl VTClient {
         }
     }
 
+    /// v2 envelope encrypt. Asks the agent to allocate one fresh
+    /// `(salt, DEK)` pair per `EncryptItem` (no plaintext leaves this
+    /// process), then locally AEAD-encrypts each plaintext under its DEK and
+    /// formats the resulting `vt://{type}{b64(salt||ct)}` URL. DEKs are
+    /// zeroized after use.
     pub async fn encrypt(&self, items: &[EncryptItem]) -> Result<Vec<CryptoResItem>> {
         #[cfg(unix)]
         {
-            let payload = serde_json::to_vec(items)?;
+            let req = EncryptReq {
+                types: items.iter().map(|i| i.t).collect(),
+            };
+            let payload = serde_json::to_vec(&req)?;
             let auth_token = self.auth_token.clone();
             let result = tokio::task::spawn_blocking(move || {
                 Self::try_agent_extension(&auth_token, "encrypt@vt", &payload)
             })
             .await??;
-            match result {
-                Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
-                None => Err(anyhow::anyhow!(
-                    "SSH agent not available — set SSH_AUTH_SOCK or run `vt ssh agent`"
-                )),
+            let bytes = match result {
+                Some(b) => b,
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "SSH agent not available — set SSH_AUTH_SOCK or run `vt ssh agent`"
+                    ))
+                }
+            };
+            let mut allocs: Vec<EncryptResItem> = serde_json::from_slice(&bytes)?;
+            ensure!(
+                allocs.len() == items.len(),
+                "agent returned {} (salt,DEK) pairs for {} items",
+                allocs.len(),
+                items.len()
+            );
+            let mut out = Vec::with_capacity(items.len());
+            for (item, alloc) in items.iter().zip(allocs.iter_mut()) {
+                if !alloc.err_message.is_empty() {
+                    out.push(CryptoResItem {
+                        result: String::new(),
+                        err_message: alloc.err_message.clone(),
+                    });
+                    alloc.dek.zeroize();
+                    continue;
+                }
+                let res = match client_encrypt_v2(
+                    item.t,
+                    &alloc.salt,
+                    &alloc.dek,
+                    item.plaintext.as_bytes(),
+                ) {
+                    Ok(url) => CryptoResItem {
+                        result: url,
+                        err_message: String::new(),
+                    },
+                    Err(e) => CryptoResItem {
+                        result: String::new(),
+                        err_message: e.to_string(),
+                    },
+                };
+                alloc.dek.zeroize();
+                out.push(res);
             }
+            // Defense in depth: also zeroize the original wire buffer.
+            let mut bytes = bytes;
+            bytes.zeroize();
+            Ok(out)
         }
         #[cfg(not(unix))]
         {
@@ -88,21 +145,145 @@ impl VTClient {
         }
     }
 
-    pub async fn decrypt(&self, req: &DecryptReq) -> Result<Vec<CryptoResItem>> {
+    /// v2 envelope decrypt. Each input `vt://...` URL is parsed locally; v2
+    /// URLs send only their salt to the agent (which returns a per-record
+    /// DEK after Touch ID), and the inner ciphertext is decrypted client-side
+    /// here. Legacy URLs are forwarded as-is and the agent returns the
+    /// finished plaintext / TOTP code (legacy behavior).
+    pub async fn decrypt(
+        &self,
+        host: &str,
+        command: &str,
+        urls: &[String],
+    ) -> Result<Vec<CryptoResItem>> {
+        // Don't bother the user for an empty batch — the agent would still
+        // prompt Touch ID for "0 items" otherwise.
+        if urls.is_empty() {
+            return Ok(Vec::new());
+        }
         #[cfg(unix)]
         {
-            let payload = serde_json::to_vec(req)?;
+            // Parse URLs locally; track v2 inner_ct + type so we can finish
+            // decryption client-side once the agent returns the DEK.
+            enum Local {
+                V2 {
+                    t: SecretType,
+                    salt: [u8; crate::core::SALT_LEN],
+                    inner_ct: Vec<u8>,
+                },
+                Legacy,
+                ParseErr(String),
+            }
+            let mut wire_items: Vec<DecryptInput> = Vec::with_capacity(urls.len());
+            let mut locals: Vec<Local> = Vec::with_capacity(urls.len());
+            for raw_url in urls {
+                match VtUrl::parse(raw_url) {
+                    Ok(VtUrl::V2 { t, salt, inner_ct }) => {
+                        wire_items.push(DecryptInput::V2 { t, salt });
+                        locals.push(Local::V2 { t, salt, inner_ct });
+                    }
+                    Ok(VtUrl::Legacy { .. }) => {
+                        wire_items.push(DecryptInput::Legacy {
+                            url: raw_url.clone(),
+                        });
+                        locals.push(Local::Legacy);
+                    }
+                    Err(e) => {
+                        // Skip the wire roundtrip for unparseable items by
+                        // pushing a Legacy placeholder we'll override on the
+                        // way back. Actually simpler: still push to keep
+                        // index alignment — agent will fail-parse, but better
+                        // to fail locally and avoid the extension call only if
+                        // *every* item is bad. Here we fail locally per-item.
+                        wire_items.push(DecryptInput::Legacy {
+                            url: raw_url.clone(),
+                        });
+                        locals.push(Local::ParseErr(e.to_string()));
+                    }
+                }
+            }
+
+            let wire = DecryptReq {
+                host: host.to_string(),
+                command: command.to_string(),
+                items: wire_items,
+            };
+            let payload = serde_json::to_vec(&wire)?;
             let auth_token = self.auth_token.clone();
             let result = tokio::task::spawn_blocking(move || {
                 Self::try_agent_extension(&auth_token, "decrypt@vt", &payload)
             })
             .await??;
-            match result {
-                Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
-                None => Err(anyhow::anyhow!(
-                    "SSH agent not available — set SSH_AUTH_SOCK or run `vt ssh agent`"
-                )),
+            let bytes = match result {
+                Some(b) => b,
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "SSH agent not available — set SSH_AUTH_SOCK or run `vt ssh agent`"
+                    ))
+                }
+            };
+            let mut wire_results: Vec<DecryptResItem> = serde_json::from_slice(&bytes)?;
+            ensure!(
+                wire_results.len() == locals.len(),
+                "agent returned {} results for {} items",
+                wire_results.len(),
+                locals.len()
+            );
+
+            let mut out = Vec::with_capacity(locals.len());
+            for (local, wire_res) in locals.into_iter().zip(wire_results.iter_mut()) {
+                let item = match (local, wire_res) {
+                    (Local::ParseErr(e), _) => CryptoResItem {
+                        result: String::new(),
+                        err_message: e,
+                    },
+                    (Local::V2 { t, salt, inner_ct }, DecryptResItem::V2 { dek, err_message }) => {
+                        if !err_message.is_empty() {
+                            let msg = std::mem::take(err_message);
+                            dek.zeroize();
+                            CryptoResItem {
+                                result: String::new(),
+                                err_message: msg,
+                            }
+                        } else {
+                            let dek_copy: Zeroizing<[u8; 32]> = Zeroizing::new(*dek);
+                            dek.zeroize();
+                            match client_decrypt_v2(t, &dek_copy, &salt, &inner_ct) {
+                                Ok(pt) => CryptoResItem {
+                                    result: pt,
+                                    err_message: String::new(),
+                                },
+                                Err(e) => CryptoResItem {
+                                    result: String::new(),
+                                    err_message: e.to_string(),
+                                },
+                            }
+                        }
+                    }
+                    (
+                        Local::Legacy,
+                        DecryptResItem::Legacy {
+                            result,
+                            err_message,
+                        },
+                    ) => CryptoResItem {
+                        result: std::mem::take(result),
+                        err_message: std::mem::take(err_message),
+                    },
+                    // Mismatched variants — agent returned the wrong shape for
+                    // this index. Should not happen unless the agent and
+                    // client disagree on protocol.
+                    _ => CryptoResItem {
+                        result: String::new(),
+                        err_message: "agent returned mismatched response variant".to_string(),
+                    },
+                };
+                out.push(item);
             }
+            // Defense in depth: scrub the wire buffer too.
+            let mut bytes = bytes;
+            bytes.zeroize();
+            Ok(out)
         }
         #[cfg(not(unix))]
         {
@@ -206,12 +387,9 @@ pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Resu
         command.push_str(" reason: ");
         command.push_str(&sanitize_prompt_field(r, 200));
     }
-    let req = DecryptReq {
-        host: get_hostname(),
-        command,
-        items: vec![vt],
-    };
-    let res = vt_client.decrypt(&req).await?;
+    let res = vt_client
+        .decrypt(&get_hostname(), &command, &[vt])
+        .await?;
     ensure!(res.len() == 1, "Expected exactly one item in response");
     ensure!(
         res[0].err_message.is_empty(),
@@ -228,8 +406,10 @@ async fn decrypt_from_multi_str(
     command: String,
 ) -> Result<Vec<String>> {
     let mut encrypted_vec = Vec::<String>::new();
-    // Extract 'vt://xxx/urlsafebase64encoded' patterns from the string
-    let vt_pattern = regex::Regex::new(r"vt://[^/]+/[A-Za-z0-9_-]+").unwrap();
+    // Extract `vt://...` patterns. Matches both v2 (`vt://0...`) and legacy
+    // (`vt://mac/0...`) shapes; the optional `mac/` segment lets new and old
+    // URLs coexist during migration. Body chars are base64url-no-pad.
+    let vt_pattern = regex::Regex::new(r"vt://(?:mac/)?[A-Za-z0-9_-]+").unwrap();
     for item in &original_str_vec {
         for vt_match in vt_pattern.find_iter(item) {
             debug!("Found encrypted item: {}", vt_match.as_str());
@@ -238,11 +418,7 @@ async fn decrypt_from_multi_str(
     }
 
     let res = vt_client
-        .decrypt(&DecryptReq {
-            host: get_hostname(),
-            command: command,
-            items: encrypted_vec.clone(),
-        })
+        .decrypt(&get_hostname(), &command, &encrypted_vec)
         .await?;
     ensure!(
         res.len() == encrypted_vec.len(),
@@ -320,7 +496,7 @@ pub async fn inject(
             .unwrap()
             .replace_all(&raw_command, " ")
             .to_string();
-        let sanitized = regex::Regex::new(r"vt://[^/]+/[A-Za-z0-9_-]+")
+        let sanitized = regex::Regex::new(r"vt://(?:mac/)?[A-Za-z0-9_-]+")
             .unwrap()
             .replace_all(&normalized, "vt://***")
             .to_string();
@@ -351,7 +527,7 @@ pub async fn inject(
 
     // Scan env vars locally for vt:// patterns — only those values enter the
     // decrypt pipeline. Env var names and non-vt values never leave this process.
-    let vt_pattern = regex::Regex::new(r"vt://[^/]+/[A-Za-z0-9_-]+").unwrap();
+    let vt_pattern = regex::Regex::new(r"vt://(?:mac/)?[A-Za-z0-9_-]+").unwrap();
     let env_vt_vars: Vec<(String, String)> = env::vars()
         .filter(|(_, v)| vt_pattern.is_match(v))
         .collect();

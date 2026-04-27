@@ -27,6 +27,8 @@ libc = "0.2.174"
 hostname = "0.4.1"
 dirs = "5"
 ssh-agent-lib = { version = "0.5", default-features = false }
+hkdf = "0.12"
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.3.0"
@@ -44,7 +46,6 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
 async-trait = "0.1"
 subtle = "2"
-zeroize = "1"
 ctap-hid-fido2 = "3.5.9"
 
 [dev-dependencies]

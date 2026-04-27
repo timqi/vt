@@ -88,7 +88,7 @@ pub fn load_credentials() -> Result<Vec<FidoCredential>> {
         return Ok(Vec::new());
     }
     let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
-    let mac_cipher = load_mac_cipher(&store, &passphrase_cipher)?;
+    let (mac_cipher, _mac_key) = load_mac_cipher(&store, &passphrase_cipher)?;
     decode_credentials(&store, &mac_cipher)
 }
 
@@ -98,7 +98,7 @@ pub fn load_credentials() -> Result<Vec<FidoCredential>> {
 fn save_credentials_locked(creds: &[FidoCredential]) -> Result<()> {
     KeychainStore::modify(|store| {
         let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
-        let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+        let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
         encode_credentials_into(store, &mac_cipher, creds)
     })
 }
@@ -110,7 +110,7 @@ fn save_credentials_locked(creds: &[FidoCredential]) -> Result<()> {
 fn save_credentials_best_effort(creds: &[FidoCredential]) -> Result<bool> {
     KeychainStore::try_modify(|store| {
         let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
-        let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+        let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
         encode_credentials_into(store, &mac_cipher, creds)
     })
 }

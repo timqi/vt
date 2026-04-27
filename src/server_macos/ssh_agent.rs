@@ -16,11 +16,14 @@ use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
 use tokio::sync::RwLock;
 
-use crate::core::crypto::AesGcmCrypto;
+use crate::core::crypto::{derive_dek, AesGcmCrypto};
 use crate::core::session::{AuthMethod, AuthOutcome};
 use crate::core::{
-    do_decrypt, do_encrypt, AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem,
+    legacy_decrypt, AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, EncryptReq,
+    EncryptResItem, SALT_LEN,
 };
+use rand::RngCore;
+use zeroize::{Zeroize, Zeroizing};
 use super::security::{
     authenticate, derive_passcode_ciphers, load_mac_cipher, local_authentication,
 };
@@ -305,7 +308,7 @@ pub const DEFAULT_AUTH_CACHE_DURATION_SECS: u64 = 120;
 fn load_all_keys() -> Result<HashMap<String, PrivateKey>> {
     let store = KeychainStore::load()?;
     let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
-    let mac_cipher = load_mac_cipher(&store, &passphrase_cipher)?;
+    let (mac_cipher, _mac_key) = load_mac_cipher(&store, &passphrase_cipher)?;
     let entries = decode_ssh_keys(&store, &mac_cipher)?;
     let mut keys = HashMap::new();
     for entry in &entries {
@@ -361,6 +364,11 @@ pub struct VtSshAgentFactory {
     idle_cleared: Arc<RwLock<bool>>,
     auth_cache: Arc<RwLock<AuthCache>>,
     cache_mode: AuthCacheMode,
+    /// When true, `decrypt@vt` rejects `Legacy` items (v0/v1 URLs). v2 envelope
+    /// items continue to work. Lets users who have fully migrated harden the
+    /// agent so the "agent emits plaintext over wire" path can never be
+    /// triggered.
+    disable_legacy_decrypt: bool,
 }
 
 impl VtSshAgentFactory {
@@ -368,6 +376,7 @@ impl VtSshAgentFactory {
         keys: HashMap<String, PrivateKey>,
         cache_mode: AuthCacheMode,
         cache_duration_secs: u64,
+        disable_legacy_decrypt: bool,
     ) -> Self {
         Self {
             keys: Arc::new(RwLock::new(keys)),
@@ -377,6 +386,7 @@ impl VtSshAgentFactory {
             idle_cleared: Arc::new(RwLock::new(false)),
             auth_cache: Arc::new(RwLock::new(AuthCache::new(cache_duration_secs))),
             cache_mode,
+            disable_legacy_decrypt,
         }
     }
 }
@@ -424,6 +434,7 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             auth_cache: Arc::clone(&self.auth_cache),
             peer_pid,
             cache_context,
+            disable_legacy_decrypt: self.disable_legacy_decrypt,
         }
     }
 }
@@ -440,6 +451,7 @@ struct VtSshSession {
     peer_pid: Option<i32>,
     /// Resolved once at session creation. `None` = always prompt.
     cache_context: Option<CacheContext>,
+    disable_legacy_decrypt: bool,
 }
 
 impl VtSshSession {
@@ -708,26 +720,65 @@ impl Session for VtSshSession {
                 AgentError::Failure
             })?;
 
-        let response_bytes = match extension.name.as_str() {
+        let response_bytes: Zeroizing<Vec<u8>> = match extension.name.as_str() {
             EXT_ENCRYPT => {
-                let items: Vec<EncryptItem> =
+                // v2 envelope: agent allocates a fresh per-record (salt, DEK)
+                // pair for each requested SecretType. The agent NEVER receives
+                // plaintext on this path. The salt is generated server-side
+                // (never accepted from the client) — this is the security
+                // invariant that prevents an attacker holding `VT_AUTH` from
+                // extracting a salt from a stored vt://0{salt||ct} URL and
+                // requesting its DEK to bypass Touch ID.
+                let req: EncryptReq =
                     serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
-                let mac_cipher =
+                let (_mac_cipher, mac_key) =
                     load_mac_cipher(&store, &passphrase_cipher).map_err(agent_err)?;
-                let result: Vec<CryptoResItem> = do_encrypt(&mac_cipher, items);
-                serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
+                let mut result: Vec<EncryptResItem> = Vec::with_capacity(req.types.len());
+                for _t in &req.types {
+                    let mut salt = [0u8; SALT_LEN];
+                    rand::thread_rng().fill_bytes(&mut salt);
+                    let dek = derive_dek(&mac_key, &salt);
+                    result.push(EncryptResItem {
+                        salt,
+                        dek,
+                        err_message: String::new(),
+                    });
+                }
+                drop(mac_key);
+                let bytes = serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?;
+                // The DEKs now live inside `bytes`; scrub the in-memory
+                // `Vec<EncryptResItem>` copy before it falls out of scope.
+                for item in result.iter_mut() {
+                    item.dek.zeroize();
+                }
+                Zeroizing::new(bytes)
             }
             EXT_DECRYPT => {
                 let req: DecryptReq =
                     serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
+
+                // Count v2 vs legacy items so the Touch ID prompt makes the
+                // distinction visible: legacy items emit plaintext over the
+                // wire, v2 items only release a per-record DEK.
+                let mut legacy_count = 0usize;
+                let mut v2_count = 0usize;
+                for item in &req.items {
+                    match item {
+                        DecryptInput::V2 { .. } => v2_count += 1,
+                        DecryptInput::Legacy { .. } => legacy_count += 1,
+                    }
+                }
                 let local_auth_message = format!(
-                    "decrypt {} items from {} to run `{}`",
+                    "decrypt {} items ({} legacy plaintext + {} v2 key-release) from {} to run `{}`",
                     req.items.len(),
+                    legacy_count,
+                    v2_count,
                     req.host,
                     req.command,
                 );
-                // Always prompt — never cached. Decrypting emits plaintext, so
-                // the blast radius of a cached grant is too large.
+                // Always prompt — never cached. Decrypting emits plaintext or
+                // reusable DEK material, so a cached grant's blast radius is
+                // too large.
                 match authenticate(&local_auth_message) {
                     AuthOutcome::Success(_) => {}
                     AuthOutcome::Rejected => return Err(AgentError::Failure),
@@ -736,10 +787,45 @@ impl Session for VtSshSession {
                         return Err(AgentError::Failure);
                     }
                 }
-                let mac_cipher =
+                let (mac_cipher, mac_key) =
                     load_mac_cipher(&store, &passphrase_cipher).map_err(agent_err)?;
-                let result: Vec<CryptoResItem> = do_decrypt(&mac_cipher, req.items);
-                serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
+                let mut result: Vec<DecryptResItem> = Vec::with_capacity(req.items.len());
+                for item in req.items {
+                    match item {
+                        DecryptInput::V2 { t: _, salt } => {
+                            let dek = derive_dek(&mac_key, &salt);
+                            result.push(DecryptResItem::V2 {
+                                dek,
+                                err_message: String::new(),
+                            });
+                        }
+                        DecryptInput::Legacy { url } => {
+                            if self.disable_legacy_decrypt {
+                                result.push(DecryptResItem::Legacy {
+                                    result: String::new(),
+                                    err_message:
+                                        "legacy decryption disabled on this agent".to_string(),
+                                });
+                            } else {
+                                let item = legacy_decrypt(&mac_cipher, &url);
+                                result.push(DecryptResItem::Legacy {
+                                    result: item.result,
+                                    err_message: item.err_message,
+                                });
+                            }
+                        }
+                    }
+                }
+                drop(mac_key);
+                let bytes = serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?;
+                // Scrub DEKs inside the response Vec before drop. `bytes`
+                // already carries them (still wiped via `Zeroizing` below).
+                for item in result.iter_mut() {
+                    if let DecryptResItem::V2 { dek, .. } = item {
+                        dek.zeroize();
+                    }
+                }
+                Zeroizing::new(bytes)
             }
             EXT_AUTH => {
                 let req: AuthReq =
@@ -767,7 +853,7 @@ impl Session for VtSshSession {
                 }
 
                 let result = AuthRes { approved: true };
-                serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
+                Zeroizing::new(serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?)
             }
             _ => unreachable!(),
         };
@@ -806,7 +892,7 @@ impl Session for VtSshSession {
                 tokio::task::spawn_blocking(move || {
                     KeychainStore::modify(|store| {
                         let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
-                        let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+                        let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
                         let mut entries = decode_ssh_keys(store, &mac_cipher).unwrap_or_default();
                         if !entries.iter().any(|e| e.fingerprint == fp_for_modify) {
                             entries.push(SshKeyEntry {
@@ -842,7 +928,7 @@ impl Session for VtSshSession {
         match tokio::task::spawn_blocking(move || {
             KeychainStore::modify(|store| {
                 let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
-                let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+                let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
                 let mut entries = decode_ssh_keys(store, &mac_cipher).unwrap_or_default();
                 entries.retain(|e| e.fingerprint != fp_for_modify);
                 encode_ssh_keys_into(store, &mac_cipher, &entries)?;
@@ -867,7 +953,7 @@ impl Session for VtSshSession {
         match tokio::task::spawn_blocking(|| {
             KeychainStore::modify(|store| {
                 let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
-                let mac_cipher = load_mac_cipher(store, &passphrase_cipher)?;
+                let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
                 encode_ssh_keys_into(store, &mac_cipher, &[])?;
                 Ok(())
             })
@@ -958,6 +1044,7 @@ pub async fn run_ssh_agent(
     idle_timeout_secs: u64,
     cache_mode: AuthCacheMode,
     cache_duration_secs: u64,
+    disable_legacy_decrypt: bool,
 ) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
 
@@ -984,7 +1071,11 @@ pub async fn run_ssh_agent(
         println!("echo Agent pid {};", std::process::id());
     }
 
-    let factory = VtSshAgentFactory::new(keys, cache_mode, cache_duration_secs);
+    let factory =
+        VtSshAgentFactory::new(keys, cache_mode, cache_duration_secs, disable_legacy_decrypt);
+    if disable_legacy_decrypt {
+        tracing::info!("Legacy decrypt path disabled — only v2 envelope URLs accepted");
+    }
 
     // Spawn idle sweeper that clears keys from memory after inactivity
     let sweeper_keys = Arc::clone(&factory.keys);
@@ -1068,8 +1159,16 @@ pub async fn start_ssh_agent(
     idle_timeout_secs: u64,
     cache_mode: AuthCacheMode,
     cache_duration_secs: u64,
+    disable_legacy_decrypt: bool,
 ) -> Result<()> {
-    run_ssh_agent(true, idle_timeout_secs, cache_mode, cache_duration_secs).await
+    run_ssh_agent(
+        true,
+        idle_timeout_secs,
+        cache_mode,
+        cache_duration_secs,
+        disable_legacy_decrypt,
+    )
+    .await
 }
 
 #[cfg(test)]

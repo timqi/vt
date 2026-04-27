@@ -167,6 +167,12 @@ pub enum SshCommands {
             help = "Auth cache duration in seconds for sign operations"
         )]
         auth_cache_duration: u64,
+        #[arg(
+            long = "no-legacy-decrypt",
+            default_value_t = false,
+            help = "Reject legacy v0/v1 vt:// URLs on decrypt@vt; only v2 envelope URLs are accepted. Use this once you've migrated all stored secrets to the v2 format."
+        )]
+        no_legacy_decrypt: bool,
     },
     /// Add an SSH private key to the keychain
     Add {
@@ -224,7 +230,16 @@ async fn run(cli: Cli) -> Result<()> {
                 timeout,
                 auth_cache_mode,
                 auth_cache_duration,
-            } => server_macos::ssh_agent::start_ssh_agent(*timeout, *auth_cache_mode, *auth_cache_duration).await,
+                no_legacy_decrypt,
+            } => {
+                server_macos::ssh_agent::start_ssh_agent(
+                    *timeout,
+                    *auth_cache_mode,
+                    *auth_cache_duration,
+                    *no_legacy_decrypt,
+                )
+                .await
+            }
             SshCommands::Add { file, comment } => server_macos::ssh_cli::ssh_add(file.clone(), comment.clone()),
             SshCommands::List => server_macos::ssh_cli::ssh_list(),
             SshCommands::Remove { fingerprint } => server_macos::ssh_cli::ssh_remove(fingerprint),

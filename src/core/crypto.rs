@@ -6,14 +6,35 @@
 //! lives in `crate::server_macos::security`.
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit, OsRng, Payload},
     Aes256Gcm, Nonce,
 };
 use anyhow::{ensure, Result};
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
+use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::env;
+use zeroize::Zeroizing;
+
+/// HKDF info string for the v2 envelope DEK derivation. Domain-separates this
+/// derivation from any other use of the master key.
+pub const DEK_HKDF_INFO: &[u8] = b"vt-dek-v2";
+
+/// Derive a per-record envelope DEK from the master key and a 16-byte salt.
+///
+/// SECURITY: salt MUST be unique per record. Birthday bound is ~2^64 records
+/// before 50% collision; in this design a salt collision would simultaneously
+/// collapse the DEK *and* the AES-GCM nonce (`salt[..12]`), which is
+/// catastrophic for AES-GCM. `OsRng` filling 16 random bytes makes this
+/// negligible at any realistic scale.
+pub fn derive_dek(mac_key: &[u8; 32], salt: &[u8; 16]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(salt), mac_key);
+    let mut okm = [0u8; 32];
+    hk.expand(DEK_HKDF_INFO, &mut okm)
+        .expect("32-byte HKDF expand cannot fail");
+    okm
+}
 
 /// Derive the per-user/per-binary passphrase secret. Pure: SHA-256(SHA-256(
 /// `base64(passcode):$USER:bin_path`)). `bin_path` defaults to
@@ -91,6 +112,40 @@ impl AesGcmCrypto {
             .decrypt(nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("Decryption error: {e}"))?;
         Ok(plaintext)
+    }
+
+    /// AEAD encrypt with caller-supplied 12-byte nonce and AAD. Returns
+    /// `ciphertext || tag` only — the nonce is NOT prepended (the caller is
+    /// expected to transmit/store the nonce out-of-band, e.g. as part of the
+    /// v2 URL salt prefix).
+    pub fn encrypt_with_nonce_and_aad(
+        &self,
+        nonce: &[u8; 12],
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        let nonce = Nonce::from_slice(nonce);
+        let ct = self
+            .cipher
+            .encrypt(nonce, Payload { msg: plaintext, aad })
+            .map_err(|e| anyhow::anyhow!("Encryption error: {e}"))?;
+        Ok(ct)
+    }
+
+    /// AEAD decrypt with caller-supplied 12-byte nonce and AAD. Input is
+    /// `ciphertext || tag`.
+    pub fn decrypt_with_nonce_and_aad(
+        &self,
+        nonce: &[u8; 12],
+        ct_and_tag: &[u8],
+        aad: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let nonce = Nonce::from_slice(nonce);
+        let pt = self
+            .cipher
+            .decrypt(nonce, Payload { msg: ct_and_tag, aad })
+            .map_err(|e| anyhow::anyhow!("Decryption error: {e}"))?;
+        Ok(Zeroizing::new(pt))
     }
 }
 
@@ -187,6 +242,82 @@ mod tests {
         assert_eq!(decrypted1, plaintext);
         assert_eq!(decrypted2, plaintext);
         assert_eq!(decrypted1, decrypted2);
+    }
+
+    #[test]
+    fn test_derive_dek_deterministic_and_unique() {
+        let mac_key = [0x42u8; 32];
+        let salt_a = [0x11u8; 16];
+        let salt_b = [0x22u8; 16];
+
+        let dek_a1 = derive_dek(&mac_key, &salt_a);
+        let dek_a2 = derive_dek(&mac_key, &salt_a);
+        let dek_b = derive_dek(&mac_key, &salt_b);
+
+        assert_eq!(dek_a1, dek_a2, "same inputs -> same DEK");
+        assert_ne!(dek_a1, dek_b, "different salts -> different DEK");
+        assert_eq!(dek_a1.len(), 32);
+    }
+
+    #[test]
+    fn test_derive_dek_master_separation() {
+        let salt = [0x33u8; 16];
+        let dek_1 = derive_dek(&[0u8; 32], &salt);
+        let dek_2 = derive_dek(&[1u8; 32], &salt);
+        assert_ne!(dek_1, dek_2, "different masters -> different DEK");
+    }
+
+    #[test]
+    fn test_aad_encrypt_decrypt_roundtrip() {
+        let key = AesGcmCrypto::generate_key();
+        let crypto = AesGcmCrypto::new(&key).unwrap();
+        let nonce = [0x77u8; 12];
+        let aad = b"vt:v2:0";
+        let plaintext = b"hello world";
+
+        let ct = crypto
+            .encrypt_with_nonce_and_aad(&nonce, plaintext, aad)
+            .unwrap();
+        // Output is ct || tag, no nonce prefix.
+        assert_eq!(ct.len(), plaintext.len() + 16);
+
+        let pt = crypto
+            .decrypt_with_nonce_and_aad(&nonce, &ct, aad)
+            .unwrap();
+        assert_eq!(&pt[..], plaintext);
+    }
+
+    #[test]
+    fn test_aad_tamper_detection() {
+        let key = AesGcmCrypto::generate_key();
+        let crypto = AesGcmCrypto::new(&key).unwrap();
+        let nonce = [0x77u8; 12];
+        let plaintext = b"secret";
+
+        let ct = crypto
+            .encrypt_with_nonce_and_aad(&nonce, plaintext, b"vt:v2:1")
+            .unwrap();
+
+        // Decrypting with mismatched AAD must fail.
+        let bad = crypto.decrypt_with_nonce_and_aad(&nonce, &ct, b"vt:v2:0");
+        assert!(bad.is_err(), "AAD mismatch must reject");
+    }
+
+    #[test]
+    fn test_aad_does_not_prepend_nonce() {
+        // Regression guard: the AAD encrypt API must produce ct||tag only,
+        // never the nonce-prefixed format used by the legacy `encrypt()`.
+        let key = AesGcmCrypto::generate_key();
+        let crypto = AesGcmCrypto::new(&key).unwrap();
+        let nonce = [0xAAu8; 12];
+        let plaintext = b"";
+        let ct = crypto
+            .encrypt_with_nonce_and_aad(&nonce, plaintext, b"")
+            .unwrap();
+        // Empty plaintext -> 16-byte tag only.
+        assert_eq!(ct.len(), 16);
+        // Nonce bytes should not appear at the start.
+        assert_ne!(&ct[..12.min(ct.len())], &nonce[..]);
     }
 
     #[test]

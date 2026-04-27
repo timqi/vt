@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 use crate::core::crypto::{derive_passphrase_secret, AesGcmCrypto};
 use crate::core::session::{
@@ -440,13 +441,23 @@ pub fn create_and_save_passcode_passphrase(
 /// Decrypt the master passphrase from the store and build the mac_cipher.
 /// The passphrase cipher is supplied separately so callers can hold it
 /// long-term (serve) without keeping the decrypted master key in memory.
+///
+/// Returns both the cipher (for legacy AES-GCM ops) and the raw 32-byte master
+/// key (needed as HKDF IKM for v2 envelope DEK derivation). The raw key is
+/// returned in a `Zeroizing` wrapper so it is wiped from memory on drop;
+/// callers should drop it as soon as derivation is complete.
 pub fn load_mac_cipher(
     store: &super::store::KeychainStore,
     passphrase_cipher: &AesGcmCrypto,
-) -> Result<AesGcmCrypto> {
+) -> Result<(AesGcmCrypto, Zeroizing<[u8; 32]>)> {
     let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
-    let decrypted_passphrase = passphrase_cipher.decrypt(&encrypted_passphrase)?;
-    AesGcmCrypto::new(decrypted_passphrase.as_slice().try_into()?)
+    let decrypted_passphrase =
+        Zeroizing::new(passphrase_cipher.decrypt(&encrypted_passphrase)?);
+    let mut key = Zeroizing::new([0u8; 32]);
+    let slice: &[u8; 32] = decrypted_passphrase.as_slice().try_into()?;
+    key.copy_from_slice(slice);
+    let cipher = AesGcmCrypto::new(&key)?;
+    Ok((cipher, key))
 }
 
 /// Derive `(auth_cipher, passphrase_cipher)` from the passcode bytes inside
