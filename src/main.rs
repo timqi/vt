@@ -16,8 +16,6 @@ mod fido2;
 mod fido2_cli;
 mod security;
 #[cfg(target_os = "macos")]
-mod serve;
-#[cfg(target_os = "macos")]
 mod ssh_agent;
 #[cfg(target_os = "macos")]
 mod ssh_cli;
@@ -31,15 +29,6 @@ mod store;
     about = "a simple kms. no plain, explicit auth everywhere"
 )]
 struct Cli {
-    #[arg(
-        long,
-        global = true,
-        env = "VT_ADDR",
-        hide_env = true,
-        help = "Host and port in the format host:port, e.g. 127.0.0.1:5757 (env: VT_ADDR)"
-    )]
-    addr: Option<String>,
-
     #[arg(
         long,
         global = true,
@@ -100,41 +89,13 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Trigger bio auth on the vt server (for use with PAM, sudo, etc.)
+    /// Trigger bio auth via the vt SSH agent (for use with PAM, sudo, etc.)
     Auth {
         #[arg(long, help = "Reason shown in the bio auth prompt")]
         reason: Option<String>,
     },
 
-    #[cfg(target_os = "macos")]
-    /// (Mac only) Run vt server
-    Serve {
-        #[arg(
-            long = "enable-http",
-            default_value_t = false,
-            help = "Enable the HTTP server for encrypt/decrypt endpoints"
-        )]
-        enable_http: bool,
-        #[arg(
-            long = "ssh-idle-timeout",
-            default_value_t = ssh_agent::DEFAULT_IDLE_TIMEOUT_SECS,
-            help = "SSH agent idle timeout in seconds before clearing keys from memory"
-        )]
-        ssh_idle_timeout: u64,
-        #[arg(
-            long = "ssh-auth-cache-mode",
-            default_value = "none",
-            help = "Auth cache mode: none, per-session, or per-app"
-        )]
-        auth_cache_mode: ssh_agent::AuthCacheMode,
-        #[arg(
-            long = "ssh-auth-cache-duration",
-            default_value_t = ssh_agent::DEFAULT_AUTH_CACHE_DURATION_SECS,
-            help = "Auth cache duration in seconds for sign operations"
-        )]
-        auth_cache_duration: u64,
-    },
-    /// (Mac only) Initialize passcode, passphrase which will be used by server
+    /// (Mac only) Initialize passcode and passphrase in the keychain
     #[cfg(target_os = "macos")]
     Init,
     /// (Mac only) Manage master secret
@@ -250,25 +211,7 @@ async fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
         #[cfg(target_os = "macos")]
-        Commands::Serve { .. } | Commands::Init => match &cli.command {
-            Commands::Serve {
-                enable_http,
-                ssh_idle_timeout,
-                auth_cache_mode,
-                auth_cache_duration,
-            } => {
-                serve::serve(
-                    cli.addr.as_deref().unwrap_or("127.0.0.1:5757"),
-                    *enable_http,
-                    *ssh_idle_timeout,
-                    *auth_cache_mode,
-                    *auth_cache_duration,
-                )
-                .await
-            }
-            Commands::Init => cli::init(),
-            _ => unreachable!(),
-        },
+        Commands::Init => cli::init(),
         #[cfg(target_os = "macos")]
         Commands::Secret(secret_command) => match secret_command {
             SecretCommands::Export => cli::export_secret().await,
@@ -303,17 +246,17 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Commands::Create => {
             let auth = require_auth(&cli.auth)?;
-            let vt_client = VTClient::new(cli.addr.clone(), auth);
+            let vt_client = VTClient::new(auth);
             cli::create(vt_client).await
         }
         Commands::Read { vt, reason } => {
             let auth = require_auth(&cli.auth)?;
-            let vt_client = VTClient::new(cli.addr.clone(), auth);
+            let vt_client = VTClient::new(auth);
             cli::read(vt_client, vt.to_string(), reason.as_deref()).await
         }
         Commands::Auth { reason } => {
             let auth = require_auth(&cli.auth)?;
-            let vt_client = VTClient::new(cli.addr.clone(), auth);
+            let vt_client = VTClient::new(auth);
             cli::auth(vt_client, reason.as_deref().unwrap_or("bio auth requested")).await
         }
         Commands::Inject {
@@ -325,7 +268,7 @@ async fn run(cli: Cli) -> Result<()> {
             args,
         } => {
             let auth = require_auth(&cli.auth)?;
-            let vt_client = VTClient::new(cli.addr.clone(), auth);
+            let vt_client = VTClient::new(auth);
             cli::inject(
                 vt_client,
                 replace_file.clone(),

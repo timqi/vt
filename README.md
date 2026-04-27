@@ -30,9 +30,9 @@ cp target/release/vt /usr/local/bin/
    vt init
    ```
 
-2. Start the KMS server (also starts the SSH agent on `~/.ssh/vt.sock`):
+2. Start the SSH agent (listens on `~/.ssh/vt.sock`):
    ```bash
-   vt serve
+   vt ssh agent
    ```
 
 3. Export the auth token (shown during `vt init`):
@@ -55,7 +55,6 @@ cp target/release/vt /usr/local/bin/
 |---------|-------------|
 | `version` | Show version information |
 | `init` | (macOS) Initialize passcode and passphrase in keychain |
-| `serve` | (macOS) Start the KMS HTTP server and SSH agent (supports `--ssh-idle-timeout`, `--ssh-auth-cache-mode`, `--ssh-auth-cache-duration`) |
 | `create` | Read plaintext from stdin, output encrypted vt protocol |
 | `read <vt>` | Decrypt a vt protocol string |
 | `inject` | Decrypt vt protocols in env/files, optionally run a command |
@@ -110,8 +109,7 @@ vt ssh list
 # Show public key (for adding to GitHub, servers, etc.)
 vt ssh show SHA256:...
 
-# The SSH agent starts automatically with `vt serve`.
-# To start it standalone:
+# Start the SSH agent (it listens on ~/.ssh/vt.sock):
 eval $(vt ssh agent)
 
 # Start with auth caching (skip repeated Touch ID within a time window):
@@ -166,7 +164,7 @@ macOS (vt SSH agent)  ◄──SSH agent forwarding──  Linux: sudo
 ```bash
 # Ensure vt agent is your SSH agent
 export SSH_AUTH_SOCK=~/.ssh/vt.sock
-vt serve  # or: vt ssh agent
+vt ssh agent
 
 # SSH with agent forwarding
 ssh -A user@your-server
@@ -226,8 +224,8 @@ Example: `vt://mac/0SGVsbG8gV29ybGQ`
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `VT_ADDR` | Server address | `127.0.0.1:5757` |
 | `VT_AUTH` | Authentication token (from `vt init`) | - |
+| `SSH_AUTH_SOCK` | SSH agent socket path (used by clients to reach `vt ssh agent`) | falls back to `~/.ssh/vt.sock` |
 | `RUST_LOG` | Log level | `info` (release) / `debug` (dev) |
 
 ## Secret Management
@@ -275,25 +273,70 @@ If the new store already exists the tool refuses to overwrite — delete it via 
 
 ### Security Requirements
 
-- Run `vt serve` from the same user who ran `vt init`
+- Run `vt ssh agent` from the same user who ran `vt init`
 - Keep the `vt` binary at the same absolute path as during `vt init`
-- The server requires Touch ID or local authentication for decrypt operations
+- The agent requires Touch ID or local authentication for decrypt operations
+
+## Migrating from versions with HTTP transport
+
+Earlier versions of `vt` exposed an HTTP server (`vt serve`) on `127.0.0.1:5757` with `/encrypt` and `/decrypt` endpoints. **The HTTP transport has been removed; the SSH agent at `~/.ssh/vt.sock` is now the only way clients reach the keychain.**
+
+### Why
+
+`VTClient` already preferred the SSH agent socket and only fell back to HTTP when the socket was unavailable. The agent extensions (`encrypt@vt`, `decrypt@vt`, `auth@vt`) cover every operation the HTTP endpoints did, with the same `VT_AUTH`-keyed double-encryption model. Keeping a second transport meant:
+
+- An extra long-running TCP listener (even if loopback-bound)
+- ~50+ transitive crates pulled by `axum` + `reqwest`
+- A second auth-middleware code path to maintain
+- Doubled wire-format decisions whenever the protocol evolves (error responses, retry semantics, etc.)
+
+Removing it is net-negative LOC, fewer dependencies, and a single canonical path.
+
+### What was removed
+
+| Item | Replacement |
+|---|---|
+| `vt serve` subcommand | `vt ssh agent` |
+| `--addr` flag and `VT_ADDR` env var | (removed; not needed) |
+| `--enable-http` flag on `serve` | (removed) |
+| HTTP fallback inside `VTClient` | SSH-agent-only; errors out if the socket is unreachable |
+| `axum`, `reqwest` crates | (gone) |
+| `src/serve.rs` | (deleted) |
+
+### What was preserved
+
+- Keychain layout, key derivation, and crypto unchanged
+- `VT_AUTH` still keys the auth cipher (now used to encrypt SSH-agent extension payloads)
+- `vt-migrate` is unaffected
+- All `vt ssh agent` flags work identically: `--timeout`, `--ssh-auth-cache-mode`, `--ssh-auth-cache-duration`
+
+### Steps to upgrade
+
+1. **Update your LaunchAgent / supervisor.** Replace `vt serve` invocations with `vt ssh agent`. The flags `--ssh-idle-timeout` / `--ssh-auth-cache-mode` / `--ssh-auth-cache-duration` from `vt serve` map directly to `--timeout` / `--ssh-auth-cache-mode` / `--ssh-auth-cache-duration` on `vt ssh agent`.
+2. **Unset `VT_ADDR`** from shell profiles. It's now an unrecognized flag and will fail clap parsing.
+3. **Verify the agent socket.** Run `ls -l ~/.ssh/vt.sock` after starting `vt ssh agent`. Clients fail with `SSH agent not available — set SSH_AUTH_SOCK or run \`vt ssh agent\`` if the socket is missing.
+
+### Behavior change
+
+If your local `SSH_AUTH_SOCK` points to a non-vt agent (e.g. forwarded from a host without `vt`), client commands previously fell back to HTTP. They now fail with the agent-unavailable error. Either set `SSH_AUTH_SOCK=~/.ssh/vt.sock` for `vt` clients, or unset it so the client uses the default path.
 
 ## Architecture
 
 ```
-┌─────────────┐     HTTP      ┌─────────────┐     ┌─────────────┐
-│  vt client  │ ─────────────▶│  vt serve   │────▶│   Keychain  │
-│  (create,   │  encrypted    │  (decrypt,  │     │  (passcode, │
-│   read,     │◀───────────── │   encrypt)  │◀────│  passphrase,│
-│   inject)   │    body       └─────────────┘     │  ssh keys)  │
-└─────────────┘                      │            └─────────────┘
-                                     ▼                   ▲
-                              ┌─────────────┐            │
-                              │  Touch ID   │     ┌──────┴──────┐
-                              │  (decrypt,  │     │ vt ssh agent│
-                              │   sign)     │     │ (Unix sock) │
-                              └─────────────┘     └─────────────┘
+┌─────────────┐  Unix socket  ┌──────────────┐     ┌─────────────┐
+│  vt client  │ ─────────────▶│ vt ssh agent │────▶│   Keychain  │
+│  (create,   │  encrypted    │  (decrypt,   │     │  (passcode, │
+│   read,     │◀───────────── │   encrypt,   │◀────│  passphrase,│
+│   inject,   │   extension   │   sign,      │     │  ssh keys,  │
+│   auth)     │   payload     │   auth@vt)   │     │  fido2)     │
+└─────────────┘               └──────────────┘     └─────────────┘
+                                     │
+                                     ▼
+                              ┌─────────────┐
+                              │  Touch ID   │
+                              │  (decrypt,  │
+                              │   sign)     │
+                              └─────────────┘
 ```
 
 All keychain access (passcode, passphrase, SSH keys, FIDO2) routes through a single `rusty.vault.store` item — see [Secret Management](#secret-management) for layout and migration from the legacy four-item layout.
