@@ -25,7 +25,29 @@ cp target/release/vt /usr/local/bin/
 
 ## Upgrade Warning
 
-This release changes the keychain storage layout from four legacy items to the single `rusty.vault.store` item. This is a **breaking change** for existing installs. Before replacing an older `vt` binary, run `vt secret export` with the old version. After installing this version, run `vt secret import`, update `VT_AUTH`, then re-add SSH keys and FIDO2 credentials. See [Secret Management](#secret-management) for the full upgrade path.
+### v2.0.0 — protocol redesign (BREAKING)
+
+v2.0.0 switches the client ↔ agent wire protocol to **envelope encryption**: the agent never sees plaintext on encrypt and never sees stored ciphertext on decrypt — it only releases a per-record DEK after Touch ID. The `vt://` URL format also changes: new secrets are emitted as `vt://0…` / `vt://1…` (no `mac/` segment); old `vt://mac/…` URLs continue to be readable for migration. See `src/core.rs` and the v2.0.0 release notes for full protocol details.
+
+This is a **breaking protocol change**. The client and the running `vt ssh agent` must upgrade in lockstep — an old client speaking to a new agent will fail with `unknown variant ... expected V2 or Legacy`. To upgrade:
+
+1. Build/install the new binary: `cargo install --path .` (or copy `target/release/vt` to your PATH location).
+2. Stop the running agent: `pkill -f 'vt ssh agent'`.
+3. Restart the agent from the new binary (in a fresh shell so PATH resolves correctly): `vt ssh agent`.
+4. **Migrate stored secrets** (recommended): legacy `vt://mac/…` URLs in your dotfiles / env files can be bulk-migrated to v2 with the included script:
+   ```bash
+   uv run migrate-vt-urls.py path/to/file …             # dry-run preview
+   uv run migrate-vt-urls.py --no-dry-run path/to/file … # actually rewrite
+   ```
+   The script handles RAW and TOTP types (TOTP migration uses a one-time legacy-path trick to recover the seed). Backups are left at `*.vt-migrate-backup`.
+5. Once all secrets are migrated, restart the agent with `--no-legacy-decrypt` to permanently retire the legacy code path:
+   ```bash
+   vt ssh agent --no-legacy-decrypt
+   ```
+
+### Earlier breaking change — keychain consolidation
+
+Older installs (pre-1.0.0) used four separate keychain items. The current single `rusty.vault.store` layout requires `vt secret export` with the old version, then `vt secret import` after installing. See [Secret Management](#secret-management) for the full upgrade path.
 
 ## Quick Start
 
