@@ -5,26 +5,59 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-cargo build --release        # Release build (uses real macOS keychain)
-cargo build                  # Debug build
-cargo test                   # Run non-ignored tests (pure crypto tests, no agent needed)
-cargo test test_name         # Run a specific test
-cargo test -- --ignored      # Run ALL tests (requires running agent + macOS keychain)
+cargo build --release                              # Release build (uses real macOS keychain)
+cargo build                                        # Debug build (macOS)
+cargo check --target x86_64-unknown-linux-gnu      # Cross-platform client surface check (no macOS server)
+cargo test                                         # Run non-ignored tests (pure crypto tests, no agent needed)
+cargo test test_name                               # Run a specific test
+cargo test -- --ignored                            # Run ALL tests (requires running agent + macOS keychain)
 ```
+
+The Linux cross-check is the boundary guard for the client/server split: it must stay green so any future change that smuggles a macOS-only symbol into the client surface fails locally.
 
 ## Architecture
 
-VT (Vault) is a macOS-based KMS using the system keychain for secret storage and AES-256-GCM encryption.
+VT (Vault) is a macOS-based KMS using the system keychain for secret storage and AES-256-GCM encryption. The codebase is split into a cross-platform client + protocol core, and a macOS-only server tree. The same `vt` binary contains both; on Linux the macOS tree is `cfg`-gated out.
 
-### Source Files (src/)
+### Source Tree (src/)
 
-- **main.rs** — CLI entry point (clap). Subcommands: `init`, `create`, `read`, `inject`, `auth`, `secret {export,import,rotate-passcode}`, `ssh {agent,add,list,remove,remove-all,comment,show}`, `fido2 {register,list,remove,remove-all}`. macOS-only commands (`init`, `secret`, `ssh`, `fido2`) are `#[cfg(target_os = "macos")]`. `auth` is platform-agnostic (client runs on Linux, agent runs on macOS).
-- **core.rs** — Shared domain types (`EncryptItem`, `DecryptReq`, `CryptoResItem`, `SecretType`) and crypto logic (`do_encrypt`, `do_decrypt`). Used by `ssh_agent.rs`.
-- **cli.rs** — Client logic. `VTClient` sends extension requests over the SSH agent Unix socket (`encrypt@vt` / `decrypt@vt` / `auth@vt`); each extension payload is encrypted with the `VT_AUTH`-derived auth cipher. `inject` uses `libc::fork()` for timed file cleanup and `exec::Command` to replace the process.
-- **security.rs** — `AesGcmCrypto` wrapper (AES-256-GCM with 12-byte nonce prepended to ciphertext). Low-level keychain access via `security-framework` crate (`set_keychain`, `get_keychain`, `delete_keychain`); higher-level callers should go through `KeychainStore` instead. `derive_passcode_ciphers(&KeychainStore)` and `load_mac_cipher(&KeychainStore, &passphrase_cipher)` are the canonical entry points. Local auth uses `objc2-local-authentication` so LAError codes can be classified precisely.
-- **store.rs** — `KeychainStore` type backing the single `rusty.vault.store` keychain item. JSON-serialized blob with fields `passcode_and_auth_token`, `encrypted_passphrase`, optional `encrypted_ssh_keys`, optional `encrypted_fido2`. Provides `load`/`save` and the cross-process `modify` (blocking flock) and `try_modify` (non-blocking flock, used by FIDO2 sign-counter persistence to avoid stalling SSH sessions) helpers. Lock file lives at `$TMPDIR/vt-keychain.lock` and is never deleted (per-user, cleared on reboot).
-- **ssh_agent.rs** — SSH agent implementation using `ssh-agent-lib`. Split into `VtSshAgentFactory` (implements `Agent<UnixListener>`, owns shared state) and `VtSshSession` (per-connection, implements `Session`). Includes `AuthCacheMode`/`AuthCache` for optional per-session or per-app Touch ID caching, and a `proc_info` module for macOS process introspection (`proc_pidinfo`/`proc_pidpath`). Keys live inside `KeychainStore.encrypted_ssh_keys` (a single encrypted JSON blob, formerly its own keychain item). Touch ID required for `sign()` and `decrypt@vt` (with optional caching). Non-vt extensions (e.g. `session-bind@openssh.com`) are passed through gracefully. Touch ID prompt includes the calling process name. Supports Ed25519, RSA, ECDSA P-256/P-384. Lock passphrase is SHA-256 hashed (never stored in plaintext) and compared with constant-time equality (`subtle`); stored hash is zeroized on unlock. Lock also clears keys from memory; unlock reloads them from keychain. `add_identity`/`remove_identity`/`remove_all_identities` go through `KeychainStore::modify` on a `tokio::task::spawn_blocking` worker so the file lock and synchronous keychain I/O don't block the async runtime.
-- **ssh_cli.rs** — CLI functions for SSH key management: `ssh_add` (parse key from file or stdin with interactive comment prompt, encrypt, store), `ssh_list` (read index), `ssh_remove`/`ssh_remove_all` (delete from keychain + index), `ssh_show` (display public key).
+```
+main.rs                    cross-platform; clap routing only
+client.rs                  cross-platform; VTClient + create/read/inject/auth bodies
+core.rs                    cross-platform; protocol types, vt:// parsing, do_encrypt/do_decrypt
+core/
+├── crypto.rs              AesGcmCrypto, derive_passphrase_secret, decode_auth_cipher_from_b64
+└── session.rs             SessionFlags/SessionState/AuthOutcome/AuthMethod + classify_session
+tty.rs                     cross-platform; prompt_input_password (used by client + server admin)
+server_macos/              #[cfg(target_os = "macos")]
+├── mod.rs
+├── admin.rs               init, secret export/import/rotate-passcode
+├── security.rs            keychain (set/get/delete_keychain), LA chain (authenticate, classify_la_error),
+│                          create_and_save_passcode_passphrase, derive_passcode_ciphers, load_mac_cipher
+├── store.rs               KeychainStore — single `rusty.vault.store` JSON blob, flock RMW
+├── ssh_agent.rs           SSH-agent (VtSshAgentFactory/VtSshSession), AuthCache, proc_info
+├── ssh_cli.rs             ssh add/list/remove/comment/show command bodies
+├── fido2.rs               FIDO2 enrollment + assertion, encrypted-credential storage
+└── fido2_cli.rs           fido2 register/list/remove command bodies
+```
+
+Layer rules:
+
+- `core` has no I/O and no platform deps. Pure types, pure crypto, pure classifiers.
+- `client` depends only on `core`, `tty`, `ssh-agent-lib` (blocking client), and Unix-but-cross-platform crates (`dirs`, `hostname`, `regex`, `exec`, `libc`). It must never reach into `server_macos`.
+- `server_macos` is the only consumer of `KeychainStore`, `LAContext`, FIDO2/CTAP, `ssh-key`, and macOS framework FFI.
+- `main.rs` routes commands. Client commands (`create`/`read`/`inject`/`auth`) are unconditional; admin commands (`init`/`secret`/`ssh`/`fido2`) are gated on macOS at the clap-derive level.
+- In `Cargo.toml`, `ssh-agent-lib` is listed twice on purpose: once in `[dependencies]` with `default-features = false` (the client only needs `proto::Extension` + `blocking::Client`) and once under `[target.'cfg(target_os = "macos")'.dependencies]` adding `["agent","codec"]` for the agent server. `ssh-key`, `security-framework`, all `objc2*`, FIDO2/CTAP, and the curve crates live entirely in the macOS target block. Anything new that reaches the keychain or LA goes there too.
+
+### Detailed Module Notes
+
+- **client.rs** — `VTClient` sends extension requests over the SSH agent Unix socket (`encrypt@vt` / `decrypt@vt` / `auth@vt`); each extension payload is encrypted with the `VT_AUTH`-derived auth cipher. `inject` uses `libc::fork()` for timed file cleanup and `exec::Command` to replace the process.
+- **core/crypto.rs** — `AesGcmCrypto` (AES-256-GCM with 12-byte nonce prepended to ciphertext), `derive_passphrase_secret` (SHA-256(SHA-256(`base64(passcode):$USER:bin_path`))), `decode_auth_cipher_from_b64` (turns the `VT_AUTH` env var into the auth cipher key).
+- **core/session.rs** — Platform-neutral session-state classifier. The macOS adapter in `server_macos::security` reads `CGSessionCopyCurrentDictionary` into a `SessionFlags` and feeds it through `classify_session`.
+- **server_macos/security.rs** — Low-level keychain access via `security-framework` (`set_keychain`, `get_keychain`); higher-level callers should go through `KeychainStore` instead. `derive_passcode_ciphers(&KeychainStore)` and `load_mac_cipher(&KeychainStore, &passphrase_cipher)` are the canonical entry points. The auth chain (`authenticate`) is Touch ID → FIDO2 → password, with `classify_la_error` lifting `LAError` codes into `EvalOutcome` for testable fallback decisions. Local auth uses `objc2-local-authentication` so LAError codes can be classified precisely.
+- **server_macos/store.rs** — `KeychainStore` type backing the single `rusty.vault.store` keychain item. JSON-serialized blob with fields `passcode_and_auth_token`, `encrypted_passphrase`, optional `encrypted_ssh_keys`, optional `encrypted_fido2`. Provides `load`/`save` and the cross-process `modify` (blocking flock) and `try_modify` (non-blocking flock, used by FIDO2 sign-counter persistence to avoid stalling SSH sessions) helpers. Lock file lives at `$TMPDIR/vt-keychain.lock` and is never deleted (per-user, cleared on reboot).
+- **server_macos/ssh_agent.rs** — SSH agent implementation using `ssh-agent-lib`. Split into `VtSshAgentFactory` (implements `Agent<UnixListener>`, owns shared state) and `VtSshSession` (per-connection, implements `Session`). Includes `AuthCacheMode`/`AuthCache` for optional per-session or per-app Touch ID caching, and a `proc_info` module for macOS process introspection (`proc_pidinfo`/`proc_pidpath`). Keys live inside `KeychainStore.encrypted_ssh_keys` (a single encrypted JSON blob, formerly its own keychain item). Touch ID required for `sign()` and `decrypt@vt` (with optional caching). Non-vt extensions (e.g. `session-bind@openssh.com`) are passed through gracefully. Touch ID prompt includes the calling process name. Supports Ed25519, RSA, ECDSA P-256/P-384. Lock passphrase is SHA-256 hashed (never stored in plaintext) and compared with constant-time equality (`subtle`); stored hash is zeroized on unlock. Lock also clears keys from memory; unlock reloads them from keychain. `add_identity`/`remove_identity`/`remove_all_identities` go through `KeychainStore::modify` on a `tokio::task::spawn_blocking` worker so the file lock and synchronous keychain I/O don't block the async runtime.
+- **server_macos/ssh_cli.rs** — CLI functions for SSH key management: `ssh_add` (parse key from file or stdin with interactive comment prompt, encrypt, store), `ssh_list` (read index), `ssh_remove`/`ssh_remove_all` (delete from keychain + index), `ssh_show` (display public key).
 
 ### Keychain Access
 

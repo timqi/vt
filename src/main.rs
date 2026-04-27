@@ -1,26 +1,24 @@
+// Server-side modules consume most cross-platform symbols (`do_encrypt`,
+// session classifiers, etc.). On non-macOS targets the server tree is
+// cfg-gated out, so those symbols look unused. Suppress the noise rather
+// than sprinkle `#[allow(dead_code)]` across `core` items.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::cli::VTClient;
+use crate::client::VTClient;
 
 fn require_auth(auth: &Option<String>) -> Result<String> {
     auth.clone()
         .ok_or_else(|| anyhow::anyhow!("VT_AUTH not set — run `vt init` and export the token"))
 }
 
-mod cli;
+mod client;
 mod core;
 #[cfg(target_os = "macos")]
-mod fido2;
-#[cfg(target_os = "macos")]
-mod fido2_cli;
-mod security;
-#[cfg(target_os = "macos")]
-mod ssh_agent;
-#[cfg(target_os = "macos")]
-mod ssh_cli;
-#[cfg(target_os = "macos")]
-mod store;
+mod server_macos;
+mod tty;
 
 #[derive(Parser)]
 #[command(
@@ -153,7 +151,7 @@ pub enum SshCommands {
         #[arg(
             short = 't',
             long = "timeout",
-            default_value_t = ssh_agent::DEFAULT_IDLE_TIMEOUT_SECS,
+            default_value_t = server_macos::ssh_agent::DEFAULT_IDLE_TIMEOUT_SECS,
             help = "Idle timeout in seconds before clearing keys from memory"
         )]
         timeout: u64,
@@ -162,10 +160,10 @@ pub enum SshCommands {
             default_value = "none",
             help = "Auth cache mode: none, per-session, or per-app"
         )]
-        auth_cache_mode: ssh_agent::AuthCacheMode,
+        auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
         #[arg(
             long = "ssh-auth-cache-duration",
-            default_value_t = ssh_agent::DEFAULT_AUTH_CACHE_DURATION_SECS,
+            default_value_t = server_macos::ssh_agent::DEFAULT_AUTH_CACHE_DURATION_SECS,
             help = "Auth cache duration in seconds for sign operations"
         )]
         auth_cache_duration: u64,
@@ -211,13 +209,13 @@ async fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
         #[cfg(target_os = "macos")]
-        Commands::Init => cli::init(),
+        Commands::Init => server_macos::admin::init(),
         #[cfg(target_os = "macos")]
         Commands::Secret(secret_command) => match secret_command {
-            SecretCommands::Export => cli::export_secret().await,
-            SecretCommands::Import => cli::import_secret().await,
+            SecretCommands::Export => server_macos::admin::export_secret().await,
+            SecretCommands::Import => server_macos::admin::import_secret().await,
             SecretCommands::RotatePasscode { bin_absolute_path } => {
-                cli::rotate_passcode(bin_absolute_path.clone()).await
+                server_macos::admin::rotate_passcode(bin_absolute_path.clone()).await
             }
         },
         #[cfg(target_os = "macos")]
@@ -226,38 +224,38 @@ async fn run(cli: Cli) -> Result<()> {
                 timeout,
                 auth_cache_mode,
                 auth_cache_duration,
-            } => ssh_agent::start_ssh_agent(*timeout, *auth_cache_mode, *auth_cache_duration).await,
-            SshCommands::Add { file, comment } => ssh_cli::ssh_add(file.clone(), comment.clone()),
-            SshCommands::List => ssh_cli::ssh_list(),
-            SshCommands::Remove { fingerprint } => ssh_cli::ssh_remove(fingerprint),
-            SshCommands::RemoveAll => ssh_cli::ssh_remove_all(),
+            } => server_macos::ssh_agent::start_ssh_agent(*timeout, *auth_cache_mode, *auth_cache_duration).await,
+            SshCommands::Add { file, comment } => server_macos::ssh_cli::ssh_add(file.clone(), comment.clone()),
+            SshCommands::List => server_macos::ssh_cli::ssh_list(),
+            SshCommands::Remove { fingerprint } => server_macos::ssh_cli::ssh_remove(fingerprint),
+            SshCommands::RemoveAll => server_macos::ssh_cli::ssh_remove_all(),
             SshCommands::Comment {
                 fingerprint,
                 comment,
-            } => ssh_cli::ssh_comment(fingerprint, comment),
-            SshCommands::Show { fingerprint } => ssh_cli::ssh_show(fingerprint),
+            } => server_macos::ssh_cli::ssh_comment(fingerprint, comment),
+            SshCommands::Show { fingerprint } => server_macos::ssh_cli::ssh_show(fingerprint),
         },
         #[cfg(target_os = "macos")]
         Commands::Fido2(cmd) => match cmd {
-            Fido2Commands::Register { label } => fido2_cli::fido2_register(label.clone()),
-            Fido2Commands::List => fido2_cli::fido2_list(),
-            Fido2Commands::Remove { short_id } => fido2_cli::fido2_remove(short_id),
-            Fido2Commands::RemoveAll => fido2_cli::fido2_remove_all(),
+            Fido2Commands::Register { label } => server_macos::fido2_cli::fido2_register(label.clone()),
+            Fido2Commands::List => server_macos::fido2_cli::fido2_list(),
+            Fido2Commands::Remove { short_id } => server_macos::fido2_cli::fido2_remove(short_id),
+            Fido2Commands::RemoveAll => server_macos::fido2_cli::fido2_remove_all(),
         },
         Commands::Create => {
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(auth);
-            cli::create(vt_client).await
+            client::create(vt_client).await
         }
         Commands::Read { vt, reason } => {
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(auth);
-            cli::read(vt_client, vt.to_string(), reason.as_deref()).await
+            client::read(vt_client, vt.to_string(), reason.as_deref()).await
         }
         Commands::Auth { reason } => {
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(auth);
-            cli::auth(vt_client, reason.as_deref().unwrap_or("bio auth requested")).await
+            client::auth(vt_client, reason.as_deref().unwrap_or("bio auth requested")).await
         }
         Commands::Inject {
             replace_file,
@@ -269,7 +267,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(auth);
-            cli::inject(
+            client::inject(
                 vt_client,
                 replace_file.clone(),
                 input_file.clone(),

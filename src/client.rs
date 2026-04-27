@@ -1,30 +1,19 @@
-use std::{env, vec};
+//! Cross-platform vt client.
+//!
+//! Talks to a local `vt ssh agent` over the SSH-agent Unix socket using the
+//! `encrypt@vt` / `decrypt@vt` / `auth@vt` extension messages. The wire
+//! payload is encrypted with the auth cipher derived from `VT_AUTH`. No
+//! keychain, no LocalAuthentication, no `ssh-key` — those all live on the
+//! macOS server side.
 
-use crate::security::{
-    create_and_save_passcode_passphrase, decode_auth_cipher_from_b64, derive_passcode_ciphers,
-    local_authentication, AesGcmCrypto,
-};
-#[cfg(target_os = "macos")]
-use crate::store::KeychainStore;
+use std::env;
+use std::io::{self, Write};
+
+use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
 use crate::core::{AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem, SecretType};
 use anyhow::{ensure, Context, Result};
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use base64::Engine;
-use sha2::{Digest, Sha256};
 use ssh_agent_lib::proto::{Extension, Unparsed};
-use std::io::{self, Write};
 use tracing::debug;
-
-pub fn init() -> Result<()> {
-    if KeychainStore::load().is_ok() {
-        Err(anyhow::anyhow!(
-            "Error: already initialized? Please delete 'rusty.vault.store' from the keychain first"
-        ))?;
-        std::process::exit(1);
-    }
-    create_and_save_passcode_passphrase(&AesGcmCrypto::generate_key(), None)?;
-    Ok(())
-}
 
 pub struct VTClient {
     auth_token: String,
@@ -157,21 +146,6 @@ impl VTClient {
     }
 }
 
-fn prompt_input_password(prompt_before: &str, prompt_after: &str) -> Result<String> {
-    let secret = rpassword::prompt_password(prompt_before).context("Failed to read password")?;
-    let secret = secret.trim();
-    if secret.is_empty() {
-        return Err(anyhow::anyhow!("Secret cannot be empty"));
-    }
-    println!(
-        "{}{}****{}",
-        prompt_after,
-        &secret[..2],
-        &secret[secret.len() - 2..]
-    );
-    Ok(secret.to_string())
-}
-
 pub async fn create(vt_client: VTClient) -> Result<()> {
     print!("Enter secret type (raw/totp) [default: raw]: ");
     io::stdout().flush()?;
@@ -186,7 +160,7 @@ pub async fn create(vt_client: VTClient) -> Result<()> {
         return Err(anyhow::anyhow!("Invalid secret type: {}", input));
     }
 
-    let secret = prompt_input_password("Enter secret: ", "Secret entered: ")?;
+    let secret = crate::tty::prompt_input_password("Enter secret: ", "Secret entered: ")?;
     debug!("User input for secret: '{}'", secret);
 
     let res = vt_client
@@ -612,103 +586,4 @@ pub async fn inject(
     );
 
     Err(anyhow::anyhow!("Failed to execute command: {}", err))
-}
-
-pub async fn export_secret() -> Result<()> {
-    if !local_authentication("export master secret") {
-        Err(anyhow::anyhow!(
-            "Local authentication failed for export master secret"
-        ))?;
-    }
-    let store = KeychainStore::load()?;
-    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
-    let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
-    let decrypted_passphrase = passphrase_cipher
-        .decrypt(&encrypted_passphrase)
-        .context("Failed to decrypt passphrase")?;
-
-    let master_secret_passphrase = prompt_input_password(
-        "Enter master secret passphrase: ",
-        "Master secret passphrase entered: ",
-    )?;
-    let hash = Sha256::digest(&Sha256::digest(master_secret_passphrase.as_bytes()));
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&hash[..32]);
-    let export_cipher =
-        AesGcmCrypto::new(&key).context("Failed to create AES-GCM cipher for master secret")?;
-
-    let new_encrypted_passphrase_bytes = export_cipher
-        .encrypt(&decrypted_passphrase)
-        .context("Failed to encrypt master secret passphrase")?;
-    println!(
-        "Encrypted master secret passphrase (base64): {}",
-        BASE64_URL_SAFE_NO_PAD.encode(new_encrypted_passphrase_bytes)
-    );
-
-    Ok(())
-}
-
-pub async fn import_secret() -> Result<()> {
-    if KeychainStore::load().is_ok() {
-        Err(anyhow::anyhow!(
-            "Error: already imported? Please delete 'rusty.vault.store' from the keychain first"
-        ))?;
-        std::process::exit(1);
-    }
-    let master_secret = prompt_input_password("Enter master secret: ", "Master secret entered: ")?;
-    let encrypted_passphrase_bytes = BASE64_URL_SAFE_NO_PAD.decode(master_secret)?;
-
-    let master_secret_passphrase = prompt_input_password(
-        "Enter master secret passphrase: ",
-        "Master secret passphrase entered: ",
-    )?;
-    let hash = Sha256::digest(&Sha256::digest(master_secret_passphrase.as_bytes()));
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&hash[..32]);
-    let import_cipher =
-        AesGcmCrypto::new(&key).context("Failed to create AES-GCM cipher for master secret")?;
-
-    let vt_path = env::current_exe().unwrap().to_string_lossy().to_string();
-    print!("Enter absolute path of vt (Default: {}): ", vt_path);
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    if input.trim().is_empty() {
-        input = vt_path;
-    } else {
-        input = input.trim().to_string();
-    }
-
-    let real_passphrase = import_cipher.decrypt(&encrypted_passphrase_bytes)?;
-    let passphrase_array: [u8; 32] = real_passphrase
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;
-
-    create_and_save_passcode_passphrase(&passphrase_array, Some(&input))
-        .context("Failed to create and save passcode passphrase")?;
-
-    Ok(())
-}
-
-pub async fn rotate_passcode(bin_absolute_path: Option<String>) -> Result<()> {
-    if !local_authentication("rotate passcode") {
-        Err(anyhow::anyhow!(
-            "Local authentication failed for rotate passcode"
-        ))?;
-    }
-    let store = KeychainStore::load()?;
-    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
-    let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
-    let decrypted_passphrase = passphrase_cipher
-        .decrypt(&encrypted_passphrase)
-        .context("Failed to decrypt passphrase. Wrong bin path?")?;
-    let passphrase_array: [u8; 32] = decrypted_passphrase
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;
-    create_and_save_passcode_passphrase(&passphrase_array, bin_absolute_path.as_deref())?;
-    eprintln!(
-        "Passcode rotated. If `vt ssh agent` is running, restart it — the cached passphrase cipher \
-        is now stale and decrypt requests will fail until a fresh process is started."
-    );
-    Ok(())
 }

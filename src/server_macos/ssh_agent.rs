@@ -16,14 +16,15 @@ use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
 use tokio::sync::RwLock;
 
+use crate::core::crypto::AesGcmCrypto;
+use crate::core::session::{AuthMethod, AuthOutcome};
 use crate::core::{
     do_decrypt, do_encrypt, AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem,
 };
-use crate::security::{
-    authenticate, derive_passcode_ciphers, load_mac_cipher, local_authentication, AesGcmCrypto,
-    AuthMethod, AuthOutcome,
+use super::security::{
+    authenticate, derive_passcode_ciphers, load_mac_cipher, local_authentication,
 };
-use crate::store::KeychainStore;
+use super::store::KeychainStore;
 
 /// SSH agent extension names used by vt.
 pub const EXT_ENCRYPT: &str = "encrypt@vt";
@@ -1125,7 +1126,7 @@ mod tests {
 
     #[test]
     fn test_decode_ssh_keys_returns_empty_when_field_missing() {
-        use crate::store::KeychainStore;
+        use super::super::store::KeychainStore;
         let store = KeychainStore::new(&[0u8; 64], &[1u8; 60]);
         let key = AesGcmCrypto::generate_key();
         let cipher = AesGcmCrypto::new(&key).unwrap();

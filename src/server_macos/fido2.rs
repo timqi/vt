@@ -20,8 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Assertion;
 
-use crate::security::{derive_passcode_ciphers, load_mac_cipher, AesGcmCrypto};
-use crate::store::KeychainStore;
+use crate::core::crypto::AesGcmCrypto;
+use super::security::{derive_passcode_ciphers, load_mac_cipher};
+use super::store::KeychainStore;
 
 pub const RP_ID: &str = "com.timqi.vt";
 

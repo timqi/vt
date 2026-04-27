@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use ssh_key::private::PrivateKey;
 use ssh_key::HashAlg;
 
-use crate::security::{derive_passcode_ciphers, load_mac_cipher, local_authentication};
-use crate::ssh_agent::{decode_ssh_keys, encode_ssh_keys_into, SshKeyEntry};
-use crate::store::KeychainStore;
+use super::security::{derive_passcode_ciphers, load_mac_cipher, local_authentication};
+use super::ssh_agent::{decode_ssh_keys, encode_ssh_keys_into, SshKeyEntry};
+use super::store::KeychainStore;
 
 pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
     if !local_authentication("add SSH key") {

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 
-use crate::security::{get_keychain, set_keychain};
+use super::security::{get_keychain, set_keychain};
 
 const STORE_NAME: &str = "store";
 const LOCK_FILE_NAME: &str = "vt-keychain.lock";

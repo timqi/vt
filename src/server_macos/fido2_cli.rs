@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 
-use crate::fido2;
-use crate::security::touch_id_authentication;
+use super::fido2;
+use super::security::touch_id_authentication;
 
 pub fn fido2_register(label: Option<String>) -> Result<()> {
     if !touch_id_authentication("register YubiKey for vt") {

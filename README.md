@@ -346,6 +346,10 @@ If your local `SSH_AUTH_SOCK` points to a non-vt agent (e.g. forwarded from a ho
 
 All keychain access (passcode, passphrase, SSH keys, FIDO2) routes through a single `rusty.vault.store` item — see [Secret Management](#secret-management) for the layout and the breaking-change upgrade path from the legacy four-item layout.
 
+### Client / Server Split
+
+The `vt` source tree is split into a cross-platform client (`create`/`read`/`inject`/`auth`) and a macOS-only server (`init`/`secret`/`ssh`/`fido2`, including the SSH agent itself). Both ship in the same binary; on Linux the macOS server is `cfg`-gated out, so the Linux build only contains the client commands.
+
 ## License
 
 MIT
