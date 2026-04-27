@@ -15,8 +15,8 @@ Strategy:
   - Re-encrypt each plaintext via `vt create` (no Touch ID; encrypt@vt is
     unauthenticated by design) and capture the new vt://0... or vt://1...
     URL.
-  - Atomically rewrite each input file; a `<file>.vt-migrate-backup` copy
-    is left next to each modified file.
+  - Atomically rewrite each input file. Pass `--backup` to leave a
+    `<file>.vt-migrate-backup` copy next to each modified file.
 
 Requires `vt` on PATH and a running `vt ssh agent`.
 
@@ -129,10 +129,10 @@ def reencrypt(plaintext: str, secret_type: str) -> str:
     return new_url
 
 
-def rewrite_file(path: Path, mapping: dict[str, str]) -> int:
-    """Replace every old URL in `path` with its new value. Writes a backup
-    `<path>.vt-migrate-backup` first; the rewrite itself uses os.replace
-    for atomicity. Returns the number of substitutions made."""
+def rewrite_file(path: Path, mapping: dict[str, str], backup: bool) -> int:
+    """Replace every old URL in `path` with its new value. The rewrite uses
+    os.replace for atomicity. When `backup` is True, also leaves a copy at
+    `<path>.vt-migrate-backup`. Returns the number of substitutions made."""
     text = path.read_text(encoding="utf-8")
     count = sum(text.count(old) for old in mapping)
     if count == 0:
@@ -140,8 +140,9 @@ def rewrite_file(path: Path, mapping: dict[str, str]) -> int:
     new_text = text
     for old, new in mapping.items():
         new_text = new_text.replace(old, new)
-    backup = path.with_suffix(path.suffix + ".vt-migrate-backup")
-    backup.write_bytes(path.read_bytes())
+    if backup:
+        backup_path = path.with_suffix(path.suffix + ".vt-migrate-backup")
+        backup_path.write_bytes(path.read_bytes())
     tmp = path.with_suffix(path.suffix + ".vt-migrate-tmp")
     tmp.write_text(new_text, encoding="utf-8")
     os.replace(tmp, path)
@@ -158,6 +159,12 @@ def main() -> int:
         action="store_true",
         help="actually decrypt, re-encrypt, and rewrite files. Without this "
         "flag the script only previews the URLs it would migrate.",
+    )
+    ap.add_argument(
+        "--backup",
+        action="store_true",
+        help="leave a <file>.vt-migrate-backup copy next to each rewritten "
+        "file. Off by default.",
     )
     args = ap.parse_args()
     dry_run = not args.no_dry_run
@@ -200,16 +207,19 @@ def main() -> int:
 
     total = 0
     for f in files:
-        n = rewrite_file(f, url_map)
+        n = rewrite_file(f, url_map, backup=args.backup)
         if n:
-            print(f"  {f}: {n} substitution(s); backup at {f}.vt-migrate-backup")
+            if args.backup:
+                print(f"  {f}: {n} substitution(s); backup at {f}.vt-migrate-backup")
+            else:
+                print(f"  {f}: {n} substitution(s)")
             total += n
 
     print(f"\ndone. {total} substitution(s) across {len(files)} file(s).")
-    print(
-        "verify the result, then delete .vt-migrate-backup files and consider "
-        "restarting the agent with --no-legacy-decrypt to retire the legacy path."
-    )
+    tail = "verify the result, then consider restarting the agent with --no-legacy-decrypt to retire the legacy path."
+    if args.backup:
+        tail = "verify the result, then delete .vt-migrate-backup files and consider restarting the agent with --no-legacy-decrypt to retire the legacy path."
+    print(tail)
     return 0
 
 
