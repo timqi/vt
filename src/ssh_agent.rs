@@ -21,7 +21,7 @@ use crate::core::{
 };
 use crate::security::{
     authenticate, derive_passcode_ciphers, load_mac_cipher, local_authentication, AesGcmCrypto,
-    AuthMethod,
+    AuthMethod, AuthOutcome,
 };
 use crate::store::KeychainStore;
 
@@ -506,8 +506,17 @@ impl VtSshSession {
         }
 
         // Prompt (no locks held)
-        let Some(method) = authenticate(auth_message) else {
-            return false;
+        let method = match authenticate(auth_message) {
+            AuthOutcome::Success(m) => m,
+            AuthOutcome::Rejected => return false,
+            AuthOutcome::Unavailable(reason) => {
+                tracing::warn!(
+                    "Auth unavailable for fingerprint={} reason={:?}",
+                    fingerprint,
+                    reason
+                );
+                return false;
+            }
         };
 
         // Cache Biometric and Password; skip FIDO2 (weaker factor).
@@ -718,8 +727,13 @@ impl Session for VtSshSession {
                 );
                 // Always prompt — never cached. Decrypting emits plaintext, so
                 // the blast radius of a cached grant is too large.
-                if !local_authentication(&local_auth_message) {
-                    return Err(AgentError::Failure);
+                match authenticate(&local_auth_message) {
+                    AuthOutcome::Success(_) => {}
+                    AuthOutcome::Rejected => return Err(AgentError::Failure),
+                    AuthOutcome::Unavailable(reason) => {
+                        tracing::warn!("decrypt@vt unavailable: {:?}", reason);
+                        return Err(AgentError::Failure);
+                    }
                 }
                 let mac_cipher =
                     load_mac_cipher(&store, &passphrase_cipher).map_err(agent_err)?;
@@ -742,8 +756,13 @@ impl Session for VtSshSession {
                 // Always prompt Touch ID — no auth caching for auth@vt.
                 // Over forwarded agents, all remote sessions share the same local
                 // process, so caching would approve all sudo from any session.
-                if !local_authentication(&auth_message) {
-                    return Err(AgentError::Failure);
+                match authenticate(&auth_message) {
+                    AuthOutcome::Success(_) => {}
+                    AuthOutcome::Rejected => return Err(AgentError::Failure),
+                    AuthOutcome::Unavailable(reason) => {
+                        tracing::warn!("auth@vt unavailable: {:?}", reason);
+                        return Err(AgentError::Failure);
+                    }
                 }
 
                 let result = AuthRes { approved: true };
