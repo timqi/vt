@@ -379,9 +379,7 @@ impl TouchDialog {
         // System Events would leak the alert because it'd be owned by a
         // different process.
         let script = format!(
-            r#"display alert "vt — YubiKey auth" message "🔑  Touch your YubiKey
-
-{}" buttons {{"Reject"}} as critical giving up after 60"#,
+            r#"display alert "vt" message "🔑 Touch YubiKey — {}" buttons {{"Reject"}} as critical giving up after 60"#,
             safe_reason
         );
         let mut child = Command::new("osascript")

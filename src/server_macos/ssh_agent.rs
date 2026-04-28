@@ -763,9 +763,9 @@ impl Session for VtSshSession {
             comment.to_string()
         };
         let auth_message = if proc_name.is_empty() {
-            format!("SSH sign: {}", key_label)
+            format!("sign: {}", key_label)
         } else {
-            format!("SSH sign: {} by {}", key_label, proc_name)
+            format!("sign: {} ({})", key_label, proc_name)
         };
 
         // Check auth cache or prompt Touch ID
@@ -938,12 +938,10 @@ impl Session for VtSshSession {
                     }
                 }
                 let local_auth_message = format!(
-                    "decrypt {} items ({} legacy plaintext + {} v2 key-release) from {} to run `{}`",
+                    "decrypt {}: {} on {}",
                     req.items.len(),
-                    legacy_count,
-                    v2_inputs.len(),
-                    req.host,
                     req.command,
+                    req.host,
                 );
                 // Cache-aware authorization. Pure v2 batches may skip the
                 // prompt on a full hit; any legacy item disables caching for
@@ -1010,7 +1008,7 @@ impl Session for VtSshSession {
                 let reason = sanitize(&req.reason);
                 let host = sanitize(&req.host);
 
-                let auth_message = format!("bio auth: {} from {}", reason, host);
+                let auth_message = format!("auth: {} on {}", reason, host);
 
                 // Always prompt Touch ID — no auth caching for auth@vt.
                 // Over forwarded agents, all remote sessions share the same local
