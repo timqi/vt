@@ -158,15 +158,27 @@ pub enum SshCommands {
         #[arg(
             long = "ssh-auth-cache-mode",
             default_value = "none",
-            help = "Auth cache mode: none, per-session, or per-app"
+            help = "Sign auth cache mode: none, per-session, or per-app"
         )]
         auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
         #[arg(
             long = "ssh-auth-cache-duration",
             default_value_t = server_macos::ssh_agent::DEFAULT_AUTH_CACHE_DURATION_SECS,
-            help = "Auth cache duration in seconds for sign operations"
+            help = "Sign auth cache duration in seconds"
         )]
         auth_cache_duration: u64,
+        #[arg(
+            long = "decrypt-auth-cache-mode",
+            default_value = "none",
+            help = "Decrypt auth cache mode: none, per-session, or per-app. Only v2 envelope URLs are cache-eligible; legacy items always prompt."
+        )]
+        decrypt_auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
+        #[arg(
+            long = "decrypt-auth-cache-duration",
+            default_value_t = server_macos::ssh_agent::DEFAULT_DECRYPT_AUTH_CACHE_DURATION_SECS,
+            help = "Decrypt auth cache duration in seconds (strict TTL, no sliding refresh)"
+        )]
+        decrypt_auth_cache_duration: u64,
         #[arg(
             long = "no-legacy-decrypt",
             default_value_t = false,
@@ -230,12 +242,21 @@ async fn run(cli: Cli) -> Result<()> {
                 timeout,
                 auth_cache_mode,
                 auth_cache_duration,
+                decrypt_auth_cache_mode,
+                decrypt_auth_cache_duration,
                 no_legacy_decrypt,
             } => {
+                use server_macos::ssh_agent::AuthCacheConfig;
                 server_macos::ssh_agent::start_ssh_agent(
                     *timeout,
-                    *auth_cache_mode,
-                    *auth_cache_duration,
+                    AuthCacheConfig {
+                        mode: *auth_cache_mode,
+                        ttl_secs: *auth_cache_duration,
+                    },
+                    AuthCacheConfig {
+                        mode: *decrypt_auth_cache_mode,
+                        ttl_secs: *decrypt_auth_cache_duration,
+                    },
                     *no_legacy_decrypt,
                 )
                 .await

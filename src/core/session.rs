@@ -10,14 +10,24 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Which method satisfied the auth request. Useful for callers that want to
-/// treat factor strength differently (e.g. the SSH agent cache doesn't cache
-/// FIDO2 since touch-only is weaker than Touch ID).
+/// Which method satisfied the auth request. All three are physical-presence
+/// factors and treated as equivalent for authorization caching (see
+/// `AuthMethod::is_cacheable`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
     Biometric,
     Fido2,
     Password,
+}
+
+impl AuthMethod {
+    /// True if a successful auth via this method may grant a TTL-bounded
+    /// cache entry. All three methods qualify in the VT model: Touch ID
+    /// biometric, FIDO2 YubiKey touch, and the macOS account password each
+    /// require explicit physical or credentialed action per attempt.
+    pub fn is_cacheable(self) -> bool {
+        matches!(self, AuthMethod::Biometric | AuthMethod::Fido2 | AuthMethod::Password)
+    }
 }
 
 /// Why authentication could not even be attempted right now. Distinct from

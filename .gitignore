@@ -1,3 +1,4 @@
 /.vscode
 /target
 GEMINI.md
+/.claude/scheduled_tasks.lock

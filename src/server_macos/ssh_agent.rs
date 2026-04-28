@@ -17,7 +17,7 @@ use ssh_key::{Algorithm, HashAlg, Signature};
 use tokio::sync::RwLock;
 
 use crate::core::crypto::{derive_dek, AesGcmCrypto};
-use crate::core::session::{AuthMethod, AuthOutcome};
+use crate::core::session::AuthOutcome;
 use crate::core::{
     legacy_decrypt, AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, EncryptReq,
     EncryptResItem, SALT_LEN,
@@ -125,14 +125,15 @@ pub type CacheContext = (u64, u64);
 pub struct AuthCache {
     /// Each entry stores when it expires (computed at grant time).
     entries: HashMap<(CacheContext, String), Instant>,
-    sign_duration: Duration,
+    /// Lifetime of a fresh grant.
+    ttl: Duration,
 }
 
 impl AuthCache {
-    pub fn new(sign_duration_secs: u64) -> Self {
+    pub fn new(ttl_secs: u64) -> Self {
         Self {
             entries: HashMap::new(),
-            sign_duration: Duration::from_secs(sign_duration_secs),
+            ttl: Duration::from_secs(ttl_secs),
         }
     }
 
@@ -144,11 +145,20 @@ impl AuthCache {
         }
     }
 
+    /// Strict-TTL grant: a still-valid entry's expiry is left untouched.
+    /// Concurrent grants for the same key cannot extend the original TTL.
+    /// Expired entries (or absent ones) are replaced with a fresh expiry.
     pub fn grant(&mut self, context: CacheContext, fingerprint: &str) {
-        self.entries.insert(
-            (context, fingerprint.to_string()),
-            Instant::now() + self.sign_duration,
-        );
+        let now = Instant::now();
+        let new_expires = now + self.ttl;
+        self.entries
+            .entry((context, fingerprint.to_string()))
+            .and_modify(|expires_at| {
+                if *expires_at <= now {
+                    *expires_at = new_expires;
+                }
+            })
+            .or_insert(new_expires);
     }
 
     pub fn clear(&mut self) {
@@ -259,6 +269,26 @@ mod proc_info {
         get_proc_bsdinfo(pid).map(|(_, _, s)| s)
     }
 
+    /// Get the session leader PID (POSIX sid) for `pid`.
+    ///
+    /// Under macOS terminal stacks `forkpty()` calls `setsid()` in the child
+    /// before exec, so the resulting shell IS the session leader of its own
+    /// session. `getsid()` therefore returns:
+    ///   - Terminal.app/iTerm direct shell  → that shell's PID
+    ///   - tmux/screen pane shell           → the pane's shell PID (the
+    ///                                          multiplexer server has its own
+    ///                                          separate session)
+    ///   - ssh-spawned remote shell         → that shell's PID
+    ///   - nested shells (no setsid)        → the outer shell's PID
+    pub fn get_sid(pid: i32) -> Option<i32> {
+        let sid = unsafe { libc::getsid(pid) };
+        if sid > 0 {
+            Some(sid)
+        } else {
+            None
+        }
+    }
+
     /// Walk the process tree upward to find a `.app/Contents/` ancestor.
     /// Returns the PID of the app process, or `peer_pid` itself if no app
     /// ancestor is found — never falls back to the parent, which would
@@ -301,6 +331,46 @@ fn hash_lock_passphrase(passphrase: &str) -> [u8; 32] {
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 /// Default auth cache duration for sign: 2 minutes.
 pub const DEFAULT_AUTH_CACHE_DURATION_SECS: u64 = 120;
+/// Default auth cache duration for decrypt@vt: 30 seconds.
+/// Shorter than sign because a cached decrypt grant releases per-record DEK
+/// material, whose blast radius is wider than a single-challenge signature.
+pub const DEFAULT_DECRYPT_AUTH_CACHE_DURATION_SECS: u64 = 30;
+
+/// Configuration for one of the agent's auth caches. Carries (mode, ttl)
+/// together so the sign and decrypt caches can't have their fields
+/// accidentally swapped at any of the call layers.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthCacheConfig {
+    pub mode: AuthCacheMode,
+    pub ttl_secs: u64,
+}
+
+/// Derive the decrypt-cache lookup string for a single v2 item.
+///
+/// Domain-tagged so a digest from this hash can never collide with a digest
+/// from any other use of SHA-256 in the codebase. `host` is length-prefixed
+/// so the boundary between fields is unambiguous.
+///
+/// `host` is taken from the client-supplied `DecryptReq.host` and is NOT
+/// trusted for security — it only partitions the cache so two different
+/// hostnames don't share entries. A compromised peer can lie about `host` to
+/// force a cache miss (DoS, not privilege elevation).
+fn decrypt_cache_key(t: crate::core::SecretType, salt: &[u8; SALT_LEN], host: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut h = Sha256::new();
+    h.update(b"vt-decrypt-cache-v1");
+    h.update([t.as_byte()]);
+    h.update(salt);
+    h.update((host.len() as u32).to_le_bytes());
+    h.update(host.as_bytes());
+    let digest = h.finalize();
+    let mut s = String::with_capacity(64);
+    for b in digest.iter() {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
 
 /// Load all SSH keys from the keychain store into a HashMap. The store and
 /// derived ciphers are dropped after this returns so the master key does not
@@ -362,8 +432,10 @@ pub struct VtSshAgentFactory {
     locked: Arc<RwLock<bool>>,
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
     idle_cleared: Arc<RwLock<bool>>,
-    auth_cache: Arc<RwLock<AuthCache>>,
-    cache_mode: AuthCacheMode,
+    sign_auth_cache: Arc<RwLock<AuthCache>>,
+    decrypt_auth_cache: Arc<RwLock<AuthCache>>,
+    sign_cache_mode: AuthCacheMode,
+    decrypt_cache_mode: AuthCacheMode,
     /// When true, `decrypt@vt` rejects `Legacy` items (v0/v1 URLs). v2 envelope
     /// items continue to work. Lets users who have fully migrated harden the
     /// agent so the "agent emits plaintext over wire" path can never be
@@ -374,8 +446,8 @@ pub struct VtSshAgentFactory {
 impl VtSshAgentFactory {
     fn new(
         keys: HashMap<String, PrivateKey>,
-        cache_mode: AuthCacheMode,
-        cache_duration_secs: u64,
+        sign_cache: AuthCacheConfig,
+        decrypt_cache: AuthCacheConfig,
         disable_legacy_decrypt: bool,
     ) -> Self {
         Self {
@@ -384,8 +456,10 @@ impl VtSshAgentFactory {
             locked: Arc::new(RwLock::new(false)),
             lock_passphrase: Arc::new(RwLock::new(None)),
             idle_cleared: Arc::new(RwLock::new(false)),
-            auth_cache: Arc::new(RwLock::new(AuthCache::new(cache_duration_secs))),
-            cache_mode,
+            sign_auth_cache: Arc::new(RwLock::new(AuthCache::new(sign_cache.ttl_secs))),
+            decrypt_auth_cache: Arc::new(RwLock::new(AuthCache::new(decrypt_cache.ttl_secs))),
+            sign_cache_mode: sign_cache.mode,
+            decrypt_cache_mode: decrypt_cache.mode,
             disable_legacy_decrypt,
         }
     }
@@ -398,17 +472,34 @@ impl VtSshAgentFactory {
 /// captured once at session creation — not recomputed per request — so a
 /// cache lookup can never race proc-tree state between connection and the
 /// actual `sign` call.
+///
+/// `PerSession` keys on the **session leader's** PID and start time, not the
+/// peer process's. The peer process (e.g. `gh`, `vt read`) is short-lived and
+/// has a unique start_tvsec per invocation, so anchoring on it would prevent
+/// the cache from ever hitting across separate CLI calls. The session leader
+/// (the shell at the head of the pty — see `proc_info::get_sid`) lives for the
+/// full terminal session, giving the cache a stable anchor. `tdev != 0` is
+/// still required so daemons without a controlling terminal stay uncacheable.
 fn resolve_cache_context(
     peer_pid: Option<i32>,
     mode: AuthCacheMode,
 ) -> Option<CacheContext> {
     let pid = peer_pid?;
+    // Both cache modes require the peer to have a controlling terminal.
+    // launchd-managed daemons and other non-interactive peers always prompt
+    // and never enter the cache — caching only makes sense for explicit
+    // human-driven terminal sessions.
+    if matches!(mode, AuthCacheMode::PerSession | AuthCacheMode::PerApp)
+        && proc_info::get_tty_dev(pid).is_none()
+    {
+        return None;
+    }
     match mode {
         AuthCacheMode::None => None,
         AuthCacheMode::PerSession => {
-            let tdev = proc_info::get_tty_dev(pid)?;
-            let start = proc_info::get_start_tvsec(pid)?;
-            Some((tdev as u64, start))
+            let sid = proc_info::get_sid(pid)?;
+            let start = proc_info::get_start_tvsec(sid)?;
+            Some((sid as u64, start))
         }
         AuthCacheMode::PerApp => {
             let app_pid = proc_info::find_app_pid(pid);
@@ -424,16 +515,19 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
         if let Some(pid) = peer_pid {
             tracing::debug!("New session from PID {}", pid);
         }
-        let cache_context = resolve_cache_context(peer_pid, self.cache_mode);
+        let sign_cache_context = resolve_cache_context(peer_pid, self.sign_cache_mode);
+        let decrypt_cache_context = resolve_cache_context(peer_pid, self.decrypt_cache_mode);
         VtSshSession {
             keys: Arc::clone(&self.keys),
             last_activity: Arc::clone(&self.last_activity),
             locked: Arc::clone(&self.locked),
             lock_passphrase: Arc::clone(&self.lock_passphrase),
             idle_cleared: Arc::clone(&self.idle_cleared),
-            auth_cache: Arc::clone(&self.auth_cache),
+            sign_auth_cache: Arc::clone(&self.sign_auth_cache),
+            decrypt_auth_cache: Arc::clone(&self.decrypt_auth_cache),
             peer_pid,
-            cache_context,
+            sign_cache_context,
+            decrypt_cache_context,
             disable_legacy_decrypt: self.disable_legacy_decrypt,
         }
     }
@@ -447,10 +541,13 @@ struct VtSshSession {
     locked: Arc<RwLock<bool>>,
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
     idle_cleared: Arc<RwLock<bool>>,
-    auth_cache: Arc<RwLock<AuthCache>>,
+    sign_auth_cache: Arc<RwLock<AuthCache>>,
+    decrypt_auth_cache: Arc<RwLock<AuthCache>>,
     peer_pid: Option<i32>,
-    /// Resolved once at session creation. `None` = always prompt.
-    cache_context: Option<CacheContext>,
+    /// Resolved once at session creation. `None` = always prompt for sign.
+    sign_cache_context: Option<CacheContext>,
+    /// Resolved once at session creation. `None` = always prompt for decrypt.
+    decrypt_cache_context: Option<CacheContext>,
     disable_legacy_decrypt: bool,
 }
 
@@ -491,26 +588,26 @@ impl VtSshSession {
 
     /// Check auth cache or prompt the user. Returns true if authorized.
     ///
-    /// Only used for `sign` (SSH authentication). `decrypt@vt` and `auth@vt`
-    /// always prompt — decrypt because the plaintext blast radius of a cache
-    /// hit is too large; auth because forwarded agents share one local process.
+    /// Used for `sign` (SSH authentication). `auth@vt` always prompts because
+    /// forwarded agents share one local process. `decrypt@vt` has its own
+    /// cache (see `check_or_prompt_decrypt_batch`).
     ///
-    /// FIDO2 (YubiKey touch) results are NOT cached — touch-only is a weaker
-    /// factor than Touch ID, and a YubiKey tap is fast enough that caching
-    /// adds little value. Biometric and password results are cached normally.
+    /// All three success methods (Biometric, FIDO2, Password) are cached:
+    /// FIDO2 (YubiKey touch) is treated as equivalent to Touch ID for
+    /// authorization purposes — a deliberate policy choice.
     async fn check_or_prompt_auth(&self, fingerprint: &str, auth_message: &str) -> bool {
         // If we couldn't resolve a cache context at session creation (no
         // peer PID, no TTY, missing proc info), always prompt.
-        let Some(context) = self.cache_context else {
+        let Some(context) = self.sign_cache_context else {
             return local_authentication(auth_message);
         };
 
         // Check cache (read lock, released before auth prompt)
         {
-            let cache = self.auth_cache.read().await;
+            let cache = self.sign_auth_cache.read().await;
             if cache.is_authorized(context, fingerprint) {
                 tracing::debug!(
-                    "Auth cache hit for context={:?} fingerprint={}",
+                    "Sign auth cache hit for context={:?} fingerprint={}",
                     context,
                     fingerprint
                 );
@@ -532,20 +629,82 @@ impl VtSshSession {
             }
         };
 
-        // Cache Biometric and Password; skip FIDO2 (weaker factor).
-        if matches!(method, AuthMethod::Biometric | AuthMethod::Password) {
-            let mut cache = self.auth_cache.write().await;
+        if method.is_cacheable() {
+            let mut cache = self.sign_auth_cache.write().await;
             cache.grant(context, fingerprint);
             tracing::debug!(
-                "Auth cache grant for context={:?} fingerprint={} method={:?}",
+                "Sign auth cache grant for context={:?} fingerprint={} method={:?}",
                 context,
                 fingerprint,
                 method
             );
-        } else {
+        }
+
+        true
+    }
+
+    /// Cache-aware authorization for a `decrypt@vt` batch.
+    ///
+    /// Any legacy item in the batch disables caching for the whole batch —
+    /// legacy items release plaintext, and the invariant "legacy-containing
+    /// batch always prompts" is load-bearing for that decision. Otherwise:
+    /// full hit skips Touch ID; partial hit prompts once and grants only the
+    /// previously-missing items so existing strict TTLs are not refreshed.
+    async fn check_or_prompt_decrypt_batch(
+        &self,
+        v2_items: &[(crate::core::SecretType, [u8; SALT_LEN])],
+        has_legacy: bool,
+        host: &str,
+        auth_message: &str,
+    ) -> bool {
+        // Cacheable iff there's a resolved context AND the batch is non-empty
+        // pure-v2; everything else falls through to the always-prompt path.
+        let context = match self.decrypt_cache_context {
+            Some(c) if !has_legacy && !v2_items.is_empty() => c,
+            _ => return matches!(authenticate(auth_message), AuthOutcome::Success(_)),
+        };
+
+        let keys: Vec<String> = v2_items
+            .iter()
+            .map(|(t, salt)| decrypt_cache_key(*t, salt, host))
+            .collect();
+
+        let missing: Vec<String> = {
+            let cache = self.decrypt_auth_cache.read().await;
+            keys.iter()
+                .filter(|k| !cache.is_authorized(context, k))
+                .cloned()
+                .collect()
+        };
+
+        if missing.is_empty() {
             tracing::debug!(
-                "Auth succeeded via {:?}; not caching (weaker factor)",
-                method
+                "Decrypt auth cache hit for context={:?} ({} v2 items)",
+                context,
+                v2_items.len()
+            );
+            return true;
+        }
+
+        let method = match authenticate(auth_message) {
+            AuthOutcome::Success(m) => m,
+            AuthOutcome::Rejected => return false,
+            AuthOutcome::Unavailable(reason) => {
+                tracing::warn!("decrypt@vt unavailable: {:?}", reason);
+                return false;
+            }
+        };
+
+        if method.is_cacheable() {
+            let mut cache = self.decrypt_auth_cache.write().await;
+            for k in &missing {
+                cache.grant(context, k);
+            }
+            tracing::debug!(
+                "Decrypt auth cache grant for context={:?} method={:?} new_entries={}",
+                context,
+                method,
+                missing.len()
             );
         }
 
@@ -757,14 +916,24 @@ impl Session for VtSshSession {
                 let req: DecryptReq =
                     serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
 
-                // Count v2 vs legacy items so the Touch ID prompt makes the
-                // distinction visible: legacy items emit plaintext over the
-                // wire, v2 items only release a per-record DEK.
+                // Reject `SecretType::UNKNOWN` v2 items: serde would otherwise
+                // accept them from a malformed `DecryptInput::V2`, the
+                // downstream decrypt would fail on AAD mismatch, but the
+                // cache could be polluted with `t.as_byte() == b'_'` entries
+                // in the meantime.
                 let mut legacy_count = 0usize;
-                let mut v2_count = 0usize;
+                let mut v2_inputs: Vec<(crate::core::SecretType, [u8; SALT_LEN])> =
+                    Vec::with_capacity(req.items.len());
                 for item in &req.items {
                     match item {
-                        DecryptInput::V2 { .. } => v2_count += 1,
+                        DecryptInput::V2 {
+                            t: crate::core::SecretType::UNKNOWN,
+                            ..
+                        } => {
+                            tracing::warn!("decrypt@vt rejecting v2 item with UNKNOWN type");
+                            return Err(AgentError::Failure);
+                        }
+                        DecryptInput::V2 { t, salt } => v2_inputs.push((*t, *salt)),
                         DecryptInput::Legacy { .. } => legacy_count += 1,
                     }
                 }
@@ -772,20 +941,23 @@ impl Session for VtSshSession {
                     "decrypt {} items ({} legacy plaintext + {} v2 key-release) from {} to run `{}`",
                     req.items.len(),
                     legacy_count,
-                    v2_count,
+                    v2_inputs.len(),
                     req.host,
                     req.command,
                 );
-                // Always prompt — never cached. Decrypting emits plaintext or
-                // reusable DEK material, so a cached grant's blast radius is
-                // too large.
-                match authenticate(&local_auth_message) {
-                    AuthOutcome::Success(_) => {}
-                    AuthOutcome::Rejected => return Err(AgentError::Failure),
-                    AuthOutcome::Unavailable(reason) => {
-                        tracing::warn!("decrypt@vt unavailable: {:?}", reason);
-                        return Err(AgentError::Failure);
-                    }
+                // Cache-aware authorization. Pure v2 batches may skip the
+                // prompt on a full hit; any legacy item disables caching for
+                // the entire batch.
+                if !self
+                    .check_or_prompt_decrypt_batch(
+                        &v2_inputs,
+                        legacy_count > 0,
+                        &req.host,
+                        &local_auth_message,
+                    )
+                    .await
+                {
+                    return Err(AgentError::Failure);
                 }
                 let (mac_cipher, mac_key) =
                     load_mac_cipher(&store, &passphrase_cipher).map_err(agent_err)?;
@@ -985,9 +1157,9 @@ impl Session for VtSshSession {
         let mut keys = self.keys.write().await;
         keys.clear();
 
-        // Clear auth cache on lock
-        let mut cache = self.auth_cache.write().await;
-        cache.clear();
+        // Clear both auth caches on lock.
+        self.sign_auth_cache.write().await.clear();
+        self.decrypt_auth_cache.write().await.clear();
 
         tracing::info!("Agent locked");
         Ok(())
@@ -1042,8 +1214,8 @@ impl Session for VtSshSession {
 pub async fn run_ssh_agent(
     print_env: bool,
     idle_timeout_secs: u64,
-    cache_mode: AuthCacheMode,
-    cache_duration_secs: u64,
+    sign_cache: AuthCacheConfig,
+    decrypt_cache: AuthCacheConfig,
     disable_legacy_decrypt: bool,
 ) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
@@ -1072,7 +1244,7 @@ pub async fn run_ssh_agent(
     }
 
     let factory =
-        VtSshAgentFactory::new(keys, cache_mode, cache_duration_secs, disable_legacy_decrypt);
+        VtSshAgentFactory::new(keys, sign_cache, decrypt_cache, disable_legacy_decrypt);
     if disable_legacy_decrypt {
         tracing::info!("Legacy decrypt path disabled — only v2 envelope URLs accepted");
     }
@@ -1104,21 +1276,24 @@ pub async fn run_ssh_agent(
         }
     });
 
-    // Spawn auth cache sweeper (reuse same pattern)
-    if cache_mode != AuthCacheMode::None {
-        let sweeper_cache = Arc::clone(&factory.auth_cache);
+    // Spawn auth cache sweeper (sweeps both sign and decrypt caches).
+    if sign_cache.mode != AuthCacheMode::None || decrypt_cache.mode != AuthCacheMode::None {
+        let sweeper_sign = Arc::clone(&factory.sign_auth_cache);
+        let sweeper_decrypt = Arc::clone(&factory.decrypt_auth_cache);
         tokio::spawn(async move {
             let check_interval = Duration::from_secs(60);
             loop {
                 tokio::time::sleep(check_interval).await;
-                let mut cache = sweeper_cache.write().await;
-                cache.sweep_expired();
+                sweeper_sign.write().await.sweep_expired();
+                sweeper_decrypt.write().await.sweep_expired();
             }
         });
         tracing::info!(
-            "Auth cache: mode={}, sign={}s (decrypt/auth never cached)",
-            cache_mode,
-            cache_duration_secs,
+            "Auth cache: sign(mode={}, ttl={}s) decrypt(mode={}, ttl={}s); auth@vt never cached",
+            sign_cache.mode,
+            sign_cache.ttl_secs,
+            decrypt_cache.mode,
+            decrypt_cache.ttl_secs,
         );
     }
 
@@ -1157,15 +1332,15 @@ pub async fn run_ssh_agent(
 /// Standalone entry point: runs the agent with env output.
 pub async fn start_ssh_agent(
     idle_timeout_secs: u64,
-    cache_mode: AuthCacheMode,
-    cache_duration_secs: u64,
+    sign_cache: AuthCacheConfig,
+    decrypt_cache: AuthCacheConfig,
     disable_legacy_decrypt: bool,
 ) -> Result<()> {
     run_ssh_agent(
         true,
         idle_timeout_secs,
-        cache_mode,
-        cache_duration_secs,
+        sign_cache,
+        decrypt_cache,
         disable_legacy_decrypt,
     )
     .await
@@ -1174,6 +1349,7 @@ pub async fn start_ssh_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::session::AuthMethod;
 
     #[test]
     fn test_ssh_key_entry_serde_roundtrip() {
@@ -1314,6 +1490,45 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_cache_grant_is_strict_ttl_idempotent() {
+        // A repeated grant on a still-valid entry must NOT extend its TTL —
+        // otherwise concurrent grants from racing sessions would silently
+        // refresh the entry and violate the strict-TTL invariant.
+        let mut cache = AuthCache::new(300);
+        let ctx = (1u64, 100u64);
+        cache.grant(ctx, "fp1");
+        let first_expiry = *cache.entries.get(&(ctx, "fp1".to_string())).unwrap();
+
+        // Sleep long enough that a second grant would compute a strictly
+        // later expiry if it were allowed to overwrite.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cache.grant(ctx, "fp1");
+        let second_expiry = *cache.entries.get(&(ctx, "fp1".to_string())).unwrap();
+        assert_eq!(
+            first_expiry, second_expiry,
+            "valid entry's TTL must not be refreshed by a repeat grant"
+        );
+    }
+
+    #[test]
+    fn test_auth_cache_grant_replaces_expired_entry() {
+        // An expired entry (still in the map because the sweeper hasn't run
+        // yet) must be replaced by a fresh grant — otherwise a successful
+        // re-auth after expiry would silently fail to populate the cache.
+        let mut cache = AuthCache::new(0);
+        let ctx = (1u64, 100u64);
+        cache.grant(ctx, "fp1");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(!cache.is_authorized(ctx, "fp1"), "entry should be expired");
+
+        // Switch to a non-zero TTL and re-grant; the entry is replaced with
+        // a fresh expiry.
+        cache.ttl = std::time::Duration::from_secs(300);
+        cache.grant(ctx, "fp1");
+        assert!(cache.is_authorized(ctx, "fp1"));
+    }
+
+    #[test]
     fn test_auth_cache_different_context_misses() {
         let mut cache = AuthCache::new(300);
         let ctx1 = (1u64, 100u64);
@@ -1374,6 +1589,64 @@ mod tests {
         assert!(cache.entries.is_empty());
     }
 
+    // --- decrypt_cache_key tests ---
+
+    #[test]
+    fn test_decrypt_cache_key_deterministic() {
+        let salt = [0x42u8; SALT_LEN];
+        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1");
+        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1");
+        assert_eq!(k1, k2);
+        assert_eq!(k1.len(), 64); // SHA-256 hex
+    }
+
+    #[test]
+    fn test_decrypt_cache_key_changes_with_type() {
+        let salt = [0x42u8; SALT_LEN];
+        let k_raw = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1");
+        let k_totp = decrypt_cache_key(crate::core::SecretType::TOTP, &salt, "host1");
+        assert_ne!(k_raw, k_totp);
+    }
+
+    #[test]
+    fn test_decrypt_cache_key_changes_with_salt() {
+        let s1 = [0x42u8; SALT_LEN];
+        let s2 = [0x43u8; SALT_LEN];
+        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &s1, "host1");
+        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &s2, "host1");
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_decrypt_cache_key_changes_with_host() {
+        let salt = [0x42u8; SALT_LEN];
+        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1");
+        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host2");
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_decrypt_cache_key_length_prefix_prevents_collision() {
+        // Length-prefix means "ab"+"c" must hash differently from "a"+"bc"
+        // even though concatenation matches — there's no way for the host
+        // string to absorb adjacent context bytes.
+        let salt = [0x42u8; SALT_LEN];
+        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "ab");
+        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "abc");
+        assert_ne!(k1, k2);
+    }
+
+    // --- AuthMethod::is_cacheable tests ---
+
+    #[test]
+    fn test_auth_method_is_cacheable_includes_fido2() {
+        // FIDO2 (YubiKey touch) is treated as equivalent to Touch ID for
+        // cache-grant purposes — verify the policy is in effect.
+        assert!(AuthMethod::Biometric.is_cacheable());
+        assert!(AuthMethod::Fido2.is_cacheable());
+        assert!(AuthMethod::Password.is_cacheable());
+    }
+
     // --- proc_info tests (macOS only, require running process) ---
 
     #[test]
@@ -1395,5 +1668,20 @@ mod tests {
         assert!(result.is_some(), "Should be able to get own process path");
         let path = result.unwrap();
         assert!(!path.is_empty(), "Path should not be empty");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_get_sid_self_returns_session_leader() {
+        // The current test process inherits its session from `cargo test`,
+        // so getsid(self) should return a positive PID — typically the
+        // shell that ran cargo, or cargo's own PID if it called setsid.
+        let pid = std::process::id() as i32;
+        let sid = proc_info::get_sid(pid).expect("getsid should succeed");
+        assert!(sid > 0, "Session leader PID should be positive");
+        // The session leader's start time must be queryable.
+        let start = proc_info::get_start_tvsec(sid)
+            .expect("Session leader's start_tvsec should be queryable");
+        assert!(start > 0, "Session leader start_tvsec should be positive");
     }
 }
