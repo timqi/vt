@@ -18,6 +18,9 @@ use tokio::sync::RwLock;
 
 use crate::core::crypto::{derive_dek, AesGcmCrypto};
 use crate::core::session::AuthOutcome;
+use crate::core::wire::{
+    outcome_to_err_strict, wrap_ok_envelope, ErrKind, WIRE_VERSION,
+};
 use crate::core::{
     legacy_decrypt, AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, EncryptReq,
     EncryptResItem, SALT_LEN,
@@ -650,18 +653,26 @@ impl VtSshSession {
     /// batch always prompts" is load-bearing for that decision. Otherwise:
     /// full hit skips Touch ID; partial hit prompts once and grants only the
     /// previously-missing items so existing strict TTLs are not refreshed.
+    ///
+    /// Returns `None` on success, `Some(kind)` on failure so the caller can
+    /// build a structured `ExtResponse::Err` envelope. Both failure arms
+    /// `return` before any `cache.grant` call, preserving the invariant that
+    /// failure paths never extend or create cache entries.
     async fn check_or_prompt_decrypt_batch(
         &self,
         v2_items: &[(crate::core::SecretType, [u8; SALT_LEN])],
         has_legacy: bool,
         host: &str,
         auth_message: &str,
-    ) -> bool {
+    ) -> Option<ErrKind> {
         // Cacheable iff there's a resolved context AND the batch is non-empty
         // pure-v2; everything else falls through to the always-prompt path.
         let context = match self.decrypt_cache_context {
             Some(c) if !has_legacy && !v2_items.is_empty() => c,
-            _ => return matches!(authenticate(auth_message), AuthOutcome::Success(_)),
+            // Fail closed: if `outcome_to_err` somehow returns `None` for
+            // a non-`Success` outcome (future enum variant), treat it as
+            // an authorization failure rather than silently allowing.
+            _ => return outcome_to_err_strict(authenticate(auth_message)),
         };
 
         let keys: Vec<String> = v2_items
@@ -683,15 +694,15 @@ impl VtSshSession {
                 context,
                 v2_items.len()
             );
-            return true;
+            return None;
         }
 
         let method = match authenticate(auth_message) {
             AuthOutcome::Success(m) => m,
-            AuthOutcome::Rejected => return false,
+            AuthOutcome::Rejected => return Some(ErrKind::AuthRejected),
             AuthOutcome::Unavailable(reason) => {
                 tracing::warn!("decrypt@vt unavailable: {:?}", reason);
-                return false;
+                return outcome_to_err_strict(AuthOutcome::Unavailable(reason));
             }
         };
 
@@ -708,8 +719,254 @@ impl VtSshSession {
             );
         }
 
-        true
+        None
     }
+
+    // ---- Structured-envelope dispatch helpers --------------------------------
+    //
+    // Each `handle_*` returns either the inner JSON body (DEKs included for
+    // encrypt/decrypt, wrapped in Zeroizing) or a `(ErrKind, Option<&'static
+    // str>)` failure that the caller serializes into `ExtResponse::Err`. The
+    // `detail` string is bounded to the `DETAIL_*` allow-list defined below
+    // so dynamic user-supplied data (host, command, reason, fingerprints)
+    // can never leak across `auth@vt` over a forwarded socket.
+
+    async fn handle_encrypt(
+        &self,
+        decrypted: &[u8],
+        store: &KeychainStore,
+        passphrase_cipher: &AesGcmCrypto,
+    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+        // v2 envelope: agent allocates a fresh per-record (salt, DEK) pair
+        // for each requested SecretType. The agent NEVER receives plaintext
+        // on this path. The salt is generated server-side (never accepted
+        // from the client) — this is the security invariant that prevents
+        // an attacker holding `VT_AUTH` from extracting a salt from a
+        // stored vt://0{salt||ct} URL and requesting its DEK to bypass
+        // Touch ID.
+        let req: EncryptReq = serde_json::from_slice(decrypted)
+            .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
+        let (_mac_cipher, mac_key) = load_mac_cipher(store, passphrase_cipher)
+            .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
+        let mut result: Vec<EncryptResItem> = Vec::with_capacity(req.types.len());
+        for _t in &req.types {
+            let mut salt = [0u8; SALT_LEN];
+            rand::thread_rng().fill_bytes(&mut salt);
+            let dek = derive_dek(&mac_key, &salt);
+            result.push(EncryptResItem {
+                salt,
+                dek,
+                err_message: String::new(),
+            });
+        }
+        drop(mac_key);
+        let bytes = serde_json::to_vec(&result)
+            .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?;
+        // The DEKs now live inside `bytes`; scrub the in-memory
+        // `Vec<EncryptResItem>` copy before it falls out of scope.
+        for item in result.iter_mut() {
+            item.dek.zeroize();
+        }
+        Ok(Zeroizing::new(bytes))
+    }
+
+    async fn handle_decrypt(
+        &self,
+        decrypted: &[u8],
+        store: &KeychainStore,
+        passphrase_cipher: &AesGcmCrypto,
+    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+        let req: DecryptReq = serde_json::from_slice(decrypted)
+            .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
+
+        // Reject `SecretType::UNKNOWN` v2 items: serde would otherwise
+        // accept them from a malformed `DecryptInput::V2`, the downstream
+        // decrypt would fail on AAD mismatch, but the cache could be
+        // polluted with `t.as_byte() == b'_'` entries in the meantime.
+        let mut legacy_count = 0usize;
+        let mut v2_inputs: Vec<(crate::core::SecretType, [u8; SALT_LEN])> =
+            Vec::with_capacity(req.items.len());
+        for item in &req.items {
+            match item {
+                DecryptInput::V2 {
+                    t: crate::core::SecretType::UNKNOWN,
+                    ..
+                } => {
+                    tracing::warn!("decrypt@vt rejecting v2 item with UNKNOWN type");
+                    return Err((ErrKind::BadRequest, Some(DETAIL_UNKNOWN_SECRET_TYPE)));
+                }
+                DecryptInput::V2 { t, salt } => v2_inputs.push((*t, *salt)),
+                DecryptInput::Legacy { .. } => legacy_count += 1,
+            }
+        }
+
+        // Fail fast on `--no-legacy-decrypt`: if the agent is configured to
+        // reject legacy URLs, surface a dedicated kind before prompting the
+        // user. We still let pure-v2 batches through here.
+        if self.disable_legacy_decrypt && legacy_count > 0 {
+            return Err((ErrKind::LegacyDisabled, Some(DETAIL_LEGACY_DISABLED)));
+        }
+
+        let local_auth_message = format!(
+            "decrypt {}: {} on {}",
+            req.items.len(),
+            req.command,
+            req.host,
+        );
+        // Cache-aware authorization. Pure v2 batches may skip the prompt on
+        // a full hit; any legacy item disables caching for the entire batch.
+        // Failure paths inside `check_or_prompt_decrypt_batch` never grant
+        // cache entries (verified by inspection of the helper).
+        if let Some(kind) = self
+            .check_or_prompt_decrypt_batch(
+                &v2_inputs,
+                legacy_count > 0,
+                &req.host,
+                &local_auth_message,
+            )
+            .await
+        {
+            return Err((kind, auth_outcome_detail(kind)));
+        }
+        let (mac_cipher, mac_key) = load_mac_cipher(store, passphrase_cipher)
+            .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
+        let mut result: Vec<DecryptResItem> = Vec::with_capacity(req.items.len());
+        for item in req.items {
+            match item {
+                DecryptInput::V2 { t: _, salt } => {
+                    let dek = derive_dek(&mac_key, &salt);
+                    result.push(DecryptResItem::V2 {
+                        dek,
+                        err_message: String::new(),
+                    });
+                }
+                DecryptInput::Legacy { url } => {
+                    if self.disable_legacy_decrypt {
+                        // Should be unreachable: we returned LegacyDisabled
+                        // above before prompting. Keep a defensive arm so
+                        // the per-item err is still well-formed.
+                        result.push(DecryptResItem::Legacy {
+                            result: String::new(),
+                            err_message: "legacy decryption disabled on this agent".to_string(),
+                        });
+                    } else {
+                        let item = legacy_decrypt(&mac_cipher, &url);
+                        result.push(DecryptResItem::Legacy {
+                            result: item.result,
+                            err_message: item.err_message,
+                        });
+                    }
+                }
+            }
+        }
+        drop(mac_key);
+        let bytes = serde_json::to_vec(&result)
+            .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?;
+        // Scrub DEKs inside the response Vec before drop. `bytes` already
+        // carries them (still wiped via `Zeroizing` below).
+        for item in result.iter_mut() {
+            if let DecryptResItem::V2 { dek, .. } = item {
+                dek.zeroize();
+            }
+        }
+        Ok(Zeroizing::new(bytes))
+    }
+
+    async fn handle_auth(
+        &self,
+        decrypted: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+        let req: AuthReq = serde_json::from_slice(decrypted)
+            .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
+
+        // Sanitize untrusted remote strings: strip control chars, truncate.
+        let sanitize = |s: &str| -> String {
+            s.chars().filter(|c| !c.is_control()).take(100).collect()
+        };
+        let reason = sanitize(&req.reason);
+        let host = sanitize(&req.host);
+
+        let auth_message = format!("auth: {} on {}", reason, host);
+
+        // Always prompt Touch ID — no auth caching for auth@vt. Over
+        // forwarded agents, all remote sessions share the same local
+        // process, so caching would approve all sudo from any session.
+        match authenticate(&auth_message) {
+            AuthOutcome::Success(_) => {}
+            AuthOutcome::Rejected => {
+                return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
+            }
+            AuthOutcome::Unavailable(reason) => {
+                tracing::warn!("auth@vt unavailable: {:?}", reason);
+                // Fail closed on a future-variant miss in `outcome_to_err`.
+                let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
+                    .unwrap_or(ErrKind::Generic);
+                return Err((kind, auth_outcome_detail(kind)));
+            }
+        }
+
+        let result = AuthRes { approved: true };
+        Ok(Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
+            (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
+        })?))
+    }
+}
+
+// ---- Static detail-string allow-list ----------------------------------------
+//
+// Every `&'static str` here is safe to forward to a remote `auth@vt` peer
+// (over a forwarded SSH agent socket). They contain no dynamic data — no
+// host, command, reason, fingerprint, file path, or user identifier. If you
+// add a new constant, audit it against that rule.
+
+const DETAIL_BAD_REQUEST_JSON: &str = "request body could not be parsed";
+const DETAIL_UNKNOWN_SECRET_TYPE: &str = "v2 request used an unknown SecretType";
+const DETAIL_NOT_INITIALIZED: &str = "agent store could not be unlocked — run `vt init`";
+const DETAIL_LEGACY_DISABLED: &str = "legacy decryption disabled (--no-legacy-decrypt)";
+const DETAIL_AUTH_REJECTED: &str = "authentication was declined";
+const DETAIL_SCREEN_LOCKED: &str = "screen is locked";
+const DETAIL_NO_GUI: &str = "no active GUI session";
+const DETAIL_INTERNAL_SERIALIZE: &str = "agent failed to serialize response";
+
+/// Map the three auth-outcome-derived [`ErrKind`]s to their canonical
+/// detail strings. Defined alongside the `DETAIL_*` constants so the
+/// allow-list discipline is enforced in one place.
+///
+/// Callers must only pass kinds emitted by [`outcome_to_err`]
+/// (`AuthRejected` / `SessionLocked` / `NoGuiSession`). Other kinds
+/// explicitly map to `None`; the enumeration is exhaustive so a newly
+/// added [`ErrKind`] forces a compile error here rather than silently
+/// dropping into a wildcard.
+fn auth_outcome_detail(kind: ErrKind) -> Option<&'static str> {
+    match kind {
+        ErrKind::AuthRejected => Some(DETAIL_AUTH_REJECTED),
+        ErrKind::SessionLocked => Some(DETAIL_SCREEN_LOCKED),
+        ErrKind::NoGuiSession => Some(DETAIL_NO_GUI),
+        // These kinds are never produced by `outcome_to_err`; passing one
+        // here is a programmer error. Each must be enumerated explicitly
+        // so adding a new ErrKind triggers a compile failure (no `_` arm).
+        ErrKind::Generic
+        | ErrKind::NotInitialized
+        | ErrKind::AgentLocked
+        | ErrKind::BadRequest
+        | ErrKind::LegacyDisabled
+        | ErrKind::ProtocolVersion
+        | ErrKind::Transient
+        | ErrKind::Unknown => None,
+    }
+}
+
+// ---- Envelope serialization helpers -----------------------------------------
+
+/// Concrete shape used to serialize an `err` envelope. Mirrors the JSON
+/// produced by `ExtResponse<T> { v, body: ExtBody::Err { .. } }`.
+#[derive(Serialize)]
+struct ErrEnvelope {
+    v: u16,
+    status: &'static str,
+    kind: ErrKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'static str>,
 }
 
 #[async_trait]
@@ -853,6 +1110,11 @@ impl Session for VtSshSession {
     async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
         let locked = self.locked.read().await;
         if *locked {
+            // The lock check fires before keychain ciphers are derived, so
+            // we have no `auth_cipher` to encrypt a structured envelope
+            // with. Surface as an unstructured SSH-wire failure — clients
+            // map this to `ErrKind::Generic` (exit 1) and show a hint to
+            // run `ssh-add -X`. See docs/structured-errors.md.
             return Err(AgentError::Failure);
         }
         drop(locked);
@@ -867,11 +1129,20 @@ impl Session for VtSshSession {
         // Load the store once, derive auth + passphrase ciphers, drop the
         // store. Mac_cipher is loaded on demand inside the encrypt/decrypt
         // arms so the decrypted master key only lives across that operation.
+        //
+        // Both failure modes here stay unstructured: `KeychainStore::load`
+        // fails before any cipher exists, and `derive_passcode_ciphers` IS
+        // the function that produces `auth_cipher`, so its failure means
+        // we have no key to encrypt a structured reply with. The client
+        // surfaces these as `ErrKind::Generic` via SSH-wire failure.
         let store = KeychainStore::load().map_err(agent_err)?;
         let (auth_cipher, passphrase_cipher) =
             derive_passcode_ciphers(&store).map_err(agent_err)?;
 
-        // Decrypt the extension details with auth cipher (verifies VT_AUTH)
+        // Decrypt the extension details with auth cipher (verifies VT_AUTH).
+        // Stays unstructured: without VT_AUTH we have no key to encrypt a
+        // structured reply, and emitting an unencrypted envelope would be a
+        // presence oracle for "is this socket a vt agent?".
         let decrypted = auth_cipher
             .decrypt(extension.details.as_ref())
             .map_err(|_| {
@@ -879,157 +1150,46 @@ impl Session for VtSshSession {
                 AgentError::Failure
             })?;
 
-        let response_bytes: Zeroizing<Vec<u8>> = match extension.name.as_str() {
-            EXT_ENCRYPT => {
-                // v2 envelope: agent allocates a fresh per-record (salt, DEK)
-                // pair for each requested SecretType. The agent NEVER receives
-                // plaintext on this path. The salt is generated server-side
-                // (never accepted from the client) — this is the security
-                // invariant that prevents an attacker holding `VT_AUTH` from
-                // extracting a salt from a stored vt://0{salt||ct} URL and
-                // requesting its DEK to bypass Touch ID.
-                let req: EncryptReq =
-                    serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
-                let (_mac_cipher, mac_key) =
-                    load_mac_cipher(&store, &passphrase_cipher).map_err(agent_err)?;
-                let mut result: Vec<EncryptResItem> = Vec::with_capacity(req.types.len());
-                for _t in &req.types {
-                    let mut salt = [0u8; SALT_LEN];
-                    rand::thread_rng().fill_bytes(&mut salt);
-                    let dek = derive_dek(&mac_key, &salt);
-                    result.push(EncryptResItem {
-                        salt,
-                        dek,
-                        err_message: String::new(),
-                    });
+        // Dispatch into a per-extension handler that returns either
+        // serialized ok-body bytes (containing DEKs for encrypt/decrypt —
+        // wrapped in Zeroizing so the buffer is wiped on drop) or a
+        // structured `(ErrKind, Option<&'static str>)` failure. The handler
+        // never returns `AgentError` for vt-level failures; only true
+        // transport-layer failures (e.g. an internal serialize call) bubble
+        // up as unstructured.
+        let dispatch: Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> =
+            match extension.name.as_str() {
+                EXT_ENCRYPT => {
+                    self.handle_encrypt(&decrypted, &store, &passphrase_cipher)
+                        .await
                 }
-                drop(mac_key);
-                let bytes = serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?;
-                // The DEKs now live inside `bytes`; scrub the in-memory
-                // `Vec<EncryptResItem>` copy before it falls out of scope.
-                for item in result.iter_mut() {
-                    item.dek.zeroize();
+                EXT_DECRYPT => {
+                    self.handle_decrypt(&decrypted, &store, &passphrase_cipher)
+                        .await
                 }
-                Zeroizing::new(bytes)
-            }
-            EXT_DECRYPT => {
-                let req: DecryptReq =
-                    serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
+                EXT_AUTH => self.handle_auth(&decrypted).await,
+                _ => unreachable!(),
+            };
 
-                // Reject `SecretType::UNKNOWN` v2 items: serde would otherwise
-                // accept them from a malformed `DecryptInput::V2`, the
-                // downstream decrypt would fail on AAD mismatch, but the
-                // cache could be polluted with `t.as_byte() == b'_'` entries
-                // in the meantime.
-                let mut legacy_count = 0usize;
-                let mut v2_inputs: Vec<(crate::core::SecretType, [u8; SALT_LEN])> =
-                    Vec::with_capacity(req.items.len());
-                for item in &req.items {
-                    match item {
-                        DecryptInput::V2 {
-                            t: crate::core::SecretType::UNKNOWN,
-                            ..
-                        } => {
-                            tracing::warn!("decrypt@vt rejecting v2 item with UNKNOWN type");
-                            return Err(AgentError::Failure);
-                        }
-                        DecryptInput::V2 { t, salt } => v2_inputs.push((*t, *salt)),
-                        DecryptInput::Legacy { .. } => legacy_count += 1,
-                    }
-                }
-                let local_auth_message = format!(
-                    "decrypt {}: {} on {}",
-                    req.items.len(),
-                    req.command,
-                    req.host,
-                );
-                // Cache-aware authorization. Pure v2 batches may skip the
-                // prompt on a full hit; any legacy item disables caching for
-                // the entire batch.
-                if !self
-                    .check_or_prompt_decrypt_batch(
-                        &v2_inputs,
-                        legacy_count > 0,
-                        &req.host,
-                        &local_auth_message,
-                    )
-                    .await
-                {
-                    return Err(AgentError::Failure);
-                }
-                let (mac_cipher, mac_key) =
-                    load_mac_cipher(&store, &passphrase_cipher).map_err(agent_err)?;
-                let mut result: Vec<DecryptResItem> = Vec::with_capacity(req.items.len());
-                for item in req.items {
-                    match item {
-                        DecryptInput::V2 { t: _, salt } => {
-                            let dek = derive_dek(&mac_key, &salt);
-                            result.push(DecryptResItem::V2 {
-                                dek,
-                                err_message: String::new(),
-                            });
-                        }
-                        DecryptInput::Legacy { url } => {
-                            if self.disable_legacy_decrypt {
-                                result.push(DecryptResItem::Legacy {
-                                    result: String::new(),
-                                    err_message:
-                                        "legacy decryption disabled on this agent".to_string(),
-                                });
-                            } else {
-                                let item = legacy_decrypt(&mac_cipher, &url);
-                                result.push(DecryptResItem::Legacy {
-                                    result: item.result,
-                                    err_message: item.err_message,
-                                });
-                            }
-                        }
-                    }
-                }
-                drop(mac_key);
-                let bytes = serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?;
-                // Scrub DEKs inside the response Vec before drop. `bytes`
-                // already carries them (still wiped via `Zeroizing` below).
-                for item in result.iter_mut() {
-                    if let DecryptResItem::V2 { dek, .. } = item {
-                        dek.zeroize();
-                    }
-                }
-                Zeroizing::new(bytes)
-            }
-            EXT_AUTH => {
-                let req: AuthReq =
-                    serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
-
-                // Sanitize untrusted remote strings: strip control chars, truncate
-                let sanitize = |s: &str| -> String {
-                    s.chars().filter(|c| !c.is_control()).take(100).collect()
-                };
-                let reason = sanitize(&req.reason);
-                let host = sanitize(&req.host);
-
-                let auth_message = format!("auth: {} on {}", reason, host);
-
-                // Always prompt Touch ID — no auth caching for auth@vt.
-                // Over forwarded agents, all remote sessions share the same local
-                // process, so caching would approve all sudo from any session.
-                match authenticate(&auth_message) {
-                    AuthOutcome::Success(_) => {}
-                    AuthOutcome::Rejected => return Err(AgentError::Failure),
-                    AuthOutcome::Unavailable(reason) => {
-                        tracing::warn!("auth@vt unavailable: {:?}", reason);
-                        return Err(AgentError::Failure);
-                    }
-                }
-
-                let result = AuthRes { approved: true };
-                Zeroizing::new(serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?)
-            }
-            _ => unreachable!(),
+        // Build the envelope. OK responses use a manual concat so the
+        // serialized inner body (which carries DEKs for encrypt/decrypt) is
+        // only ever held in `Zeroizing` buffers — no intermediate
+        // `serde_json::Value` allocation that wouldn't be wiped on drop.
+        let envelope_bytes: Zeroizing<Vec<u8>> = match dispatch {
+            Ok(inner_bytes) => Zeroizing::new(wrap_ok_envelope(&inner_bytes)),
+            Err((kind, detail)) => Zeroizing::new(
+                serde_json::to_vec(&ErrEnvelope {
+                    v: WIRE_VERSION,
+                    status: "err",
+                    kind,
+                    detail,
+                })
+                .map_err(|e| agent_err(e.into()))?,
+            ),
         };
 
-        // Encrypt response with auth cipher
-        let encrypted_response = auth_cipher.encrypt(&response_bytes).map_err(agent_err)?;
+        // Encrypt envelope with auth cipher.
+        let encrypted_response = auth_cipher.encrypt(&envelope_bytes).map_err(agent_err)?;
 
         Ok(Some(Extension {
             name: extension.name,

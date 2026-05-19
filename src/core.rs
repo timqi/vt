@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod session;
+pub mod wire;
 
 use crate::core::crypto::AesGcmCrypto;
 

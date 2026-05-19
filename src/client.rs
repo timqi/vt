@@ -10,14 +10,123 @@ use std::env;
 use std::io::{self, Write};
 
 use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
+use crate::core::wire::{ErrKind, WIRE_VERSION};
 use crate::core::{
     client_decrypt_v2, client_encrypt_v2, AuthReq, AuthRes, CryptoResItem, DecryptInput,
     DecryptReq, DecryptResItem, EncryptItem, EncryptReq, EncryptResItem, SecretType, VtUrl,
 };
 use anyhow::{ensure, Context, Result};
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use ssh_agent_lib::proto::{Extension, Unparsed};
 use tracing::debug;
 use zeroize::{Zeroize, Zeroizing};
+
+/// Typed client error so `main.rs` can route stable exit codes.
+///
+/// `Agent(kind, detail)` carries a structured `ErrKind` parsed from the
+/// agent's `ExtResponse::Err` envelope; the optional `detail` is the static
+/// allow-listed string the agent attached. `Transport` covers everything
+/// else (socket missing, IO error, parse failure of the envelope itself).
+#[derive(Debug)]
+pub enum VtClientError {
+    Agent(ErrKind, Option<String>),
+    Transport(anyhow::Error),
+}
+
+impl VtClientError {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            VtClientError::Agent(k, _) => k.exit_code(),
+            VtClientError::Transport(_) => 1,
+        }
+    }
+}
+
+impl std::fmt::Display for VtClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VtClientError::Agent(kind, detail) => {
+                write!(f, "{}", kind.human_message())?;
+                if let Some(d) = detail {
+                    write!(f, " ({})", d)?;
+                }
+                Ok(())
+            }
+            VtClientError::Transport(e) => write!(f, "vt: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for VtClientError {}
+
+/// Wrap any error as `VtClientError::Transport` so `?`/`.map_err()` sites
+/// stay terse. Use only on the IO/serialization paths that should NOT
+/// surface as structured agent errors.
+fn transport<E: Into<anyhow::Error>>(e: E) -> anyhow::Error {
+    anyhow::Error::from(VtClientError::Transport(e.into()))
+}
+
+/// Parse a decrypted agent envelope. Returns the inner `data` JSON bytes on
+/// success (still potentially containing DEKs — caller is responsible for
+/// scrubbing); maps the `err` variant to `VtClientError::Agent` and version
+/// mismatch to `ErrKind::ProtocolVersion`.
+///
+/// We do NOT reuse the `ExtResponse<T>` type from `core::wire` here, because
+/// it relies on `#[serde(flatten)]` which is incompatible with
+/// `Box<RawValue>` — flatten goes through serde's internal `Content` buffer
+/// that doesn't preserve the raw JSON span `RawValue` requires. Instead we
+/// deserialize the wire form directly into this flat struct and switch on
+/// `status` manually. The on-the-wire shape is identical to what
+/// `ExtResponse` produces (verified by the round-trip tests in
+/// `core::wire::tests`).
+#[derive(Deserialize)]
+struct ParsedEnvelope<'a> {
+    v: u16,
+    status: String,
+    /// Present iff `status == "ok"`. Captured as `&RawValue` so any
+    /// DEK-bearing bytes inside are not re-allocated through
+    /// `serde_json::Value`.
+    #[serde(borrow, default)]
+    data: Option<&'a RawValue>,
+    /// Present iff `status == "err"`.
+    #[serde(default)]
+    kind: Option<ErrKind>,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+fn parse_envelope(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let env: ParsedEnvelope = serde_json::from_slice(bytes)
+        .map_err(|e| transport(anyhow::anyhow!("failed to parse agent envelope: {}", e)))?;
+    if env.v != WIRE_VERSION {
+        // Different protocol versions: refuse even an "ok"-looking body.
+        // The client and agent binaries must be from the same build.
+        return Err(VtClientError::Agent(ErrKind::ProtocolVersion, None).into());
+    }
+    match env.status.as_str() {
+        "ok" => {
+            let raw = env.data.ok_or_else(|| {
+                transport(anyhow::anyhow!(
+                    "agent envelope status=ok but missing `data` field"
+                ))
+            })?;
+            Ok(Zeroizing::new(raw.get().as_bytes().to_vec()))
+        }
+        "err" => {
+            let kind = env.kind.ok_or_else(|| {
+                transport(anyhow::anyhow!(
+                    "agent envelope status=err but missing `kind` field"
+                ))
+            })?;
+            Err(VtClientError::Agent(kind, env.detail).into())
+        }
+        other => Err(transport(anyhow::anyhow!(
+            "agent envelope has unknown status `{}`",
+            other
+        ))),
+    }
+}
 
 pub struct VTClient {
     auth_token: String,
@@ -29,9 +138,28 @@ impl VTClient {
     }
 
     /// Try to send an extension request via the SSH agent socket.
-    /// Returns Ok(Some(bytes)) on success, Ok(None) if socket not available, Err on auth/agent errors.
+    ///
+    /// On the success arm returns `Ok(Some(bytes))` where `bytes` is the
+    /// already-decrypted inner `data` body (i.e. the JSON the agent's
+    /// per-extension handler produced — `Vec<EncryptResItem>`,
+    /// `Vec<DecryptResItem>`, or `AuthRes`).
+    ///
+    /// Returns `Ok(None)` if the socket is missing or refused (no agent
+    /// running — callers map this to a user-visible message). Returns
+    /// `Err(anyhow::Error)` that always carries a `VtClientError`:
+    ///
+    /// - `VtClientError::Agent(kind, detail)` when the agent emitted a
+    ///   structured `ExtResponse::Err` envelope.
+    /// - `VtClientError::Transport(_)` for SSH-wire failures, envelope parse
+    ///   errors, version mismatch, or unstructured `AgentError::Failure`
+    ///   (e.g. agent lock or wrong `VT_AUTH` — see docs/structured-errors.md
+    ///   for why those stay unstructured).
     #[cfg(unix)]
-    fn try_agent_extension(auth_token: &str, name: &str, payload: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn try_agent_extension(
+        auth_token: &str,
+        name: &str,
+        payload: &[u8],
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
         use std::os::unix::net::UnixStream;
 
         let socket_path = if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
@@ -45,12 +173,12 @@ impl VTClient {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(None),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(transport(e)),
         };
 
-        let auth_key = decode_auth_cipher_from_b64(auth_token)?;
-        let auth_cipher = AesGcmCrypto::new(&auth_key)?;
-        let encrypted_payload = auth_cipher.encrypt(payload)?;
+        let auth_key = decode_auth_cipher_from_b64(auth_token).map_err(transport)?;
+        let auth_cipher = AesGcmCrypto::new(&auth_key).map_err(transport)?;
+        let encrypted_payload = auth_cipher.encrypt(payload).map_err(transport)?;
 
         let ext = Extension {
             name: name.to_string(),
@@ -58,18 +186,27 @@ impl VTClient {
         };
 
         let mut client = ssh_agent_lib::blocking::Client::new(stream);
-        let response = client.extension(ext).map_err(|e| anyhow::anyhow!("{}", e))?;
+        // SSH-wire `SSH_AGENT_FAILURE` lands here — the agent took the
+        // unstructured path (agent lock, wrong VT_AUTH, internal error
+        // before cipher derivation). We surface a generic error and let the
+        // caller's CLI message suggest `ssh-add -X`.
+        let response = client
+            .extension(ext)
+            .map_err(|e| transport(anyhow::anyhow!("{}", e)))?;
 
         match response {
             Some(resp) => {
-                // The decrypted payload may carry DEK bytes (decrypt@vt) or
-                // freshly-allocated DEKs (encrypt@vt). Wrap it so the buffer
-                // is wiped on drop after callers have consumed/copied what
-                // they need.
-                let decrypted = auth_cipher.decrypt(resp.details.as_ref())?;
-                Ok(Some(decrypted))
+                // The decrypted payload is the ExtResponse envelope. Wrap
+                // in Zeroizing so any inner DEK bytes are wiped on drop
+                // once we've extracted the `data` body.
+                let envelope_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+                    auth_cipher.decrypt(resp.details.as_ref()).map_err(transport)?,
+                );
+                Ok(Some(parse_envelope(&envelope_bytes)?))
             }
-            None => Err(anyhow::anyhow!("Agent returned empty extension response")),
+            None => Err(transport(anyhow::anyhow!(
+                "Agent returned empty extension response"
+            ))),
         }
     }
 
@@ -133,9 +270,7 @@ impl VTClient {
                 alloc.dek.zeroize();
                 out.push(res);
             }
-            // Defense in depth: also zeroize the original wire buffer.
-            let mut bytes = bytes;
-            bytes.zeroize();
+            // `bytes` is `Zeroizing<Vec<u8>>` — wiped on drop at end of scope.
             Ok(out)
         }
         #[cfg(not(unix))]
@@ -280,9 +415,7 @@ impl VTClient {
                 };
                 out.push(item);
             }
-            // Defense in depth: scrub the wire buffer too.
-            let mut bytes = bytes;
-            bytes.zeroize();
+            // `bytes` is `Zeroizing<Vec<u8>>` — wiped on drop at end of scope.
             Ok(out)
         }
         #[cfg(not(unix))]
@@ -342,7 +475,7 @@ pub async fn create(vt_client: VTClient) -> Result<()> {
     }
 
     let secret = crate::tty::prompt_input_password("Enter secret: ", "Secret entered: ")?;
-    debug!("User input for secret: '{}'", secret);
+    // DO NOT log `secret` — plaintext the user just typed.
 
     let res = vt_client
         .encrypt(&vec![EncryptItem {
@@ -435,14 +568,14 @@ async fn decrypt_from_multi_str(
         })
         .collect();
 
-    // Create a mapping from encrypted vault items to decrypted values
+    // Create a mapping from encrypted vault items to decrypted values.
+    // DO NOT log `secret_map` — values are decrypted plaintext.
     let mut secret_map = std::collections::HashMap::new();
     for (i, encrypted) in encrypted_vec.iter().enumerate() {
         if i < decrypted_vec.len() {
             secret_map.insert(encrypted.clone(), decrypted_vec[i].clone());
         }
     }
-    debug!("secret_map: {:?}", secret_map);
 
     // Replace encrypted vault items with decrypted values in original strings
     let mut result_vec = Vec::new();
@@ -730,11 +863,11 @@ pub async fn inject(
         return Ok(());
     }
 
-    // Execute the command with decrypted arguments
+    // Execute the command with decrypted arguments.
+    // DO NOT log `command` / `args` — post-decryption command line contains
+    // plaintext values substituted in for `vt://` URLs.
     let command = &decrypted_args[0];
     let args = &decrypted_args[1..];
-
-    debug!("Executing command: {} with args: {:?}", command, args);
 
     // If exec() fails, we need to immediately restore the backup and kill the cleanup child
     // exec() never returns if successful (it replaces the process), so if we reach the code below,
@@ -762,4 +895,129 @@ pub async fn inject(
     );
 
     Err(anyhow::anyhow!("Failed to execute command: {}", err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::core::wire::wrap_ok_envelope;
+
+    /// Reproduces the agent's `ErrEnvelope` serialization shape.
+    fn fake_err_envelope(kind: &str, detail: Option<&str>) -> Vec<u8> {
+        let detail_part = detail
+            .map(|d| format!(r#","detail":"{}""#, d))
+            .unwrap_or_default();
+        format!(
+            r#"{{"v":{},"status":"err","kind":"{}"{}}}"#,
+            WIRE_VERSION, kind, detail_part
+        )
+        .into_bytes()
+    }
+
+    /// Regression test for the `#[serde(flatten)]` + `RawValue` incompatibility
+    /// that produced `invalid type: newtype struct, expected any valid JSON
+    /// value` on the first attempt. If someone ever switches `parse_envelope`
+    /// back to `ExtResponse<Box<RawValue>>`, this test must fail.
+    #[test]
+    fn parse_envelope_ok_with_array_data() {
+        let inner = br#"[{"V2":{"dek":[1,2,3,4,5,6,7,8],"err_message":""}}]"#;
+        let envelope = wrap_ok_envelope(inner);
+        let data = parse_envelope(&envelope).expect("envelope should parse");
+        assert_eq!(&data[..], &inner[..]);
+    }
+
+    #[test]
+    fn parse_envelope_ok_with_object_data() {
+        let inner = br#"{"approved":true}"#;
+        let envelope = wrap_ok_envelope(inner);
+        let data = parse_envelope(&envelope).expect("envelope should parse");
+        assert_eq!(&data[..], &inner[..]);
+    }
+
+    #[test]
+    fn parse_envelope_err_auth_rejected_maps_to_exit_10() {
+        let envelope = fake_err_envelope("auth_rejected", Some("authentication was declined"));
+        let err = parse_envelope(&envelope).expect_err("should be Err");
+        let vt_err = err
+            .downcast_ref::<VtClientError>()
+            .expect("must carry VtClientError");
+        match vt_err {
+            VtClientError::Agent(kind, detail) => {
+                assert_eq!(*kind, ErrKind::AuthRejected);
+                assert_eq!(kind.exit_code(), 10);
+                assert_eq!(detail.as_deref(), Some("authentication was declined"));
+            }
+            _ => panic!("expected Agent variant, got {:?}", vt_err),
+        }
+    }
+
+    #[test]
+    fn parse_envelope_err_without_detail() {
+        let envelope = fake_err_envelope("session_locked", None);
+        let err = parse_envelope(&envelope).expect_err("should be Err");
+        let vt_err = err.downcast_ref::<VtClientError>().unwrap();
+        match vt_err {
+            VtClientError::Agent(kind, detail) => {
+                assert_eq!(*kind, ErrKind::SessionLocked);
+                assert!(detail.is_none(), "detail must be optional");
+            }
+            _ => panic!("expected Agent variant"),
+        }
+    }
+
+    #[test]
+    fn parse_envelope_version_mismatch() {
+        // Old client, new agent with bumped version.
+        let envelope = br#"{"v":99,"status":"ok","data":[1,2,3]}"#;
+        let err = parse_envelope(envelope).expect_err("must reject mismatched v");
+        let vt_err = err.downcast_ref::<VtClientError>().unwrap();
+        match vt_err {
+            VtClientError::Agent(ErrKind::ProtocolVersion, _) => {}
+            _ => panic!("expected ProtocolVersion, got {:?}", vt_err),
+        }
+    }
+
+    #[test]
+    fn parse_envelope_unknown_future_kind_falls_back_to_unknown() {
+        // Future agent emits a kind this client doesn't recognize. Per
+        // wire-format policy (#[serde(other)] on ErrKind), this must become
+        // ErrKind::Unknown (exit 1) — never a parse error.
+        let envelope = fake_err_envelope("future_kind", Some("whatever"));
+        let err = parse_envelope(&envelope).expect_err("should be Err");
+        let vt_err = err.downcast_ref::<VtClientError>().unwrap();
+        match vt_err {
+            VtClientError::Agent(kind, _) => {
+                assert_eq!(*kind, ErrKind::Unknown);
+                assert_eq!(kind.exit_code(), 1);
+            }
+            _ => panic!("expected Agent"),
+        }
+    }
+
+    #[test]
+    fn parse_envelope_garbage_is_transport_error() {
+        let err = parse_envelope(b"not json at all").expect_err("must fail");
+        let vt_err = err.downcast_ref::<VtClientError>().unwrap();
+        assert!(
+            matches!(vt_err, VtClientError::Transport(_)),
+            "garbage must surface as Transport, got {:?}",
+            vt_err
+        );
+    }
+
+    #[test]
+    fn vt_client_error_display_appends_detail_when_present() {
+        let e = VtClientError::Agent(
+            ErrKind::AuthRejected,
+            Some("authentication was declined".into()),
+        );
+        assert_eq!(
+            e.to_string(),
+            "vt: authentication rejected (authentication was declined)"
+        );
+
+        let e2 = VtClientError::Agent(ErrKind::SessionLocked, None);
+        assert_eq!(e2.to_string(), "vt: screen is locked");
+    }
 }

@@ -338,7 +338,22 @@ async fn main() {
     let cli = Cli::parse();
 
     if let Err(e) = run(cli).await {
-        tracing::error!("Command failed: {:?}", e);
-        std::process::exit(1);
+        // Walk the error chain to find a `VtClientError`. The agent's
+        // structured `ErrKind` maps to a stable exit code; transport
+        // failures and any other error chain default to exit 1.
+        let code = e
+            .chain()
+            .find_map(|src| src.downcast_ref::<client::VtClientError>())
+            .map(|v| v.exit_code())
+            .unwrap_or(1);
+        // User-facing: one clean line on stderr. anyhow's alternate
+        // Display (`{:#}`) joins the chain with `: ` separators — for
+        // VtClientError it's just the typed message; for other anyhow
+        // chains (e.g. "Failed to read file: <path>: No such file...")
+        // it's the conventional CLI shape. The full Debug chain stays
+        // on the tracing pipeline at debug level for troubleshooting.
+        eprintln!("{:#}", e);
+        tracing::debug!("error chain: {:?}", e);
+        std::process::exit(code);
     }
 }
