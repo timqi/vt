@@ -196,7 +196,8 @@ pub async fn get_deks(
         let msg = tokio::time::timeout_at(deadline, ws_stream.next())
             .await
             .map_err(|_| anyhow!("approval timeout (6 min)"))?
-            .ok_or_else(|| anyhow!("WS closed without result"))??;
+            .ok_or_else(|| anyhow!("connection closed before approval"))?
+            .map_err(|_| anyhow!("connection closed before approval"))?;
 
         match msg {
             Message::Text(text) => {
