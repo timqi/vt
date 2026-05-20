@@ -1,4 +1,4 @@
-.PHONY: build install restart ssh
+.PHONY: build install check deploy-worker
 
 build:
 	cargo build --release --bin vt
@@ -6,11 +6,14 @@ build:
 
 install: build
 	mkdir -p ~/.local/bin
-	rm ~/.local/bin/vt
 	cp target/release/vt ~/.local/bin/vt
 
-restart: install
-	msv restart vt
+check:
+	cargo check
+	cargo check --target x86_64-unknown-linux-gnu
+
+deploy-worker:
+	cd cf-worker && wrangler deploy
 
 ssh:
 	ssh -A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \

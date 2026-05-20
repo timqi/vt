@@ -14,6 +14,7 @@ fn require_auth(auth: &Option<String>) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("VT_AUTH not set — run `vt init` and export the token"))
 }
 
+mod cf;
 mod client;
 mod core;
 #[cfg(target_os = "macos")]

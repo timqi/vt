@@ -1,0 +1,17 @@
+:root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+body { max-width: 480px; margin: 0 auto; padding: 1.5rem 1rem; line-height: 1.5; }
+h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+.hint { margin: 0 0 1.5rem; color: #666; font-size: 0.95rem; }
+section + section { margin-top: 1.5rem; }
+h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.04em; color: #888; margin: 0 0 0.5rem; }
+dl { margin: 0; padding: 0.75rem; background: rgba(127,127,127,.08); border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; }
+dl > div { display: grid; grid-template-columns: 6em 1fr; gap: .5rem; padding: .15rem 0; }
+dl dt { color: #888; }
+dl dd { margin: 0; word-break: break-all; }
+#actions { display: flex; gap: .75rem; }
+button { flex: 1; padding: .85rem 1rem; font-size: 1rem; border-radius: 10px; border: 0; background: #007aff; color: #fff; cursor: pointer; }
+button.secondary { background: rgba(127,127,127,.18); color: inherit; }
+button[disabled] { opacity: .5; cursor: not-allowed; }
+#status { margin-top: 1rem; min-height: 1.3em; font-size: .95rem; }
+#status.error { color: #b00020; }
+#status.ok { color: #2e7d32; }

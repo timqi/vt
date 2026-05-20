@@ -1,19 +1,19 @@
 //! Cross-platform vt client.
 //!
-//! Talks to a local `vt ssh agent` over the SSH-agent Unix socket using the
-//! `encrypt@vt` / `decrypt@vt` / `auth@vt` extension messages. The wire
-//! payload is encrypted with the auth cipher derived from `VT_AUTH`. No
-//! keychain, no LocalAuthentication, no `ssh-key` — those all live on the
-//! macOS server side.
+//! Primary path: SSH agent via `$SSH_AUTH_SOCK` or `~/.ssh/vt.sock`.
+//! Fallback path (Linux / macOS without agent): CF ceremony via
+//! `~/.config/vt/cf_config.json` — POST /api/challenge + WS /api/dek.
 
 use std::env;
 use std::io::{self, Write};
 
+use crate::cf;
 use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
 use crate::core::wire::{ErrKind, WIRE_VERSION};
 use crate::core::{
     client_decrypt_v2, client_encrypt_v2, AuthReq, AuthRes, CryptoResItem, DecryptInput,
     DecryptReq, DecryptResItem, EncryptItem, EncryptReq, EncryptResItem, SecretType, VtUrl,
+    SALT_LEN,
 };
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -229,11 +229,7 @@ impl VTClient {
             .await??;
             let bytes = match result {
                 Some(b) => b,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "SSH agent not available — set SSH_AUTH_SOCK or run `vt ssh agent`"
-                    ))
-                }
+                None => return Self::cf_encrypt(items, &get_hostname()).await,
             };
             let mut allocs: Vec<EncryptResItem> = serde_json::from_slice(&bytes)?;
             ensure!(
@@ -351,11 +347,7 @@ impl VTClient {
             .await??;
             let bytes = match result {
                 Some(b) => b,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "SSH agent not available — set SSH_AUTH_SOCK or run `vt ssh agent`"
-                    ))
-                }
+                None => return Self::cf_decrypt(host, command, urls).await,
             };
             let mut wire_results: Vec<DecryptResItem> = serde_json::from_slice(&bytes)?;
             ensure!(
@@ -425,6 +417,99 @@ impl VTClient {
         }
     }
 
+    // ── CF ceremony fallbacks ──────────────────────────────────────────────
+
+    async fn cf_encrypt(items: &[EncryptItem], host: &str) -> Result<Vec<CryptoResItem>> {
+        let config = cf::load_config()
+            .context("SSH agent unavailable; also failed to load CF config")?;
+        let mut salts = cf::random_salts(items.len());
+        let meta = cf::ChallengeMeta {
+            op_kind: "encrypt",
+            command: "",
+            host,
+            ip: "",
+            reason: "",
+        };
+        let deks = cf::get_deks(&config, &salts, meta).await?;
+        let mut out = Vec::with_capacity(items.len());
+        for ((item, salt), dek) in items.iter().zip(salts.iter()).zip(deks.iter()) {
+            let res = match client_encrypt_v2(item.t, salt, dek, item.plaintext.as_bytes()) {
+                Ok(url) => CryptoResItem { result: url, err_message: String::new() },
+                Err(e)  => CryptoResItem { result: String::new(), err_message: e.to_string() },
+            };
+            out.push(res);
+        }
+        salts.iter_mut().for_each(|s| s.iter_mut().for_each(|b| *b = 0));
+        Ok(out)
+    }
+
+    async fn cf_decrypt(host: &str, command: &str, urls: &[String]) -> Result<Vec<CryptoResItem>> {
+        let config = cf::load_config()
+            .context("SSH agent unavailable; also failed to load CF config")?;
+
+        // Parse URLs; collect v2 salts in order
+        struct Item {
+            t: SecretType,
+            salt: [u8; SALT_LEN],
+            inner_ct: Vec<u8>,
+        }
+        let mut items: Vec<Result<Item, String>> = Vec::with_capacity(urls.len());
+        let mut salts: Vec<[u8; SALT_LEN]> = Vec::new();
+        for raw_url in urls {
+            match VtUrl::parse(raw_url) {
+                Ok(VtUrl::V2 { t, salt, inner_ct }) => {
+                    salts.push(salt);
+                    items.push(Ok(Item { t, salt, inner_ct }));
+                }
+                Ok(VtUrl::Legacy { .. }) => {
+                    items.push(Err("legacy vt:// URLs require macOS SSH agent".to_string()));
+                }
+                Err(e) => items.push(Err(e.to_string())),
+            }
+        }
+
+        let meta = cf::ChallengeMeta {
+            op_kind: "decrypt",
+            command,
+            host,
+            ip: "",
+            reason: "",
+        };
+        let deks = cf::get_deks(&config, &salts, meta).await?;
+
+        let mut out = Vec::with_capacity(urls.len());
+        let mut dek_idx = 0usize;
+        for item_res in items {
+            match item_res {
+                Err(e) => out.push(CryptoResItem { result: String::new(), err_message: e }),
+                Ok(Item { t, salt, inner_ct }) => {
+                    let dek = &deks[dek_idx];
+                    dek_idx += 1;
+                    let res = match client_decrypt_v2(t, dek, &salt, &inner_ct) {
+                        Ok(pt) => CryptoResItem { result: pt, err_message: String::new() },
+                        Err(e) => CryptoResItem { result: String::new(), err_message: e.to_string() },
+                    };
+                    out.push(res);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn cf_auth(reason: &str) -> Result<()> {
+        let config = cf::load_config()
+            .context("SSH agent unavailable; also failed to load CF config")?;
+        let meta = cf::ChallengeMeta {
+            op_kind: "auth",
+            command: "",
+            host: &get_hostname(),
+            ip: "",
+            reason,
+        };
+        cf::get_deks(&config, &[], meta).await?;
+        Ok(())
+    }
+
     pub async fn auth(&self, reason: &str) -> Result<()> {
         #[cfg(unix)]
         {
@@ -445,11 +530,7 @@ impl VTClient {
                         serde_json::from_slice(&bytes).context("Failed to parse auth response")?;
                     return Ok(());
                 }
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "SSH agent not available — need agent forwarding or ~/.ssh/vt.sock"
-                    ));
-                }
+                None => return Self::cf_auth(reason).await,
             }
         }
 
