@@ -542,8 +542,8 @@ impl VTClient {
 }
 
 pub async fn create(vt_client: VTClient) -> Result<()> {
-    print!("Enter secret type (raw/totp) [default: raw]: ");
-    io::stdout().flush()?;
+    eprint!("Enter secret type (raw/totp) [default: raw]: ");
+    io::stderr().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     if input.trim().is_empty() {
@@ -570,7 +570,7 @@ pub async fn create(vt_client: VTClient) -> Result<()> {
             res[0].err_message
         ));
     }
-    println!("Created item: {}", res[0].result);
+    println!("{}", res[0].result);
     Ok(())
 }
 

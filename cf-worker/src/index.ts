@@ -24,7 +24,13 @@ app.get('/healthz', c => c.text('ok'));
 // assets themselves carry no secrets and the HTML they load always includes
 // the approve_token in the dynamic path.
 
-app.get('/pwa/*', async (c) => c.env.ASSETS.fetch(c.req.raw));
+app.get('/pwa/*', async (c) => {
+  // ASSETS directory = "pwa", so files are indexed without the /pwa prefix.
+  // Strip it before fetching: /pwa/libsodium.js → /libsodium.js → pwa/libsodium.js.
+  const url = new URL(c.req.url);
+  url.pathname = url.pathname.slice('/pwa'.length) || '/';
+  return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
+});
 
 // ── Secret-prefixed routes ────────────────────────────────────────────────
 
@@ -205,15 +211,15 @@ function buildApprovePage(data: ApprovePageData): string {
   <main>
     <header>
       <h1>VT 审批请求</h1>
-      <p class="hint">请用 Passkey (1Password / YubiKey) 确认下列操作。</p>
+      <p class="hint">请用 Passkey（iCloud / 1Password / YubiKey）确认下列操作。</p>
     </header>
     <section id="meta-section">
       <h2>请求信息</h2>
       <dl id="meta"></dl>
     </section>
     <section id="actions">
-      <button id="approve" type="button">同意 (Passkey)</button>
-      <button id="reject" type="button" class="secondary">拒绝</button>
+      <button id="approve" type="button">✓ 同意</button>
+      <button id="reject" type="button">拒绝</button>
     </section>
     <p id="status" role="status" aria-live="polite"></p>
   </main>

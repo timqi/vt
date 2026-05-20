@@ -79,8 +79,8 @@ pub async fn import_secret() -> Result<()> {
         AesGcmCrypto::new(&key).context("Failed to create AES-GCM cipher for master secret")?;
 
     let vt_path = env::current_exe().unwrap().to_string_lossy().to_string();
-    print!("Enter absolute path of vt (Default: {}): ", vt_path);
-    io::stdout().flush()?;
+    eprint!("Enter absolute path of vt (Default: {}): ", vt_path);
+    io::stderr().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     if input.trim().is_empty() {

@@ -1,17 +1,16 @@
-// vt-passkey v2 approve ceremony.
-//
-// v2 change from v1: instead of sealing master_key (32 bytes), derive one
-// DEK per salt received from the challenge, seal all DEKs concatenated
-// ([DEK_0 || ... || DEK_n-1]) to the daemon's X25519 pubkey. The daemon
-// opens the sealed box and gets the DEKs directly without ever holding
-// master_key.
-
 'use strict';
 
 (function () {
     var data = vt.bootData();
     if (!data) return;
     var b64uDec = vt.b64uDec, b64uEnc = vt.b64uEnc, setStatus = vt.setStatus;
+
+    // Pre-compute PRF_INPUT at page-load time. SHA-256 on a short constant
+    // finishes in microseconds; by the time the user taps (>100 ms) this
+    // Promise is already resolved, so the await below is a no-op microtask.
+    var prfInputReady = crypto.subtle.digest(
+        'SHA-256', new TextEncoder().encode('vt-passkey-prf-v1')
+    ).then(function (buf) { return new Uint8Array(buf); });
 
     function renderMeta(meta) {
         var dl = document.getElementById('meta');
@@ -36,20 +35,14 @@
     async function runApprove() {
         var k = null, kWrap = null, masterKey = null, deks = null;
         try {
-            setStatus('正在等待 libsodium 初始化…');
-            if (typeof sodium === 'undefined' || !sodium.ready) throw new Error('libsodium 未加载');
-            await sodium.ready;
-
-            // PRF input = SHA-256("vt-passkey-prf-v1")
-            var PRF_INPUT = new Uint8Array(await crypto.subtle.digest(
-                'SHA-256', new TextEncoder().encode('vt-passkey-prf-v1')));
-
-            var evalByCredential = {};
-            for (var i = 0; i < data.allow_credentials.length; i++) {
-                evalByCredential[data.allow_credentials[i].id_b64u] = { first: PRF_INPUT };
-            }
-
             setStatus('请触摸 Passkey 完成验证…');
+
+            // Await PRF_INPUT — already resolved at this point, effectively sync.
+            var PRF_INPUT = await prfInputReady;
+
+            // Use eval.first (not evalByCredential): PRF input is the same for
+            // every credential, so both forms produce identical PRF results.
+            // eval.first is more broadly supported across iOS/Safari versions.
             var assertion = await navigator.credentials.get({
                 publicKey: {
                     challenge: b64uDec(data.challenge_b64u),
@@ -58,29 +51,34 @@
                         return { type: 'public-key', id: b64uDec(c.id_b64u) };
                     }),
                     userVerification: 'required',
-                    extensions: { prf: { evalByCredential: evalByCredential } },
+                    extensions: { prf: { eval: { first: PRF_INPUT } } },
                 },
             });
+
+            // libsodium is only needed for crypto_box_seal — await it AFTER
+            // credentials.get() so it doesn't consume the user-gesture window.
+            setStatus('正在处理…');
+            if (typeof sodium === 'undefined') throw new Error('libsodium 未加载');
+            await sodium.ready;
 
             var usedId = b64uEnc(new Uint8Array(assertion.rawId));
             var entry = null;
             for (var j = 0; j < data.allow_credentials.length; j++) {
                 if (data.allow_credentials[j].id_b64u === usedId) { entry = data.allow_credentials[j]; break; }
             }
-            if (!entry) throw new Error('used credential not in allow list');
+            if (!entry) throw new Error('使用的 Passkey 不在允许列表中');
 
             var ext = assertion.getClientExtensionResults && assertion.getClientExtensionResults();
             var prfResult = ext && ext.prf && ext.prf.results && ext.prf.results.first;
             if (!prfResult) {
-                setStatus('Passkey 不支持 PRF——请用 1Password / YubiKey 重试', 'error');
+                setStatus('此 Passkey 不支持 PRF 扩展，请换用 1Password 或 YubiKey', 'error');
                 return;
             }
             k = new Uint8Array(prfResult);
 
-            // Derive K_wrap, decrypt master_key
             kWrap = await vt.deriveKWrap(k);
             var kBytes = b64uDec(entry.k_b64u);
-            if (kBytes.length !== 12 + 32 + 16) throw new Error('encrypted_master_key wrong length: ' + kBytes.length);
+            if (kBytes.length !== 60) throw new Error('k 字段长度异常: ' + kBytes.length);
             var iv = kBytes.slice(0, 12);
             var ctTag = kBytes.slice(12);
             var hBytes = b64uDec(entry.h_b64u);
@@ -90,25 +88,21 @@
             var kWrapKey = await crypto.subtle.importKey('raw', kWrap, { name: 'AES-GCM' }, false, ['decrypt']);
             var masterKeyBuf;
             try {
-                masterKeyBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv, additionalData: aad }, kWrapKey, ctTag);
-            } catch (e) {
-                throw new Error('AES-GCM 解密失败：可能是 PRF 输出与 entry 不匹配');
+                masterKeyBuf = await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: iv, additionalData: aad }, kWrapKey, ctTag);
+            } catch (_) {
+                throw new Error('AES-GCM 解密失败：PRF 输出与注册记录不匹配，可能需要重新注册 Passkey');
             }
             masterKey = new Uint8Array(masterKeyBuf);
             if (masterKey.length !== 32) throw new Error('master_key 长度异常: ' + masterKey.length);
 
-            // --- v2: derive one DEK per salt, seal all to daemon pubkey ---
             var salts = data.salts_b64u || [];
             deks = new Uint8Array(Math.max(salts.length, 1) * 32);
             if (salts.length === 0) {
-                // Auth-only: no DEKs needed. Use a zero DEK placeholder so
-                // sealed box is non-empty but well-defined.
-                // The daemon discards it for auth-only operations.
-                deks.fill(0);
+                deks.fill(0); // auth-only: placeholder DEK, daemon discards
             } else {
                 for (var s = 0; s < salts.length; s++) {
-                    var saltBytes = b64uDec(salts[s]);
-                    var dek = await vt.deriveDek(masterKey, saltBytes);
+                    var dek = await vt.deriveDek(masterKey, b64uDec(salts[s]));
                     deks.set(dek, s * 32);
                     dek.fill(0);
                 }
@@ -121,7 +115,7 @@
             var sealedDeks = sodium.crypto_box_seal(deks, daemonPk);
             deks.fill(0); deks = null;
 
-            setStatus('正在提交审批…');
+            setStatus('正在提交…');
             var resp = await fetch(vt.apiPath('/api/approve'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -134,12 +128,15 @@
                     signature_b64u: b64uEnc(new Uint8Array(assertion.response.signature)),
                 }),
             });
-            if (!resp.ok) throw new Error('审批失败（HTTP ' + resp.status + '）');
-            setStatus('审批成功，可关闭页面', 'ok');
+            if (!resp.ok) throw new Error('提交失败（HTTP ' + resp.status + '）');
+            setStatus('✓ 审批成功', 'ok');
             document.getElementById('approve').disabled = true;
             document.getElementById('reject').disabled = true;
+            setTimeout(function () { window.close(); }, 800);
         } catch (e) {
-            setStatus('错误：' + (e.message || e), 'error');
+            var msg = (e && e.message) ? e.message : String(e);
+            if (/NotAllowed|not allowed/i.test(msg)) msg = '未找到匹配的 Passkey，或操作被取消';
+            setStatus('错误：' + msg, 'error');
             console.error(e);
         } finally {
             vt.zeroize(k); vt.zeroize(kWrap); vt.zeroize(masterKey); vt.zeroize(deks);
@@ -148,7 +145,7 @@
 
     async function runReject() {
         var approveBtn = document.getElementById('approve');
-        var rejectBtn = document.getElementById('reject');
+        var rejectBtn  = document.getElementById('reject');
         approveBtn.disabled = true; rejectBtn.disabled = true;
         try {
             setStatus('请触摸 Passkey 完成拒绝…');
@@ -176,14 +173,17 @@
                 }),
             });
             if (!resp.ok) {
-                if (resp.status === 410) setStatus('请求已失效（可能已审批或超时）', 'error');
+                if (resp.status === 410) setStatus('请求已失效（已审批或超时）', 'error');
                 else setStatus('拒绝失败（HTTP ' + resp.status + '）', 'error');
                 approveBtn.disabled = false; rejectBtn.disabled = false;
                 return;
             }
-            setStatus('已拒绝，请关闭页面', 'ok');
+            setStatus('✓ 已拒绝', 'ok');
+            setTimeout(function () { window.close(); }, 800);
         } catch (e) {
-            setStatus('错误：' + (e.message || e), 'error');
+            var msg = (e && e.message) ? e.message : String(e);
+            if (/NotAllowed|not allowed/i.test(msg)) msg = '未找到匹配的 Passkey，或操作被取消';
+            setStatus('错误：' + msg, 'error');
             console.error(e);
             approveBtn.disabled = false; rejectBtn.disabled = false;
         }
