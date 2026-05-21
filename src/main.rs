@@ -96,6 +96,24 @@ enum Commands {
         reason: Option<String>,
     },
 
+    /// Ask the local vt SSH agent to run an allowlisted program on this Mac
+    /// after Touch ID. Typically invoked from a remote host via a forwarded
+    /// SSH agent socket — e.g. `vt run -- zed ssh://g1/path` from a remote
+    /// shell pops Zed open locally pointed at the remote folder. Fire and
+    /// forget; no stdout/stderr/exit-code is returned. Touch ID is required
+    /// for every call (no caching).
+    Run {
+        #[arg(long, help = "Reason shown in the Touch ID prompt")]
+        reason: Option<String>,
+
+        #[arg(
+            trailing_var_arg = true,
+            required = true,
+            help = "Program and arguments to run on the agent's machine, e.g. `zed ssh://g1/path`"
+        )]
+        argv: Vec<String>,
+    },
+
     /// (Mac only) Initialize passcode and passphrase in the keychain
     #[cfg(target_os = "macos")]
     Init,
@@ -188,6 +206,12 @@ pub enum SshCommands {
             help = "Reject legacy v0/v1 vt:// URLs on decrypt@vt; only v2 envelope URLs are accepted. Use this once you've migrated all stored secrets to the v2 format."
         )]
         no_legacy_decrypt: bool,
+        #[arg(
+            long = "run-allow",
+            default_value = "",
+            help = "Comma-separated allowlist for `run@vt` (e.g. `zed,code,/Applications/Zed.app/Contents/MacOS/cli`). Bare names match argv[0] without `/` and are resolved via the agent's own PATH; entries containing `/` must be absolute and match argv[0] post-canonicalization. Empty (the default) disables run@vt entirely."
+        )]
+        run_allow: String,
     },
     /// Add an SSH private key to the keychain
     Add {
@@ -248,8 +272,11 @@ async fn run(cli: Cli) -> Result<()> {
                 decrypt_auth_cache_mode,
                 decrypt_auth_cache_duration,
                 no_legacy_decrypt,
+                run_allow,
             } => {
-                use server_macos::ssh_agent::AuthCacheConfig;
+                use server_macos::ssh_agent::{AuthCacheConfig, RunAllowlist};
+                let run_allow = RunAllowlist::parse(run_allow)
+                    .map_err(|e| anyhow::anyhow!("--run-allow: {}", e))?;
                 server_macos::ssh_agent::start_ssh_agent(
                     *timeout,
                     AuthCacheConfig {
@@ -261,6 +288,7 @@ async fn run(cli: Cli) -> Result<()> {
                         ttl_secs: *decrypt_auth_cache_duration,
                     },
                     *no_legacy_decrypt,
+                    run_allow,
                 )
                 .await
             }
@@ -295,6 +323,11 @@ async fn run(cli: Cli) -> Result<()> {
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(auth)?;
             client::auth(vt_client, reason.as_deref().unwrap_or("bio auth requested")).await
+        }
+        Commands::Run { reason, argv } => {
+            let auth = require_auth(&cli.auth)?;
+            let vt_client = VTClient::new(auth)?;
+            client::run(vt_client, argv.clone(), reason.as_deref()).await
         }
         Commands::Inject {
             replace_file,

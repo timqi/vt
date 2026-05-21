@@ -13,7 +13,7 @@ use crate::core::wire::{ErrKind, WIRE_VERSION};
 use crate::core::{
     client_decrypt_v2, client_encrypt_v2, collapse_whitespace, has_vt_url, iter_vt_urls,
     redact_vt_urls, AuthReq, AuthRes, CryptoResItem, DecryptInput, DecryptReq, DecryptResItem,
-    EncryptItem, EncryptReq, EncryptResItem, SecretType, VtUrl, SALT_LEN,
+    EncryptItem, EncryptReq, EncryptResItem, RunReq, RunRes, SecretType, VtUrl, SALT_LEN,
 };
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -566,6 +566,53 @@ impl VTClient {
         Ok(())
     }
 
+    /// Ask the local agent to run an allowlisted program. SSH-agent path
+    /// only — there is no CF passkey fallback, because the whole feature
+    /// only makes sense when "local" means "the Mac at the other end of the
+    /// forwarded agent socket". If `VT_AUTH` is unset (no agent path
+    /// configured) we refuse here instead of silently failing further down.
+    pub async fn run(&self, argv: Vec<String>, reason: Option<&str>) -> Result<()> {
+        #[cfg(unix)]
+        {
+            if self.auth_token.is_empty() {
+                anyhow::bail!(
+                    "vt run requires the SSH-agent path (set VT_AUTH and ensure \
+                     SSH_AUTH_SOCK / ~/.ssh/vt.sock points at a vt agent — there \
+                     is no phone-passkey fallback for run@vt)"
+                );
+            }
+            if argv.is_empty() {
+                anyhow::bail!("vt run: argv is empty");
+            }
+            let req = RunReq {
+                host: get_hostname(),
+                argv,
+                reason: reason.map(str::to_string),
+                meta: cf::collect_client_meta(),
+            };
+            let payload = serde_json::to_vec(&req)?;
+            let auth_token = self.auth_token.clone();
+            let result =
+                Self::agent_call_or_fallback(auth_token, "run@vt", payload).await?;
+            match result {
+                Some(bytes) => {
+                    let res: RunRes = serde_json::from_slice(&bytes)
+                        .context("Failed to parse run response")?;
+                    tracing::debug!("vt run: spawned pid={}", res.pid);
+                    Ok(())
+                }
+                None => Err(anyhow::anyhow!(
+                    "vt run: SSH agent path unavailable (no fallback exists for run@vt)"
+                )),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (argv, reason);
+            Err(anyhow::anyhow!("vt run requires Unix (SSH agent socket)"))
+        }
+    }
+
     pub async fn auth(&self, reason: &str) -> Result<()> {
         #[cfg(unix)]
         {
@@ -638,6 +685,10 @@ pub fn get_hostname() -> String {
 
 pub async fn auth(vt_client: VTClient, reason: &str) -> Result<()> {
     vt_client.auth(reason).await
+}
+
+pub async fn run(vt_client: VTClient, argv: Vec<String>, reason: Option<&str>) -> Result<()> {
+    vt_client.run(argv, reason).await
 }
 
 fn sanitize_prompt_field(s: &str, max_chars: usize) -> String {

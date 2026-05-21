@@ -46,10 +46,10 @@ cf-worker/            TypeScript Cloudflare Worker + PWA
 ## Architecture
 
 ```
-CLI (vt read / write / auth)
+CLI (vt read / write / auth / run)
   |
   +-- if $VT_AUTH set: try $SSH_AUTH_SOCK / ~/.ssh/vt.sock  (macOS: vt ssh agent)
-  |    -> SSH extension protocol encrypt@vt / decrypt@vt / auth@vt
+  |    -> SSH extension protocol encrypt@vt / decrypt@vt / auth@vt / run@vt
   |
   +-- if $VT_PASSKEY_URL + $VT_PASSKEY_TOKEN set, CF ceremony
   |   (used as fallback when agent path is unavailable, or as the only path
@@ -87,6 +87,42 @@ Routing rules:
 - Neither configured → CLI refuses at startup with an actionable error.
 
 There is no config file. The previous `~/.config/vt/cf_config.json` has been removed.
+
+## run@vt — remote-triggered local command launcher
+
+`vt run -- <argv...>` (typically run on a remote host with the SSH agent
+forwarded back to a Mac) asks the local agent to fork/exec a program on the
+Mac after Touch ID. Use case: `vt run -- zed ssh://g1/some/path` from inside
+a remote shell opens Zed locally on the remote folder.
+
+Properties:
+- **Allowlist-gated.** Agent only spawns programs whose `argv[0]` matches
+  `--run-allow` (comma-separated). Bare names (`zed`) match argv[0] only
+  when argv[0] also has no `/`; the agent resolves them against its own
+  PATH. Slash-bearing entries must be absolute and match argv[0] post-
+  canonicalize. Empty allowlist disables the feature.
+- **Touch ID every call.** Same policy as `auth@vt` — never cached,
+  because forwarded agents share one process across all remote sessions.
+- **Concurrent prompts serialized** via a global `Semaphore(1)` so a
+  hostile peer with `VT_AUTH` cannot queue dozens of prompts at the user.
+- **Fire-and-forget.** Child detaches via `setsid`, stdio → /dev/null,
+  fds ≥ 3 closed, cwd = `$HOME`. Reaped by a background task.
+- **Env scrubbed.** Child inherits `env_clear()` plus an allowlist of
+  benign vars (HOME / USER / PATH / SHELL / TERM / TMPDIR / LANG /
+  LC_ALL / LC_CTYPE / DISPLAY). VT_AUTH, VT_PASSKEY_*, SSH_AUTH_SOCK,
+  SSH_AGENT_PID, DYLD_*, LD_*, PYTHONPATH, RUBYOPT, NODE_OPTIONS,
+  PERL5LIB etc. are all dropped — a granted Touch ID cannot be used to
+  exfil credentials or re-enter the agent via the forwarded socket.
+- **No CF passkey fallback.** `run@vt` is SSH-agent-only by design.
+- TCC grants are inherited (intentional — Zed needs disk access).
+
+Enable on the agent:
+
+```bash
+vt ssh agent --run-allow zed,code,subl
+# or with absolute paths:
+vt ssh agent --run-allow /Applications/Zed.app/Contents/MacOS/cli
+```
 
 ## Worker deployment
 

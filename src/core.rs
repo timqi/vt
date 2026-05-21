@@ -198,6 +198,29 @@ pub enum DecryptResItem {
     },
 }
 
+/// Request from a (typically remote) client → local agent for `run@vt`.
+/// Touch ID gates every call, allowlist is enforced server-side, no cache.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct RunReq {
+    /// Hostname the request originated from (display only; never trusted).
+    pub host: String,
+    /// `[program, arg1, arg2, ...]`. argv[0] is resolved against the agent's
+    /// allowlist before any Touch ID prompt.
+    pub argv: Vec<String>,
+    /// Optional human-readable reason shown in the Touch ID prompt.
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub meta: ClientMeta,
+}
+
+/// Response for an approved `run@vt`. Fire-and-forget — the child has been
+/// spawned and detached. The client just gets the local PID for logging.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct RunRes {
+    pub pid: u32,
+}
+
 // ---- v2 URL parsing ---------------------------------------------------------
 
 /// Parsed `vt://...` URL. Strict parser (no `url::Url`, no normalization).
@@ -716,6 +739,18 @@ mod tests {
         assert_eq!(back.tty, "/dev/pts/3");
         assert_eq!(back.ppid_cmd, "zsh -i");
         assert_eq!(back.ssh_client, "10.0.0.5 5234 22");
+    }
+
+    #[test]
+    fn run_req_deserializes_when_meta_and_reason_missing() {
+        // Mirror the AuthReq/DecryptReq forward-compat policy: an older
+        // client that omits `meta` and `reason` must still parse.
+        let json = br#"{"host":"g1","argv":["zed","ssh://g1/x"]}"#;
+        let req: RunReq = serde_json::from_slice(json).expect("must parse old-shape RunReq");
+        assert_eq!(req.host, "g1");
+        assert_eq!(req.argv, vec!["zed".to_string(), "ssh://g1/x".to_string()]);
+        assert!(req.reason.is_none());
+        assert_eq!(req.meta.user, "");
     }
 
     #[test]
