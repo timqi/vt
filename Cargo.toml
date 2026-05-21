@@ -56,3 +56,9 @@ ctap-hid-fido2 = "3.5.9"
 
 [dev-dependencies]
 tracing-test = "0.2.5"
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"

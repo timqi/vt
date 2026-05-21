@@ -41,20 +41,36 @@ export interface PushoverSecrets {
   userToken: string;
 }
 
+// Truncate untrusted strings before they're surfaced upstream.
+function truncate(s: string, max = 256): string {
+  return s.length <= max ? s : s.slice(0, max - 1) + '…';
+}
+
 // Fire a Pushover notification. Returns an empty string on success or an error
 // description on non-fatal failure (missing secrets, HTTP error, no devices).
 export async function notifyApproval(
   secrets: PushoverSecrets | null,
   opKind: string,
-  meta: { command: string; host: string; ip: string; reason: string },
+  meta: {
+    command: string;
+    host: string;
+    user?: string;
+    pwd?: string;
+    ssh_client?: string;
+    ip: string;
+    reason: string;
+  },
   approveUrl: string,
 ): Promise<string> {
-  if (!secrets) return 'missing Pushover secrets';
+  if (!secrets) return truncate('missing Pushover secrets');
 
   const title = opKind ? `VT 审批: ${opKind}` : 'VT 审批请求';
+  const who = [meta.user, meta.host].filter(Boolean).join('@');
   const lines: string[] = [];
+  if (who) lines.push(who);
+  if (meta.pwd) lines.push(`pwd: ${meta.pwd}`);
   if (meta.command) lines.push(`cmd: ${meta.command}`);
-  if (meta.host) lines.push(`host: ${meta.host}`);
+  if (meta.ssh_client) lines.push(`ssh: ${meta.ssh_client}`);
   if (meta.ip) lines.push(`ip: ${meta.ip}`);
   if (meta.reason) lines.push(`reason: ${meta.reason}`);
   lines.push(approveUrl);
@@ -64,14 +80,14 @@ export async function notifyApproval(
   try {
     [status, body] = await sendPush(secrets.appToken, secrets.userToken, title, message);
   } catch (e) {
-    return `pushover transport error: ${e}`;
+    return truncate(`pushover transport error: ${e}`);
   }
 
-  if (status < 200 || status >= 300) return `pushover http ${status}: ${body}`;
+  if (status < 200 || status >= 300) return truncate(`pushover http ${status}: ${body}`);
   let parsed: Record<string, unknown>;
-  try { parsed = JSON.parse(body); } catch { return `pushover invalid json: ${body}`; }
-  if (parsed['status'] !== 1) return `pushover status != 1: ${body}`;
+  try { parsed = JSON.parse(body); } catch { return truncate(`pushover invalid json: ${body}`); }
+  if (parsed['status'] !== 1) return truncate(`pushover status != 1: ${body}`);
   const info = parsed['info'];
-  if (typeof info === 'string' && info) return `pushover delivery warning: ${info}`;
+  if (typeof info === 'string' && info) return truncate(`pushover delivery warning: ${info}`);
   return '';
 }

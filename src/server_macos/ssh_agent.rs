@@ -321,6 +321,42 @@ mod proc_info {
 
 // --- SSH Agent ---
 
+// Defense-in-depth re-sanitization before surfacing wire meta to the Touch ID
+// prompt — forwarded SSH agent sockets could be rewritten by a hostile hop.
+use crate::core::sanitize_for_display as sanitize_prompt;
+
+/// Render `user@host`, omitting either side when empty so the prompt
+/// degrades gracefully for old clients that don't send `meta.user`.
+fn who_at_host(user: &str, host: &str) -> String {
+    let u = sanitize_prompt(user, 40);
+    let h = sanitize_prompt(host, 60);
+    match (u.is_empty(), h.is_empty()) {
+        (true, true)   => String::new(),
+        (true, false)  => h,
+        (false, true)  => u,
+        (false, false) => format!("{}@{}", u, h),
+    }
+}
+
+/// Append the extra context lines (pwd, parent process, ssh-from) to the
+/// Touch ID prompt body. Each is on its own line — `LAContext`'s
+/// `localizedReason` renders multi-line strings. Empty fields are skipped so
+/// the prompt stays compact for old clients.
+fn append_meta_lines(message: &mut String, meta: &crate::core::ClientMeta) {
+    if !meta.pwd.is_empty() {
+        message.push_str("\npwd: ");
+        message.push_str(&sanitize_prompt(&meta.pwd, 100));
+    }
+    if !meta.ppid_cmd.is_empty() {
+        message.push_str("\nvia: ");
+        message.push_str(&sanitize_prompt(&meta.ppid_cmd, 100));
+    }
+    if !meta.ssh_client.is_empty() {
+        message.push_str("\nssh: ");
+        message.push_str(&sanitize_prompt(&meta.ssh_client, 80));
+    }
+}
+
 /// Hash a lock passphrase to a 32-byte SHA-256 digest.
 fn hash_lock_passphrase(passphrase: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -807,12 +843,14 @@ impl VtSshSession {
             return Err((ErrKind::LegacyDisabled, Some(DETAIL_LEGACY_DISABLED)));
         }
 
-        let local_auth_message = format!(
+        let who = who_at_host(&req.meta.user, &req.host);
+        let mut local_auth_message = format!(
             "decrypt {}: {} on {}",
             req.items.len(),
-            req.command,
-            req.host,
+            sanitize_prompt(&req.command, 120),
+            who,
         );
+        append_meta_lines(&mut local_auth_message, &req.meta);
         // Cache-aware authorization. Pure v2 batches may skip the prompt on
         // a full hit; any legacy item disables caching for the entire batch.
         // Failure paths inside `check_or_prompt_decrypt_batch` never grant
@@ -879,14 +917,13 @@ impl VtSshSession {
         let req: AuthReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
-        // Sanitize untrusted remote strings: strip control chars, truncate.
-        let sanitize = |s: &str| -> String {
-            s.chars().filter(|c| !c.is_control()).take(100).collect()
-        };
-        let reason = sanitize(&req.reason);
-        let host = sanitize(&req.host);
-
-        let auth_message = format!("auth: {} on {}", reason, host);
+        let who = who_at_host(&req.meta.user, &req.host);
+        let mut auth_message = format!(
+            "auth: {} on {}",
+            sanitize_prompt(&req.reason, 100),
+            who,
+        );
+        append_meta_lines(&mut auth_message, &req.meta);
 
         // Always prompt Touch ID — no auth caching for auth@vt. Over
         // forwarded agents, all remote sessions share the same local
@@ -1841,5 +1878,124 @@ mod tests {
         let start = proc_info::get_start_tvsec(sid)
             .expect("Session leader's start_tvsec should be queryable");
         assert!(start > 0, "Session leader start_tvsec should be positive");
+    }
+
+    // ── Touch-ID prompt helpers ────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_prompt_strips_control_chars() {
+        // Newline, tab, carriage return, NUL, DEL — all must go. The decrypt
+        // prompt is shown via LAContext.localizedReason; an attacker who
+        // controls a forwarded agent socket could try to break out of the
+        // prompt layout or smuggle in extra newlines that look like
+        // legitimate `pwd:` / `via:` fields.
+        let evil = "good\n\r\t\x00\x7fend";
+        assert_eq!(sanitize_prompt(evil, 100), "goodend");
+    }
+
+    #[test]
+    fn sanitize_prompt_truncates_with_ellipsis() {
+        let long: String = "x".repeat(50);
+        let out = sanitize_prompt(&long, 10);
+        assert_eq!(out.chars().count(), 11, "10 chars + …");
+        assert!(out.ends_with('…'));
+        assert!(out.starts_with("xxxxxxxxxx"));
+    }
+
+    #[test]
+    fn sanitize_prompt_passes_short_input_unchanged() {
+        assert_eq!(sanitize_prompt("hi", 100), "hi");
+        assert_eq!(sanitize_prompt("", 10), "");
+    }
+
+    #[test]
+    fn who_at_host_renders_user_and_host() {
+        assert_eq!(who_at_host("qiqi", "alpha"), "qiqi@alpha");
+    }
+
+    #[test]
+    fn who_at_host_degrades_gracefully_for_old_clients() {
+        // Old client doesn't send meta.user — fall back to bare host so the
+        // prompt still reads naturally.
+        assert_eq!(who_at_host("", "alpha"), "alpha");
+        // Symmetrically, a missing host should not produce a leading "@".
+        assert_eq!(who_at_host("qiqi", ""), "qiqi");
+        assert_eq!(who_at_host("", ""), "");
+    }
+
+    #[test]
+    fn who_at_host_strips_control_chars_in_either_field() {
+        // Defense-in-depth: a hostile forwarded peer could lie about user
+        // or host. The agent never trusts the wire for layout.
+        assert_eq!(who_at_host("qi\nqi", "al\tpha"), "qiqi@alpha");
+    }
+
+    #[test]
+    fn append_meta_lines_emits_only_populated_fields() {
+        let meta = crate::core::ClientMeta {
+            user: "qiqi".into(),
+            pwd: "/tmp".into(),
+            tty: "/dev/pts/3".into(), // intentionally skipped on prompt
+            ppid_cmd: "".into(),       // empty — must be skipped
+            ssh_client: "".into(),     // empty — must be skipped
+        };
+        let mut msg = String::from("auth: sudo on qiqi@alpha");
+        append_meta_lines(&mut msg, &meta);
+        assert_eq!(msg, "auth: sudo on qiqi@alpha\npwd: /tmp");
+    }
+
+    #[test]
+    fn append_meta_lines_emits_all_when_present() {
+        let meta = crate::core::ClientMeta {
+            user: "qiqi".into(),
+            pwd: "/tmp".into(),
+            tty: "/dev/pts/3".into(),
+            ppid_cmd: "zsh -i".into(),
+            ssh_client: "10.0.0.5 5234 22".into(),
+        };
+        let mut msg = String::from("decrypt 1: [read] on qiqi@alpha");
+        append_meta_lines(&mut msg, &meta);
+        let lines: Vec<&str> = msg.split('\n').collect();
+        assert_eq!(lines[0], "decrypt 1: [read] on qiqi@alpha");
+        assert_eq!(lines[1], "pwd: /tmp");
+        assert_eq!(lines[2], "via: zsh -i");
+        assert_eq!(lines[3], "ssh: 10.0.0.5 5234 22");
+        assert_eq!(lines.len(), 4, "tty must not be rendered on prompt");
+    }
+
+    #[test]
+    fn append_meta_lines_is_noop_for_default_meta() {
+        // Old clients deserialize to ClientMeta::default() — empty everywhere.
+        // The prompt must remain a single line in that case.
+        let meta = crate::core::ClientMeta::default();
+        let mut msg = String::from("auth: sudo on alpha");
+        append_meta_lines(&mut msg, &meta);
+        assert_eq!(msg, "auth: sudo on alpha");
+        assert!(!msg.contains('\n'));
+    }
+
+    #[test]
+    fn append_meta_lines_caps_long_fields() {
+        // A hostile peer that floods e.g. pwd with megabytes of junk must
+        // not be able to push the Touch ID dialog off-screen.
+        let huge = "a".repeat(1000);
+        let meta = crate::core::ClientMeta {
+            pwd: huge.clone(),
+            ppid_cmd: huge.clone(),
+            ssh_client: huge,
+            ..Default::default()
+        };
+        let mut msg = String::new();
+        append_meta_lines(&mut msg, &meta);
+        // pwd:100, via:100, ssh:80 — plus the labels and newlines.
+        // Conservative upper bound: each line under 120 chars (label + 100 + …).
+        for line in msg.split('\n').filter(|l| !l.is_empty()) {
+            assert!(
+                line.chars().count() <= 120,
+                "prompt line too long ({} chars): {}",
+                line.chars().count(),
+                line,
+            );
+        }
     }
 }

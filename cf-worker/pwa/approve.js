@@ -4,21 +4,36 @@
     var data = vt.bootData();
     if (!data) return;
     var b64uDec = vt.b64uDec, b64uEnc = vt.b64uEnc, setStatus = vt.setStatus;
+    var ENC = new TextEncoder();
 
-    // Pre-compute PRF_INPUT at page-load time. SHA-256 on a short constant
-    // finishes in microseconds; by the time the user taps (>100 ms) this
-    // Promise is already resolved, so the await below is a no-op microtask.
+    // Pre-warm everything that runApprove() needs before navigator.credentials.get()
+    // so that those awaits land on already-resolved promises by the time the
+    // user taps. iOS Safari is strict about the user-gesture window — once we
+    // hit a real async boundary, the gesture is gone and the Passkey prompt
+    // won't appear.
     var prfInputReady = crypto.subtle.digest(
-        'SHA-256', new TextEncoder().encode('vt-passkey-prf-v1')
+        'SHA-256', ENC.encode('vt-passkey-prf-v1')
     ).then(function (buf) { return new Uint8Array(buf); });
+    var sodiumReady = (typeof sodium !== 'undefined') ? sodium.ready : Promise.reject(new Error('libsodium 未加载'));
 
     function renderMeta(meta) {
         var dl = document.getElementById('meta');
         dl.innerHTML = '';
         if (!meta) return;
+        // Order top-down by "does this help me recognize the session": who/where
+        // first, then what command, then transport details, last the free-form
+        // reason and the request kind.
         var fields = [
-            ['host', 'host'], ['ip', 'IP'], ['command', '命令'],
-            ['reason', '原因'], ['op_kind', '类型']
+            ['op_kind',    '类型'],
+            ['host',       '主机'],
+            ['user',       '用户'],
+            ['pwd',        '目录'],
+            ['command',    '命令'],
+            ['tty',        '终端'],
+            ['ppid_cmd',   '父进程'],
+            ['ssh_client', 'SSH 来源'],
+            ['ip',         'IP'],
+            ['reason',     '原因']
         ];
         for (var i = 0; i < fields.length; i++) {
             var key = fields[i][0], label = fields[i][1];
@@ -34,18 +49,32 @@
 
     async function runApprove() {
         var k = null, kWrap = null, masterKey = null, deks = null;
+        var pwaSk = null, shared = null, bindingKey = null;
         try {
             setStatus('请触摸 Passkey 完成验证…');
 
-            // Await PRF_INPUT — already resolved at this point, effectively sync.
+            // Both promises were kicked off at page load and are resolved by now.
             var PRF_INPUT = await prfInputReady;
+            await sodiumReady;
+
+            // Ephemeral X25519 keypair, then commit pwa_pk into the WebAuthn
+            // challenge: effective_challenge = SHA-256(approve_challenge_hash || pwa_pk).
+            // Any swap of pwa_pk on the wire invalidates the assertion signature.
+            var kp = sodium.crypto_box_keypair();
+            var pwaPk = kp.publicKey;
+            pwaSk = kp.privateKey;
+            var approveChHash = b64uDec(data.approve_challenge_b64u);
+            var concat = new Uint8Array(approveChHash.length + pwaPk.length);
+            concat.set(approveChHash, 0);
+            concat.set(pwaPk, approveChHash.length);
+            var effectiveChallenge = await vt.sha256(concat);
 
             // Use eval.first (not evalByCredential): PRF input is the same for
             // every credential, so both forms produce identical PRF results.
             // eval.first is more broadly supported across iOS/Safari versions.
             var assertion = await navigator.credentials.get({
                 publicKey: {
-                    challenge: b64uDec(data.challenge_b64u),
+                    challenge: effectiveChallenge,
                     rpId: data.rp_id,
                     allowCredentials: data.allow_credentials.map(function (c) {
                         return { type: 'public-key', id: b64uDec(c.id_b64u) };
@@ -55,11 +84,7 @@
                 },
             });
 
-            // libsodium is only needed for crypto_box_seal — await it AFTER
-            // credentials.get() so it doesn't consume the user-gesture window.
             setStatus('正在处理…');
-            if (typeof sodium === 'undefined') throw new Error('libsodium 未加载');
-            await sodium.ready;
 
             var usedId = b64uEnc(new Uint8Array(assertion.rawId));
             var entry = null;
@@ -83,7 +108,7 @@
             var ctTag = kBytes.slice(12);
             var hBytes = b64uDec(entry.h_b64u);
             var aad = new Uint8Array(16 + hBytes.length);
-            aad.set(new TextEncoder().encode('vt-master-key-v1'), 0);
+            aad.set(ENC.encode('vt-master-key-v1'), 0);
             aad.set(hBytes, 16);
             var kWrapKey = await crypto.subtle.importKey('raw', kWrap, { name: 'AES-GCM' }, false, ['decrypt']);
             var masterKeyBuf;
@@ -115,6 +140,26 @@
             var sealedDeks = sodium.crypto_box_seal(deks, daemonPk);
             deks.fill(0); deks = null;
 
+            // Bind sealed_deks via ECDH(pwa_sk, daemon_pk) → HKDF → HMAC, so an
+            // attacker between PWA and Worker can't substitute sealed_deks
+            // without forging a MAC keyed on a secret only the PWA and the
+            // daemon hold.
+            shared = sodium.crypto_scalarmult(pwaSk, daemonPk);
+            bindingKey = await vt.hkdfSha256(shared, ENC.encode('vt-sealed-deks-bind-v1'), 32);
+            var domain = ENC.encode('vt-bind-v1');
+            var msg = new Uint8Array(domain.length + approveChHash.length + daemonPk.length + pwaPk.length + sealedDeks.length);
+            var off = 0;
+            msg.set(domain, off); off += domain.length;
+            msg.set(approveChHash, off); off += approveChHash.length;
+            msg.set(daemonPk, off); off += daemonPk.length;
+            msg.set(pwaPk, off); off += pwaPk.length;
+            msg.set(sealedDeks, off);
+            var bindingTag = await vt.hmacSha256(bindingKey, msg);
+
+            vt.zeroize(shared); shared = null;
+            vt.zeroize(bindingKey); bindingKey = null;
+            vt.zeroize(pwaSk); pwaSk = null;
+
             setStatus('正在提交…');
             var resp = await fetch(vt.apiPath('/api/approve'), {
                 method: 'POST',
@@ -126,6 +171,8 @@
                     client_data_json_b64u: b64uEnc(new Uint8Array(assertion.response.clientDataJSON)),
                     authenticator_data_b64u: b64uEnc(new Uint8Array(assertion.response.authenticatorData)),
                     signature_b64u: b64uEnc(new Uint8Array(assertion.response.signature)),
+                    pwa_pk_b64u: b64uEnc(pwaPk),
+                    binding_tag_b64u: b64uEnc(bindingTag),
                 }),
             });
             if (!resp.ok) throw new Error('提交失败（HTTP ' + resp.status + '）');
@@ -140,6 +187,7 @@
             console.error(e);
         } finally {
             vt.zeroize(k); vt.zeroize(kWrap); vt.zeroize(masterKey); vt.zeroize(deks);
+            vt.zeroize(pwaSk); vt.zeroize(shared); vt.zeroize(bindingKey);
         }
     }
 
@@ -151,7 +199,7 @@
             setStatus('请触摸 Passkey 完成拒绝…');
             var assertion = await navigator.credentials.get({
                 publicKey: {
-                    challenge: b64uDec(data.challenge_b64u),
+                    challenge: b64uDec(data.reject_challenge_b64u),
                     rpId: data.rp_id,
                     allowCredentials: data.allow_credentials.map(function (c) {
                         return { type: 'public-key', id: b64uDec(c.id_b64u) };

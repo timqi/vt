@@ -20,8 +20,10 @@ export async function verifyAssertion(opts: {
   expectedChallenge: Uint8Array;
   /** Relying party ID (hostname) */
   rpId: string;
+  /** Expected clientData.origin (canonical scheme+host[+port], no trailing slash) */
+  expectedOrigin: string;
 }): Promise<void> {
-  const { cosePublicKey, clientDataJson, authenticatorData, signature, expectedChallenge, rpId } = opts;
+  const { cosePublicKey, clientDataJson, authenticatorData, signature, expectedChallenge, rpId, expectedOrigin } = opts;
 
   // 1. Parse and validate clientDataJSON
   const clientData = JSON.parse(new TextDecoder().decode(clientDataJson));
@@ -32,6 +34,12 @@ export async function verifyAssertion(opts: {
   if (!ctEq(challengeBytes, expectedChallenge)) {
     throw new Error('challenge mismatch');
   }
+  if (typeof clientData.origin !== 'string' || clientData.origin !== expectedOrigin) {
+    throw new Error('origin mismatch');
+  }
+  if (clientData.crossOrigin === true) {
+    throw new Error('crossOrigin assertion rejected');
+  }
 
   // 2. Check rpIdHash
   const rpIdHash = await sha256(new TextEncoder().encode(rpId));
@@ -40,8 +48,9 @@ export async function verifyAssertion(opts: {
     throw new Error('rpIdHash mismatch');
   }
 
-  // 3. Check UV flag (bit 2 of flags byte at offset 32)
+  // 3. Check UP + UV flags (UP=bit0, UV=bit2 of flags byte at offset 32)
   const flags = authenticatorData[32]!;
+  if ((flags & 0x01) === 0) throw new Error('user presence (UP) flag not set');
   if ((flags & 0x04) === 0) throw new Error('user verification required but UV flag not set');
 
   // 4. Build signed data

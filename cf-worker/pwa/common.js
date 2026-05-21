@@ -44,22 +44,33 @@
     vt.PATH_PREFIX = '/' + location.pathname.split('/')[1];
     vt.apiPath = function (suffix) { return vt.PATH_PREFIX + suffix; };
 
-    vt.PRF_INFO_BYTES = new TextEncoder().encode('vt-master-wrap-v1');
+    var PRF_INFO_BYTES = new TextEncoder().encode('vt-master-wrap-v1');
+    var DEK_INFO_BYTES = new TextEncoder().encode('vt-dek-v2');
 
-    // K_wrap = HKDF-SHA256(K, salt=empty, info="vt-master-wrap-v1", L=32)
-    vt.deriveKWrap = async function (k) {
-        var kKey = await crypto.subtle.importKey('raw', k, { name: 'HKDF' }, false, ['deriveBits']);
-        return new Uint8Array(await crypto.subtle.deriveBits(
-            { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: vt.PRF_INFO_BYTES },
-            kKey, 256));
+    vt.sha256 = async function (data) {
+        return new Uint8Array(await crypto.subtle.digest('SHA-256', data));
     };
 
-    // DEK[i] = HKDF-SHA256(master_key, salt=saltBytes, info="vt-dek-v2", L=32)
-    vt.deriveDek = async function (masterKey, saltBytes) {
-        var mKey = await crypto.subtle.importKey('raw', masterKey, { name: 'HKDF' }, false, ['deriveBits']);
+    // HKDF-SHA256(ikm, salt, info, L=32). salt defaults to empty.
+    vt.hkdfSha256 = async function (ikm, info, lenBytes, salt) {
+        var key = await crypto.subtle.importKey('raw', ikm, { name: 'HKDF' }, false, ['deriveBits']);
         return new Uint8Array(await crypto.subtle.deriveBits(
-            { name: 'HKDF', hash: 'SHA-256', salt: saltBytes, info: new TextEncoder().encode('vt-dek-v2') },
-            mKey, 256));
+            { name: 'HKDF', hash: 'SHA-256', salt: salt || new Uint8Array(0), info: info },
+            key, (lenBytes || 32) * 8));
+    };
+
+    // K_wrap = HKDF-SHA256(K, salt=empty, info="vt-master-wrap-v1", L=32)
+    vt.deriveKWrap = function (k) { return vt.hkdfSha256(k, PRF_INFO_BYTES, 32); };
+
+    // DEK[i] = HKDF-SHA256(master_key, salt=saltBytes, info="vt-dek-v2", L=32)
+    vt.deriveDek = function (masterKey, saltBytes) {
+        return vt.hkdfSha256(masterKey, DEK_INFO_BYTES, 32, saltBytes);
+    };
+
+    vt.hmacSha256 = async function (keyBytes, data) {
+        var key = await crypto.subtle.importKey(
+            'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        return new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
     };
 
     vt.zeroize = function (arr) { if (!arr) return; try { arr.fill(0); } catch (_) {} };

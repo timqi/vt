@@ -338,6 +338,7 @@ impl VTClient {
                 host: host.to_string(),
                 command: command.to_string(),
                 items: wire_items,
+                meta: cf::collect_client_meta(),
             };
             let payload = serde_json::to_vec(&wire)?;
             let auth_token = self.auth_token.clone();
@@ -419,17 +420,11 @@ impl VTClient {
 
     // ── CF ceremony fallbacks ──────────────────────────────────────────────
 
-    async fn cf_encrypt(items: &[EncryptItem], host: &str) -> Result<Vec<CryptoResItem>> {
+    async fn cf_encrypt(items: &[EncryptItem], _host: &str) -> Result<Vec<CryptoResItem>> {
         let config = cf::load_config()
             .context("SSH agent unavailable; also failed to load CF config")?;
         let mut salts = cf::random_salts(items.len());
-        let meta = cf::ChallengeMeta {
-            op_kind: "encrypt",
-            command: "",
-            host,
-            ip: "",
-            reason: "",
-        };
+        let meta = cf::collect_meta("encrypt", "", "");
         let deks = cf::get_deks(&config, &salts, meta).await?;
         let mut out = Vec::with_capacity(items.len());
         for ((item, salt), dek) in items.iter().zip(salts.iter()).zip(deks.iter()) {
@@ -443,7 +438,7 @@ impl VTClient {
         Ok(out)
     }
 
-    async fn cf_decrypt(host: &str, command: &str, urls: &[String]) -> Result<Vec<CryptoResItem>> {
+    async fn cf_decrypt(_host: &str, command: &str, urls: &[String]) -> Result<Vec<CryptoResItem>> {
         let config = cf::load_config()
             .context("SSH agent unavailable; also failed to load CF config")?;
 
@@ -468,13 +463,7 @@ impl VTClient {
             }
         }
 
-        let meta = cf::ChallengeMeta {
-            op_kind: "decrypt",
-            command,
-            host,
-            ip: "",
-            reason: "",
-        };
+        let meta = cf::collect_meta("decrypt", command, "");
         let deks = cf::get_deks(&config, &salts, meta).await?;
 
         let mut out = Vec::with_capacity(urls.len());
@@ -499,13 +488,7 @@ impl VTClient {
     async fn cf_auth(reason: &str) -> Result<()> {
         let config = cf::load_config()
             .context("SSH agent unavailable; also failed to load CF config")?;
-        let meta = cf::ChallengeMeta {
-            op_kind: "auth",
-            command: "",
-            host: &get_hostname(),
-            ip: "",
-            reason,
-        };
+        let meta = cf::collect_meta("auth", "", reason);
         cf::get_deks(&config, &[], meta).await?;
         Ok(())
     }
@@ -516,6 +499,7 @@ impl VTClient {
             let req = AuthReq {
                 host: get_hostname(),
                 reason: reason.to_string(),
+                meta: cf::collect_client_meta(),
             };
             let payload = serde_json::to_vec(&req)?;
             let auth_token = self.auth_token.clone();

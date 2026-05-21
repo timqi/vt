@@ -15,6 +15,22 @@ export function b64uDec(s: string): Uint8Array {
   return out;
 }
 
+// Decode b64u and assert exact byte length. Throws on missing/non-b64u
+// inputs and on length mismatch; callers translate the throw into a 400.
+const B64U_RE = /^[A-Za-z0-9_-]+$/;
+export function decodeB64uExact(v: unknown, expectedLen: number, field: string): Uint8Array {
+  if (typeof v !== 'string' || v.length === 0 || !B64U_RE.test(v)) {
+    throw new Error(`${field}: missing or not b64u`);
+  }
+  const bytes = b64uDec(v);
+  if (bytes.length !== expectedLen) throw new Error(`${field}: wrong length`);
+  return bytes;
+}
+
+export function isB64uString(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0 && B64U_RE.test(v);
+}
+
 export async function sha256(data: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest('SHA-256', data));
 }
@@ -34,19 +50,26 @@ export async function derivePathPrefix(vtAuthCf: string): Promise<string> {
 }
 
 // challenge_hash = SHA-256(
-//   "vt-challenge-v1"  (15 bytes)
-//   || daemon_pubkey   (32 bytes)
-//   || worker_nonce    (16 bytes)
-//   || timestamp_ms    (8 bytes big-endian u64)
-//   || sha256(concat(salts))  (32 bytes) — binds salts to the phone's assertion
+//   "vt-challenge-v2"        (15 bytes)
+//   || daemon_pubkey         (32 bytes)
+//   || worker_nonce          (16 bytes)
+//   || timestamp_ms          (8 bytes big-endian u64)
+//   || sha256(concat(salts)) (32 bytes) — binds salts to the phone's assertion
+//   || action_byte           (1 byte: 0x01 approve, 0x02 reject)
 // )
+// Domain-separating the action prevents replay of an approve assertion against
+// /api/reject (or vice versa).
+const ACTION_BYTE = { approve: 0x01, reject: 0x02 } as const;
+export type ChallengeAction = keyof typeof ACTION_BYTE;
+
 export async function challengeHash(
   daemonPubkey: Uint8Array,
   workerNonce: Uint8Array,
   timestampMs: number,
   salts: Uint8Array[],
+  action: ChallengeAction,
 ): Promise<Uint8Array> {
-  const domain = new TextEncoder().encode('vt-challenge-v1');
+  const domain = new TextEncoder().encode('vt-challenge-v2');
   const tsBytes = new Uint8Array(8);
   new DataView(tsBytes.buffer).setBigUint64(0, BigInt(timestampMs), false);
 
@@ -56,12 +79,13 @@ export async function challengeHash(
   for (const s of salts) { saltConcat.set(s, off); off += s.length; }
   const saltsHash = await sha256(saltConcat);
 
-  const msg = new Uint8Array(15 + 32 + 16 + 8 + 32);
+  const msg = new Uint8Array(15 + 32 + 16 + 8 + 32 + 1);
   msg.set(domain, 0);
   msg.set(daemonPubkey, 15);
   msg.set(workerNonce, 47);
   msg.set(tsBytes, 63);
   msg.set(saltsHash, 71);
+  msg[103] = ACTION_BYTE[action];
   return sha256(msg);
 }
 

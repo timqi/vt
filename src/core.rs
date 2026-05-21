@@ -33,10 +33,50 @@ pub struct EncryptItem {
     pub t: SecretType,
 }
 
+/// Display-only context about the client process collected on the CLI side.
+/// Travels with `decrypt@vt` and `auth@vt` so the agent can show the operator
+/// (Touch ID prompt) — and, on the CF ceremony path, the phone's approval
+/// page — enough context to recognize the session before approving.
+///
+/// Wire shape is forward/backward compatible: every field is `#[serde(default)]`
+/// so an older client without these fields still deserializes (yielding empty
+/// strings), and a newer agent reading an older request gracefully gets a
+/// `ClientMeta::default()`. The CLI sanitizes (control-char strip, char
+/// truncation) before sending; the agent re-sanitizes defensively before
+/// surfacing to a UI.
+/// Strip ASCII/Unicode control chars and length-cap a string for display.
+/// Used everywhere display text crosses a trust boundary (CF approval page,
+/// Touch ID prompt, log lines). Truncates with an ellipsis (`…`).
+pub fn sanitize_for_display(s: &str, max_chars: usize) -> String {
+    let cleaned: String = s.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.chars().count() > max_chars {
+        let truncated: String = cleaned.chars().take(max_chars).collect();
+        format!("{}…", truncated)
+    } else {
+        cleaned
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+pub struct ClientMeta {
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub pwd: String,
+    #[serde(default)]
+    pub tty: String,
+    #[serde(default)]
+    pub ppid_cmd: String,
+    #[serde(default)]
+    pub ssh_client: String,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct AuthReq {
     pub host: String,
     pub reason: String,
+    #[serde(default)]
+    pub meta: ClientMeta,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -140,6 +180,8 @@ pub struct DecryptReq {
     pub host: String,
     pub command: String,
     pub items: Vec<DecryptInput>,
+    #[serde(default)]
+    pub meta: ClientMeta,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -540,5 +582,68 @@ mod tests {
             assert!(!url.contains("mac/"), "url must not contain mac/: {}", url);
             assert!(url.starts_with("vt://"));
         }
+    }
+
+    // ── ClientMeta wire-compat tests ──────────────────────────────────────
+    //
+    // The wire-version bump policy (#[serde(default)] on every new field) is
+    // load-bearing for mixed CLI/agent rollouts. These tests pin that
+    // behavior so a future #[serde(deny_unknown_fields)] or a removed
+    // #[serde(default)] will fail the suite.
+
+    #[test]
+    fn auth_req_deserializes_when_meta_is_missing() {
+        // An old client (pre-meta) sends only host/reason. The agent must
+        // still parse the request and get an empty ClientMeta.
+        let json = br#"{"host":"alpha","reason":"sudo"}"#;
+        let req: AuthReq = serde_json::from_slice(json).expect("must parse old-shape AuthReq");
+        assert_eq!(req.host, "alpha");
+        assert_eq!(req.reason, "sudo");
+        assert_eq!(req.meta.user, "");
+        assert_eq!(req.meta.pwd, "");
+        assert_eq!(req.meta.ssh_client, "");
+    }
+
+    #[test]
+    fn decrypt_req_deserializes_when_meta_is_missing() {
+        // Same forward-compat property for DecryptReq.
+        let json = br#"{"host":"alpha","command":"[read]","items":[]}"#;
+        let req: DecryptReq = serde_json::from_slice(json).expect("must parse old-shape DecryptReq");
+        assert_eq!(req.host, "alpha");
+        assert_eq!(req.command, "[read]");
+        assert!(req.items.is_empty());
+        assert_eq!(req.meta.user, "");
+        assert_eq!(req.meta.pwd, "");
+    }
+
+    #[test]
+    fn client_meta_roundtrip_preserves_all_fields() {
+        let m = ClientMeta {
+            user: "qiqi".into(),
+            pwd: "/Users/qiqi/proj".into(),
+            tty: "/dev/pts/3".into(),
+            ppid_cmd: "zsh -i".into(),
+            ssh_client: "10.0.0.5 5234 22".into(),
+        };
+        let json = serde_json::to_vec(&m).unwrap();
+        let back: ClientMeta = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.user, "qiqi");
+        assert_eq!(back.pwd, "/Users/qiqi/proj");
+        assert_eq!(back.tty, "/dev/pts/3");
+        assert_eq!(back.ppid_cmd, "zsh -i");
+        assert_eq!(back.ssh_client, "10.0.0.5 5234 22");
+    }
+
+    #[test]
+    fn client_meta_partial_fields_default_the_rest() {
+        // A future client that omits ssh_client (because the env var is
+        // empty) must still produce a well-formed ClientMeta.
+        let json = br#"{"user":"qiqi","pwd":"/tmp"}"#;
+        let m: ClientMeta = serde_json::from_slice(json).unwrap();
+        assert_eq!(m.user, "qiqi");
+        assert_eq!(m.pwd, "/tmp");
+        assert_eq!(m.tty, "");
+        assert_eq!(m.ppid_cmd, "");
+        assert_eq!(m.ssh_client, "");
     }
 }
