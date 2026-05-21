@@ -44,20 +44,6 @@ app.use('*', async (c, next) => {
 
 app.get('/healthz', c => c.text('ok'));
 
-// ── Static PWA assets — routed through the ASSETS binding ─────────────────
-// The pwa/ directory is bound to ASSETS in wrangler.toml. Assets are served
-// at /pwa/* directly, without the secret prefix. This is intentional: the
-// assets themselves carry no secrets and the HTML they load always includes
-// the approve_token in the dynamic path.
-
-app.get('/pwa/*', async (c) => {
-  // ASSETS directory = "pwa", so files are indexed without the /pwa prefix.
-  // Strip it before fetching: /pwa/libsodium.js → /libsodium.js → pwa/libsodium.js.
-  const url = new URL(c.req.url);
-  url.pathname = url.pathname.slice('/pwa'.length) || '/';
-  return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
-});
-
 // ── Secret-prefixed routes ────────────────────────────────────────────────
 
 app.all('/:prefix/*', async (c, next) => {
@@ -68,6 +54,18 @@ app.all('/:prefix/*', async (c, next) => {
     return c.text('Not Found', 404);
   }
   return next();
+});
+
+// Static PWA assets — served under the secret prefix so the whole API
+// surface (including CSS/JS) sits behind the same firewall policy that
+// gates /:prefix/*. The pwa/ directory is bound to ASSETS in wrangler.toml.
+app.get('/:prefix/pwa/*', async (c) => {
+  const url = new URL(c.req.url);
+  // Strip "/{prefix}/pwa" so ASSETS resolves against the pwa/ root:
+  // /{prefix}/pwa/libsodium.js → /libsodium.js → pwa/libsodium.js
+  const prefix = c.req.param('prefix');
+  url.pathname = url.pathname.slice(`/${prefix}/pwa`.length) || '/';
+  return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
 });
 
 // POST /api/challenge — daemon creates a challenge
@@ -224,6 +222,7 @@ app.post('/:prefix/api/reject', async (c) => {
 // GET /a/:approve_token — serve the approval PWA page
 app.get('/:prefix/a/:approve_token', async (c) => {
   const approveToken = c.req.param('approve_token');
+  const prefix = c.req.param('prefix');
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   // Fetch page data from DO
   const dataResp = await stub.fetch(`https://account.do/op/page?approve_token=${approveToken}`);
@@ -234,11 +233,11 @@ app.get('/:prefix/a/:approve_token', async (c) => {
   const pageData: ApprovePageData = await dataResp.json();
 
   // Inject page data into HTML template
-  const html = buildApprovePage(pageData);
+  const html = buildApprovePage(pageData, prefix);
   const resp = c.html(html);
   // Tight CSP for the approval page. <script type="application/json"> is
-  // non-executable and exempt from script-src; same-origin /pwa/* scripts and
-  // styles match 'self'; fetch() to /:prefix/api/* is same-origin.
+  // non-executable and exempt from script-src; same-origin /:prefix/pwa/*
+  // scripts and styles match 'self'; fetch() to /:prefix/api/* is same-origin.
   resp.headers.set(
     'Content-Security-Policy',
     "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
@@ -248,20 +247,21 @@ app.get('/:prefix/a/:approve_token', async (c) => {
 
 // ── HTML template ─────────────────────────────────────────────────────────
 
-function buildApprovePage(data: ApprovePageData): string {
+function buildApprovePage(data: ApprovePageData, prefix: string): string {
   const dataJson = JSON.stringify(data)
     .replace(/</g, '\\u003c')
     .replace(/>/g, '\\u003e')
     .replace(/&/g, '\\u0026')
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029');
+  const base = `/${prefix}/pwa`;
   return `<!doctype html>
 <html lang="zh">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>VT 审批请求</title>
-  <link rel="stylesheet" href="/pwa/approve.css">
+  <link rel="stylesheet" href="${base}/approve.css">
 </head>
 <body>
   <script type="application/json" id="vt-data">${dataJson}</script>
@@ -280,9 +280,9 @@ function buildApprovePage(data: ApprovePageData): string {
     </section>
     <p id="status" role="status" aria-live="polite"></p>
   </main>
-  <script src="/pwa/libsodium.js"></script>
-  <script src="/pwa/common.js"></script>
-  <script src="/pwa/approve.js"></script>
+  <script src="${base}/libsodium.js"></script>
+  <script src="${base}/common.js"></script>
+  <script src="${base}/approve.js"></script>
 </body>
 </html>`;
 }
