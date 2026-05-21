@@ -18,6 +18,7 @@ import { Env, Challenge, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, W
 import { b64uDec, b64uEnc, isB64uString, decodeB64uExact } from './crypto';
 import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
+import { log, logErr, tokenPrefix } from './log';
 
 const TTL_MS = 5 * 60 * 1000;
 const RETENTION_MS = 10 * 60 * 1000;
@@ -121,6 +122,14 @@ export class AccountDO extends DurableObject<Env> {
         for (const ws of wss) {
           try { ws.send(JSON.stringify({ status: 'expired' } satisfies WsMessage)); ws.close(1000, 'expired'); } catch {}
         }
+        log('expired', {
+          at: tokenPrefix(ch.approve_token),
+          op_kind: ch.meta.op_kind,
+          host: ch.meta.host,
+          user: ch.meta.user,
+          tty: ch.meta.tty,
+          age_ms: now - ch.created_ms,
+        });
         // Retain `ch:` for RETENTION_MS so an in-flight WS reconnect still
         // sees the terminal status; drop only the routing key now.
         toDelete.push(ptKey);
@@ -190,7 +199,7 @@ export class AccountDO extends DurableObject<Env> {
     try {
       creds = parseCredentials(this.env.CREDENTIALS_JSON);
     } catch (e) {
-      console.error('credentials parse error:', e);
+      logErr('credentials.parse_error', e);
       return new Response('server error', { status: 500 });
     }
     const credId = b64uDec(body.credential_id_b64u);
@@ -222,7 +231,7 @@ export class AccountDO extends DurableObject<Env> {
         expectedOrigin: this.expectedOrigin,
       });
     } catch (e) {
-      console.error('webauthn verify failed:', e);
+      logErr('webauthn.verify_failed', e, { at: tokenPrefix(ch.approve_token) });
       return new Response('assertion verification failed', { status: 401 });
     }
 
@@ -232,6 +241,15 @@ export class AccountDO extends DurableObject<Env> {
     ch.binding_tag_b64u = body.binding_tag_b64u;
     ch.finalized_ms = Date.now();
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
+
+    log('approved', {
+      at: tokenPrefix(ch.approve_token),
+      op_kind: ch.meta.op_kind,
+      host: ch.meta.host,
+      user: ch.meta.user,
+      tty: ch.meta.tty,
+      latency_ms: ch.finalized_ms - ch.created_ms,
+    });
 
     // Wake waiting WS clients
     const wss = this.ctx.getWebSockets(`pt:${ch.poll_token}`);
@@ -302,6 +320,15 @@ export class AccountDO extends DurableObject<Env> {
     for (const ws of wss) {
       try { ws.send(JSON.stringify({ status: 'rejected' } satisfies WsMessage)); ws.close(1000, 'rejected'); } catch {}
     }
+
+    log('rejected', {
+      at: tokenPrefix(ch.approve_token),
+      op_kind: ch.meta.op_kind,
+      host: ch.meta.host,
+      user: ch.meta.user,
+      tty: ch.meta.tty,
+      latency_ms: ch.finalized_ms - ch.created_ms,
+    });
 
     return new Response('ok');
   }

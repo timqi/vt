@@ -119,7 +119,6 @@ pub struct ChallengeMeta {
     pub tty: String,
     pub ppid_cmd: String,
     pub ssh_client: String,
-    pub ip: String,
     pub reason: String,
 }
 
@@ -138,7 +137,6 @@ pub fn collect_meta(op_kind: &str, command: &str, reason: &str) -> ChallengeMeta
         tty: client.tty,
         ppid_cmd: client.ppid_cmd,
         ssh_client: client.ssh_client,
-        ip: String::new(),
         reason: sanitize(reason, 200),
     }
 }

@@ -9,6 +9,7 @@ import { Env } from './types';
 import { derivePathPrefix, b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, inReplayWindow } from './crypto';
 import { notifyApproval } from './pushover';
 import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ApproveRequest, RejectRequest } from './types';
+import { log, logErr, tokenPrefix } from './log';
 
 export { AccountDO } from './do_account';
 
@@ -131,7 +132,10 @@ app.post('/:prefix/api/challenge', async (c) => {
       tty:        capMeta(body.meta?.tty, 40),
       ppid_cmd:   capMeta(body.meta?.ppid_cmd, 200),
       ssh_client: capMeta(body.meta?.ssh_client, 100),
-      ip:         capMeta(body.meta?.ip ?? c.req.header('CF-Connecting-IP'), 64),
+      // IP is set by the worker from CF-Connecting-IP, never trusted from the
+      // CLI body — a compromised or misconfigured CLI could otherwise spoof
+      // the source IP shown to the approver.
+      ip:         capMeta(c.req.header('CF-Connecting-IP'), 64),
       reason:     capMeta(body.meta?.reason, 200),
     },
     status: 'pending',
@@ -158,7 +162,17 @@ app.post('/:prefix/api/challenge', async (c) => {
     ? { appToken: c.env.PUSHOVER_APP_TOKEN, userToken: c.env.PUSHOVER_USER_TOKEN }
     : null;
   const pushWarning = await notifyApproval(secrets, ch.meta.op_kind, ch.meta, approveUrl);
-  if (pushWarning) console.error('pushover (non-fatal):', pushWarning);
+  if (pushWarning) logErr('pushover.failed', pushWarning, { at: tokenPrefix(approveToken) });
+
+  log('challenge.created', {
+    at: tokenPrefix(approveToken),
+    op_kind: ch.meta.op_kind,
+    host: ch.meta.host,
+    user: ch.meta.user,
+    tty: ch.meta.tty,
+    ip: ch.meta.ip,
+    salts: saltArrays.length,
+  });
 
   const resp: ChallengeResponse = {
     approve_token: approveToken,
@@ -272,5 +286,11 @@ function buildApprovePage(data: ApprovePageData): string {
 </body>
 </html>`;
 }
+
+// Unhandled exceptions → one structured error event + opaque 500 to caller.
+app.onError((err, c) => {
+  logErr('error', err, { path: new URL(c.req.url).pathname });
+  return c.text('internal error', 500);
+});
 
 export default app;
