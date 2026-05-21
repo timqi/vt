@@ -3,7 +3,7 @@
 // Called by client.rs when the SSH agent path is unavailable (Linux, or macOS
 // without a running vt ssh agent). The ceremony:
 //
-//   1. Load cf_config.json (worker_url + worker_auth).
+//   1. Read VT_PASSKEY_URL + VT_PASSKEY_TOKEN from the environment.
 //   2. Generate ephemeral X25519 keypair and per-DEK salts (16 B each).
 //   3. POST /api/challenge  →  approve_url, poll_token, worker_nonce.
 //   4. Print approve_url to stderr.
@@ -13,8 +13,6 @@
 //   8. Return DEKs to caller; ephemeral secret key is wiped on drop.
 //
 // master_key never leaves the user's phone. The daemon never holds it.
-
-use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -46,24 +44,29 @@ pub fn random_salts(n: usize) -> Vec<[u8; 16]> {
 
 // ── Config ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct CfConfig {
     pub worker_url: String,
     pub worker_auth: String,
 }
 
+/// Read the CF worker URL + HMAC token from the environment.
+///
+/// Both vars are required: there is no file fallback and no implicit default,
+/// so a misconfigured host fails fast rather than silently calling the wrong
+/// worker.
 pub fn load_config() -> Result<CfConfig> {
-    let path = config_path();
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
-    serde_json::from_str(&raw)
-        .with_context(|| format!("parse {}", path.display()))
-}
-
-fn config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/vt/cf_config.json")
+    let worker_url = std::env::var("VT_PASSKEY_URL")
+        .context("VT_PASSKEY_URL not set")?;
+    let worker_auth = std::env::var("VT_PASSKEY_TOKEN")
+        .context("VT_PASSKEY_TOKEN not set")?;
+    if worker_url.trim().is_empty() {
+        bail!("VT_PASSKEY_URL is empty");
+    }
+    if worker_auth.trim().is_empty() {
+        bail!("VT_PASSKEY_TOKEN is empty");
+    }
+    Ok(CfConfig { worker_url, worker_auth })
 }
 
 // ── Path prefix ────────────────────────────────────────────────────────────

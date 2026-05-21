@@ -2,7 +2,7 @@
 //!
 //! Primary path: SSH agent via `$SSH_AUTH_SOCK` or `~/.ssh/vt.sock`.
 //! Fallback path (Linux / macOS without agent): CF ceremony via
-//! `~/.config/vt/cf_config.json` — POST /api/challenge + WS /api/dek.
+//! VT_PASSKEY_URL + VT_PASSKEY_TOKEN env vars — POST /api/challenge + WS /api/dek.
 
 use std::env;
 use std::io::{self, Write};
@@ -161,8 +161,22 @@ pub struct VTClient {
 }
 
 impl VTClient {
-    pub fn new(auth_token: String) -> Self {
-        VTClient { auth_token }
+    /// Build a client and verify that at least one decryption path is
+    /// configured. Each path is opt-in by its own env vars:
+    ///
+    /// - SSH agent path: `VT_AUTH` (passed in as `auth_token`)
+    /// - CF passkey path: `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN`
+    ///
+    /// If neither is set we fail here rather than deep inside the routing
+    /// code, so the user sees a single actionable error.
+    pub fn new(auth_token: String) -> Result<Self> {
+        if auth_token.is_empty() && std::env::var("VT_PASSKEY_URL").is_err() {
+            anyhow::bail!(
+                "no decryption path configured — set VT_AUTH for the SSH agent path, \
+                 or VT_PASSKEY_URL + VT_PASSKEY_TOKEN for the phone passkey ceremony"
+            );
+        }
+        Ok(VTClient { auth_token })
     }
 
     /// Try to send an extension request via the SSH agent socket.
@@ -189,6 +203,14 @@ impl VTClient {
         payload: &[u8],
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
         use std::os::unix::net::UnixStream;
+
+        // No VT_AUTH → caller hasn't opted in to the SSH-agent path; skip it
+        // and let agent_call_or_fallback route to the CF passkey ceremony.
+        // This also avoids decoding an empty auth token when $SSH_AUTH_SOCK
+        // happens to point at an unrelated ssh-agent (common on Linux).
+        if auth_token.is_empty() {
+            return Ok(None);
+        }
 
         let socket_path = if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
             std::path::PathBuf::from(sock)
@@ -473,7 +495,7 @@ impl VTClient {
 
     async fn cf_encrypt(items: &[EncryptItem], _host: &str) -> Result<Vec<CryptoResItem>> {
         let config = cf::load_config()
-            .context("SSH agent unavailable; also failed to load CF config")?;
+            .context("SSH agent unavailable; CF passkey env not configured")?;
         let mut salts = cf::random_salts(items.len());
         let meta = cf::collect_meta("encrypt", "", "");
         let deks = cf::get_deks(&config, &salts, meta).await?;
@@ -491,7 +513,7 @@ impl VTClient {
 
     async fn cf_decrypt(_host: &str, command: &str, urls: &[String]) -> Result<Vec<CryptoResItem>> {
         let config = cf::load_config()
-            .context("SSH agent unavailable; also failed to load CF config")?;
+            .context("SSH agent unavailable; CF passkey env not configured")?;
 
         // Parse URLs; collect v2 salts in order
         struct Item {
@@ -538,7 +560,7 @@ impl VTClient {
 
     async fn cf_auth(reason: &str) -> Result<()> {
         let config = cf::load_config()
-            .context("SSH agent unavailable; also failed to load CF config")?;
+            .context("SSH agent unavailable; CF passkey env not configured")?;
         let meta = cf::collect_meta("auth", "", reason);
         cf::get_deks(&config, &[], meta).await?;
         Ok(())
