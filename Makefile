@@ -2,7 +2,6 @@
 
 build:
 	cargo build --release --bin vt
-	codesign --force --sign "qiqi dev" target/release/vt
 
 install: build
 	mkdir -p ~/.local/bin
