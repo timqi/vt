@@ -406,6 +406,90 @@ pub fn legacy_decrypt(mac_cipher: &AesGcmCrypto, url: &str) -> CryptoResItem {
     }
 }
 
+// ---- vt:// URL scanning -----------------------------------------------------
+//
+// Hand-rolled scanners replace the `regex` dependency for the trivial pattern
+// `vt://(?:mac/)?[A-Za-z0-9_-]+`. The regex crate adds ~600KB to the binary
+// for just two patterns, so we inline them here.
+
+#[inline]
+fn is_vt_body_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Find the next `vt://` URL starting at or after `from`. Returns the byte
+/// range `[start, end)` covering the full match, or `None` if no match.
+fn next_vt_url(s: &str, from: usize) -> Option<std::ops::Range<usize>> {
+    let bytes = s.as_bytes();
+    let mut cursor = from;
+    while let Some(rel) = s[cursor..].find("vt://") {
+        let start = cursor + rel;
+        let mut body = start + 5;
+        if body + 4 <= bytes.len() && &bytes[body..body + 4] == b"mac/" {
+            body += 4;
+        }
+        let mut end = body;
+        while end < bytes.len() && is_vt_body_byte(bytes[end]) {
+            end += 1;
+        }
+        if end > body {
+            return Some(start..end);
+        }
+        cursor = start + 5;
+    }
+    None
+}
+
+/// Iterate over non-overlapping `vt://[mac/]?<body>` matches as `&str` slices.
+pub fn iter_vt_urls(s: &str) -> impl Iterator<Item = &str> {
+    let mut cursor = 0usize;
+    std::iter::from_fn(move || {
+        let r = next_vt_url(s, cursor)?;
+        cursor = r.end;
+        Some(&s[r])
+    })
+}
+
+/// `true` if `s` contains at least one `vt://` URL match.
+pub fn has_vt_url(s: &str) -> bool {
+    next_vt_url(s, 0).is_some()
+}
+
+/// Replace every `vt://` URL in `s` with `replacement`. Non-URL bytes are
+/// preserved verbatim (no other normalization).
+pub fn redact_vt_urls(s: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    while let Some(r) = next_vt_url(s, cursor) {
+        out.push_str(&s[cursor..r.start]);
+        out.push_str(replacement);
+        cursor = r.end;
+    }
+    out.push_str(&s[cursor..]);
+    out
+}
+
+/// Collapse every run of Unicode whitespace to a single ASCII space.
+/// Equivalent to `Regex::new(r"\s+").replace_all(s, " ")`: leading and
+/// trailing whitespace runs are preserved as a single space (i.e. NOT
+/// trimmed), matching the original regex behavior used for command display.
+pub fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+                in_space = true;
+            }
+        } else {
+            out.push(ch);
+            in_space = false;
+        }
+    }
+    out
+}
+
 // ---- Tests ------------------------------------------------------------------
 
 #[cfg(test)]
@@ -645,5 +729,95 @@ mod tests {
         assert_eq!(m.tty, "");
         assert_eq!(m.ppid_cmd, "");
         assert_eq!(m.ssh_client, "");
+    }
+
+    // ── vt:// URL scanner tests ────────────────────────────────────────────
+    //
+    // These pin behavior against the previous regex (`vt://(?:mac/)?[A-Za-z0-9_-]+`)
+    // so anyone touching the hand-rolled scanner sees breakage immediately.
+
+    fn collect_urls(s: &str) -> Vec<&str> {
+        iter_vt_urls(s).collect()
+    }
+
+    #[test]
+    fn scan_single_url() {
+        assert_eq!(collect_urls("vt://abc"), vec!["vt://abc"]);
+    }
+
+    #[test]
+    fn scan_mac_variant() {
+        assert_eq!(collect_urls("vt://mac/abc_def-ghi"), vec!["vt://mac/abc_def-ghi"]);
+    }
+
+    #[test]
+    fn scan_multiple_urls_in_text() {
+        assert_eq!(
+            collect_urls("export FOO=vt://abc BAR=vt://mac/xyz BAZ=42"),
+            vec!["vt://abc", "vt://mac/xyz"],
+        );
+    }
+
+    #[test]
+    fn scan_stops_at_non_body_char() {
+        // '.', '!', '/', and unicode chars all terminate the body.
+        assert_eq!(collect_urls("vt://abc.suffix"), vec!["vt://abc"]);
+        assert_eq!(collect_urls("vt://abc! more"), vec!["vt://abc"]);
+        assert_eq!(collect_urls("vt://abc/extra"), vec!["vt://abc"]);
+        assert_eq!(collect_urls("vt://αβγ"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn scan_rejects_empty_body() {
+        // "vt://" with no body chars must not match (regex `+` requires 1+).
+        assert!(collect_urls("vt://").is_empty());
+        assert!(collect_urls("vt://mac/").is_empty());
+        assert!(collect_urls("vt:// vt://").is_empty());
+    }
+
+    #[test]
+    fn scan_adjacent_urls() {
+        // Whitespace-separated; the scanner must not glue them together.
+        assert_eq!(collect_urls("vt://a vt://b"), vec!["vt://a", "vt://b"]);
+    }
+
+    #[test]
+    fn scan_charset_covers_b64url() {
+        // Body matches base64url-no-pad alphabet plus alphanumerics: every
+        // char a real URL body could contain must be accepted.
+        let body = "ABCabc012_-";
+        let s = format!("vt://{body}");
+        assert_eq!(collect_urls(&s), vec![s.as_str()]);
+    }
+
+    #[test]
+    fn has_vt_url_works() {
+        assert!(has_vt_url("hello vt://abc world"));
+        assert!(has_vt_url("vt://mac/x"));
+        assert!(!has_vt_url("hello world"));
+        assert!(!has_vt_url("vt://"));
+        assert!(!has_vt_url(""));
+    }
+
+    #[test]
+    fn redact_replaces_all_matches() {
+        assert_eq!(
+            redact_vt_urls("echo vt://abc and vt://mac/xyz!", "vt://***"),
+            "echo vt://*** and vt://***!",
+        );
+        assert_eq!(redact_vt_urls("no urls here", "vt://***"), "no urls here");
+        assert_eq!(redact_vt_urls("vt:// alone", "vt://***"), "vt:// alone");
+    }
+
+    #[test]
+    fn collapse_whitespace_matches_regex() {
+        // Internal runs collapse.
+        assert_eq!(collapse_whitespace("a   b\tc\nd"), "a b c d");
+        // Leading/trailing runs collapse to a single space (NOT trimmed),
+        // matching `Regex::new(r"\s+").replace_all(s, " ")` semantics.
+        assert_eq!(collapse_whitespace("  foo  "), " foo ");
+        assert_eq!(collapse_whitespace(""), "");
+        // Unicode whitespace is treated as whitespace too.
+        assert_eq!(collapse_whitespace("a\u{00A0}b"), "a b");
     }
 }

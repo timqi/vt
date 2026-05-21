@@ -294,7 +294,8 @@ pub async fn get_deks(
         bail!("challenge: HTTP {status}: {body}");
     }
 
-    let ch: ChallengeResp = resp.json().await.context("challenge response parse")?;
+    let body = resp.bytes().await.context("challenge response read")?;
+    let ch: ChallengeResp = serde_json::from_slice(&body).context("challenge response parse")?;
 
     let worker_nonce: [u8; 16] = decode_b64u_exact(&ch.worker_nonce_b64u, "worker_nonce")?;
     let approve_challenge_hash =

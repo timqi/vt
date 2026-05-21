@@ -11,9 +11,9 @@ use crate::cf;
 use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
 use crate::core::wire::{ErrKind, WIRE_VERSION};
 use crate::core::{
-    client_decrypt_v2, client_encrypt_v2, AuthReq, AuthRes, CryptoResItem, DecryptInput,
-    DecryptReq, DecryptResItem, EncryptItem, EncryptReq, EncryptResItem, SecretType, VtUrl,
-    SALT_LEN,
+    client_decrypt_v2, client_encrypt_v2, collapse_whitespace, has_vt_url, iter_vt_urls,
+    redact_vt_urls, AuthReq, AuthRes, CryptoResItem, DecryptInput, DecryptReq, DecryptResItem,
+    EncryptItem, EncryptReq, EncryptResItem, SecretType, VtUrl, SALT_LEN,
 };
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -678,11 +678,10 @@ async fn decrypt_from_multi_str(
     // Extract `vt://...` patterns. Matches both v2 (`vt://0...`) and legacy
     // (`vt://mac/0...`) shapes; the optional `mac/` segment lets new and old
     // URLs coexist during migration. Body chars are base64url-no-pad.
-    let vt_pattern = regex::Regex::new(r"vt://(?:mac/)?[A-Za-z0-9_-]+").unwrap();
     for item in &original_str_vec {
-        for vt_match in vt_pattern.find_iter(item) {
-            debug!("Found encrypted item: {}", vt_match.as_str());
-            encrypted_vec.push(vt_match.as_str().to_string());
+        for url in iter_vt_urls(item) {
+            debug!("Found encrypted item: {}", url);
+            encrypted_vec.push(url.to_string());
         }
     }
 
@@ -761,14 +760,8 @@ pub async fn inject(
     if raw_command.is_empty() {
         original_command.push_str(" [no shell command, output to stdout]");
     } else {
-        let normalized = regex::Regex::new(r"\s+")
-            .unwrap()
-            .replace_all(&raw_command, " ")
-            .to_string();
-        let sanitized = regex::Regex::new(r"vt://(?:mac/)?[A-Za-z0-9_-]+")
-            .unwrap()
-            .replace_all(&normalized, "vt://***")
-            .to_string();
+        let normalized = collapse_whitespace(&raw_command);
+        let sanitized = redact_vt_urls(&normalized, "vt://***");
         const MAX_CMD_LEN: usize = 60;
         let truncated = if sanitized.chars().count() > MAX_CMD_LEN {
             let s: String = sanitized.chars().take(MAX_CMD_LEN).collect();
@@ -796,9 +789,8 @@ pub async fn inject(
 
     // Scan env vars locally for vt:// patterns — only those values enter the
     // decrypt pipeline. Env var names and non-vt values never leave this process.
-    let vt_pattern = regex::Regex::new(r"vt://(?:mac/)?[A-Za-z0-9_-]+").unwrap();
     let env_vt_vars: Vec<(String, String)> = env::vars()
-        .filter(|(_, v)| vt_pattern.is_match(v))
+        .filter(|(_, v)| has_vt_url(v))
         .collect();
     for (_, value) in &env_vt_vars {
         args.push(value.clone());
