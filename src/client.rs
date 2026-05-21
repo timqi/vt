@@ -96,6 +96,34 @@ struct ParsedEnvelope<'a> {
     detail: Option<String>,
 }
 
+/// Policy for the `auto` backend mode (currently the only mode): when an
+/// SSH agent call fails, may we silently retry via the CF passkey path?
+///
+/// Falls back for:
+/// - Transport failures (socket talk, envelope parse, version mismatch,
+///   unstructured `AgentError::Failure`).
+/// - Agent errors where the agent self-reports it cannot deliver key
+///   material on this host (`SessionLocked`, `NoGuiSession`,
+///   `NotInitialized`, `AgentLocked`, `Generic`, `Transient`, `Unknown`,
+///   `LegacyDisabled`, `ProtocolVersion`).
+///
+/// Does NOT fall back for:
+/// - `AuthRejected` — user explicitly declined on Touch ID / phone; silently
+///   re-prompting via CF would be reverse of intent.
+/// - `BadRequest` — client constructed a malformed request; CF won't fix
+///   it and the structured error is more useful for debugging than a
+///   second failure on a different path.
+fn should_fallback_to_cf(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<VtClientError>() {
+        Some(VtClientError::Agent(kind, _)) => !matches!(
+            kind,
+            ErrKind::AuthRejected | ErrKind::BadRequest
+        ),
+        Some(VtClientError::Transport(_)) => true,
+        None => false,
+    }
+}
+
 fn parse_envelope(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let env: ParsedEnvelope = serde_json::from_slice(bytes)
         .map_err(|e| transport(anyhow::anyhow!("failed to parse agent envelope: {}", e)))?;
@@ -210,6 +238,33 @@ impl VTClient {
         }
     }
 
+    /// Wrap `try_agent_extension` with the `auto`-mode fallback policy:
+    /// translate `Ok(None)` (socket missing/refused) and recoverable
+    /// `Err(_)` (per [`should_fallback_to_cf`]) into a single `Ok(None)` so
+    /// callers can route to the CF path. Non-recoverable errors propagate.
+    #[cfg(unix)]
+    async fn agent_call_or_fallback(
+        auth_token: String,
+        name: &'static str,
+        payload: Vec<u8>,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let result = tokio::task::spawn_blocking(move || {
+            Self::try_agent_extension(&auth_token, name, &payload)
+        })
+        .await?;
+        match result {
+            Ok(some_or_none) => Ok(some_or_none),
+            Err(e) => {
+                if should_fallback_to_cf(&e) {
+                    eprintln!("{} — falling back to phone passkey", e);
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// v2 envelope encrypt. Asks the agent to allocate one fresh
     /// `(salt, DEK)` pair per `EncryptItem` (no plaintext leaves this
     /// process), then locally AEAD-encrypts each plaintext under its DEK and
@@ -223,10 +278,8 @@ impl VTClient {
             };
             let payload = serde_json::to_vec(&req)?;
             let auth_token = self.auth_token.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                Self::try_agent_extension(&auth_token, "encrypt@vt", &payload)
-            })
-            .await??;
+            let result =
+                Self::agent_call_or_fallback(auth_token, "encrypt@vt", payload).await?;
             let bytes = match result {
                 Some(b) => b,
                 None => return Self::cf_encrypt(items, &get_hostname()).await,
@@ -342,10 +395,8 @@ impl VTClient {
             };
             let payload = serde_json::to_vec(&wire)?;
             let auth_token = self.auth_token.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                Self::try_agent_extension(&auth_token, "decrypt@vt", &payload)
-            })
-            .await??;
+            let result =
+                Self::agent_call_or_fallback(auth_token, "decrypt@vt", payload).await?;
             let bytes = match result {
                 Some(b) => b,
                 None => return Self::cf_decrypt(host, command, urls).await,
@@ -503,10 +554,8 @@ impl VTClient {
             };
             let payload = serde_json::to_vec(&req)?;
             let auth_token = self.auth_token.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                Self::try_agent_extension(&auth_token, "auth@vt", &payload)
-            })
-            .await??;
+            let result =
+                Self::agent_call_or_fallback(auth_token, "auth@vt", payload).await?;
 
             match result {
                 Some(bytes) => {
@@ -1069,6 +1118,52 @@ mod tests {
             "garbage must surface as Transport, got {:?}",
             vt_err
         );
+    }
+
+    #[test]
+    fn fallback_policy_auth_rejected_does_not_fall_back() {
+        let e: anyhow::Error = VtClientError::Agent(ErrKind::AuthRejected, None).into();
+        assert!(!should_fallback_to_cf(&e));
+    }
+
+    #[test]
+    fn fallback_policy_bad_request_does_not_fall_back() {
+        let e: anyhow::Error = VtClientError::Agent(ErrKind::BadRequest, None).into();
+        assert!(!should_fallback_to_cf(&e));
+    }
+
+    #[test]
+    fn fallback_policy_session_locked_falls_back() {
+        let e: anyhow::Error = VtClientError::Agent(ErrKind::SessionLocked, None).into();
+        assert!(should_fallback_to_cf(&e));
+    }
+
+    #[test]
+    fn fallback_policy_other_agent_kinds_fall_back() {
+        for kind in [
+            ErrKind::NoGuiSession,
+            ErrKind::NotInitialized,
+            ErrKind::AgentLocked,
+            ErrKind::Generic,
+            ErrKind::Transient,
+            ErrKind::Unknown,
+            ErrKind::LegacyDisabled,
+            ErrKind::ProtocolVersion,
+        ] {
+            let e: anyhow::Error = VtClientError::Agent(kind, None).into();
+            assert!(
+                should_fallback_to_cf(&e),
+                "expected {:?} to fall back",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_policy_transport_falls_back() {
+        let e: anyhow::Error =
+            VtClientError::Transport(anyhow::anyhow!("socket closed")).into();
+        assert!(should_fallback_to_cf(&e));
     }
 
     #[test]

@@ -334,6 +334,7 @@ async fn main() {
         .with_max_level(log_level)
         .with_target(true)
         .with_line_number(true)
+        .with_writer(std::io::stderr)
         .compact()
         .init();
     let cli = Cli::parse();
