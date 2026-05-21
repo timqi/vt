@@ -31,6 +31,9 @@ const app = new Hono<{ Bindings: Env }>();
 
 app.use('*', async (c, next) => {
   await next();
+  // Responses from ASSETS.fetch / fetch() have immutable headers; rebuild
+  // so the security headers below can be applied uniformly.
+  c.res = new Response(c.res.body, c.res);
   c.res.headers.set('Strict-Transport-Security', 'max-age=31536000');
   c.res.headers.set('X-Content-Type-Options', 'nosniff');
   c.res.headers.set('Referrer-Policy', 'no-referrer');
