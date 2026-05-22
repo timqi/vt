@@ -57,26 +57,22 @@ enum Commands {
         #[arg(long, help = "Reason shown in the bio auth prompt")]
         reason: Option<String>,
     },
-    /// Read env/file and decrypt vt protocol, output to output-file or standard output
+    /// Decrypt vt:// in a file (in place, restored after --timeout) and/or
+    /// env/argv, then exec the given command.
     Inject {
         #[arg(
             short = 'r',
             long = "replace-file",
-            help = "Path to the file to replace with the decrypted vt protocol"
+            help = "File whose vt:// records are decrypted in place; restored after --timeout"
         )]
         replace_file: Option<String>,
-
-        #[arg(short = 'i', long = "input-file", help = "Path to the input file")]
-        input_file: Option<String>,
-
-        #[arg(short = 'o', long = "output-file", help = "Path to the output file")]
-        output_file: Option<String>,
 
         #[arg(
             short = 't',
             long,
             default_value = "2",
-            help = "Timeout for deleting output_file after the spawned process in seconds"
+            value_parser = clap::value_parser!(u32).range(1..),
+            help = "Seconds before the backup is restored over the decrypted file (>= 1)"
         )]
         timeout: u32,
 
@@ -331,8 +327,6 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Inject {
             replace_file,
-            input_file,
-            output_file,
             timeout,
             reason,
             args,
@@ -342,8 +336,6 @@ async fn run(cli: Cli) -> Result<()> {
             client::inject(
                 vt_client,
                 replace_file.clone(),
-                input_file.clone(),
-                output_file.clone(),
                 *timeout,
                 reason.as_deref(),
                 args.clone(),
@@ -353,8 +345,16 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // The inject supervisor is dispatched here, *before* tokio / tracing /
+    // clap load. It runs in the spawned child of `vt inject -r ...` and only
+    // needs to sleep, unlink a tmp file, and rename a backup over the target.
+    // Avoiding tokio shaves ~MB of RSS off a process that sleeps for seconds.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).and_then(|s| s.to_str()) == Some(client::SUPERVISOR_SUBCOMMAND) {
+        std::process::exit(client::supervisor_main(&args[2..]));
+    }
+
     let log_level = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| {
             if cfg!(debug_assertions) {
@@ -374,7 +374,11 @@ async fn main() {
         .init();
     let cli = Cli::parse();
 
-    if let Err(e) = run(cli).await {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    if let Err(e) = rt.block_on(run(cli)) {
         // Walk the error chain to find a `VtClientError`. The agent's
         // structured `ErrKind` maps to a stable exit code; transport
         // failures and any other error chain default to exit 1.

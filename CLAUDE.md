@@ -46,7 +46,7 @@ cf-worker/            TypeScript Cloudflare Worker + PWA
 ## Architecture
 
 ```
-CLI (vt read / write / auth / run)
+CLI (vt read / write / auth / run / inject)
   |
   +-- if $VT_AUTH set: try $SSH_AUTH_SOCK / ~/.ssh/vt.sock  (macOS: vt ssh agent)
   |    -> SSH extension protocol encrypt@vt / decrypt@vt / auth@vt / run@vt
@@ -123,6 +123,45 @@ vt ssh agent --run-allow zed,code,subl
 # or with absolute paths:
 vt ssh agent --run-allow /Applications/Zed.app/Contents/MacOS/cli
 ```
+
+## vt inject — transient in-place decryption
+
+`vt inject [-r FILE] [-t SECS] -- <cmd...>` decrypts every `vt://` it finds in
+(a) the `-r` file, (b) the trailing argv, and (c) any env var whose value
+contains a `vt://`, then `exec`s `cmd` so the child sees plaintext.
+
+The plaintext-exposure protocol (when `-r` is set):
+
+1. Open target with `O_NOFOLLOW`, stat to capture mode + reject non-regular.
+2. Write a sibling `.{name}.vt-backup-{rand}` (ciphertext copy, `O_CREAT|O_EXCL|O_NOFOLLOW`, mode = orig).
+3. **Spawn the restore supervisor** (self-exec'd `vt _internal-restore-after`, hidden subcommand). On spawn failure, delete the backup and return — no plaintext has touched disk yet.
+4. Write the plaintext to a sibling `.{name}.vt-tmp-{rand}` (same hidden-name rules as backup).
+5. `rename(tmp, target)` — atomic plaintext exposure.
+6. Parent `exec`s the user command. Supervisor restores ciphertext after `--timeout`.
+
+On exec failure the parent immediately `rename`s the backup back over target so the user doesn't wait out the timeout. The still-running supervisor later observes `ENOENT` on the backup and exits silently.
+
+Properties of the supervisor:
+
+- **Self-exec'd, not in-process fork.** Spawn happens via `Command::spawn()` with `pre_exec`; the supervisor is `vt _internal-restore-after <secs> <tmp> <backup> <target>` — a hidden subcommand dispatched in `main()` *before* tokio / clap / tracing load. Avoids the multi-threaded-`fork()` malloc-deadlock class and gives the supervisor process a tiny RSS (vt's text segment shared with the parent via the page cache; no tokio runtime).
+- **`setsid()` in `pre_exec`** detaches from the controlling TTY + session, so SIGHUP on terminal close and SIGINT on Ctrl+C of the parent's foreground pgroup don't reach us.
+- **Signal dispositions installed in the subcommand body, not `pre_exec`.** Rust's runtime resets signals between `execve` and our entry point; installing `SIG_IGN` for HUP/INT/TERM/PIPE/QUIT *after* runtime init and *before* the double-fork is the only way to make them survive into the grandchild. Verified via `/proc/$pid/status` `SigIgn` mask.
+- **Double-fork inside the subcommand body** orphans the sleeper to init (`PPID = 1`). The supervisor is invisible to user-cmd's process tree and `waitpid(-1)` loops.
+- **Stdio attached to `/dev/null`** so output never leaks back to the user's terminal.
+- **SIGKILL is the only kill that lands.** SIGSTOP would pause but not terminate. Everything else is ignored. Reboot or `kill -9` is out of vt's reach; the file is left plaintext on disk with an orphaned `.vt-backup-*` next to it (no automatic crash-recovery yet — see "Known gaps" below).
+
+Other properties:
+
+- **`--timeout` must be ≥ 1.** Enforced at clap layer (`value_parser = clap::value_parser!(u32).range(1..)`); `vt inject -r FILE -t 0` is rejected upfront.
+- **Plaintext routing via Unix composition, not flags.** No `--output-file` or `--stdout` mode — use the child: `vt inject -r a.vt -- cat a.vt`, `… -- cp a.vt /tmp/b`, `… -- jq .key a.vt`.
+- **env/argv decryption is independent of `-r`.** `vt inject -- cmd ...` (no file) still scans the parent's env and the trailing argv, decrypts any `vt://` values, sets the resolved env vars into the child, and execs.
+- **Symlinks refused.** `O_NOFOLLOW` on the original `-r` file and on every backup/temp create means a squatted symlink can't redirect the write.
+- **Path agnostic.** Same routing as the other CLI verbs — tries SSH agent first when `VT_AUTH` is set, falls back to the CF passkey ceremony.
+
+Known gaps:
+
+- **No crash-recovery on reboot.** If the system reboots while the supervisor is sleeping, the supervisor dies and never restores. Plaintext stays at `target`, ciphertext sits at the orphaned `.{name}.vt-backup-*` sibling. Manual recovery is `mv .{name}.vt-backup-* target`. A future on-boot sweep (sidecar state files + `vt inject --recover`) is deferred.
+- **Snapshot / backup leakage.** If Time Machine, ZFS snapshots, restic, etc., run while the plaintext is exposed, the snapshot retains plaintext indefinitely even after the supervisor restores. Out of scope.
 
 ## Worker deployment
 

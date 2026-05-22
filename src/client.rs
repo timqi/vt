@@ -776,23 +776,18 @@ async fn decrypt_from_multi_str(
     Ok(result_vec)
 }
 
+/// Argv[1] that triggers the detached restore supervisor. Dispatched in
+/// `main()` before tokio / clap, so the supervisor process is lean and never
+/// pays the cost of the full vt initialization.
+pub const SUPERVISOR_SUBCOMMAND: &str = "_internal-restore-after";
+
 pub async fn inject(
     vt_client: VTClient,
     replace_file: Option<String>,
-    input_file: Option<String>,
-    output_file: Option<String>,
     timeout: u32,
     reason: Option<&str>,
     mut args: Vec<String>,
 ) -> Result<()> {
-    if replace_file.is_some() {
-        if input_file.is_some() || output_file.is_some() {
-            return Err(anyhow::anyhow!(
-                "Cannot specify both replace file and input file or output file"
-            ));
-        }
-    }
-
     let raw_command = args.join(" ");
     debug!("Original command: {}", raw_command);
     let mut original_command = String::from("[inject]");
@@ -800,16 +795,8 @@ pub async fn inject(
         original_command.push_str(" -r ");
         original_command.push_str(&sanitize_prompt_field(p, 100));
     }
-    if let Some(p) = input_file.as_ref() {
-        original_command.push_str(" -i ");
-        original_command.push_str(&sanitize_prompt_field(p, 100));
-    }
-    if let Some(p) = output_file.as_ref() {
-        original_command.push_str(" -o ");
-        original_command.push_str(&sanitize_prompt_field(p, 100));
-    }
     if raw_command.is_empty() {
-        original_command.push_str(" [no shell command, output to stdout]");
+        original_command.push_str(" [no shell command]");
     } else {
         let normalized = collapse_whitespace(&raw_command);
         let sanitized = redact_vt_urls(&normalized, "vt://***");
@@ -828,7 +815,7 @@ pub async fn inject(
         original_command.push_str(&sanitize_prompt_field(r, 200));
     }
 
-    let input_file_content = match replace_file.as_ref().or(input_file.as_ref()) {
+    let replace_file_content = match replace_file.as_ref() {
         Some(file) => {
             debug!("Reading file: {}", file);
             std::fs::read_to_string(file)
@@ -836,7 +823,7 @@ pub async fn inject(
         }
         None => String::new(),
     };
-    args.push(input_file_content);
+    args.push(replace_file_content);
 
     // Scan env vars locally for vt:// patterns — only those values enter the
     // decrypt pipeline. Env var names and non-vt values never leave this process.
@@ -855,20 +842,26 @@ pub async fn inject(
         env::set_var(key, decrypted_value);
     }
 
-    let output_file_content = decrypted_args.pop().unwrap();
+    let decrypted_file_content = decrypted_args.pop().unwrap();
 
-    // For `--replace-file` and `--output-file`, write the plaintext safely:
-    //   - open the original with `O_NOFOLLOW` so we refuse symlinks;
-    //   - create backup and temp files with `O_CREAT|O_EXCL|O_NOFOLLOW` and
-    //     mode copied from the original (or 0600 for new outputs), so a
-    //     squatted sibling can't be opened and the file is not world-readable;
-    //   - randomize backup/temp names so the target isn't predictable between
-    //     the write and the eventual restore;
-    //   - write the plaintext to a sibling temp file and atomically rename it
-    //     over the original, eliminating the mid-write symlink race.
-    // The backup path is then passed to the cleanup child, which renames it
-    // back over the original after the timeout.
-    let backup_path: Option<std::path::PathBuf> = if let Some(replace_file_path) = &replace_file {
+    // Plaintext exposure protocol when -r is set:
+    //   1. Open target with O_NOFOLLOW, stat to capture mode + reject non-regular.
+    //   2. Write a backup file alongside the target (ciphertext copy, randomized
+    //      hidden name, O_CREAT|O_EXCL|O_NOFOLLOW, mode = orig).
+    //   3. Spawn the detached supervisor before any plaintext can hit disk.
+    //      Failure here deletes the backup and aborts — target stays ciphertext.
+    //   4. Write the tmp file (plaintext, same hidden-name rules as backup).
+    //   5. rename(tmp, target) — atomic plaintext exposure.
+    //   6. Parent execs the user command; supervisor restores after timeout.
+    //
+    // Steps 4, 5, and 6 each call `immediate_restore` on failure so the
+    // observable post-failure state collapses to "target = ciphertext, no
+    // sidecars" without waiting for the supervisor. The supervisor is the
+    // durable backstop: even if a parent crash makes immediate_restore
+    // unreachable, the supervisor's `unlink(tmp) + rename(backup, target)`
+    // after timeout still brings everything home (modulo SIGKILL / reboot).
+    let armed: Option<(String, std::path::PathBuf)> = if let Some(replace_file_path) = &replace_file
+    {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         let orig_path = std::path::Path::new(replace_file_path);
@@ -912,6 +905,7 @@ pub async fn inject(
         let backup_path = dir.join(format!(".{}.vt-backup-{}", file_name, suffix));
         let tmp_path = dir.join(format!(".{}.vt-tmp-{}", file_name, suffix));
 
+        // Step 2: write backup (ciphertext copy of target).
         {
             let mut backup_file = std::fs::OpenOptions::new()
                 .write(true)
@@ -933,106 +927,36 @@ pub async fn inject(
         drop(src);
         debug!("Created backup at: {}", backup_path.display());
 
-        {
-            let mut tmp_file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .mode(orig_mode)
-                .open(&tmp_path)
-                .with_context(|| format!("Failed to create temp file: {}", tmp_path.display()))?;
-            tmp_file
-                .write_all(output_file_content.as_bytes())
-                .with_context(|| format!("Failed to write temp file: {}", tmp_path.display()))?;
-            tmp_file.sync_all().ok();
+        // Step 3: arm supervisor before any plaintext touches disk.
+        match spawn_restore_supervisor(timeout, &tmp_path, &backup_path, replace_file_path) {
+            Ok(()) => debug!("Restore supervisor armed (timeout={}s)", timeout),
+            Err(e) => {
+                let _ = std::fs::remove_file(&backup_path);
+                return Err(e);
+            }
         }
-        std::fs::rename(&tmp_path, replace_file_path).with_context(|| {
-            format!("Failed to atomically replace file: {}", replace_file_path)
-        })?;
+
+        // Step 4: write tmp (plaintext).
+        if let Err(e) = write_plaintext_tmp(&tmp_path, orig_mode, &decrypted_file_content) {
+            // Parent does immediate cleanup so the failure leaves no visible
+            // sidecar state for the timeout window. Supervisor will later
+            // observe ENOENT on backup and exit silently.
+            let _ = std::fs::remove_file(&tmp_path);
+            immediate_restore(replace_file_path, &backup_path);
+            return Err(e);
+        }
+
+        // Step 5: atomically expose plaintext at target.
+        if let Err(e) = std::fs::rename(&tmp_path, replace_file_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            immediate_restore(replace_file_path, &backup_path);
+            return Err(e).with_context(|| {
+                format!("Failed to atomically replace file: {}", replace_file_path)
+            });
+        }
         debug!("Content written to replace file: {}", replace_file_path);
 
-        Some(backup_path)
-    } else if let Some(output_file_path) = &output_file {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut out = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(0o600)
-            .open(output_file_path)
-            .with_context(|| {
-                format!(
-                    "Failed to create output file (refuses existing/symlink): {}",
-                    output_file_path
-                )
-            })?;
-        out.write_all(output_file_content.as_bytes())
-            .with_context(|| format!("Failed to write output file: {}", output_file_path))?;
-        out.sync_all().ok();
-        debug!("Content written to output file: {}", output_file_path);
-        None
-    } else {
-        print!("{}", output_file_content);
-        None
-    };
-
-    // Restore the randomized backup over the original (replace mode) or
-    // delete the output file. Used by both the cleanup child after the
-    // timeout and the parent on exec failure.
-    let restore_backup = |replace_file_path: Option<&String>,
-                          output_file_path: Option<&String>,
-                          backup_path: Option<&std::path::PathBuf>| {
-        if let (Some(replace_file_path), Some(backup_path)) = (replace_file_path, backup_path) {
-            if let Err(e) = std::fs::rename(backup_path, replace_file_path) {
-                eprintln!("Failed to restore backup file: {}", e);
-            } else {
-                debug!("Restored backup file: {}", replace_file_path);
-            }
-        } else if let Some(output_file_path) = output_file_path {
-            if let Err(e) = std::fs::remove_file(output_file_path) {
-                eprintln!("Failed to delete output file: {}", e);
-            } else {
-                debug!("Deleted output file: {}", output_file_path);
-            }
-        }
-    };
-
-    let cleanup_pid = if timeout > 0 && (output_file.is_some() || replace_file.is_some()) {
-        // Fork the process to handle file deletion in the background.
-        // This is `unsafe` because it can violate Rust's memory safety guarantees,
-        // especially in a multi-threaded context. However, for our simple case
-        // where the child process only sleeps and deletes a file, it's acceptable.
-        let pid = unsafe { libc::fork() };
-
-        if pid > 0 {
-            // Parent process: Continue to the exec call.
-            debug!("Spawned cleanup process with PID: {}", pid);
-            Some(pid)
-        } else if pid == 0 {
-            // Child process: Sleep, then restore backup or delete output file, and exit.
-            // Using std::thread::sleep instead of tokio::time::sleep is safer after a fork.
-            std::thread::sleep(std::time::Duration::from_secs(timeout as u64));
-
-            if let (Some(replace_file_path), Some(backup_path)) =
-                (replace_file.as_ref(), backup_path.as_ref())
-            {
-                if let Err(e) = std::fs::rename(backup_path, replace_file_path) {
-                    eprintln!("Child process failed to restore backup file: {}", e);
-                }
-            } else if let Some(output_file_path) = output_file.as_ref() {
-                if let Err(e) = std::fs::remove_file(output_file_path) {
-                    eprintln!("Child process failed to delete output file: {}", e);
-                }
-            }
-            // The child's work is done, it must exit.
-            std::process::exit(0);
-        } else {
-            // Fork failed.
-            return Err(anyhow::anyhow!(
-                "Failed to fork cleanup process: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        Some((replace_file_path.clone(), backup_path))
     } else {
         None
     };
@@ -1048,32 +972,181 @@ pub async fn inject(
     let command = &decrypted_args[0];
     let args = &decrypted_args[1..];
 
-    // If exec() fails, we need to immediately restore the backup and kill the cleanup child
-    // exec() never returns if successful (it replaces the process), so if we reach the code below,
-    // it means exec() failed
+    // exec() never returns on success; reaching here means it failed.
     let err = exec::Command::new(command).args(args).exec();
 
-    // If we reach here, exec() failed - immediately restore backup and kill cleanup child
-    if let Some(cleanup_pid) = cleanup_pid {
-        // Kill the cleanup child process immediately since exec failed
-        unsafe {
-            libc::kill(cleanup_pid, libc::SIGTERM);
-        }
-        // Wait for the child to exit to avoid zombie processes
-        let mut status = 0;
-        unsafe {
-            libc::waitpid(cleanup_pid, &mut status, 0);
+    // Restore immediately on exec failure so the user doesn't wait out the
+    // supervisor's timeout. The supervisor will later observe ENOENT on the
+    // backup and exit silently.
+    if let Some((target, backup)) = &armed {
+        immediate_restore(target, backup);
+    }
+    Err(anyhow::anyhow!("Failed to execute command: {}", err))
+}
+
+/// Best-effort parent-side restore. Called on any step-4/5/6 failure to
+/// collapse the post-failure state to "target = ciphertext, no sidecars" as
+/// fast as possible. The detached supervisor will later see ENOENT on backup
+/// and exit silently — there are deliberately two restorers, with the parent
+/// as the fast path and the supervisor as the durable fallback.
+fn immediate_restore(target: &str, backup: &std::path::Path) {
+    if let Err(e) = std::fs::rename(backup, target) {
+        eprintln!(
+            "vt inject: restore-on-fail failed: {}; backup remains at {}",
+            e,
+            backup.display()
+        );
+    }
+}
+
+fn write_plaintext_tmp(tmp: &std::path::Path, mode: u32, content: &str) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode)
+        .open(tmp)
+        .with_context(|| format!("Failed to create temp file: {}", tmp.display()))?;
+    tmp_file
+        .write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
+    tmp_file.sync_all().ok();
+    Ok(())
+}
+
+/// Spawn the restore supervisor as a self-exec'd child. The intermediate
+/// process exits immediately after double-forking inside the supervisor
+/// subcommand body; we reap that exit here, leaving the grandchild reparented
+/// to init (or the nearest subreaper) and detached from the user's session.
+fn spawn_restore_supervisor(
+    timeout: u32,
+    tmp_path: &std::path::Path,
+    backup_path: &std::path::Path,
+    target_path: &str,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe =
+        std::env::current_exe().with_context(|| "Failed to resolve current executable path")?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg(SUPERVISOR_SUBCOMMAND)
+        .arg(timeout.to_string())
+        .arg(tmp_path)
+        .arg(backup_path)
+        .arg(target_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: the closure runs post-fork, pre-exec in the child. Body uses
+    // only async-signal-safe syscalls (setsid) — no allocator, no Rust
+    // globals, no FFI that could touch shared locks.
+    unsafe {
+        cmd.pre_exec(|| {
+            // setsid: new session + pgroup. Detaches from controlling TTY so
+            // SIGHUP on terminal close doesn't sweep us in via the session,
+            // and Ctrl+C on the parent's foreground pgroup doesn't reach us.
+            // Signal dispositions (SIG_IGN for HUP/INT/TERM/PIPE/QUIT) are
+            // set in `supervisor_main` AFTER Rust's runtime init — installing
+            // them here in pre_exec gets clobbered by the runtime's own
+            // signal setup between execve and our entry point.
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut spawned = cmd
+        .spawn()
+        .with_context(|| "Failed to spawn restore supervisor")?;
+    let status = spawned
+        .wait()
+        .with_context(|| "Failed to reap supervisor intermediate")?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "Restore supervisor failed to launch: intermediate exited with {:?}",
+            status
+        ));
+    }
+    Ok(())
+}
+
+/// Pre-tokio, pre-clap entry point for the detached restore supervisor.
+/// Dispatched from `main()` so this process never builds a tokio runtime,
+/// parses clap definitions, or loads tracing — its RSS is just vt's text
+/// segment (shared with the parent via page cache) + a few KB of heap.
+///
+/// Args (after the SUPERVISOR_SUBCOMMAND marker): `<secs> <tmp> <backup> <target>`.
+pub fn supervisor_main(args: &[std::ffi::OsString]) -> i32 {
+    // Stdio is /dev/null — any failure here is invisible to the user. Parent
+    // distinguishes the intermediate's success (exit 0 after double-fork)
+    // from any failure (non-zero) via Child::wait().
+    if args.len() != 4 {
+        return 2;
+    }
+    let secs: u64 = match args[0].to_str().and_then(|s| s.parse().ok()) {
+        Some(n) => n,
+        None => return 2,
+    };
+    let tmp = std::path::PathBuf::from(&args[1]);
+    let backup = std::path::PathBuf::from(&args[2]);
+    let target = std::path::PathBuf::from(&args[3]);
+
+    // Install SIG_IGN for the signals that would otherwise sweep us up when
+    // the user closes the terminal, hits Ctrl+C, or runs `pkill vt`. These
+    // are installed AFTER Rust's runtime init (which resets some of them to
+    // SIG_DFL between execve and our entry point), and BEFORE the double-
+    // fork so the grandchild inherits the same dispositions. SIGKILL and
+    // SIGSTOP cannot be ignored — fundamental Unix limit.
+    //
+    // SAFETY: zeroed sigaction is a valid POSIX struct; SIG_IGN and the
+    // listed signal numbers are libc constants; sigemptyset writes through a
+    // valid &mut. Failures are intentionally ignored — best-effort.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_IGN;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for &sig in &[
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGTERM,
+            libc::SIGPIPE,
+            libc::SIGQUIT,
+        ] {
+            // Best-effort — if this fails the supervisor still works, it's
+            // just more vulnerable to signals. Don't abort the restore path.
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
         }
     }
 
-    // Immediately restore the backup since exec failed
-    restore_backup(
-        replace_file.as_ref(),
-        output_file.as_ref(),
-        backup_path.as_ref(),
-    );
+    // Double-fork: orphan the sleeper to init so it's invisible to the
+    // user-cmd's process tree (no entry under `pstree user-cmd`, no
+    // interference with `waitpid(-1)` from the user-cmd or its parent shell).
+    //
+    // SAFETY: fork has well-defined POSIX behavior; the grandchild runs
+    // only async-signal-safe code below (thread::sleep, remove_file, rename
+    // — all of which are async-signal-safe at the syscall level). The
+    // intermediate uses _exit(0) which is async-signal-safe and skips any
+    // Rust destructors that would touch shared global state.
+    unsafe {
+        match libc::fork() {
+            -1 => return 3,
+            0 => { /* grandchild continues */ }
+            _ => libc::_exit(0),
+        }
+    }
 
-    Err(anyhow::anyhow!("Failed to execute command: {}", err))
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+
+    // Wipe any orphaned plaintext tmp first. If the parent crashed between
+    // write_plaintext_tmp and rename(tmp,target), this is the only path
+    // that removes it — the supervisor doesn't otherwise know.
+    let _ = std::fs::remove_file(&tmp);
+    // Restore ciphertext over the target. Either succeeds (normal case) or
+    // returns ENOENT (parent already restored on exec failure / rename failure).
+    let _ = std::fs::rename(&backup, &target);
+    0
 }
 
 #[cfg(test)]

@@ -45,6 +45,32 @@ This is a **breaking protocol change**. The client and the running `vt ssh agent
    vt ssh agent --no-legacy-decrypt
    ```
 
+### `vt inject` — `-i` / `-o` removed
+
+Earlier versions accepted `--input-file` / `--output-file` to decrypt to stdout
+or to a separate path. These were dropped in favor of Unix composition through
+the trailing command: the same effects are now `vt inject -r FILE -- cat FILE`
+(stdout) and `vt inject -r FILE -- cp FILE OUT` (another path). Scripts using
+`-i` / `-o` will fail to parse; migrate them to `-r ... -- <cmd>` form. See
+[Inject Command](#inject-command).
+
+### `vt inject` — restore now runs in a detached supervisor process
+
+The cleanup-after-timeout that used to run as an in-process forked child now
+runs as a self-exec'd `vt _internal-restore-after` subprocess, detached via
+`setsid` + `SIG_IGN` for HUP/INT/TERM/PIPE/QUIT. Two observable changes for
+operators:
+
+- `vt inject -r FILE -t 0` is rejected at parse time (`--timeout` must be
+  ≥ 1). Previously `-t 0` meant "skip cleanup".
+- `ps aux | grep vt` will show a `vt _internal-restore-after …` process for
+  the duration of the timeout window. Process-count alerts, `pkill -f vt`
+  cleanup hooks, AppArmor/SELinux profiles, and similar tooling may need
+  to whitelist this process name.
+
+See [vt inject in CLAUDE.md](CLAUDE.md#vt-inject--transient-in-place-decryption)
+for the full plaintext-exposure protocol and supervisor design.
+
 ### Earlier breaking change — keychain consolidation
 
 Older installs (pre-1.0.0) used four separate keychain items. The current single `rusty.vault.store` layout requires `vt secret export` with the old version, then `vt secret import` after installing. See [Secret Management](#secret-management) for the full upgrade path.
@@ -83,7 +109,7 @@ Older installs (pre-1.0.0) used four separate keychain items. The current single
 | `init` | (macOS) Initialize passcode and passphrase in keychain |
 | `create` | Read plaintext from stdin, output encrypted vt protocol |
 | `read <vt>` | Decrypt a vt protocol string |
-| `inject` | Decrypt vt protocols in env/files, optionally run a command |
+| `inject [-r FILE] -- cmd...` | Transiently decrypt `vt://` in the file / env / argv, then exec the command |
 | `auth [--reason <text>]` | Trigger bio auth via SSH agent forwarding (for PAM/sudo) |
 | `secret export` | (macOS) Export the encrypted master secret |
 | `secret import` | (macOS) Import an encrypted master secret |
@@ -98,24 +124,28 @@ Older installs (pre-1.0.0) used four separate keychain items. The current single
 
 ### Inject Command
 
-The `inject` command supports several modes:
+`inject` temporarily decrypts a config file (and/or env vars and argv) so a
+child process can read plaintext, then atomically restores the ciphertext
+backup after `--timeout` seconds.
 
 ```bash
-# Replace vt:// patterns in a file
-vt inject -r config.yaml
+# Run a service against an in-place-decrypted config; restored to ciphertext
+# ~2s after exec, regardless of when the child finishes.
+vt inject -r config.yaml -- ./run.sh
 
-# Read from input file, write to output file, then run command
-vt inject -i template.env -o .env -- myapp --config .env
+# Need the plaintext elsewhere? Compose with standard Unix tools — the file
+# stays decrypted for the lifetime of the child:
+vt inject -r config.yaml -- cat config.yaml        # decrypt → stdout
+vt inject -r config.yaml -- cp config.yaml /tmp/c  # decrypt → another path
+vt inject -r config.yaml -- jq .api_key config.yaml
 
-# Inject env vars and run command (output file auto-deleted after timeout)
-vt inject -o secrets.env -t 5 -- ./run.sh
+# No file: only substitute vt:// in env vars and argv, then exec.
+vt inject -- ./run.sh
 ```
 
 Options:
-- `-r, --replace-file <FILE>`: Replace vt protocols in-place
-- `-i, --input-file <FILE>`: Input file with vt protocols
-- `-o, --output-file <FILE>`: Output file for decrypted content
-- `-t, --timeout <SECONDS>`: Seconds before deleting output file (default: 2)
+- `-r, --replace-file <FILE>`: Decrypt vt:// in the file in place; restore from backup after timeout
+- `-t, --timeout <SECONDS>`: Seconds before the backup is rolled back over the decrypted original (default: 2)
 
 ### SSH Agent
 
