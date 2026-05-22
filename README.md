@@ -34,12 +34,13 @@ This is a **breaking protocol change**. The client and the running `vt ssh agent
 1. Build/install the new binary: `cargo install --path .` (or copy `target/release/vt` to your PATH location).
 2. Stop the running agent: `pkill -f 'vt ssh agent'`.
 3. Restart the agent from the new binary (in a fresh shell so PATH resolves correctly): `vt ssh agent`.
-4. **Migrate stored secrets** (recommended): legacy `vt://mac/…` URLs in your dotfiles / env files can be bulk-migrated to v2 with the included script:
+4. **Migrate stored secrets** (recommended): legacy `vt://mac/…` URLs in your dotfiles / env files can be bulk-migrated to v2 with the built-in `vt rewrap` subcommand:
    ```bash
-   uv run migrate-vt-urls.py path/to/file …             # dry-run preview
-   uv run migrate-vt-urls.py --no-dry-run path/to/file … # actually rewrite
+   vt rewrap path/to/file …                  # dry-run preview
+   vt rewrap --no-dry-run path/to/file …     # actually rewrite
+   vt rewrap --no-dry-run --backup path/to/file …   # also leave *.vt-migrate-backup
    ```
-   The script handles RAW and TOTP types (TOTP migration uses a one-time legacy-path trick to recover the seed). Backups are left at `*.vt-migrate-backup`.
+   `vt rewrap` handles RAW and TOTP types (TOTP migration uses a one-time legacy-path trick to recover the seed). One Touch ID covers the whole batch.
 5. Once all secrets are migrated, restart the agent with `--no-legacy-decrypt` to permanently retire the legacy code path:
    ```bash
    vt ssh agent --no-legacy-decrypt

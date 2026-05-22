@@ -533,6 +533,278 @@ pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Resu
     Ok(())
 }
 
+/// Find every legacy `vt://mac/{0|1|_}<body>` URL in `text` and return the
+/// byte ranges. Body chars are `[A-Za-z0-9_-]` (base64url, no pad), matching
+/// the Python migration script's `LEGACY_RE`.
+fn find_legacy_urls(text: &str) -> Vec<(usize, usize)> {
+    const PREFIX: &str = "vt://mac/";
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(PREFIX) {
+        let start = search_from + rel;
+        let type_idx = start + PREFIX.len();
+        if type_idx >= bytes.len() {
+            break;
+        }
+        let type_byte = bytes[type_idx];
+        if !matches!(type_byte, b'0' | b'1' | b'_') {
+            search_from = start + 1;
+            continue;
+        }
+        let mut end = type_idx + 1;
+        while end < bytes.len() {
+            let c = bytes[end];
+            let ok = c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+            if !ok {
+                break;
+            }
+            end += 1;
+        }
+        if end > type_idx + 1 {
+            out.push((start, end));
+            search_from = end;
+        } else {
+            search_from = start + 1;
+        }
+    }
+    out
+}
+
+fn legacy_secret_type(url: &str) -> SecretType {
+    // Type byte sits at index len("vt://mac/") = 9.
+    match url.as_bytes().get(9).copied() {
+        Some(b'1') => SecretType::TOTP,
+        _ => SecretType::RAW,
+    }
+}
+
+/// Re-encrypt every legacy `vt://mac/...` URL found in the given files as the
+/// v2 envelope format, and rewrite each file in place.
+///
+/// Strategy mirrors the old `migrate-vt-urls.py`:
+///  - Decrypt all URLs in a single agent call (one Touch ID for the batch).
+///    For TOTP (type=1) URLs we momentarily flip the type byte to 0 in the
+///    request — the legacy agent path then returns the raw base32 seed
+///    instead of generating a 6-digit code. This trick relies on legacy
+///    ciphertexts having no AAD; v2 closes that hole, and
+///    `vt ssh agent --no-legacy-decrypt` retires this path.
+///  - Re-encrypt each plaintext (no Touch ID; `encrypt@vt` is unauthenticated
+///    by design) and capture the new `vt://0...` / `vt://1...` URL.
+///  - Rewrite each input file atomically via `rename(2)`. With `--backup`,
+///    leave a `<file>.vt-migrate-backup` copy next to each modified file.
+pub async fn rewrap(
+    vt_client: VTClient,
+    files: Vec<std::path::PathBuf>,
+    no_dry_run: bool,
+    backup: bool,
+) -> Result<()> {
+    use std::collections::HashSet;
+
+    let (files, missing): (Vec<_>, Vec<_>) = files.into_iter().partition(|p| p.is_file());
+    for p in &missing {
+        eprintln!("warning: not a file, skipping: {}", p.display());
+    }
+
+    // Discover unique URLs in encounter order across files.
+    let mut pairs: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for f in &files {
+        let text = std::fs::read_to_string(f)
+            .with_context(|| format!("Failed to read file: {}", f.display()))?;
+        for (s, e) in find_legacy_urls(&text) {
+            let url = text[s..e].to_string();
+            if seen.insert(url.clone()) {
+                pairs.push((f.clone(), url));
+            }
+        }
+    }
+
+    if pairs.is_empty() {
+        println!("no legacy vt://mac/ URLs found");
+        return Ok(());
+    }
+
+    let urls: Vec<String> = pairs.iter().map(|(_, u)| u.clone()).collect();
+
+    let (mut n_raw, mut n_totp) = (0usize, 0usize);
+    for u in &urls {
+        match legacy_secret_type(u) {
+            SecretType::TOTP => n_totp += 1,
+            _ => n_raw += 1,
+        }
+    }
+    let mut summary_parts: Vec<String> = Vec::new();
+    if n_raw > 0 {
+        summary_parts.push(format!("{} raw", n_raw));
+    }
+    if n_totp > 0 {
+        summary_parts.push(format!("{} totp", n_totp));
+    }
+    println!(
+        "discovered {} unique legacy URL(s) across {} file(s): {}",
+        urls.len(),
+        files.len(),
+        summary_parts.join(", ")
+    );
+
+    if !no_dry_run {
+        for (f, u) in &pairs {
+            let t = match legacy_secret_type(u) {
+                SecretType::TOTP => "totp",
+                _ => "raw",
+            };
+            println!("  {}: {}  ({})", f.display(), u, t);
+        }
+        println!();
+        println!("[dry-run] no changes made. Re-run with --no-dry-run to apply.");
+        return Ok(());
+    }
+
+    // TOTP type-flip trick: flip `vt://mac/1...` -> `vt://mac/0...` so the
+    // legacy agent emits the raw base32 seed rather than a generated code.
+    let flipped: Vec<String> = urls
+        .iter()
+        .map(|u| {
+            if u.starts_with("vt://mac/1") {
+                let mut s = String::with_capacity(u.len());
+                s.push_str("vt://mac/0");
+                s.push_str(&u["vt://mac/1".len()..]);
+                s
+            } else {
+                u.clone()
+            }
+        })
+        .collect();
+
+    println!("requesting Touch ID for batch decrypt of all URLs...");
+    let dec = vt_client
+        .decrypt(&get_hostname(), "[rewrap]", &flipped)
+        .await?;
+    ensure!(
+        dec.len() == urls.len(),
+        "agent returned {} items for {} URLs",
+        dec.len(),
+        urls.len()
+    );
+    for (i, item) in dec.iter().enumerate() {
+        ensure!(
+            item.err_message.is_empty(),
+            "decrypt failed for {}: {}",
+            urls[i],
+            item.err_message
+        );
+    }
+
+    println!(
+        "re-encrypting {} secret(s) as v2 (no Touch ID needed)...",
+        urls.len()
+    );
+    let items: Vec<EncryptItem> = urls
+        .iter()
+        .zip(dec.iter())
+        .map(|(u, plain)| EncryptItem {
+            plaintext: plain.result.clone(),
+            t: legacy_secret_type(u),
+        })
+        .collect();
+    let enc = vt_client.encrypt(&items).await?;
+    ensure!(
+        enc.len() == urls.len(),
+        "encrypt returned {} items for {} URLs",
+        enc.len(),
+        urls.len()
+    );
+
+    let mut url_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(urls.len());
+    for (i, item) in enc.iter().enumerate() {
+        ensure!(
+            item.err_message.is_empty(),
+            "encrypt failed for {}: {}",
+            urls[i],
+            item.err_message
+        );
+        ensure!(
+            item.result.starts_with("vt://") && !item.result.starts_with("vt://mac/"),
+            "vt encrypt did not return a v2 URL: {}",
+            item.result
+        );
+        let st_label = match items[i].t {
+            SecretType::TOTP => "totp",
+            _ => "raw",
+        };
+        let old_short: String = urls[i].chars().take(24).collect();
+        let new_short: String = item.result.chars().take(24).collect();
+        println!(
+            "  [{}/{}] {}: {}... -> {}...",
+            i + 1,
+            urls.len(),
+            st_label,
+            old_short,
+            new_short
+        );
+        url_map.insert(urls[i].clone(), item.result.clone());
+    }
+
+    let mut total: usize = 0;
+    for f in &files {
+        let text = std::fs::read_to_string(f)
+            .with_context(|| format!("Failed to read file: {}", f.display()))?;
+        let mut count: usize = 0;
+        for old in url_map.keys() {
+            count += text.matches(old.as_str()).count();
+        }
+        if count == 0 {
+            continue;
+        }
+        let mut new_text = text.clone();
+        for (old, new) in &url_map {
+            new_text = new_text.replace(old.as_str(), new.as_str());
+        }
+        if backup {
+            let mut backup_path = f.clone().into_os_string();
+            backup_path.push(".vt-migrate-backup");
+            std::fs::copy(f, &backup_path).with_context(|| {
+                format!("Failed to write backup: {}", std::path::Path::new(&backup_path).display())
+            })?;
+        }
+        let mut tmp_path = f.clone().into_os_string();
+        tmp_path.push(".vt-migrate-tmp");
+        std::fs::write(&tmp_path, &new_text).with_context(|| {
+            format!("Failed to write temp: {}", std::path::Path::new(&tmp_path).display())
+        })?;
+        std::fs::rename(&tmp_path, f).with_context(|| {
+            format!("Failed to atomically replace: {}", f.display())
+        })?;
+        if backup {
+            println!(
+                "  {}: {} substitution(s); backup at {}.vt-migrate-backup",
+                f.display(),
+                count,
+                f.display()
+            );
+        } else {
+            println!("  {}: {} substitution(s)", f.display(), count);
+        }
+        total += count;
+    }
+
+    println!();
+    println!(
+        "done. {} substitution(s) across {} file(s).",
+        total,
+        files.len()
+    );
+    let tail = if backup {
+        "verify the result, then delete .vt-migrate-backup files and consider restarting the agent with --no-legacy-decrypt to retire the legacy path."
+    } else {
+        "verify the result, then consider restarting the agent with --no-legacy-decrypt to retire the legacy path."
+    };
+    println!("{}", tail);
+    Ok(())
+}
+
 async fn decrypt_from_multi_str(
     vt_client: VTClient,
     original_str_vec: Vec<String>,
