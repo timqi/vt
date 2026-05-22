@@ -33,10 +33,50 @@ pub struct EncryptItem {
     pub t: SecretType,
 }
 
+/// Display-only context about the client process collected on the CLI side.
+/// Travels with `decrypt@vt` and `auth@vt` so the agent can show the operator
+/// (Touch ID prompt) — and, on the CF ceremony path, the phone's approval
+/// page — enough context to recognize the session before approving.
+///
+/// Wire shape is forward/backward compatible: every field is `#[serde(default)]`
+/// so an older client without these fields still deserializes (yielding empty
+/// strings), and a newer agent reading an older request gracefully gets a
+/// `ClientMeta::default()`. The CLI sanitizes (control-char strip, char
+/// truncation) before sending; the agent re-sanitizes defensively before
+/// surfacing to a UI.
+/// Strip ASCII/Unicode control chars and length-cap a string for display.
+/// Used everywhere display text crosses a trust boundary (CF approval page,
+/// Touch ID prompt, log lines). Truncates with an ellipsis (`…`).
+pub fn sanitize_for_display(s: &str, max_chars: usize) -> String {
+    let cleaned: String = s.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.chars().count() > max_chars {
+        let truncated: String = cleaned.chars().take(max_chars).collect();
+        format!("{}…", truncated)
+    } else {
+        cleaned
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+pub struct ClientMeta {
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub pwd: String,
+    #[serde(default)]
+    pub tty: String,
+    #[serde(default)]
+    pub ppid_cmd: String,
+    #[serde(default)]
+    pub ssh_client: String,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct AuthReq {
     pub host: String,
     pub reason: String,
+    #[serde(default)]
+    pub meta: ClientMeta,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -140,6 +180,8 @@ pub struct DecryptReq {
     pub host: String,
     pub command: String,
     pub items: Vec<DecryptInput>,
+    #[serde(default)]
+    pub meta: ClientMeta,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -154,6 +196,29 @@ pub enum DecryptResItem {
         result: String,
         err_message: String,
     },
+}
+
+/// Request from a (typically remote) client → local agent for `run@vt`.
+/// Touch ID gates every call, allowlist is enforced server-side, no cache.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct RunReq {
+    /// Hostname the request originated from (display only; never trusted).
+    pub host: String,
+    /// `[program, arg1, arg2, ...]`. argv[0] is resolved against the agent's
+    /// allowlist before any Touch ID prompt.
+    pub argv: Vec<String>,
+    /// Optional human-readable reason shown in the Touch ID prompt.
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub meta: ClientMeta,
+}
+
+/// Response for an approved `run@vt`. Fire-and-forget — the child has been
+/// spawned and detached. The client just gets the local PID for logging.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct RunRes {
+    pub pid: u32,
 }
 
 // ---- v2 URL parsing ---------------------------------------------------------
@@ -364,6 +429,90 @@ pub fn legacy_decrypt(mac_cipher: &AesGcmCrypto, url: &str) -> CryptoResItem {
     }
 }
 
+// ---- vt:// URL scanning -----------------------------------------------------
+//
+// Hand-rolled scanners replace the `regex` dependency for the trivial pattern
+// `vt://(?:mac/)?[A-Za-z0-9_-]+`. The regex crate adds ~600KB to the binary
+// for just two patterns, so we inline them here.
+
+#[inline]
+fn is_vt_body_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Find the next `vt://` URL starting at or after `from`. Returns the byte
+/// range `[start, end)` covering the full match, or `None` if no match.
+fn next_vt_url(s: &str, from: usize) -> Option<std::ops::Range<usize>> {
+    let bytes = s.as_bytes();
+    let mut cursor = from;
+    while let Some(rel) = s[cursor..].find("vt://") {
+        let start = cursor + rel;
+        let mut body = start + 5;
+        if body + 4 <= bytes.len() && &bytes[body..body + 4] == b"mac/" {
+            body += 4;
+        }
+        let mut end = body;
+        while end < bytes.len() && is_vt_body_byte(bytes[end]) {
+            end += 1;
+        }
+        if end > body {
+            return Some(start..end);
+        }
+        cursor = start + 5;
+    }
+    None
+}
+
+/// Iterate over non-overlapping `vt://[mac/]?<body>` matches as `&str` slices.
+pub fn iter_vt_urls(s: &str) -> impl Iterator<Item = &str> {
+    let mut cursor = 0usize;
+    std::iter::from_fn(move || {
+        let r = next_vt_url(s, cursor)?;
+        cursor = r.end;
+        Some(&s[r])
+    })
+}
+
+/// `true` if `s` contains at least one `vt://` URL match.
+pub fn has_vt_url(s: &str) -> bool {
+    next_vt_url(s, 0).is_some()
+}
+
+/// Replace every `vt://` URL in `s` with `replacement`. Non-URL bytes are
+/// preserved verbatim (no other normalization).
+pub fn redact_vt_urls(s: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    while let Some(r) = next_vt_url(s, cursor) {
+        out.push_str(&s[cursor..r.start]);
+        out.push_str(replacement);
+        cursor = r.end;
+    }
+    out.push_str(&s[cursor..]);
+    out
+}
+
+/// Collapse every run of Unicode whitespace to a single ASCII space.
+/// Equivalent to `Regex::new(r"\s+").replace_all(s, " ")`: leading and
+/// trailing whitespace runs are preserved as a single space (i.e. NOT
+/// trimmed), matching the original regex behavior used for command display.
+pub fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+                in_space = true;
+            }
+        } else {
+            out.push(ch);
+            in_space = false;
+        }
+    }
+    out
+}
+
 // ---- Tests ------------------------------------------------------------------
 
 #[cfg(test)]
@@ -540,5 +689,170 @@ mod tests {
             assert!(!url.contains("mac/"), "url must not contain mac/: {}", url);
             assert!(url.starts_with("vt://"));
         }
+    }
+
+    // ── ClientMeta wire-compat tests ──────────────────────────────────────
+    //
+    // The wire-version bump policy (#[serde(default)] on every new field) is
+    // load-bearing for mixed CLI/agent rollouts. These tests pin that
+    // behavior so a future #[serde(deny_unknown_fields)] or a removed
+    // #[serde(default)] will fail the suite.
+
+    #[test]
+    fn auth_req_deserializes_when_meta_is_missing() {
+        // An old client (pre-meta) sends only host/reason. The agent must
+        // still parse the request and get an empty ClientMeta.
+        let json = br#"{"host":"alpha","reason":"sudo"}"#;
+        let req: AuthReq = serde_json::from_slice(json).expect("must parse old-shape AuthReq");
+        assert_eq!(req.host, "alpha");
+        assert_eq!(req.reason, "sudo");
+        assert_eq!(req.meta.user, "");
+        assert_eq!(req.meta.pwd, "");
+        assert_eq!(req.meta.ssh_client, "");
+    }
+
+    #[test]
+    fn decrypt_req_deserializes_when_meta_is_missing() {
+        // Same forward-compat property for DecryptReq.
+        let json = br#"{"host":"alpha","command":"[read]","items":[]}"#;
+        let req: DecryptReq = serde_json::from_slice(json).expect("must parse old-shape DecryptReq");
+        assert_eq!(req.host, "alpha");
+        assert_eq!(req.command, "[read]");
+        assert!(req.items.is_empty());
+        assert_eq!(req.meta.user, "");
+        assert_eq!(req.meta.pwd, "");
+    }
+
+    #[test]
+    fn client_meta_roundtrip_preserves_all_fields() {
+        let m = ClientMeta {
+            user: "qiqi".into(),
+            pwd: "/Users/qiqi/proj".into(),
+            tty: "/dev/pts/3".into(),
+            ppid_cmd: "zsh -i".into(),
+            ssh_client: "10.0.0.5 5234 22".into(),
+        };
+        let json = serde_json::to_vec(&m).unwrap();
+        let back: ClientMeta = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.user, "qiqi");
+        assert_eq!(back.pwd, "/Users/qiqi/proj");
+        assert_eq!(back.tty, "/dev/pts/3");
+        assert_eq!(back.ppid_cmd, "zsh -i");
+        assert_eq!(back.ssh_client, "10.0.0.5 5234 22");
+    }
+
+    #[test]
+    fn run_req_deserializes_when_meta_and_reason_missing() {
+        // Mirror the AuthReq/DecryptReq forward-compat policy: an older
+        // client that omits `meta` and `reason` must still parse.
+        let json = br#"{"host":"g1","argv":["zed","ssh://g1/x"]}"#;
+        let req: RunReq = serde_json::from_slice(json).expect("must parse old-shape RunReq");
+        assert_eq!(req.host, "g1");
+        assert_eq!(req.argv, vec!["zed".to_string(), "ssh://g1/x".to_string()]);
+        assert!(req.reason.is_none());
+        assert_eq!(req.meta.user, "");
+    }
+
+    #[test]
+    fn client_meta_partial_fields_default_the_rest() {
+        // A future client that omits ssh_client (because the env var is
+        // empty) must still produce a well-formed ClientMeta.
+        let json = br#"{"user":"qiqi","pwd":"/tmp"}"#;
+        let m: ClientMeta = serde_json::from_slice(json).unwrap();
+        assert_eq!(m.user, "qiqi");
+        assert_eq!(m.pwd, "/tmp");
+        assert_eq!(m.tty, "");
+        assert_eq!(m.ppid_cmd, "");
+        assert_eq!(m.ssh_client, "");
+    }
+
+    // ── vt:// URL scanner tests ────────────────────────────────────────────
+    //
+    // These pin behavior against the previous regex (`vt://(?:mac/)?[A-Za-z0-9_-]+`)
+    // so anyone touching the hand-rolled scanner sees breakage immediately.
+
+    fn collect_urls(s: &str) -> Vec<&str> {
+        iter_vt_urls(s).collect()
+    }
+
+    #[test]
+    fn scan_single_url() {
+        assert_eq!(collect_urls("vt://abc"), vec!["vt://abc"]);
+    }
+
+    #[test]
+    fn scan_mac_variant() {
+        assert_eq!(collect_urls("vt://mac/abc_def-ghi"), vec!["vt://mac/abc_def-ghi"]);
+    }
+
+    #[test]
+    fn scan_multiple_urls_in_text() {
+        assert_eq!(
+            collect_urls("export FOO=vt://abc BAR=vt://mac/xyz BAZ=42"),
+            vec!["vt://abc", "vt://mac/xyz"],
+        );
+    }
+
+    #[test]
+    fn scan_stops_at_non_body_char() {
+        // '.', '!', '/', and unicode chars all terminate the body.
+        assert_eq!(collect_urls("vt://abc.suffix"), vec!["vt://abc"]);
+        assert_eq!(collect_urls("vt://abc! more"), vec!["vt://abc"]);
+        assert_eq!(collect_urls("vt://abc/extra"), vec!["vt://abc"]);
+        assert_eq!(collect_urls("vt://αβγ"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn scan_rejects_empty_body() {
+        // "vt://" with no body chars must not match (regex `+` requires 1+).
+        assert!(collect_urls("vt://").is_empty());
+        assert!(collect_urls("vt://mac/").is_empty());
+        assert!(collect_urls("vt:// vt://").is_empty());
+    }
+
+    #[test]
+    fn scan_adjacent_urls() {
+        // Whitespace-separated; the scanner must not glue them together.
+        assert_eq!(collect_urls("vt://a vt://b"), vec!["vt://a", "vt://b"]);
+    }
+
+    #[test]
+    fn scan_charset_covers_b64url() {
+        // Body matches base64url-no-pad alphabet plus alphanumerics: every
+        // char a real URL body could contain must be accepted.
+        let body = "ABCabc012_-";
+        let s = format!("vt://{body}");
+        assert_eq!(collect_urls(&s), vec![s.as_str()]);
+    }
+
+    #[test]
+    fn has_vt_url_works() {
+        assert!(has_vt_url("hello vt://abc world"));
+        assert!(has_vt_url("vt://mac/x"));
+        assert!(!has_vt_url("hello world"));
+        assert!(!has_vt_url("vt://"));
+        assert!(!has_vt_url(""));
+    }
+
+    #[test]
+    fn redact_replaces_all_matches() {
+        assert_eq!(
+            redact_vt_urls("echo vt://abc and vt://mac/xyz!", "vt://***"),
+            "echo vt://*** and vt://***!",
+        );
+        assert_eq!(redact_vt_urls("no urls here", "vt://***"), "no urls here");
+        assert_eq!(redact_vt_urls("vt:// alone", "vt://***"), "vt:// alone");
+    }
+
+    #[test]
+    fn collapse_whitespace_matches_regex() {
+        // Internal runs collapse.
+        assert_eq!(collapse_whitespace("a   b\tc\nd"), "a b c d");
+        // Leading/trailing runs collapse to a single space (NOT trimmed),
+        // matching `Regex::new(r"\s+").replace_all(s, " ")` semantics.
+        assert_eq!(collapse_whitespace("  foo  "), " foo ");
+        assert_eq!(collapse_whitespace(""), "");
+        // Unicode whitespace is treated as whitespace too.
+        assert_eq!(collapse_whitespace("a\u{00A0}b"), "a b");
     }
 }

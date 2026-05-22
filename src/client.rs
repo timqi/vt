@@ -1,19 +1,19 @@
 //! Cross-platform vt client.
 //!
-//! Talks to a local `vt ssh agent` over the SSH-agent Unix socket using the
-//! `encrypt@vt` / `decrypt@vt` / `auth@vt` extension messages. The wire
-//! payload is encrypted with the auth cipher derived from `VT_AUTH`. No
-//! keychain, no LocalAuthentication, no `ssh-key` — those all live on the
-//! macOS server side.
+//! Primary path: SSH agent via `$SSH_AUTH_SOCK` or `~/.ssh/vt.sock`.
+//! Fallback path (Linux / macOS without agent): CF ceremony via
+//! VT_PASSKEY_URL + VT_PASSKEY_TOKEN env vars — POST /api/challenge + WS /api/dek.
 
 use std::env;
 use std::io::{self, Write};
 
+use crate::cf;
 use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
 use crate::core::wire::{ErrKind, WIRE_VERSION};
 use crate::core::{
-    client_decrypt_v2, client_encrypt_v2, AuthReq, AuthRes, CryptoResItem, DecryptInput,
-    DecryptReq, DecryptResItem, EncryptItem, EncryptReq, EncryptResItem, SecretType, VtUrl,
+    client_decrypt_v2, client_encrypt_v2, collapse_whitespace, has_vt_url, iter_vt_urls,
+    redact_vt_urls, AuthReq, AuthRes, CryptoResItem, DecryptInput, DecryptReq, DecryptResItem,
+    EncryptItem, EncryptReq, EncryptResItem, RunReq, RunRes, SecretType, VtUrl, SALT_LEN,
 };
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -96,6 +96,34 @@ struct ParsedEnvelope<'a> {
     detail: Option<String>,
 }
 
+/// Policy for the `auto` backend mode (currently the only mode): when an
+/// SSH agent call fails, may we silently retry via the CF passkey path?
+///
+/// Falls back for:
+/// - Transport failures (socket talk, envelope parse, version mismatch,
+///   unstructured `AgentError::Failure`).
+/// - Agent errors where the agent self-reports it cannot deliver key
+///   material on this host (`SessionLocked`, `NoGuiSession`,
+///   `NotInitialized`, `AgentLocked`, `Generic`, `Transient`, `Unknown`,
+///   `LegacyDisabled`, `ProtocolVersion`).
+///
+/// Does NOT fall back for:
+/// - `AuthRejected` — user explicitly declined on Touch ID / phone; silently
+///   re-prompting via CF would be reverse of intent.
+/// - `BadRequest` — client constructed a malformed request; CF won't fix
+///   it and the structured error is more useful for debugging than a
+///   second failure on a different path.
+fn should_fallback_to_cf(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<VtClientError>() {
+        Some(VtClientError::Agent(kind, _)) => !matches!(
+            kind,
+            ErrKind::AuthRejected | ErrKind::BadRequest
+        ),
+        Some(VtClientError::Transport(_)) => true,
+        None => false,
+    }
+}
+
 fn parse_envelope(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let env: ParsedEnvelope = serde_json::from_slice(bytes)
         .map_err(|e| transport(anyhow::anyhow!("failed to parse agent envelope: {}", e)))?;
@@ -133,8 +161,22 @@ pub struct VTClient {
 }
 
 impl VTClient {
-    pub fn new(auth_token: String) -> Self {
-        VTClient { auth_token }
+    /// Build a client and verify that at least one decryption path is
+    /// configured. Each path is opt-in by its own env vars:
+    ///
+    /// - SSH agent path: `VT_AUTH` (passed in as `auth_token`)
+    /// - CF passkey path: `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN`
+    ///
+    /// If neither is set we fail here rather than deep inside the routing
+    /// code, so the user sees a single actionable error.
+    pub fn new(auth_token: String) -> Result<Self> {
+        if auth_token.is_empty() && std::env::var("VT_PASSKEY_URL").is_err() {
+            anyhow::bail!(
+                "no decryption path configured — set VT_AUTH for the SSH agent path, \
+                 or VT_PASSKEY_URL + VT_PASSKEY_TOKEN for the phone passkey ceremony"
+            );
+        }
+        Ok(VTClient { auth_token })
     }
 
     /// Try to send an extension request via the SSH agent socket.
@@ -161,6 +203,14 @@ impl VTClient {
         payload: &[u8],
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
         use std::os::unix::net::UnixStream;
+
+        // No VT_AUTH → caller hasn't opted in to the SSH-agent path; skip it
+        // and let agent_call_or_fallback route to the CF passkey ceremony.
+        // This also avoids decoding an empty auth token when $SSH_AUTH_SOCK
+        // happens to point at an unrelated ssh-agent (common on Linux).
+        if auth_token.is_empty() {
+            return Ok(None);
+        }
 
         let socket_path = if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
             std::path::PathBuf::from(sock)
@@ -210,6 +260,33 @@ impl VTClient {
         }
     }
 
+    /// Wrap `try_agent_extension` with the `auto`-mode fallback policy:
+    /// translate `Ok(None)` (socket missing/refused) and recoverable
+    /// `Err(_)` (per [`should_fallback_to_cf`]) into a single `Ok(None)` so
+    /// callers can route to the CF path. Non-recoverable errors propagate.
+    #[cfg(unix)]
+    async fn agent_call_or_fallback(
+        auth_token: String,
+        name: &'static str,
+        payload: Vec<u8>,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let result = tokio::task::spawn_blocking(move || {
+            Self::try_agent_extension(&auth_token, name, &payload)
+        })
+        .await?;
+        match result {
+            Ok(some_or_none) => Ok(some_or_none),
+            Err(e) => {
+                if should_fallback_to_cf(&e) {
+                    eprintln!("{} — falling back to phone passkey", e);
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// v2 envelope encrypt. Asks the agent to allocate one fresh
     /// `(salt, DEK)` pair per `EncryptItem` (no plaintext leaves this
     /// process), then locally AEAD-encrypts each plaintext under its DEK and
@@ -223,17 +300,11 @@ impl VTClient {
             };
             let payload = serde_json::to_vec(&req)?;
             let auth_token = self.auth_token.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                Self::try_agent_extension(&auth_token, "encrypt@vt", &payload)
-            })
-            .await??;
+            let result =
+                Self::agent_call_or_fallback(auth_token, "encrypt@vt", payload).await?;
             let bytes = match result {
                 Some(b) => b,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "SSH agent not available — set SSH_AUTH_SOCK or run `vt ssh agent`"
-                    ))
-                }
+                None => return Self::cf_encrypt(items, &get_hostname()).await,
             };
             let mut allocs: Vec<EncryptResItem> = serde_json::from_slice(&bytes)?;
             ensure!(
@@ -342,20 +413,15 @@ impl VTClient {
                 host: host.to_string(),
                 command: command.to_string(),
                 items: wire_items,
+                meta: cf::collect_client_meta(),
             };
             let payload = serde_json::to_vec(&wire)?;
             let auth_token = self.auth_token.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                Self::try_agent_extension(&auth_token, "decrypt@vt", &payload)
-            })
-            .await??;
+            let result =
+                Self::agent_call_or_fallback(auth_token, "decrypt@vt", payload).await?;
             let bytes = match result {
                 Some(b) => b,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "SSH agent not available — set SSH_AUTH_SOCK or run `vt ssh agent`"
-                    ))
-                }
+                None => return Self::cf_decrypt(host, command, urls).await,
             };
             let mut wire_results: Vec<DecryptResItem> = serde_json::from_slice(&bytes)?;
             ensure!(
@@ -425,19 +491,140 @@ impl VTClient {
         }
     }
 
+    // ── CF ceremony fallbacks ──────────────────────────────────────────────
+
+    async fn cf_encrypt(items: &[EncryptItem], _host: &str) -> Result<Vec<CryptoResItem>> {
+        let config = cf::load_config()
+            .context("SSH agent unavailable; CF passkey env not configured")?;
+        let mut salts = cf::random_salts(items.len());
+        let meta = cf::collect_meta("encrypt", "", "");
+        let deks = cf::get_deks(&config, &salts, meta).await?;
+        let mut out = Vec::with_capacity(items.len());
+        for ((item, salt), dek) in items.iter().zip(salts.iter()).zip(deks.iter()) {
+            let res = match client_encrypt_v2(item.t, salt, dek, item.plaintext.as_bytes()) {
+                Ok(url) => CryptoResItem { result: url, err_message: String::new() },
+                Err(e)  => CryptoResItem { result: String::new(), err_message: e.to_string() },
+            };
+            out.push(res);
+        }
+        salts.iter_mut().for_each(|s| s.iter_mut().for_each(|b| *b = 0));
+        Ok(out)
+    }
+
+    async fn cf_decrypt(_host: &str, command: &str, urls: &[String]) -> Result<Vec<CryptoResItem>> {
+        let config = cf::load_config()
+            .context("SSH agent unavailable; CF passkey env not configured")?;
+
+        // Parse URLs; collect v2 salts in order
+        struct Item {
+            t: SecretType,
+            salt: [u8; SALT_LEN],
+            inner_ct: Vec<u8>,
+        }
+        let mut items: Vec<Result<Item, String>> = Vec::with_capacity(urls.len());
+        let mut salts: Vec<[u8; SALT_LEN]> = Vec::new();
+        for raw_url in urls {
+            match VtUrl::parse(raw_url) {
+                Ok(VtUrl::V2 { t, salt, inner_ct }) => {
+                    salts.push(salt);
+                    items.push(Ok(Item { t, salt, inner_ct }));
+                }
+                Ok(VtUrl::Legacy { .. }) => {
+                    items.push(Err("legacy vt:// URLs require macOS SSH agent".to_string()));
+                }
+                Err(e) => items.push(Err(e.to_string())),
+            }
+        }
+
+        let meta = cf::collect_meta("decrypt", command, "");
+        let deks = cf::get_deks(&config, &salts, meta).await?;
+
+        let mut out = Vec::with_capacity(urls.len());
+        let mut dek_idx = 0usize;
+        for item_res in items {
+            match item_res {
+                Err(e) => out.push(CryptoResItem { result: String::new(), err_message: e }),
+                Ok(Item { t, salt, inner_ct }) => {
+                    let dek = &deks[dek_idx];
+                    dek_idx += 1;
+                    let res = match client_decrypt_v2(t, dek, &salt, &inner_ct) {
+                        Ok(pt) => CryptoResItem { result: pt, err_message: String::new() },
+                        Err(e) => CryptoResItem { result: String::new(), err_message: e.to_string() },
+                    };
+                    out.push(res);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn cf_auth(reason: &str) -> Result<()> {
+        let config = cf::load_config()
+            .context("SSH agent unavailable; CF passkey env not configured")?;
+        let meta = cf::collect_meta("auth", "", reason);
+        cf::get_deks(&config, &[], meta).await?;
+        Ok(())
+    }
+
+    /// Ask the local agent to run an allowlisted program. SSH-agent path
+    /// only — there is no CF passkey fallback, because the whole feature
+    /// only makes sense when "local" means "the Mac at the other end of the
+    /// forwarded agent socket". If `VT_AUTH` is unset (no agent path
+    /// configured) we refuse here instead of silently failing further down.
+    pub async fn run(&self, argv: Vec<String>, reason: Option<&str>) -> Result<()> {
+        #[cfg(unix)]
+        {
+            if self.auth_token.is_empty() {
+                anyhow::bail!(
+                    "vt run requires the SSH-agent path (set VT_AUTH and ensure \
+                     SSH_AUTH_SOCK / ~/.ssh/vt.sock points at a vt agent — there \
+                     is no phone-passkey fallback for run@vt)"
+                );
+            }
+            if argv.is_empty() {
+                anyhow::bail!("vt run: argv is empty");
+            }
+            let req = RunReq {
+                host: get_hostname(),
+                argv,
+                reason: reason.map(str::to_string),
+                meta: cf::collect_client_meta(),
+            };
+            let payload = serde_json::to_vec(&req)?;
+            let auth_token = self.auth_token.clone();
+            let result =
+                Self::agent_call_or_fallback(auth_token, "run@vt", payload).await?;
+            match result {
+                Some(bytes) => {
+                    let res: RunRes = serde_json::from_slice(&bytes)
+                        .context("Failed to parse run response")?;
+                    tracing::debug!("vt run: spawned pid={}", res.pid);
+                    Ok(())
+                }
+                None => Err(anyhow::anyhow!(
+                    "vt run: SSH agent path unavailable (no fallback exists for run@vt)"
+                )),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (argv, reason);
+            Err(anyhow::anyhow!("vt run requires Unix (SSH agent socket)"))
+        }
+    }
+
     pub async fn auth(&self, reason: &str) -> Result<()> {
         #[cfg(unix)]
         {
             let req = AuthReq {
                 host: get_hostname(),
                 reason: reason.to_string(),
+                meta: cf::collect_client_meta(),
             };
             let payload = serde_json::to_vec(&req)?;
             let auth_token = self.auth_token.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                Self::try_agent_extension(&auth_token, "auth@vt", &payload)
-            })
-            .await??;
+            let result =
+                Self::agent_call_or_fallback(auth_token, "auth@vt", payload).await?;
 
             match result {
                 Some(bytes) => {
@@ -445,11 +632,7 @@ impl VTClient {
                         serde_json::from_slice(&bytes).context("Failed to parse auth response")?;
                     return Ok(());
                 }
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "SSH agent not available — need agent forwarding or ~/.ssh/vt.sock"
-                    ));
-                }
+                None => return Self::cf_auth(reason).await,
             }
         }
 
@@ -461,8 +644,8 @@ impl VTClient {
 }
 
 pub async fn create(vt_client: VTClient) -> Result<()> {
-    print!("Enter secret type (raw/totp) [default: raw]: ");
-    io::stdout().flush()?;
+    eprint!("Enter secret type (raw/totp) [default: raw]: ");
+    io::stderr().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     if input.trim().is_empty() {
@@ -489,7 +672,7 @@ pub async fn create(vt_client: VTClient) -> Result<()> {
             res[0].err_message
         ));
     }
-    println!("Created item: {}", res[0].result);
+    println!("{}", res[0].result);
     Ok(())
 }
 
@@ -502,6 +685,10 @@ pub fn get_hostname() -> String {
 
 pub async fn auth(vt_client: VTClient, reason: &str) -> Result<()> {
     vt_client.auth(reason).await
+}
+
+pub async fn run(vt_client: VTClient, argv: Vec<String>, reason: Option<&str>) -> Result<()> {
+    vt_client.run(argv, reason).await
 }
 
 fn sanitize_prompt_field(s: &str, max_chars: usize) -> String {
@@ -814,11 +1001,10 @@ async fn decrypt_from_multi_str(
     // Extract `vt://...` patterns. Matches both v2 (`vt://0...`) and legacy
     // (`vt://mac/0...`) shapes; the optional `mac/` segment lets new and old
     // URLs coexist during migration. Body chars are base64url-no-pad.
-    let vt_pattern = regex::Regex::new(r"vt://(?:mac/)?[A-Za-z0-9_-]+").unwrap();
     for item in &original_str_vec {
-        for vt_match in vt_pattern.find_iter(item) {
-            debug!("Found encrypted item: {}", vt_match.as_str());
-            encrypted_vec.push(vt_match.as_str().to_string());
+        for url in iter_vt_urls(item) {
+            debug!("Found encrypted item: {}", url);
+            encrypted_vec.push(url.to_string());
         }
     }
 
@@ -897,14 +1083,8 @@ pub async fn inject(
     if raw_command.is_empty() {
         original_command.push_str(" [no shell command, output to stdout]");
     } else {
-        let normalized = regex::Regex::new(r"\s+")
-            .unwrap()
-            .replace_all(&raw_command, " ")
-            .to_string();
-        let sanitized = regex::Regex::new(r"vt://(?:mac/)?[A-Za-z0-9_-]+")
-            .unwrap()
-            .replace_all(&normalized, "vt://***")
-            .to_string();
+        let normalized = collapse_whitespace(&raw_command);
+        let sanitized = redact_vt_urls(&normalized, "vt://***");
         const MAX_CMD_LEN: usize = 60;
         let truncated = if sanitized.chars().count() > MAX_CMD_LEN {
             let s: String = sanitized.chars().take(MAX_CMD_LEN).collect();
@@ -932,9 +1112,8 @@ pub async fn inject(
 
     // Scan env vars locally for vt:// patterns — only those values enter the
     // decrypt pipeline. Env var names and non-vt values never leave this process.
-    let vt_pattern = regex::Regex::new(r"vt://(?:mac/)?[A-Za-z0-9_-]+").unwrap();
     let env_vt_vars: Vec<(String, String)> = env::vars()
-        .filter(|(_, v)| vt_pattern.is_match(v))
+        .filter(|(_, v)| has_vt_url(v))
         .collect();
     for (_, value) in &env_vt_vars {
         args.push(value.clone());
@@ -1276,6 +1455,52 @@ mod tests {
             "garbage must surface as Transport, got {:?}",
             vt_err
         );
+    }
+
+    #[test]
+    fn fallback_policy_auth_rejected_does_not_fall_back() {
+        let e: anyhow::Error = VtClientError::Agent(ErrKind::AuthRejected, None).into();
+        assert!(!should_fallback_to_cf(&e));
+    }
+
+    #[test]
+    fn fallback_policy_bad_request_does_not_fall_back() {
+        let e: anyhow::Error = VtClientError::Agent(ErrKind::BadRequest, None).into();
+        assert!(!should_fallback_to_cf(&e));
+    }
+
+    #[test]
+    fn fallback_policy_session_locked_falls_back() {
+        let e: anyhow::Error = VtClientError::Agent(ErrKind::SessionLocked, None).into();
+        assert!(should_fallback_to_cf(&e));
+    }
+
+    #[test]
+    fn fallback_policy_other_agent_kinds_fall_back() {
+        for kind in [
+            ErrKind::NoGuiSession,
+            ErrKind::NotInitialized,
+            ErrKind::AgentLocked,
+            ErrKind::Generic,
+            ErrKind::Transient,
+            ErrKind::Unknown,
+            ErrKind::LegacyDisabled,
+            ErrKind::ProtocolVersion,
+        ] {
+            let e: anyhow::Error = VtClientError::Agent(kind, None).into();
+            assert!(
+                should_fallback_to_cf(&e),
+                "expected {:?} to fall back",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_policy_transport_falls_back() {
+        let e: anyhow::Error =
+            VtClientError::Transport(anyhow::anyhow!("socket closed")).into();
+        assert!(should_fallback_to_cf(&e));
     }
 
     #[test]

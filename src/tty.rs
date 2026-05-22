@@ -14,7 +14,7 @@ pub fn prompt_input_password(prompt_before: &str, prompt_after: &str) -> Result<
     if secret.is_empty() {
         return Err(anyhow::anyhow!("Secret cannot be empty"));
     }
-    println!(
+    eprintln!(
         "{}{}****{}",
         prompt_after,
         &secret[..2],

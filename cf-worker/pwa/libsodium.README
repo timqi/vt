@@ -1,0 +1,10 @@
+Place libsodium.js (sumo build) here before deploying.
+
+Download: https://github.com/jedisct1/libsodium.js/releases
+File: sodium.js from the "sumo" package (includes crypto_box_seal).
+
+Or install via npm and copy:
+  npm install libsodium-wrappers-sumo
+  cp node_modules/libsodium-wrappers-sumo/dist/modules/libsodium-wrappers-sumo.js ./libsodium.js
+
+The file is ~2MB and not committed to the repo.

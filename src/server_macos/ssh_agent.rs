@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use ssh_agent_lib::proto::{
 use ssh_key::private::{KeypairData, PrivateKey};
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::core::crypto::{derive_dek, AesGcmCrypto};
 use crate::core::session::AuthOutcome;
@@ -23,7 +24,7 @@ use crate::core::wire::{
 };
 use crate::core::{
     legacy_decrypt, AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, EncryptReq,
-    EncryptResItem, SALT_LEN,
+    EncryptResItem, RunReq, RunRes, SALT_LEN,
 };
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
@@ -36,6 +37,7 @@ use super::store::KeychainStore;
 pub const EXT_ENCRYPT: &str = "encrypt@vt";
 pub const EXT_DECRYPT: &str = "decrypt@vt";
 pub const EXT_AUTH: &str = "auth@vt";
+pub const EXT_RUN: &str = "run@vt";
 
 fn agent_err(e: anyhow::Error) -> AgentError {
     AgentError::Other(Box::new(std::io::Error::new(
@@ -321,6 +323,42 @@ mod proc_info {
 
 // --- SSH Agent ---
 
+// Defense-in-depth re-sanitization before surfacing wire meta to the Touch ID
+// prompt — forwarded SSH agent sockets could be rewritten by a hostile hop.
+use crate::core::sanitize_for_display as sanitize_prompt;
+
+/// Render `user@host`, omitting either side when empty so the prompt
+/// degrades gracefully for old clients that don't send `meta.user`.
+fn who_at_host(user: &str, host: &str) -> String {
+    let u = sanitize_prompt(user, 40);
+    let h = sanitize_prompt(host, 60);
+    match (u.is_empty(), h.is_empty()) {
+        (true, true)   => String::new(),
+        (true, false)  => h,
+        (false, true)  => u,
+        (false, false) => format!("{}@{}", u, h),
+    }
+}
+
+/// Append the extra context lines (pwd, parent process, ssh-from) to the
+/// Touch ID prompt body. Each is on its own line — `LAContext`'s
+/// `localizedReason` renders multi-line strings. Empty fields are skipped so
+/// the prompt stays compact for old clients.
+fn append_meta_lines(message: &mut String, meta: &crate::core::ClientMeta) {
+    if !meta.pwd.is_empty() {
+        message.push_str("\npwd: ");
+        message.push_str(&sanitize_prompt(&meta.pwd, 100));
+    }
+    if !meta.ppid_cmd.is_empty() {
+        message.push_str("\nvia: ");
+        message.push_str(&sanitize_prompt(&meta.ppid_cmd, 100));
+    }
+    if !meta.ssh_client.is_empty() {
+        message.push_str("\nssh: ");
+        message.push_str(&sanitize_prompt(&meta.ssh_client, 80));
+    }
+}
+
 /// Hash a lock passphrase to a 32-byte SHA-256 digest.
 fn hash_lock_passphrase(passphrase: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -329,6 +367,152 @@ fn hash_lock_passphrase(passphrase: &str) -> [u8; 32] {
     out.copy_from_slice(&hash);
     out
 }
+
+// --- run@vt allowlist + spawn helpers ---------------------------------------
+//
+// `run@vt` lets a (typically remote) client request that the local agent
+// spawn a program on this Mac after Touch ID. It is the only vt extension
+// whose side effect is "fork/exec arbitrary code as the agent's UID", so the
+// design is conservative: empty allowlist disables the feature entirely,
+// argv[0] is resolved against the allowlist before any Touch ID prompt, the
+// child's env is a fresh allowlist (not a denylist scrub of the agent's env),
+// and concurrent `run@vt` calls are serialized so a remote attacker holding
+// VT_AUTH cannot queue dozens of prompts at the user.
+
+/// Parsed `--run-allow` flag. An empty allowlist means `run@vt` is disabled
+/// outright. Slash-bearing entries match argv[0] post-canonicalization;
+/// bare-name entries match argv[0] iff argv[0] is itself a bare name (the
+/// agent then resolves it via its own PATH).
+#[derive(Debug, Clone)]
+pub struct RunAllowlist {
+    bare_names: HashSet<String>,
+    abs_paths: HashSet<PathBuf>,
+}
+
+impl RunAllowlist {
+    /// Parse a comma-separated allowlist string. Whitespace around each item
+    /// is trimmed; empty items are ignored so `--run-allow ""` parses to an
+    /// empty (i.e. disabled) allowlist.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut bare_names = HashSet::new();
+        let mut abs_paths = HashSet::new();
+        for raw in spec.split(',') {
+            let item = raw.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if item.contains('\0') {
+                return Err(format!("run-allow item contains NUL: {:?}", item));
+            }
+            if item.contains('/') {
+                let p = PathBuf::from(item);
+                if !p.is_absolute() {
+                    return Err(format!(
+                        "run-allow path must be absolute (got {:?})",
+                        item
+                    ));
+                }
+                let canon = std::fs::canonicalize(&p)
+                    .map_err(|e| format!("run-allow canonicalize {:?}: {}", p, e))?;
+                abs_paths.insert(canon);
+            } else {
+                if item.chars().any(|c| c.is_whitespace()) {
+                    return Err(format!("run-allow name has whitespace: {:?}", item));
+                }
+                bare_names.insert(item.to_string());
+            }
+        }
+        Ok(Self {
+            bare_names,
+            abs_paths,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bare_names.is_empty() && self.abs_paths.is_empty()
+    }
+
+    /// Resolve a client-supplied argv[0] to a canonical absolute path that
+    /// passes the allowlist, or return a static failure reason. The returned
+    /// path is what the agent will pass to `Command::new` — never the raw
+    /// client string. Bare-name argv[0]s are resolved against the agent's
+    /// `PATH` (not the client's), which means PATH-injection from the remote
+    /// side is impossible: the remote cannot influence what `zed` resolves
+    /// to on this Mac.
+    pub fn resolve(&self, argv0: &str) -> Result<PathBuf, &'static str> {
+        if argv0.is_empty() {
+            return Err("argv[0] empty");
+        }
+        if argv0.contains('\0') {
+            return Err("argv[0] has NUL byte");
+        }
+        // Reject `..` components anywhere — canonicalize would resolve them
+        // but we want to reject them outright so the user-visible allowlist
+        // entries remain meaningful (no `/Applications/../etc/...` tricks).
+        if argv0.split('/').any(|c| c == "..") {
+            return Err("argv[0] has .. component");
+        }
+        if argv0.contains('/') {
+            let p = PathBuf::from(argv0);
+            if !p.is_absolute() {
+                return Err("argv[0] with / must be absolute");
+            }
+            let canon = std::fs::canonicalize(&p).map_err(|_| "argv[0] canonicalize failed")?;
+            if self.abs_paths.contains(&canon) {
+                Ok(canon)
+            } else {
+                Err("argv[0] path not in allowlist")
+            }
+        } else {
+            if !self.bare_names.contains(argv0) {
+                return Err("argv[0] name not in allowlist");
+            }
+            let path_env = std::env::var("PATH").unwrap_or_default();
+            resolve_in_path(argv0, &path_env).ok_or("argv[0] not found in agent PATH")
+        }
+    }
+}
+
+/// Tiny PATH lookup: walks `:`-separated dirs, returns the canonicalized path
+/// of the first executable file matching `name`. Avoids adding the `which`
+/// crate for ~10 lines of straightforward logic.
+fn resolve_in_path(name: &str, path_env: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in path_env.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = PathBuf::from(dir).join(name);
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 {
+            return std::fs::canonicalize(&candidate).ok();
+        }
+    }
+    None
+}
+
+/// Cap on the total characters of joined argv shown in the Touch ID prompt.
+/// Beyond this the prompt is truncated; argv itself is still passed in full.
+const RUN_PROMPT_ARGV_MAX: usize = 400;
+
+/// Cap on the total bytes of argv strings the agent will accept. Avoids
+/// extreme inputs (e.g. multi-MB argv) being kept alive across the Touch ID
+/// prompt window or being rendered to the UI.
+const RUN_REQ_ARGV_MAX_BYTES: usize = 8 * 1024;
+
+/// Environment variables passed through to the spawned child. The list is
+/// deliberately short: it MUST NOT include any vt credentials (VT_AUTH,
+/// VT_PASSKEY_*), the forwarded SSH agent socket (SSH_AUTH_SOCK,
+/// SSH_AGENT_PID), GPG agent info, or any dynamic-linker injection vector
+/// (DYLD_*, LD_*, PYTHONPATH, RUBYOPT, NODE_OPTIONS, PERL5LIB). Adding a
+/// new entry here is a security-sensitive decision — see codex review in
+/// PR history.
+const RUN_ENV_PASSTHROUGH: &[&str] = &[
+    "HOME", "USER", "LOGNAME", "PATH", "SHELL", "TERM", "TMPDIR", "LANG",
+    "LC_ALL", "LC_CTYPE", "DISPLAY",
+];
 
 /// Default idle timeout: 30 minutes.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
@@ -444,6 +628,14 @@ pub struct VtSshAgentFactory {
     /// agent so the "agent emits plaintext over wire" path can never be
     /// triggered.
     disable_legacy_decrypt: bool,
+    /// run@vt allowlist. Empty = feature disabled.
+    run_allow: Arc<RunAllowlist>,
+    /// Global serializer for run@vt Touch ID prompts. One permit means a
+    /// remote attacker holding VT_AUTH and opening N parallel SSH agent
+    /// connections cannot queue N concurrent prompts at the user — they
+    /// must approve or reject each in sequence. Critically, run@vt has
+    /// no auth cache (same rule as auth@vt — see check_or_prompt_run).
+    run_prompt_sem: Arc<Semaphore>,
 }
 
 impl VtSshAgentFactory {
@@ -452,6 +644,7 @@ impl VtSshAgentFactory {
         sign_cache: AuthCacheConfig,
         decrypt_cache: AuthCacheConfig,
         disable_legacy_decrypt: bool,
+        run_allow: RunAllowlist,
     ) -> Self {
         Self {
             keys: Arc::new(RwLock::new(keys)),
@@ -464,6 +657,8 @@ impl VtSshAgentFactory {
             sign_cache_mode: sign_cache.mode,
             decrypt_cache_mode: decrypt_cache.mode,
             disable_legacy_decrypt,
+            run_allow: Arc::new(run_allow),
+            run_prompt_sem: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -528,6 +723,8 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             idle_cleared: Arc::clone(&self.idle_cleared),
             sign_auth_cache: Arc::clone(&self.sign_auth_cache),
             decrypt_auth_cache: Arc::clone(&self.decrypt_auth_cache),
+            run_allow: Arc::clone(&self.run_allow),
+            run_prompt_sem: Arc::clone(&self.run_prompt_sem),
             peer_pid,
             sign_cache_context,
             decrypt_cache_context,
@@ -546,6 +743,11 @@ struct VtSshSession {
     idle_cleared: Arc<RwLock<bool>>,
     sign_auth_cache: Arc<RwLock<AuthCache>>,
     decrypt_auth_cache: Arc<RwLock<AuthCache>>,
+    /// Cloned per session for cheap reads; the underlying allowlist is
+    /// constant for the lifetime of the agent process.
+    run_allow: Arc<RunAllowlist>,
+    /// Shared across all sessions so run@vt prompts serialize globally.
+    run_prompt_sem: Arc<Semaphore>,
     peer_pid: Option<i32>,
     /// Resolved once at session creation. `None` = always prompt for sign.
     sign_cache_context: Option<CacheContext>,
@@ -807,12 +1009,14 @@ impl VtSshSession {
             return Err((ErrKind::LegacyDisabled, Some(DETAIL_LEGACY_DISABLED)));
         }
 
-        let local_auth_message = format!(
+        let who = who_at_host(&req.meta.user, &req.host);
+        let mut local_auth_message = format!(
             "decrypt {}: {} on {}",
             req.items.len(),
-            req.command,
-            req.host,
+            sanitize_prompt(&req.command, 120),
+            who,
         );
+        append_meta_lines(&mut local_auth_message, &req.meta);
         // Cache-aware authorization. Pure v2 batches may skip the prompt on
         // a full hit; any legacy item disables caching for the entire batch.
         // Failure paths inside `check_or_prompt_decrypt_batch` never grant
@@ -879,14 +1083,13 @@ impl VtSshSession {
         let req: AuthReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
-        // Sanitize untrusted remote strings: strip control chars, truncate.
-        let sanitize = |s: &str| -> String {
-            s.chars().filter(|c| !c.is_control()).take(100).collect()
-        };
-        let reason = sanitize(&req.reason);
-        let host = sanitize(&req.host);
-
-        let auth_message = format!("auth: {} on {}", reason, host);
+        let who = who_at_host(&req.meta.user, &req.host);
+        let mut auth_message = format!(
+            "auth: {} on {}",
+            sanitize_prompt(&req.reason, 100),
+            who,
+        );
+        append_meta_lines(&mut auth_message, &req.meta);
 
         // Always prompt Touch ID — no auth caching for auth@vt. Over
         // forwarded agents, all remote sessions share the same local
@@ -910,6 +1113,191 @@ impl VtSshSession {
             (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
         })?))
     }
+
+    /// Touch-ID-gated local command launcher. Every call prompts — no auth
+    /// cache, by design. Mirrors the auth@vt policy: forwarded agents share
+    /// a single local process, so caching would let any one remote session's
+    /// approval be reused by every other session's request, defeating the
+    /// guarantee that each `vt run` is acknowledged by a human tap.
+    ///
+    /// Returns the structured envelope body for the OK arm (`RunRes`) or an
+    /// `(ErrKind, detail)` pair the dispatcher turns into `ExtResponse::Err`.
+    async fn handle_run(
+        &self,
+        decrypted: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+        let req: RunReq = serde_json::from_slice(decrypted)
+            .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
+
+        // Fast-fail before any user interaction --------------------------------
+        if self.run_allow.is_empty() {
+            return Err((ErrKind::BadRequest, Some(DETAIL_RUN_DISABLED)));
+        }
+        if req.argv.is_empty() {
+            return Err((ErrKind::BadRequest, Some(DETAIL_RUN_ARGV_EMPTY)));
+        }
+        let argv_total: usize = req.argv.iter().map(|s| s.len()).sum();
+        if argv_total > RUN_REQ_ARGV_MAX_BYTES {
+            return Err((ErrKind::BadRequest, Some(DETAIL_RUN_ARGV_TOO_LARGE)));
+        }
+        // NUL bytes in any argv string would either be rejected by `Command`
+        // later or, worse, silently truncated by some downstream consumers.
+        // Reject up front with a stable static reason.
+        if req.argv.iter().any(|s| s.contains('\0')) {
+            return Err((ErrKind::BadRequest, Some(DETAIL_RUN_ARGV_EMPTY)));
+        }
+
+        let resolved = self.run_allow.resolve(&req.argv[0]).map_err(|why| {
+            tracing::warn!("run@vt rejected: {} (argv0={:?})", why, &req.argv[0]);
+            (ErrKind::BadRequest, Some(DETAIL_RUN_NOT_ALLOWLISTED))
+        })?;
+
+        // Build the Touch ID message. The resolved canonical path is shown on
+        // its own line so the user is approving the *resolved* program, not
+        // the (potentially confusing) raw argv[0] from a remote peer.
+        let who = who_at_host(&req.meta.user, &req.host);
+        let argv_joined: String = req
+            .argv
+            .iter()
+            .map(|a| sanitize_prompt(a, 80))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let argv_for_prompt = sanitize_prompt(&argv_joined, RUN_PROMPT_ARGV_MAX);
+        let exe_display = sanitize_prompt(&resolved.display().to_string(), 160);
+        let mut auth_message = format!(
+            "run on this Mac\nexe: {}\nargv: {}\nfrom: {}",
+            exe_display, argv_for_prompt, who,
+        );
+        if let Some(reason) = req.reason.as_deref() {
+            if !reason.is_empty() {
+                auth_message.push_str("\nreason: ");
+                auth_message.push_str(&sanitize_prompt(reason, 120));
+            }
+        }
+        append_meta_lines(&mut auth_message, &req.meta);
+
+        // Serialize Touch ID prompts globally for run@vt. Without this,
+        // each accepted SSH-agent socket runs in its own tokio task and
+        // a remote attacker holding VT_AUTH could queue N concurrent
+        // prompts at the user. The permit is held across the (synchronous)
+        // `authenticate` call so prompts are presented one at a time.
+        // SAFETY: the semaphore is never `close`d, so `acquire` cannot
+        // fail; mapping the error to Generic is a defensive default.
+        let _permit = self.run_prompt_sem.acquire().await.map_err(|_| {
+            (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
+        })?;
+
+        // NEVER cache. run@vt is treated like auth@vt — every call prompts
+        // because a forwarded agent socket is shared across all remote
+        // sessions, and any cache here would let one session's approval
+        // be reused by another to run arbitrary allowlisted programs.
+        match authenticate(&auth_message) {
+            AuthOutcome::Success(_) => {}
+            AuthOutcome::Rejected => {
+                return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
+            }
+            AuthOutcome::Unavailable(reason) => {
+                tracing::warn!("run@vt unavailable: {:?}", reason);
+                let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
+                    .unwrap_or(ErrKind::Generic);
+                return Err((kind, auth_outcome_detail(kind)));
+            }
+        }
+
+        // Spawn detached. `setsid` makes the child a new session leader so it
+        // survives agent exit; closing fds 3..1024 prevents the child from
+        // inheriting the agent's listener / keychain / tokio fds; redirecting
+        // stdio to /dev/null means no remote channel back. The child inherits
+        // the agent's UID and macOS TCC grants — that is intentional for a
+        // GUI launcher (e.g. `zed` needs disk access) but documented here so
+        // future maintainers don't accidentally widen what `run@vt` is.
+        let pid = spawn_detached(&resolved, &req.argv[1..]).map_err(|e| {
+            tracing::warn!("run@vt spawn failed: {}", e);
+            (ErrKind::Generic, Some(DETAIL_RUN_SPAWN_FAILED))
+        })?;
+        tracing::info!(
+            "run@vt: spawned pid={} exe={} from={}",
+            pid,
+            resolved.display(),
+            who,
+        );
+
+        let result = RunRes { pid };
+        Ok(Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
+            (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
+        })?))
+    }
+}
+
+/// Spawn `exe` with `args` as a detached background process. Returns the
+/// child PID for logging. The child:
+/// - inherits a freshly-built environment containing only `RUN_ENV_PASSTHROUGH`
+///   variables (so `VT_AUTH`, `SSH_AUTH_SOCK`, `DYLD_*`, etc. are dropped),
+/// - has stdin/stdout/stderr redirected to `/dev/null`,
+/// - starts in `$HOME` (or `/` if `HOME` is unset),
+/// - calls `setsid` and closes fds >= 3 via `pre_exec` so it cannot interact
+///   with the agent's open sockets or terminal,
+/// - is reaped by a background tokio task to avoid zombies if it exits while
+///   the agent is still running.
+fn spawn_detached(exe: &std::path::Path, args: &[String]) -> std::io::Result<u32> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let cwd = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .current_dir(&cwd)
+        .env_clear();
+    for &k in RUN_ENV_PASSTHROUGH {
+        if let Some(v) = std::env::var_os(k) {
+            cmd.env(k, v);
+        }
+    }
+    // SAFETY: pre_exec runs in the forked child between fork and exec.
+    // Only async-signal-safe libc calls are allowed; `setsid` and `close`
+    // satisfy that constraint. We do NOT touch heap-allocated state.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close every fd >= 3 so the agent's listener socket,
+            // keychain fds, tokio sleeper pipes, etc. don't leak into
+            // the child. We cap at the soft RLIMIT_NOFILE so this scales
+            // with whatever the agent was started with.
+            let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let max_fd = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0
+                && rlim.rlim_cur > 0
+                && rlim.rlim_cur < libc::rlim_t::MAX
+            {
+                rlim.rlim_cur as libc::c_int
+            } else {
+                1024
+            };
+            for fd in 3..max_fd {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    let pid = child.id();
+
+    // Reap asynchronously to avoid zombies. We must own `child` for the
+    // entire wait, otherwise `Drop for Child` would leak the zombie.
+    tokio::spawn(async move {
+        let mut child = child;
+        // `child.wait()` is blocking. Hop to the blocking pool so we don't
+        // peg a tokio worker for the lifetime of a possibly-long GUI app.
+        let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+    });
+    Ok(pid)
 }
 
 // ---- Static detail-string allow-list ----------------------------------------
@@ -927,6 +1315,13 @@ const DETAIL_AUTH_REJECTED: &str = "authentication was declined";
 const DETAIL_SCREEN_LOCKED: &str = "screen is locked";
 const DETAIL_NO_GUI: &str = "no active GUI session";
 const DETAIL_INTERNAL_SERIALIZE: &str = "agent failed to serialize response";
+// run@vt-specific failure reasons. All strings are static program info
+// (no host/argv/user data) and therefore safe to surface to a remote peer.
+const DETAIL_RUN_DISABLED: &str = "run@vt disabled (--run-allow not set on agent)";
+const DETAIL_RUN_ARGV_EMPTY: &str = "run@vt argv is empty";
+const DETAIL_RUN_ARGV_TOO_LARGE: &str = "run@vt argv exceeds size cap";
+const DETAIL_RUN_NOT_ALLOWLISTED: &str = "run@vt program is not in the agent's allowlist";
+const DETAIL_RUN_SPAWN_FAILED: &str = "run@vt failed to spawn the program";
 
 /// Map the three auth-outcome-derived [`ErrKind`]s to their canonical
 /// detail strings. Defined alongside the `DETAIL_*` constants so the
@@ -1120,7 +1515,10 @@ impl Session for VtSshSession {
         drop(locked);
 
         // Only handle vt custom protocol extensions; ignore standard SSH extensions
-        if !matches!(extension.name.as_str(), EXT_ENCRYPT | EXT_DECRYPT | EXT_AUTH) {
+        if !matches!(
+            extension.name.as_str(),
+            EXT_ENCRYPT | EXT_DECRYPT | EXT_AUTH | EXT_RUN
+        ) {
             return Ok(None);
         }
 
@@ -1168,6 +1566,7 @@ impl Session for VtSshSession {
                         .await
                 }
                 EXT_AUTH => self.handle_auth(&decrypted).await,
+                EXT_RUN => self.handle_run(&decrypted).await,
                 _ => unreachable!(),
             };
 
@@ -1375,6 +1774,7 @@ pub async fn run_ssh_agent(
     sign_cache: AuthCacheConfig,
     decrypt_cache: AuthCacheConfig,
     disable_legacy_decrypt: bool,
+    run_allow: RunAllowlist,
 ) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
 
@@ -1401,10 +1801,21 @@ pub async fn run_ssh_agent(
         println!("echo Agent pid {};", std::process::id());
     }
 
-    let factory =
-        VtSshAgentFactory::new(keys, sign_cache, decrypt_cache, disable_legacy_decrypt);
+    let run_allow_empty = run_allow.is_empty();
+    let factory = VtSshAgentFactory::new(
+        keys,
+        sign_cache,
+        decrypt_cache,
+        disable_legacy_decrypt,
+        run_allow,
+    );
     if disable_legacy_decrypt {
         tracing::info!("Legacy decrypt path disabled — only v2 envelope URLs accepted");
+    }
+    if run_allow_empty {
+        tracing::info!("run@vt disabled (no --run-allow entries)");
+    } else {
+        tracing::info!("run@vt enabled (allowlist configured)");
     }
 
     // Spawn idle sweeper that clears keys from memory after inactivity
@@ -1493,6 +1904,7 @@ pub async fn start_ssh_agent(
     sign_cache: AuthCacheConfig,
     decrypt_cache: AuthCacheConfig,
     disable_legacy_decrypt: bool,
+    run_allow: RunAllowlist,
 ) -> Result<()> {
     run_ssh_agent(
         true,
@@ -1500,6 +1912,7 @@ pub async fn start_ssh_agent(
         sign_cache,
         decrypt_cache,
         disable_legacy_decrypt,
+        run_allow,
     )
     .await
 }
@@ -1841,5 +2254,220 @@ mod tests {
         let start = proc_info::get_start_tvsec(sid)
             .expect("Session leader's start_tvsec should be queryable");
         assert!(start > 0, "Session leader start_tvsec should be positive");
+    }
+
+    // ── Touch-ID prompt helpers ────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_prompt_strips_control_chars() {
+        // Newline, tab, carriage return, NUL, DEL — all must go. The decrypt
+        // prompt is shown via LAContext.localizedReason; an attacker who
+        // controls a forwarded agent socket could try to break out of the
+        // prompt layout or smuggle in extra newlines that look like
+        // legitimate `pwd:` / `via:` fields.
+        let evil = "good\n\r\t\x00\x7fend";
+        assert_eq!(sanitize_prompt(evil, 100), "goodend");
+    }
+
+    #[test]
+    fn sanitize_prompt_truncates_with_ellipsis() {
+        let long: String = "x".repeat(50);
+        let out = sanitize_prompt(&long, 10);
+        assert_eq!(out.chars().count(), 11, "10 chars + …");
+        assert!(out.ends_with('…'));
+        assert!(out.starts_with("xxxxxxxxxx"));
+    }
+
+    #[test]
+    fn sanitize_prompt_passes_short_input_unchanged() {
+        assert_eq!(sanitize_prompt("hi", 100), "hi");
+        assert_eq!(sanitize_prompt("", 10), "");
+    }
+
+    #[test]
+    fn who_at_host_renders_user_and_host() {
+        assert_eq!(who_at_host("qiqi", "alpha"), "qiqi@alpha");
+    }
+
+    #[test]
+    fn who_at_host_degrades_gracefully_for_old_clients() {
+        // Old client doesn't send meta.user — fall back to bare host so the
+        // prompt still reads naturally.
+        assert_eq!(who_at_host("", "alpha"), "alpha");
+        // Symmetrically, a missing host should not produce a leading "@".
+        assert_eq!(who_at_host("qiqi", ""), "qiqi");
+        assert_eq!(who_at_host("", ""), "");
+    }
+
+    #[test]
+    fn who_at_host_strips_control_chars_in_either_field() {
+        // Defense-in-depth: a hostile forwarded peer could lie about user
+        // or host. The agent never trusts the wire for layout.
+        assert_eq!(who_at_host("qi\nqi", "al\tpha"), "qiqi@alpha");
+    }
+
+    #[test]
+    fn append_meta_lines_emits_only_populated_fields() {
+        let meta = crate::core::ClientMeta {
+            user: "qiqi".into(),
+            pwd: "/tmp".into(),
+            tty: "/dev/pts/3".into(), // intentionally skipped on prompt
+            ppid_cmd: "".into(),       // empty — must be skipped
+            ssh_client: "".into(),     // empty — must be skipped
+        };
+        let mut msg = String::from("auth: sudo on qiqi@alpha");
+        append_meta_lines(&mut msg, &meta);
+        assert_eq!(msg, "auth: sudo on qiqi@alpha\npwd: /tmp");
+    }
+
+    #[test]
+    fn append_meta_lines_emits_all_when_present() {
+        let meta = crate::core::ClientMeta {
+            user: "qiqi".into(),
+            pwd: "/tmp".into(),
+            tty: "/dev/pts/3".into(),
+            ppid_cmd: "zsh -i".into(),
+            ssh_client: "10.0.0.5 5234 22".into(),
+        };
+        let mut msg = String::from("decrypt 1: [read] on qiqi@alpha");
+        append_meta_lines(&mut msg, &meta);
+        let lines: Vec<&str> = msg.split('\n').collect();
+        assert_eq!(lines[0], "decrypt 1: [read] on qiqi@alpha");
+        assert_eq!(lines[1], "pwd: /tmp");
+        assert_eq!(lines[2], "via: zsh -i");
+        assert_eq!(lines[3], "ssh: 10.0.0.5 5234 22");
+        assert_eq!(lines.len(), 4, "tty must not be rendered on prompt");
+    }
+
+    #[test]
+    fn append_meta_lines_is_noop_for_default_meta() {
+        // Old clients deserialize to ClientMeta::default() — empty everywhere.
+        // The prompt must remain a single line in that case.
+        let meta = crate::core::ClientMeta::default();
+        let mut msg = String::from("auth: sudo on alpha");
+        append_meta_lines(&mut msg, &meta);
+        assert_eq!(msg, "auth: sudo on alpha");
+        assert!(!msg.contains('\n'));
+    }
+
+    // --- run@vt allowlist tests ----------------------------------------------
+
+    #[test]
+    fn run_allowlist_empty_means_disabled() {
+        let a = RunAllowlist::parse("").unwrap();
+        assert!(a.is_empty());
+        let a = RunAllowlist::parse("   ,  ").unwrap();
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn run_allowlist_rejects_relative_path_entry() {
+        // Slash-bearing entries must be absolute; otherwise the canonicalize
+        // would resolve against the agent's cwd at parse time — surprising.
+        let err = RunAllowlist::parse("bin/zed").unwrap_err();
+        assert!(err.contains("absolute"), "got: {}", err);
+    }
+
+    #[test]
+    fn run_allowlist_rejects_nul_in_entry() {
+        let err = RunAllowlist::parse("zed,fo\0o").unwrap_err();
+        assert!(err.contains("NUL"), "got: {}", err);
+    }
+
+    #[test]
+    fn run_allowlist_rejects_relative_argv0() {
+        let a = RunAllowlist::parse("zed").unwrap();
+        assert_eq!(a.resolve("./zed"), Err("argv[0] with / must be absolute"));
+    }
+
+    #[test]
+    fn run_allowlist_rejects_dotdot_in_argv0() {
+        let a = RunAllowlist::parse("/usr/bin/zed").unwrap_or_else(|_| {
+            // /usr/bin/zed may not exist on this machine; fall back to a
+            // bare-name allowlist for the .. rejection check.
+            RunAllowlist::parse("zed").unwrap()
+        });
+        assert_eq!(a.resolve("/Applications/../etc/passwd"), Err("argv[0] has .. component"));
+        assert_eq!(a.resolve("/foo/../bar"), Err("argv[0] has .. component"));
+    }
+
+    #[test]
+    fn run_allowlist_rejects_empty_and_nul_argv0() {
+        let a = RunAllowlist::parse("zed").unwrap();
+        assert_eq!(a.resolve(""), Err("argv[0] empty"));
+        assert_eq!(a.resolve("ze\0d"), Err("argv[0] has NUL byte"));
+    }
+
+    #[test]
+    fn run_allowlist_bare_name_rejects_path_argv0() {
+        // bare name "zed" must NOT let an attacker pass /tmp/zed.
+        let a = RunAllowlist::parse("zed").unwrap();
+        // /tmp exists; create a transient executable there to be sure
+        // canonicalize doesn't trip on a missing file.
+        use std::io::Write;
+        let mut path = std::env::temp_dir();
+        path.push(format!("vt-run-allow-test-{}", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "#!/bin/sh\necho hi").unwrap();
+        }
+        // chmod +x so it'd be considered executable by resolve_in_path.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let res = a.resolve(&path.display().to_string());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(res, Err("argv[0] path not in allowlist"));
+    }
+
+    #[test]
+    fn run_allowlist_resolves_bare_name_via_path() {
+        // /bin/sh is essentially always on PATH on macOS dev hosts.
+        let a = RunAllowlist::parse("sh").unwrap();
+        let resolved = a.resolve("sh").expect("sh should resolve via PATH");
+        assert!(resolved.is_absolute(), "expected absolute path, got {:?}", resolved);
+        // basename should be `sh`; on some systems /bin/sh is a symlink so we
+        // just sanity-check that the resolved file exists.
+        assert!(resolved.exists());
+    }
+
+    #[test]
+    fn run_allowlist_abs_path_exact_match() {
+        // Use /bin/sh (or its canonicalized form) as a real exec on disk.
+        let sh = std::fs::canonicalize("/bin/sh").expect("/bin/sh must exist on macOS");
+        let spec = sh.display().to_string();
+        let a = RunAllowlist::parse(&spec).unwrap();
+        assert_eq!(a.resolve(&spec).unwrap(), sh);
+        // Different absolute path → not allowlisted (use a canonicalize-able path).
+        let other = std::fs::canonicalize("/bin/ls").expect("/bin/ls must exist on macOS");
+        assert_eq!(
+            a.resolve(&other.display().to_string()),
+            Err("argv[0] path not in allowlist")
+        );
+    }
+
+    #[test]
+    fn append_meta_lines_caps_long_fields() {
+        // A hostile peer that floods e.g. pwd with megabytes of junk must
+        // not be able to push the Touch ID dialog off-screen.
+        let huge = "a".repeat(1000);
+        let meta = crate::core::ClientMeta {
+            pwd: huge.clone(),
+            ppid_cmd: huge.clone(),
+            ssh_client: huge,
+            ..Default::default()
+        };
+        let mut msg = String::new();
+        append_meta_lines(&mut msg, &meta);
+        // pwd:100, via:100, ssh:80 — plus the labels and newlines.
+        // Conservative upper bound: each line under 120 chars (label + 100 + …).
+        for line in msg.split('\n').filter(|l| !l.is_empty()) {
+            assert!(
+                line.chars().count() <= 120,
+                "prompt line too long ({} chars): {}",
+                line.chars().count(),
+                line,
+            );
+        }
     }
 }

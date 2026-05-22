@@ -11,7 +11,7 @@ path = "src/main.rs"
 clap = { version = "4.5.43", features = ["derive", "env"] }
 tokio = { version = "1.47.1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
 aes-gcm = "0.10"
 rand = "0.8"
 anyhow = "1.0.98"
@@ -21,14 +21,19 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.128", features = ["raw_value"] }
 totp-rs = "5.7.0"
 rpassword = "7.4.0"
-regex = "1.11.1"
 exec = "0.3.1"
 libc = "0.2.174"
 hostname = "0.4.1"
 dirs = "5"
 ssh-agent-lib = { version = "0.5", default-features = false }
 hkdf = "0.12"
+hmac = "0.12"
 zeroize = { version = "1", features = ["zeroize_derive"] }
+# CF ceremony (Linux / macOS fallback)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+dryoc = "0.8"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.3.0"
@@ -50,3 +55,9 @@ ctap-hid-fido2 = "3.5.9"
 
 [dev-dependencies]
 tracing-test = "0.2.5"
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
