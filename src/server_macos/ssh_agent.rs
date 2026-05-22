@@ -326,6 +326,31 @@ mod proc_info {
 // Defense-in-depth re-sanitization before surfacing wire meta to the Touch ID
 // prompt — forwarded SSH agent sockets could be rewritten by a hostile hop.
 use crate::core::sanitize_for_display as sanitize_prompt;
+use crate::core::sanitize_for_display_multiline as sanitize_prompt_multiline;
+
+/// Per-line cap and total-line cap for the multi-line `command` body the CLI
+/// sends. The CLI builds something like `op: inject\nfile: …\ncmd: …\nreason: …`
+/// so 6 lines is enough headroom; further lines from a hostile peer are
+/// silently dropped so the dialog can't be pushed off-screen.
+const PROMPT_COMMAND_MAX_LINES: usize = 6;
+const PROMPT_COMMAND_MAX_LINE_LEN: usize = 120;
+
+fn plural_secrets(n: usize) -> &'static str {
+    if n == 1 { "secret" } else { "secrets" }
+}
+
+/// First line of every Touch ID prompt: `"{verb}"` for old clients that
+/// don't send `meta.user`/`host`, or `"{verb} {prep} {who}"` when we have
+/// somewhere to attribute the request to. `prep` is per-call ("on" for
+/// decrypt/auth on the box; "from" for `run` which spawns *on* this Mac
+/// but *originates* on the remote host).
+fn header_with_who(verb: &str, prep: &str, who: &str) -> String {
+    if who.is_empty() {
+        verb.to_string()
+    } else {
+        format!("{} {} {}", verb, prep, who)
+    }
+}
 
 /// Render `user@host`, omitting either side when empty so the prompt
 /// degrades gracefully for old clients that don't send `meta.user`.
@@ -501,6 +526,13 @@ const RUN_PROMPT_ARGV_MAX: usize = 400;
 /// extreme inputs (e.g. multi-MB argv) being kept alive across the Touch ID
 /// prompt window or being rendered to the UI.
 const RUN_REQ_ARGV_MAX_BYTES: usize = 8 * 1024;
+
+/// Cap on the size of free-form display strings (`DecryptReq.command`,
+/// `AuthReq.reason`) the agent will sanitize and render. Without this, a
+/// hostile peer holding a forwarded `VT_AUTH` could push arbitrarily large
+/// strings and amplify per-prompt CPU/memory work. Generous compared to
+/// the few-hundred-char display caps so we never reject legitimate input.
+const PROMPT_DISPLAY_MAX_BYTES: usize = 8 * 1024;
 
 /// Environment variables passed through to the spawned child. The list is
 /// deliberately short: it MUST NOT include any vt credentials (VT_AUTH,
@@ -981,6 +1013,10 @@ impl VtSshSession {
         let req: DecryptReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
+        if req.command.len() > PROMPT_DISPLAY_MAX_BYTES {
+            return Err((ErrKind::BadRequest, Some(DETAIL_DISPLAY_FIELD_TOO_LARGE)));
+        }
+
         // Reject `SecretType::UNKNOWN` v2 items: serde would otherwise
         // accept them from a malformed `DecryptInput::V2`, the downstream
         // decrypt would fail on AAD mismatch, but the cache could be
@@ -1010,12 +1046,21 @@ impl VtSshSession {
         }
 
         let who = who_at_host(&req.meta.user, &req.host);
-        let mut local_auth_message = format!(
-            "decrypt {}: {} on {}",
-            req.items.len(),
-            sanitize_prompt(&req.command, 120),
-            who,
+        let n = req.items.len();
+        let mut local_auth_message = header_with_who(
+            &format!("decrypt {} {}", n, plural_secrets(n)),
+            "on",
+            &who,
         );
+        let body = sanitize_prompt_multiline(
+            &req.command,
+            PROMPT_COMMAND_MAX_LINE_LEN,
+            PROMPT_COMMAND_MAX_LINES,
+        );
+        if !body.is_empty() {
+            local_auth_message.push('\n');
+            local_auth_message.push_str(&body);
+        }
         append_meta_lines(&mut local_auth_message, &req.meta);
         // Cache-aware authorization. Pure v2 batches may skip the prompt on
         // a full hit; any legacy item disables caching for the entire batch.
@@ -1083,12 +1128,17 @@ impl VtSshSession {
         let req: AuthReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
+        if req.reason.len() > PROMPT_DISPLAY_MAX_BYTES {
+            return Err((ErrKind::BadRequest, Some(DETAIL_DISPLAY_FIELD_TOO_LARGE)));
+        }
+
         let who = who_at_host(&req.meta.user, &req.host);
-        let mut auth_message = format!(
-            "auth: {} on {}",
-            sanitize_prompt(&req.reason, 100),
-            who,
-        );
+        let mut auth_message = header_with_who("auth", "on", &who);
+        let reason = sanitize_prompt(&req.reason, 100);
+        if !reason.is_empty() {
+            auth_message.push_str("\nreason: ");
+            auth_message.push_str(&reason);
+        }
         append_meta_lines(&mut auth_message, &req.meta);
 
         // Always prompt Touch ID — no auth caching for auth@vt. Over
@@ -1164,10 +1214,11 @@ impl VtSshSession {
             .join(" ");
         let argv_for_prompt = sanitize_prompt(&argv_joined, RUN_PROMPT_ARGV_MAX);
         let exe_display = sanitize_prompt(&resolved.display().to_string(), 160);
-        let mut auth_message = format!(
-            "run on this Mac\nexe: {}\nargv: {}\nfrom: {}",
-            exe_display, argv_for_prompt, who,
-        );
+        let mut auth_message = header_with_who("run on this Mac", "from", &who);
+        auth_message.push_str("\nexe: ");
+        auth_message.push_str(&exe_display);
+        auth_message.push_str("\nargv: ");
+        auth_message.push_str(&argv_for_prompt);
         if let Some(reason) = req.reason.as_deref() {
             if !reason.is_empty() {
                 auth_message.push_str("\nreason: ");
@@ -1320,6 +1371,7 @@ const DETAIL_INTERNAL_SERIALIZE: &str = "agent failed to serialize response";
 const DETAIL_RUN_DISABLED: &str = "run@vt disabled (--run-allow not set on agent)";
 const DETAIL_RUN_ARGV_EMPTY: &str = "run@vt argv is empty";
 const DETAIL_RUN_ARGV_TOO_LARGE: &str = "run@vt argv exceeds size cap";
+const DETAIL_DISPLAY_FIELD_TOO_LARGE: &str = "display field exceeds size cap";
 const DETAIL_RUN_NOT_ALLOWLISTED: &str = "run@vt program is not in the agent's allowlist";
 const DETAIL_RUN_SPAWN_FAILED: &str = "run@vt failed to spawn the program";
 
@@ -2444,6 +2496,58 @@ mod tests {
             a.resolve(&other.display().to_string()),
             Err("argv[0] path not in allowlist")
         );
+    }
+
+    #[test]
+    fn plural_secrets_matches_count() {
+        assert_eq!(plural_secrets(0), "secrets");
+        assert_eq!(plural_secrets(1), "secret");
+        assert_eq!(plural_secrets(2), "secrets");
+    }
+
+    /// End-to-end shape of the new decrypt prompt: header on line 1,
+    /// the CLI's multi-line `command` body, then `append_meta_lines` rows.
+    #[test]
+    fn decrypt_prompt_renders_multiline_command_and_meta() {
+        let who = who_at_host("qiqi", "xy4");
+        let n = 5usize;
+        let mut msg = format!("decrypt {} {} on {}", n, plural_secrets(n), who);
+        let body = sanitize_prompt_multiline(
+            "op: inject\nfile: /Users/qiqi/.config/aux/config.jsonc\ncmd: /bin/cat /Users/qiqi/.config/aux/config.jsonc\nreason: aux config.jsonc",
+            PROMPT_COMMAND_MAX_LINE_LEN,
+            PROMPT_COMMAND_MAX_LINES,
+        );
+        assert!(!body.is_empty());
+        msg.push('\n');
+        msg.push_str(&body);
+        append_meta_lines(
+            &mut msg,
+            &crate::core::ClientMeta {
+                user: "qiqi".into(),
+                pwd: "/".into(),
+                tty: String::new(),
+                ppid_cmd: "/Applications/aux.app/Contents/MacOS/aux".into(),
+                ssh_client: String::new(),
+            },
+        );
+        let lines: Vec<&str> = msg.split('\n').collect();
+        assert_eq!(lines[0], "decrypt 5 secrets on qiqi@xy4");
+        assert_eq!(lines[1], "op: inject");
+        assert_eq!(lines[2], "file: /Users/qiqi/.config/aux/config.jsonc");
+        assert_eq!(lines[3], "cmd: /bin/cat /Users/qiqi/.config/aux/config.jsonc");
+        assert_eq!(lines[4], "reason: aux config.jsonc");
+        assert_eq!(lines[5], "pwd: /");
+        assert_eq!(lines[6], "via: /Applications/aux.app/Contents/MacOS/aux");
+        assert_eq!(lines.len(), 7);
+    }
+
+    #[test]
+    fn decrypt_prompt_caps_hostile_command_line_count() {
+        // A malicious peer floods `command` with extra lines trying to push
+        // the dialog off-screen — the multiline sanitizer must drop the tail.
+        let huge = (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let body = sanitize_prompt_multiline(&huge, PROMPT_COMMAND_MAX_LINE_LEN, PROMPT_COMMAND_MAX_LINES);
+        assert_eq!(body.split('\n').count(), PROMPT_COMMAND_MAX_LINES);
     }
 
     #[test]

@@ -12,8 +12,9 @@ use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
 use crate::core::wire::{ErrKind, WIRE_VERSION};
 use crate::core::{
     client_decrypt_v2, client_encrypt_v2, collapse_whitespace, has_vt_url, iter_vt_urls,
-    redact_vt_urls, AuthReq, AuthRes, CryptoResItem, DecryptInput, DecryptReq, DecryptResItem,
-    EncryptItem, EncryptReq, EncryptResItem, RunReq, RunRes, SecretType, VtUrl, SALT_LEN,
+    redact_vt_urls, sanitize_for_display, AuthReq, AuthRes, CryptoResItem, DecryptInput,
+    DecryptReq, DecryptResItem, EncryptItem, EncryptReq, EncryptResItem, RunReq, RunRes,
+    SecretType, VtUrl, SALT_LEN,
 };
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -691,21 +692,11 @@ pub async fn run(vt_client: VTClient, argv: Vec<String>, reason: Option<&str>) -
     vt_client.run(argv, reason).await
 }
 
-fn sanitize_prompt_field(s: &str, max_chars: usize) -> String {
-    let cleaned: String = s.chars().filter(|c| !c.is_control()).collect();
-    if cleaned.chars().count() > max_chars {
-        let truncated: String = cleaned.chars().take(max_chars).collect();
-        format!("{}...", truncated)
-    } else {
-        cleaned
-    }
-}
-
 pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Result<()> {
-    let mut command = "[read]".to_string();
+    let mut command = "op: read".to_string();
     if let Some(r) = reason {
-        command.push_str(" reason: ");
-        command.push_str(&sanitize_prompt_field(r, 200));
+        command.push_str("\nreason: ");
+        command.push_str(&sanitize_for_display(r, 200));
     }
     let res = vt_client
         .decrypt(&get_hostname(), &command, &[vt])
@@ -1062,29 +1053,22 @@ pub async fn inject(
 ) -> Result<()> {
     let raw_command = args.join(" ");
     debug!("Original command: {}", raw_command);
-    let mut original_command = String::from("[inject]");
+    let mut original_command = String::from("op: inject");
     if let Some(p) = replace_file.as_ref() {
-        original_command.push_str(" -r ");
-        original_command.push_str(&sanitize_prompt_field(p, 100));
+        original_command.push_str("\nfile: ");
+        original_command.push_str(&sanitize_for_display(p, 100));
     }
     if raw_command.is_empty() {
-        original_command.push_str(" [no shell command]");
+        original_command.push_str("\ncmd: [no shell command]");
     } else {
         let normalized = collapse_whitespace(&raw_command);
-        let sanitized = redact_vt_urls(&normalized, "vt://***");
-        const MAX_CMD_LEN: usize = 60;
-        let truncated = if sanitized.chars().count() > MAX_CMD_LEN {
-            let s: String = sanitized.chars().take(MAX_CMD_LEN).collect();
-            format!("{}...", s)
-        } else {
-            sanitized
-        };
-        original_command.push_str(" cmd: ");
-        original_command.push_str(&truncated);
+        let redacted = redact_vt_urls(&normalized, "vt://***");
+        original_command.push_str("\ncmd: ");
+        original_command.push_str(&sanitize_for_display(&redacted, 80));
     }
     if let Some(r) = reason {
-        original_command.push_str(" reason: ");
-        original_command.push_str(&sanitize_prompt_field(r, 200));
+        original_command.push_str("\nreason: ");
+        original_command.push_str(&sanitize_for_display(r, 200));
     }
 
     let replace_file_content = match replace_file.as_ref() {

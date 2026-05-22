@@ -48,13 +48,44 @@ pub struct EncryptItem {
 /// Used everywhere display text crosses a trust boundary (CF approval page,
 /// Touch ID prompt, log lines). Truncates with an ellipsis (`…`).
 pub fn sanitize_for_display(s: &str, max_chars: usize) -> String {
-    let cleaned: String = s.chars().filter(|c| !c.is_control()).collect();
-    if cleaned.chars().count() > max_chars {
-        let truncated: String = cleaned.chars().take(max_chars).collect();
-        format!("{}…", truncated)
-    } else {
-        cleaned
+    let mut out = String::with_capacity(s.len().min(max_chars).saturating_add(4));
+    let mut n = 0usize;
+    for c in s.chars().filter(|c| !c.is_control()) {
+        if n == max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(c);
+        n += 1;
     }
+    out
+}
+
+/// Like `sanitize_for_display` but preserves `\n`. Caps line count to bound
+/// the rendered dialog height against a hostile peer pushing it off-screen.
+pub fn sanitize_for_display_multiline(
+    s: &str,
+    max_chars_per_line: usize,
+    max_lines: usize,
+) -> String {
+    let mut out = String::new();
+    for (i, line) in s.split('\n').take(max_lines).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        // Inline a single-pass sanitize per line so the whole multi-line
+        // body lands in `out` with one allocation regardless of input size.
+        let mut n = 0usize;
+        for c in line.chars().filter(|c| !c.is_control()) {
+            if n == max_chars_per_line {
+                out.push('…');
+                break;
+            }
+            out.push(c);
+            n += 1;
+        }
+    }
+    out
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
@@ -524,6 +555,27 @@ mod tests {
         let mac_key = [0x42u8; 32];
         let salt = [0x11u8; SALT_LEN];
         derive_dek(&mac_key, &salt)
+    }
+
+    #[test]
+    fn sanitize_multiline_preserves_newlines_and_strips_other_controls() {
+        let s = "op: inject\nfile: /tmp/x\tdata\nreason: hi";
+        let out = sanitize_for_display_multiline(s, 100, 10);
+        assert_eq!(out, "op: inject\nfile: /tmp/xdata\nreason: hi");
+    }
+
+    #[test]
+    fn sanitize_multiline_caps_each_line_independently() {
+        let s = "short\n".to_string() + &"x".repeat(200);
+        let out = sanitize_for_display_multiline(&s, 10, 10);
+        assert_eq!(out, "short\nxxxxxxxxxx…");
+    }
+
+    #[test]
+    fn sanitize_multiline_caps_total_line_count() {
+        let s = "a\nb\nc\nd\ne";
+        let out = sanitize_for_display_multiline(s, 100, 3);
+        assert_eq!(out, "a\nb\nc");
     }
 
     #[test]

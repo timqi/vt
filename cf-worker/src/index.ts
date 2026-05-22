@@ -26,6 +26,17 @@ function capMeta(v: unknown, max: number): string {
   return cleaned.length <= max ? cleaned : cleaned.slice(0, max) + '…';
 }
 
+// Variant that preserves `\n` for the multi-line `command` body the CLI
+// builds (`op: …\nfile: …\ncmd: …\nreason: …`). Per-line cap + total line
+// cap mirror the SSH-agent's `PROMPT_COMMAND_MAX_*` so the same input
+// renders the same height on Touch ID and on the approval page.
+function capMetaMultiline(v: unknown, maxCharsPerLine: number, maxLines: number): string {
+  if (typeof v !== 'string') return '';
+  return v.split('\n').slice(0, maxLines)
+    .map(line => capMeta(line, maxCharsPerLine))
+    .join('\n');
+}
+
 const app = new Hono<{ Bindings: Env }>();
 
 // ── Global security headers ───────────────────────────────────────────────
@@ -123,7 +134,7 @@ app.post('/:prefix/api/challenge', async (c) => {
     salts_b64u: saltsB64u,
     meta: {
       op_kind:    capMeta(body.meta?.op_kind, 32),
-      command:    capMeta(body.meta?.command, 300),
+      command:    capMetaMultiline(body.meta?.command, 120, 6),
       host:       capMeta(body.meta?.host, 100),
       user:       capMeta(body.meta?.user, 64),
       pwd:        capMeta(body.meta?.pwd, 200),

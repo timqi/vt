@@ -69,7 +69,12 @@ export async function notifyApproval(
   const lines: string[] = [];
   if (who) lines.push(who);
   if (meta.pwd) lines.push(`pwd: ${meta.pwd}`);
-  if (meta.command) lines.push(`cmd: ${meta.command}`);
+  if (meta.command) {
+    // The CLI now sends `command` as a self-labelled multi-line body
+    // (`op: …\nfile: …\ncmd: …\nreason: …`); prefixing with another `cmd:`
+    // would just duplicate the labels. Inline single-line legacy commands.
+    lines.push(meta.command.includes('\n') ? meta.command : `cmd: ${meta.command}`);
+  }
   if (meta.ssh_client) lines.push(`ssh: ${meta.ssh_client}`);
   if (meta.ip) lines.push(`ip: ${meta.ip}`);
   if (meta.reason) lines.push(`reason: ${meta.reason}`);

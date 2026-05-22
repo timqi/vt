@@ -62,7 +62,7 @@ dl > div + div {
 }
 
 dl dt { color: #888; }
-dl dd { margin: 0; word-break: break-all; }
+dl dd { margin: 0; word-break: break-all; white-space: pre-wrap; }
 
 #actions {
   display: grid;

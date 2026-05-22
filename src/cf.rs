@@ -28,6 +28,14 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zeroize::Zeroizing;
 
 use crate::core::sanitize_for_display as sanitize;
+use crate::core::sanitize_for_display_multiline;
+
+/// Per-line and total-line caps used when sanitizing the multi-line
+/// `command` body for the phone approval page. Mirror the SSH-agent side
+/// (`PROMPT_COMMAND_MAX_*` in `ssh_agent.rs`) so the same input renders
+/// the same on both transports.
+const CF_COMMAND_MAX_LINE_LEN: usize = 120;
+const CF_COMMAND_MAX_LINES: usize = 6;
 
 // ── Salt generation ─────────────────────────────────────────────────────────
 
@@ -133,7 +141,7 @@ pub fn collect_meta(op_kind: &str, command: &str, reason: &str) -> ChallengeMeta
     let client = collect_client_meta();
     ChallengeMeta {
         op_kind: sanitize(op_kind, 32),
-        command: sanitize(command, 300),
+        command: sanitize_for_display_multiline(command, CF_COMMAND_MAX_LINE_LEN, CF_COMMAND_MAX_LINES),
         host: sanitize(&crate::client::get_hostname(), 100),
         user: client.user,
         pwd: client.pwd,
