@@ -779,7 +779,7 @@ fn legacy_secret_type(url: &str) -> SecretType {
 ///  - Re-encrypt each plaintext (no Touch ID; `encrypt@vt` is unauthenticated
 ///    by design) and capture the new `vt://0...` / `vt://1...` URL.
 ///  - Rewrite each input file atomically via `rename(2)`. With `--backup`,
-///    leave a `<file>.vt-migrate-backup` copy next to each modified file.
+///    leave a `<file>.vt-rewrap-backup` copy next to each modified file.
 pub async fn rewrap(
     vt_client: VTClient,
     files: Vec<std::path::PathBuf>,
@@ -951,13 +951,13 @@ pub async fn rewrap(
         }
         if backup {
             let mut backup_path = f.clone().into_os_string();
-            backup_path.push(".vt-migrate-backup");
+            backup_path.push(".vt-rewrap-backup");
             std::fs::copy(f, &backup_path).with_context(|| {
                 format!("Failed to write backup: {}", std::path::Path::new(&backup_path).display())
             })?;
         }
         let mut tmp_path = f.clone().into_os_string();
-        tmp_path.push(".vt-migrate-tmp");
+        tmp_path.push(".vt-rewrap-tmp");
         std::fs::write(&tmp_path, &new_text).with_context(|| {
             format!("Failed to write temp: {}", std::path::Path::new(&tmp_path).display())
         })?;
@@ -966,7 +966,7 @@ pub async fn rewrap(
         })?;
         if backup {
             println!(
-                "  {}: {} substitution(s); backup at {}.vt-migrate-backup",
+                "  {}: {} substitution(s); backup at {}.vt-rewrap-backup",
                 f.display(),
                 count,
                 f.display()
@@ -984,7 +984,7 @@ pub async fn rewrap(
         files.len()
     );
     let tail = if backup {
-        "verify the result, then delete .vt-migrate-backup files and consider restarting the agent with --no-legacy-decrypt to retire the legacy path."
+        "verify the result, then delete .vt-rewrap-backup files and consider restarting the agent with --no-legacy-decrypt to retire the legacy path."
     } else {
         "verify the result, then consider restarting the agent with --no-legacy-decrypt to retire the legacy path."
     };

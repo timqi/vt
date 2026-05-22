@@ -103,7 +103,7 @@ enum Commands {
         no_dry_run: bool,
         #[arg(
             long,
-            help = "Leave a <file>.vt-migrate-backup copy next to each rewritten file. Off by default."
+            help = "Leave a <file>.vt-rewrap-backup copy next to each rewritten file. Off by default."
         )]
         backup: bool,
     },

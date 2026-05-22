@@ -38,7 +38,7 @@ This is a **breaking protocol change**. The client and the running `vt ssh agent
    ```bash
    vt rewrap path/to/file …                  # dry-run preview
    vt rewrap --no-dry-run path/to/file …     # actually rewrite
-   vt rewrap --no-dry-run --backup path/to/file …   # also leave *.vt-migrate-backup
+   vt rewrap --no-dry-run --backup path/to/file …   # also leave *.vt-rewrap-backup
    ```
    `vt rewrap` handles RAW and TOTP types (TOTP migration uses a one-time legacy-path trick to recover the seed). One Touch ID covers the whole batch.
 5. Once all secrets are migrated, restart the agent with `--no-legacy-decrypt` to permanently retire the legacy code path:
