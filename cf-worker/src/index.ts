@@ -1,17 +1,44 @@
 // vt-passkey v2 Worker — Hono router.
 //
-// All sensitive endpoints live under a secret path prefix derived from
-// VT_AUTH_CF so random scanners never see the API surface. The prefix is
-// 16 base64url chars (≈96 bits) — unguessable in practice.
+// Endpoints sit at the root (no secret path prefix). Security rests on:
+//   • /api/challenge        — HMAC(VT_AUTH_CF) over the request body
+//   • /a/:token, approve    — 12-byte (96-bit) unguessable approve/poll tokens + WebAuthn
+//   • /<ADMIN_SEG>/*        — Cloudflare Access (edge) + Worker JWT verification
+//
+// Admin landing redirects to the audit view; Setup is a sibling tab.
 
 import { Hono } from 'hono';
 import { Env } from './types';
-import { derivePathPrefix, b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, inReplayWindow } from './crypto';
+import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, inReplayWindow } from './crypto';
 import { notifyApproval } from './pushover';
 import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ApproveRequest, RejectRequest } from './types';
 import { log, logErr, tokenPrefix } from './log';
+import { requireAccess } from './access';
 
 export { AccountDO } from './do_account';
+
+// Shared strict CSP for Worker-rendered HTML pages (approval + admin). All page
+// scripts are same-origin and use only crypto.subtle / WebAuthn / fetch — no
+// inline or eval — so 'self' is sufficient.
+const STRICT_CSP =
+  "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+// URL segment for the admin surface. Deliberately non-obvious so scanners that
+// probe /admin, /dashboard, etc. miss it (the real gate is Cloudflare Access —
+// this is just to cut noise). Change to any value you like, but keep it in sync
+// with the Cloudflare Access application's Path. The on-disk asset folder stays
+// pwa/admin/ regardless of this value.
+const ADMIN_SEG = 'kestrel';
+
+// Escape a JSON string for safe embedding in a <script type="application/json"> block.
+function escapeJsonForHtml(obj: unknown): string {
+  return JSON.stringify(obj)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
@@ -55,32 +82,62 @@ app.use('*', async (c, next) => {
 
 app.get('/healthz', c => c.text('ok'));
 
-// ── Secret-prefixed routes ────────────────────────────────────────────────
-
-app.all('/:prefix/*', async (c, next) => {
-  const provided = c.req.param('prefix');
-  const expected = await derivePathPrefix(c.env.VT_AUTH_CF);
-  const enc = new TextEncoder();
-  if (!ctEq(enc.encode(provided), enc.encode(expected))) {
-    return c.text('Not Found', 404);
-  }
-  return next();
-});
-
-// Static PWA assets — served under the secret prefix so the whole API
-// surface (including CSS/JS) sits behind the same firewall policy that
-// gates /:prefix/*. The pwa/ directory is bound to ASSETS in wrangler.toml.
-app.get('/:prefix/pwa/*', async (c) => {
+// Static PWA assets. Strip "/pwa" so ASSETS resolves against the pwa/ root:
+// /pwa/libsodium.js → /libsodium.js → pwa/libsodium.js
+app.get('/pwa/*', async (c) => {
   const url = new URL(c.req.url);
-  // Strip "/{prefix}/pwa" so ASSETS resolves against the pwa/ root:
-  // /{prefix}/pwa/libsodium.js → /libsodium.js → pwa/libsodium.js
-  const prefix = c.req.param('prefix');
-  url.pathname = url.pathname.slice(`/${prefix}/pwa`.length) || '/';
+  url.pathname = url.pathname.slice('/pwa'.length) || '/';
   return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
 });
 
+// ── Admin surface (Cloudflare Access protected) ───────────────────────────
+//
+// requireAccess verifies the Cf-Access-Jwt-Assertion JWT (RS256, kid, aud, iss,
+// exp) and fails closed. It gates BOTH the bare `/${ADMIN_SEG}` entry and
+// everything under `/${ADMIN_SEG}/*` (Hono's `/*` does not match the bare path,
+// so register both). The Cloudflare Access application's Path must equal
+// `${ADMIN_SEG}` (no secret prefix to keep in sync).
+app.use(`/${ADMIN_SEG}`, requireAccess);
+app.use(`/${ADMIN_SEG}/*`, requireAccess);
+
+// Admin static assets. Map /{ADMIN_SEG}/pwa/X → /admin/X → pwa/admin/X
+// (the single [assets] dir is "pwa"; the on-disk folder stays "admin").
+app.get(`/${ADMIN_SEG}/pwa/*`, async (c) => {
+  const url = new URL(c.req.url);
+  url.pathname = '/admin' + url.pathname.slice(`/${ADMIN_SEG}/pwa`.length);
+  return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
+});
+
+// Admin landing → default to the audit view (Setup is a sibling tab).
+app.get(`/${ADMIN_SEG}`, (c) => c.redirect(`/${ADMIN_SEG}/audit`, 302));
+
+// Audit page (HTML shell; data fetched from the JSON API below).
+app.get(`/${ADMIN_SEG}/audit`, (c) => {
+  const resp = c.html(buildAuditPage());
+  resp.headers.set('Content-Security-Policy', STRICT_CSP);
+  return resp;
+});
+
+// Setup page (pure client-side CREDENTIALS_JSON generator).
+app.get(`/${ADMIN_SEG}/setup`, (c) => {
+  const resp = c.html(buildSetupPage(c.env.RP_ID));
+  resp.headers.set('Content-Security-Policy', STRICT_CSP);
+  return resp;
+});
+
+// Audit data API — forwards a read-only cursor query to the DO.
+app.get(`/${ADMIN_SEG}/api/audit`, async (c) => {
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  const u = new URL('https://account.do/op/audit-query');
+  for (const k of ['limit', 'before_id', 'status', 'host']) {
+    const v = c.req.query(k);
+    if (v) u.searchParams.set(k, v);
+  }
+  return stub.fetch(u.toString());
+});
+
 // POST /api/challenge — daemon creates a challenge
-app.post('/:prefix/api/challenge', async (c) => {
+app.post('/api/challenge', async (c) => {
   // 1. HMAC auth
   const auth = c.req.header('Authorization') ?? '';
   const prefix = 'VT-HMAC ';
@@ -114,9 +171,11 @@ app.post('/:prefix/api/challenge', async (c) => {
     return c.text((e as Error).message, 400);
   }
 
-  // 6. Generate tokens
-  const approveToken = b64uEnc(randomBytes(32));
-  const pollToken   = b64uEnc(randomBytes(32));
+  // 6. Generate tokens. 12 bytes = 96-bit capability tokens (16 b64url chars):
+  // unguessable within the 5-min single-use TTL, and approval still requires a
+  // server-verified WebAuthn assertion regardless. Shortens the approve URL.
+  const approveToken = b64uEnc(randomBytes(12));
+  const pollToken   = b64uEnc(randomBytes(12));
   const workerNonce = randomBytes(16);
 
   // 7. Compute approve + reject challenge hashes
@@ -164,8 +223,7 @@ app.post('/:prefix/api/challenge', async (c) => {
 
   // 9. Pushover (non-fatal)
   const origin = c.env.WORKER_ORIGIN;
-  const pathPrefix = await derivePathPrefix(c.env.VT_AUTH_CF);
-  const approveUrl = `${origin}/${pathPrefix}/a/${approveToken}`;
+  const approveUrl = `${origin}/a/${approveToken}`;
 
   const secrets = (c.env.PUSHOVER_APP_TOKEN && c.env.PUSHOVER_USER_TOKEN)
     ? { appToken: c.env.PUSHOVER_APP_TOKEN, userToken: c.env.PUSHOVER_USER_TOKEN }
@@ -195,7 +253,7 @@ app.post('/:prefix/api/challenge', async (c) => {
 });
 
 // GET /api/dek — WebSocket; client waits for sealed DEKs
-app.get('/:prefix/api/dek', async (c) => {
+app.get('/api/dek', async (c) => {
   // Forward to DO which handles WS hibernation
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   const wsUrl = `https://account.do/ws?poll_token=${c.req.query('poll_token') ?? ''}`;
@@ -205,7 +263,7 @@ app.get('/:prefix/api/dek', async (c) => {
 });
 
 // POST /api/approve — PWA submits sealed DEKs after WebAuthn
-app.post('/:prefix/api/approve', async (c) => {
+app.post('/api/approve', async (c) => {
   let body: ApproveRequest;
   try { body = await c.req.json<ApproveRequest>(); }
   catch { return c.text('invalid json', 400); }
@@ -218,7 +276,7 @@ app.post('/:prefix/api/approve', async (c) => {
 });
 
 // POST /api/reject — PWA rejects
-app.post('/:prefix/api/reject', async (c) => {
+app.post('/api/reject', async (c) => {
   let body: RejectRequest;
   try { body = await c.req.json<RejectRequest>(); }
   catch { return c.text('invalid json', 400); }
@@ -231,9 +289,8 @@ app.post('/:prefix/api/reject', async (c) => {
 });
 
 // GET /a/:approve_token — serve the approval PWA page
-app.get('/:prefix/a/:approve_token', async (c) => {
+app.get('/a/:approve_token', async (c) => {
   const approveToken = c.req.param('approve_token');
-  const prefix = c.req.param('prefix');
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   // Fetch page data from DO
   const dataResp = await stub.fetch(`https://account.do/op/page?approve_token=${approveToken}`);
@@ -244,28 +301,20 @@ app.get('/:prefix/a/:approve_token', async (c) => {
   const pageData: ApprovePageData = await dataResp.json();
 
   // Inject page data into HTML template
-  const html = buildApprovePage(pageData, prefix);
+  const html = buildApprovePage(pageData);
   const resp = c.html(html);
   // Tight CSP for the approval page. <script type="application/json"> is
-  // non-executable and exempt from script-src; same-origin /:prefix/pwa/*
-  // scripts and styles match 'self'; fetch() to /:prefix/api/* is same-origin.
-  resp.headers.set(
-    'Content-Security-Policy',
-    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-  );
+  // non-executable and exempt from script-src; same-origin /pwa/* scripts and
+  // styles match 'self'; fetch() to /api/* is same-origin.
+  resp.headers.set('Content-Security-Policy', STRICT_CSP);
   return resp;
 });
 
 // ── HTML template ─────────────────────────────────────────────────────────
 
-function buildApprovePage(data: ApprovePageData, prefix: string): string {
-  const dataJson = JSON.stringify(data)
-    .replace(/</g, '\\u003c')
-    .replace(/>/g, '\\u003e')
-    .replace(/&/g, '\\u0026')
-    .replace(/\u2028/g, '\\u2028')
-    .replace(/\u2029/g, '\\u2029');
-  const base = `/${prefix}/pwa`;
+function buildApprovePage(data: ApprovePageData): string {
+  const dataJson = escapeJsonForHtml(data);
+  const base = `/pwa`;
   return `<!doctype html>
 <html lang="zh">
 <head>
@@ -294,6 +343,109 @@ function buildApprovePage(data: ApprovePageData, prefix: string): string {
   <script src="${base}/libsodium.js"></script>
   <script src="${base}/common.js"></script>
   <script src="${base}/approve.js"></script>
+</body>
+</html>`;
+}
+
+// ── Admin HTML templates ──────────────────────────────────────────────────
+
+// Tab bar shared by audit + setup. Both tabs carry equal weight; `active`
+// ∈ {'audit','setup'} marks the current one.
+function adminTabs(active: 'audit' | 'setup'): string {
+  const tab = (href: string, key: 'audit' | 'setup', label: string) =>
+    `<a class="tab${key === active ? ' active' : ''}" href="${href}"${key === active ? ' aria-current="page"' : ''}>${label}</a>`;
+  return `<nav class="tabs">${tab(`/${ADMIN_SEG}/audit`, 'audit', '审计')}${tab(`/${ADMIN_SEG}/setup`, 'setup', 'Setup')}</nav>`;
+}
+
+function buildAuditPage(): string {
+  const base = `/${ADMIN_SEG}`;
+  return `<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>VT 审计</title>
+  <link rel="stylesheet" href="${base}/pwa/admin.css">
+</head>
+<body>
+  <main>
+    ${adminTabs('audit')}
+    <p class="hint">每个挑战一行（状态：pending / approved / rejected / expired）。点击行查看完整详情。保留 90 天。</p>
+    <section id="filters">
+      <label>状态 <select id="f-status">
+        <option value="">全部</option>
+        <option value="pending">pending</option>
+        <option value="approved">approved</option>
+        <option value="rejected">rejected</option>
+        <option value="expired">expired</option>
+      </select></label>
+      <label>主机 <input id="f-host" type="text" placeholder="host"></label>
+      <button id="apply" type="button">查询</button>
+    </section>
+    <div id="table-wrap"><table id="audit"><thead><tr>
+      <th>时间</th><th>状态</th><th>主机</th><th>命令</th><th>IP</th><th>DEK</th><th>延迟ms</th>
+    </tr></thead><tbody id="rows"></tbody></table></div>
+    <section id="actions">
+      <button id="more" type="button">加载更多</button>
+      <span id="status" role="status" aria-live="polite"></span>
+    </section>
+  </main>
+  <div id="detail-backdrop" hidden><div id="detail-card" role="dialog" aria-modal="true">
+    <button id="detail-close" type="button" aria-label="关闭">×</button>
+    <dl id="detail-dl"></dl>
+  </div></div>
+  <script src="${base}/pwa/audit.js"></script>
+</body>
+</html>`;
+}
+
+function buildSetupPage(rpId: string): string {
+  const adminBase = `/${ADMIN_SEG}`;
+  const pwaBase = `/pwa`;
+  const dataJson = escapeJsonForHtml({ rp_id: rpId });
+  return `<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>VT Setup — 生成 CREDENTIALS_JSON</title>
+  <link rel="stylesheet" href="${adminBase}/pwa/admin.css">
+</head>
+<body>
+  <script type="application/json" id="vt-data">${dataJson}</script>
+  <main>
+    ${adminTabs('setup')}
+    <p class="hint">纯本地生成 <code>CREDENTIALS_JSON</code>。master_key 不离开此浏览器；生成后请手动 <code>wrangler secret put CREDENTIALS_JSON</code>。</p>
+    <section id="modes">
+      <label><input type="radio" name="mode" value="bootstrap" checked> 首个 Passkey（bootstrap）</label>
+      <label><input type="radio" name="mode" value="add"> 新增 Passkey</label>
+      <label><input type="radio" name="mode" value="revoke"> 吊销 Passkey</label>
+    </section>
+    <section id="existing-section" hidden>
+      <h2>现有 CREDENTIALS_JSON</h2>
+      <textarea id="existing" rows="6" placeholder="粘贴当前 CREDENTIALS_JSON（add / revoke 需要）"></textarea>
+    </section>
+    <section id="label-section">
+      <label>标签 <input id="label" type="text" placeholder="如 iphone-icloud"></label>
+    </section>
+    <section id="revoke-section" hidden>
+      <label>吊销条目 <select id="revoke-pick"></select></label>
+      <p class="warn">⚠️ 吊销 ≠ 密钥轮换：仅从允许列表移除，master_key 不变。若该 Passkey 的密文与 PRF 曾泄露，仍可离线解出同一 master_key。</p>
+    </section>
+    <section id="actions">
+      <button id="run" type="button">生成</button>
+      <button id="selfcheck" type="button" hidden>自检（逐条验证）</button>
+    </section>
+    <p id="status" role="status" aria-live="polite"></p>
+    <section id="output-section" hidden>
+      <h2>输出</h2>
+      <textarea id="output" rows="10" readonly></textarea>
+      <button id="copy" type="button">复制</button>
+    </section>
+  </main>
+  <script src="${pwaBase}/common.js"></script>
+  <script src="${adminBase}/pwa/cbor.js"></script>
+  <script src="${adminBase}/pwa/setup.js"></script>
 </body>
 </html>`;
 }

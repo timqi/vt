@@ -39,11 +39,6 @@
         }
     };
 
-    // Secret path prefix = first segment of the current page URL.
-    // The page is served at /{prefix}/a/{token}, so split('/')[1] = prefix.
-    vt.PATH_PREFIX = '/' + location.pathname.split('/')[1];
-    vt.apiPath = function (suffix) { return vt.PATH_PREFIX + suffix; };
-
     var PRF_INFO_BYTES = new TextEncoder().encode('vt-master-wrap-v1');
     var DEK_INFO_BYTES = new TextEncoder().encode('vt-dek-v2');
 

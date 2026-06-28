@@ -1,0 +1,141 @@
+/* Light-first, adaptive theme. Default = Light. Dark only when the device
+   explicitly prefers it (prefers-color-scheme: dark). */
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-2: #eef1f5;
+  --fg: #1c2129;
+  --muted: #5b6573;
+  --accent: #2563eb;
+  --ok: #15803d;
+  --err: #c0392b;
+  --warn: #b7791f;
+  --border: #d8dee6;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --panel-2: #1f232c;
+    --fg: #e6e8ec;
+    --muted: #9aa3b2;
+    --accent: #4f8cff;
+    --ok: #2ecc71;
+    --err: #ff5c5c;
+    --warn: #ffb648;
+    --border: #2a2f3a;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+main {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 20px 16px 64px;
+}
+
+.hint { color: var(--muted); margin: 8px 0 16px; font-size: 13px; }
+.warn { color: var(--warn); font-size: 13px; }
+code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+h2 { font-size: 15px; margin: 18px 0 8px; }
+
+/* Tabs (audit / setup) — equal weight */
+.tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin: 8px 0 4px;
+}
+.tab {
+  padding: 9px 18px;
+  text-decoration: none;
+  color: var(--muted);
+  font-weight: 600;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab:hover { color: var(--fg); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* Forms */
+section { margin: 14px 0; }
+label { display: inline-flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); margin-right: 14px; }
+#modes label, #revoke-section label { flex-direction: row; align-items: center; gap: 6px; color: var(--fg); }
+input[type="text"], select, textarea {
+  background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; font: inherit; min-width: 180px;
+}
+textarea { width: 100%; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+button {
+  background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+  padding: 9px 16px; font: inherit; cursor: pointer; margin-right: 8px;
+}
+button:hover { filter: brightness(1.08); }
+button:disabled { opacity: .5; cursor: default; }
+
+#actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+#actions #status { margin-top: 0; }
+#status { min-height: 20px; font-size: 13px; margin-top: 12px; }
+#status.ok { color: var(--ok); }
+#status.error { color: var(--err); }
+
+/* Audit table */
+#table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel-2); }
+tbody tr:hover { background: var(--panel-2); }
+
+tbody tr.clickable { cursor: pointer; }
+
+.badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+.badge-pending { background: #e7eaef; color: #5b6573; }
+.badge-approved { background: #d7f5e3; color: #15803d; }
+.badge-rejected { background: #fde0e6; color: #be123c; }
+.badge-expired { background: #fdecca; color: #92600c; }
+
+@media (prefers-color-scheme: dark) {
+  .badge-pending { background: #2a2f3a; color: #9aa3b2; }
+  .badge-approved { background: #1f3d2c; color: #7ee2a8; }
+  .badge-rejected { background: #4a2230; color: #ff9bb0; }
+  .badge-expired { background: #3a3320; color: #ffd591; }
+}
+
+/* Detail card (modal) */
+#detail-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.45);
+  display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10;
+}
+/* `display:flex` above would otherwise override the UA `[hidden]{display:none}`,
+   leaving the modal permanently visible — re-assert hidden with higher specificity. */
+#detail-backdrop[hidden] { display: none; }
+#detail-card {
+  position: relative; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px;
+  max-width: 680px; width: 100%; max-height: 85vh; overflow: auto;
+}
+#detail-close {
+  position: absolute; top: 10px; right: 10px; background: transparent; color: var(--muted);
+  font-size: 22px; line-height: 1; padding: 4px 10px; margin: 0;
+}
+#detail-close:hover { color: var(--fg); filter: none; }
+#detail-dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+#detail-dl dt { color: var(--muted); font-size: 13px; }
+#detail-dl dd { margin: 0; font-size: 13px; word-break: break-word; }
+#detail-dl dd.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+
+@media (max-width: 640px) {
+  label { display: flex; margin-right: 0; }
+  #detail-dl { grid-template-columns: 1fr; gap: 2px 0; }
+  #detail-dl dt { margin-top: 8px; }
+}

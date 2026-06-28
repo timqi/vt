@@ -161,7 +161,7 @@
             vt.zeroize(pwaSk); pwaSk = null;
 
             setStatus('正在提交…');
-            var resp = await fetch(vt.apiPath('/api/approve'), {
+            var resp = await fetch('/api/approve', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -209,7 +209,7 @@
             });
             var usedId = b64uEnc(new Uint8Array(assertion.rawId));
             setStatus('正在提交拒绝…');
-            var resp = await fetch(vt.apiPath('/api/reject'), {
+            var resp = await fetch('/api/reject', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({

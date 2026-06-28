@@ -9,6 +9,39 @@ export interface Env {
   PUSHOVER_USER_TOKEN: string;
   WORKER_ORIGIN: string;
   RP_ID: string;
+  /** Cloudflare Access team domain, e.g. "myteam.cloudflareaccess.com". Empty → admin surface fails closed. */
+  ACCESS_TEAM_DOMAIN: string;
+  /** Cloudflare Access Application AUD tag. Empty → admin surface fails closed. */
+  ACCESS_AUD: string;
+}
+
+// ── Audit (DO SQLite) ──────────────────────────────────────────────────────
+
+/** One row of the DO-internal `audit` table — one row PER CHALLENGE (the
+ *  lifecycle stages update this row in place; params are stored once). */
+export interface AuditRow {
+  id: number;
+  token_id: string;
+  created_ms: number;
+  finalized_ms: number | null;
+  status: string;            // pending | approved | rejected | expired
+  op_kind: string | null;
+  command: string | null;
+  reason: string | null;
+  host: string | null;
+  user: string | null;
+  pwd: string | null;
+  tty: string | null;
+  ppid_cmd: string | null;
+  ssh_client: string | null;
+  ip: string | null;
+  salts: number | null;
+  latency_ms: number | null;
+  verify_failures: number;
+}
+
+export interface AuditQueryResponse {
+  rows: AuditRow[];
 }
 
 // ── Challenge stored in DO ─────────────────────────────────────────────────

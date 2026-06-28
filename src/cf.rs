@@ -77,14 +77,6 @@ pub fn load_config() -> Result<CfConfig> {
     Ok(CfConfig { worker_url, worker_auth })
 }
 
-// ── Path prefix ────────────────────────────────────────────────────────────
-
-fn derive_path_prefix(worker_auth: &str) -> String {
-    let mac = hmac_sha256(worker_auth.as_bytes(), b"vt-path-prefix");
-    let b64 = URL_SAFE_NO_PAD.encode(mac);
-    b64[..16].to_string()
-}
-
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(key)
         .expect("HMAC accepts any key length");
@@ -269,8 +261,7 @@ pub async fn get_deks(
     let n_deks = salts.len();
     let salts_b64u: Vec<String> = salts.iter().map(|s| URL_SAFE_NO_PAD.encode(s)).collect();
 
-    let prefix = derive_path_prefix(&config.worker_auth);
-    let challenge_url = format!("{}/{}/api/challenge", config.worker_url, prefix);
+    let challenge_url = format!("{}/api/challenge", config.worker_url);
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -316,10 +307,9 @@ pub async fn get_deks(
     eprintln!("vt: approve at: {}", ch.approve_url);
 
     let ws_url = format!(
-        "{}/{}/api/dek?poll_token={}",
+        "{}/api/dek?poll_token={}",
         config.worker_url.replacen("https://", "wss://", 1)
             .replacen("http://", "ws://", 1),
-        prefix,
         ch.poll_token
     );
 

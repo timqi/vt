@@ -16,7 +16,8 @@ export async function verifyAssertion(opts: {
   authenticatorData: Uint8Array;
   /** Signature bytes from authenticator */
   signature: Uint8Array;
-  /** The expected challenge bytes (= challenge_hash 32 bytes) */
+  /** The expected clientData challenge bytes. For reject this is the
+   *  reject_challenge_hash; for approve it is SHA-256(approve_challenge_hash || pwa_pk). */
   expectedChallenge: Uint8Array;
   /** Relying party ID (hostname) */
   rpId: string;

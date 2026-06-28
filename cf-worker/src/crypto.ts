@@ -1,4 +1,4 @@
-// Crypto primitives: SHA-256, HMAC-SHA256, challenge_hash, path prefix,
+// Crypto primitives: SHA-256, HMAC-SHA256, challenge_hash,
 // constant-time comparison, random bytes.
 
 export function b64uEnc(bytes: Uint8Array): string {
@@ -39,14 +39,6 @@ export async function hmacSha256(keyBytes: Uint8Array, data: Uint8Array): Promis
   const key = await crypto.subtle.importKey(
     'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   return new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
-}
-
-// Returns 16 b64url chars of HMAC-SHA256(VT_AUTH_CF, "vt-path-prefix").
-// Must match the Rust derive_path_prefix() in src/cf.rs exactly.
-export async function derivePathPrefix(vtAuthCf: string): Promise<string> {
-  const keyBytes = new TextEncoder().encode(vtAuthCf);
-  const mac = await hmacSha256(keyBytes, new TextEncoder().encode('vt-path-prefix'));
-  return b64uEnc(mac).slice(0, 16);
 }
 
 // challenge_hash = SHA-256(
