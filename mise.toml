@@ -1,2 +1,6 @@
 [tools]
 wrangler = "latest"
+
+[env]
+CLOUDFLARE_API_TOKEN = "vt://0k9C3y3bqpxt0DnH-gSF7tKrOOhR-vusdgxrCI2RswByL9XeaGbu_YZO4R2dKC1ZVwM-65o_Nb4I5c_qfQJFJ9TicWwmguPcrJZqLlWakdZ1zGG1fOQ"
+CLOUDFLARE_ACCOUNT_ID = "vt://0-CuqtzN8ln25ZsuSM-sHNT1c06uDq-u6gWR48pnmms47iMOmuOdZdMd2UxeYn0Vf99TVcosakUSazsjs8NVZqg"
