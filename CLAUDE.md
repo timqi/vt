@@ -4,6 +4,19 @@ Single-binary KMS with Passkey-based approval for Linux. No daemon, no
 master_key cache. Secrets stay encrypted at rest and are decrypted
 on-demand via a phone WebAuthn ceremony.
 
+**Opt-in DEK cache (off by default).** The approver may grant a short TTL
+(8m / 20m / 2h) at approval time; within that window, decrypt requests for the
+same records from the **same source IP and parent PID** are served from a
+server-side cache **without a phone approval**. This deliberately trades the
+"every decrypt needs the phone" guarantee for convenience: in the window, those
+records collapse to a single factor (possession of `VT_PASSKEY_TOKEN`) for a
+caller behind the same egress IP. IP binding (worker-derived, unspoofable)
+defeats token exfiltration to another host; PPID binding (client-reported) is
+advisory blast-radius reduction. Default is 0 (no cache, historical behaviour);
+caching is fully disabled unless the `CACHE_SECKEY` worker secret is set. Every
+cache read (hit/miss) is audited. See `docs/dek-cache.md` for the full design,
+threat model, and `wrangler secret put CACHE_SECKEY` setup.
+
 ## Build
 
 ```bash

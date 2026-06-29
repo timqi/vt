@@ -121,9 +121,25 @@ pub struct ChallengeMeta {
     pub pwd: String,
     pub tty: String,
     pub ppid_cmd: String,
+    /// Numeric parent PID. Half of the DEK-cache binding context recorded at
+    /// approval time; a later /api/dek-cache request must report the same ppid
+    /// (and come from the same IP) to hit the cache. See docs/dek-cache.md.
+    pub ppid: u32,
     pub ssh_client: String,
     pub reason: String,
 }
+
+/// Numeric parent PID of the current process (libc::getppid). 0 where
+/// unavailable. Reported to the worker so the DEK cache can be scoped to the
+/// same parent process; advisory only (client-reported, spoofable by a
+/// fully-compromised host) — the worker-derived IP is the trustworthy half.
+#[cfg(unix)]
+pub fn current_ppid() -> u32 {
+    let p = unsafe { libc::getppid() };
+    if p > 0 { p as u32 } else { 0 }
+}
+#[cfg(not(unix))]
+pub fn current_ppid() -> u32 { 0 }
 
 /// Build a `ChallengeMeta` by collecting local context from the running
 /// process: hostname, $USER, cwd, controlling TTY, parent process command
@@ -139,6 +155,7 @@ pub fn collect_meta(op_kind: &str, command: &str, reason: &str) -> ChallengeMeta
         pwd: client.pwd,
         tty: client.tty,
         ppid_cmd: client.ppid_cmd,
+        ppid: current_ppid(),
         ssh_client: client.ssh_client,
         reason: sanitize(reason, 200),
     }
@@ -242,6 +259,69 @@ struct WsMsg {
     binding_tag_b64u: Option<String>,
 }
 
+#[derive(Serialize)]
+struct DekCacheReq<'a> {
+    daemon_pubkey_b64u: String,
+    salts_b64u: Vec<String>,
+    timestamp_ms: u64,
+    /// Full display meta (host/user/command/ppid/…), same shape as the challenge
+    /// request — so a cache HIT is audited with the same context as a ceremony
+    /// decrypt. `meta.ppid` is also the PPID half of the cache binding ctx.
+    meta: &'a ChallengeMeta,
+}
+
+#[derive(Deserialize)]
+struct DekCacheResp {
+    /// Discriminant: "cache" on a hit. Absent/other ⇒ treat as miss (state-
+    /// confusion guard — a non-cache response can never be opened on this path).
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    sealed_deks_b64u: Option<String>,
+    #[serde(default)]
+    miss: bool,
+}
+
+/// POST to the worker with the egress IP family pinned to IPv4 (with graceful
+/// fallback). Both the challenge (which writes the DEK-cache entry, ctx bound to
+/// CF-Connecting-IP) and the dek-cache probe (which reads it) go through here,
+/// so a dual-stack host can't flip between its IPv4 and IPv6 egress across the
+/// two separate `vt` processes — that flip would change CF-Connecting-IP, hence
+/// the cache ctx, and cause a permanent miss. Cloudflare always publishes A
+/// records, so IPv4 connects whenever the host has any IPv4 egress; on an
+/// IPv6-only host the IPv4 connect fails and we retry without the pin (both
+/// requests then consistently use IPv6).
+async fn cf_post(url: &str, auth_header: &str, body: &[u8]) -> Result<reqwest::Response> {
+    async fn send_once(client: reqwest::Client, url: &str, auth_header: &str, body: &[u8])
+        -> reqwest::Result<reqwest::Response>
+    {
+        client
+            .post(url)
+            .header("Authorization", auth_header)
+            .header("Content-Type", "application/json")
+            .body(body.to_vec())
+            .send()
+            .await
+    }
+
+    let v4 = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        .build()?;
+    match send_once(v4, url, auth_header, body).await {
+        Ok(r) => Ok(r),
+        // IPv6-only host (or no IPv4 route): retry without the family pin so both
+        // requests consistently fall back to IPv6.
+        Err(e) if e.is_connect() || e.is_builder() => {
+            let any = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?;
+            Ok(send_once(any, url, auth_header, body).await?)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 // ── Main entry point ───────────────────────────────────────────────────────
 
 /// Run the CF approval ceremony and return one DEK per salt.
@@ -254,8 +334,10 @@ pub async fn get_deks(
     salts: &[[u8; 16]],
     meta: ChallengeMeta,
 ) -> Result<Vec<Zeroizing<[u8; 32]>>> {
-    // Ephemeral X25519 keypair (PublicKey / SecretKey are [u8; 32] type aliases)
-    let (pk, sk) = crypto_box_keypair();
+    // Ephemeral X25519 keypair (PublicKey / SecretKey are [u8; 32] type aliases).
+    // Wrap the secret in Zeroizing so it is wiped on return (S1).
+    let (pk, sk_raw) = crypto_box_keypair();
+    let sk = Zeroizing::new(sk_raw);
     let pk_b64u = URL_SAFE_NO_PAD.encode(pk);
 
     let n_deks = salts.len();
@@ -274,16 +356,8 @@ pub async fn get_deks(
         meta,
     })?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let resp = client
-        .post(&challenge_url)
-        .header("Authorization", hmac_auth_header(&config.worker_auth, &req_body))
-        .header("Content-Type", "application/json")
-        .body(req_body)
-        .send()
+    let auth_header = hmac_auth_header(&config.worker_auth, &req_body);
+    let resp = cf_post(&challenge_url, &auth_header, &req_body)
         .await
         .context("POST /api/challenge")?;
 
@@ -347,14 +421,14 @@ pub async fn get_deks(
 
                         verify_binding(
                             &pk,
-                            &sk,
+                            &*sk,
                             &pwa_pk,
                             &approve_challenge_hash,
                             &sealed_deks_bytes,
                             &binding_tag,
                         )?;
 
-                        return open_sealed_deks(sealed_b64u, &pk, &sk, n_deks);
+                        return open_sealed_deks(sealed_b64u, &pk, &*sk, n_deks);
                     }
                     "rejected" => bail!("approval rejected by user"),
                     "expired"  => bail!("approval request expired"),
@@ -365,6 +439,85 @@ pub async fn get_deks(
             _ => continue,
         }
     }
+}
+
+/// Fast path: try the opt-in server-side DEK cache before running a full phone
+/// approval. Returns `Some(deks)` on a full cache hit (all `salts` present,
+/// unexpired, and the request's IP+ppid match what was recorded at approval),
+/// or `None` on any miss / disabled cache / recoverable transport error (the
+/// caller then falls back to `get_deks`).
+///
+/// SECURITY: the cache path has NO PWA and NO binding tag, so `verify_binding`
+/// does not apply (a cache hit is the worker delivering DEKs it already holds —
+/// the malicious-worker substitution that binding defends against is moot
+/// here). We therefore require the explicit `source == "cache"` discriminant
+/// before opening the sealed box, so a normal ceremony response can never be
+/// mistakenly accepted on this unbound path. Confidentiality of the response
+/// still rests on the sealed_box being sealed to our fresh ephemeral pubkey
+/// (only we can open it) plus TLS.
+pub async fn try_cache(
+    config: &CfConfig,
+    salts: &[[u8; 16]],
+    meta: &ChallengeMeta,
+) -> Result<Option<Vec<Zeroizing<[u8; 32]>>>> {
+    if salts.is_empty() {
+        return Ok(None); // auth-only / nothing to look up
+    }
+
+    let (pk, sk_raw) = crypto_box_keypair();
+    // SecretKey is a bare [u8;32] (no Drop) — wrap so the ephemeral key is wiped
+    // when this fn returns (S1).
+    let sk = Zeroizing::new(sk_raw);
+    let pk_b64u = URL_SAFE_NO_PAD.encode(pk);
+    let salts_b64u: Vec<String> = salts.iter().map(|s| URL_SAFE_NO_PAD.encode(s)).collect();
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let req_body = match serde_json::to_vec(&DekCacheReq {
+        daemon_pubkey_b64u: pk_b64u,
+        salts_b64u,
+        timestamp_ms: ts_ms,
+        meta,
+    }) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+
+    let url = format!("{}/api/dek-cache", config.worker_url);
+    let auth_header = hmac_auth_header(&config.worker_auth, &req_body);
+    // Same IPv4-pinned client as the challenge POST so CF-Connecting-IP (half the
+    // cache ctx) is stable across the two processes. Any transport/HTTP failure →
+    // fall back to the ceremony rather than abort.
+    let resp = match cf_post(&url, &auth_header, &req_body).await {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let parsed: DekCacheResp = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+
+    if parsed.miss || parsed.source != "cache" {
+        return Ok(None);
+    }
+    let sealed = match parsed.sealed_deks_b64u {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    // Cache hit: open the sealed box sealed to our ephemeral pubkey. No binding
+    // verification on this path (see SECURITY note above).
+    let deks = open_sealed_deks(&sealed, &pk, &*sk, salts.len())?;
+    Ok(Some(deks))
 }
 
 fn open_sealed_deks(
@@ -515,6 +668,29 @@ mod tests {
         // byte layout — if this fails, the formula has drifted from the spec.
         let expected = "4f53ae2e9692a575f7f35bc4c6c03ad91d8cc024f08152c266d3bfdedcd6917f";
         assert_eq!(hex_encode(&h), expected);
+    }
+
+    /// Cross-impl wire-compat: a sealed box produced by the WORKER's
+    /// tweetnacl + blakejs `crypto_box_seal` (cf-worker/src/cache_crypto.ts)
+    /// MUST open with the Rust client's dryoc `crypto_box_seal_open` — this is
+    /// exactly the cache-hit delivery path (worker seals cached DEKs to the
+    /// daemon pubkey; cf.rs opens). Vector generated by that JS code over a
+    /// fixed secret key (32×0x11) and message bytes 0..32. If this fails, the
+    /// worker's sealed-box construction has drifted from libsodium and cache
+    /// hits will silently fail to decrypt.
+    #[test]
+    fn worker_sealed_box_opens_with_dryoc() {
+        let sk: [u8; 32] = decode_b64u_exact(
+            "ERERERERERERERERERERERERERERERERERERERERERE", "sk").unwrap();
+        let pk: [u8; 32] = decode_b64u_exact(
+            "e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM", "pk").unwrap();
+        let expected: Vec<u8> = (0u8..32).collect();
+        let sealed = "JEYfUWAkbFlSTgjZD-GXcSHkANGFWCT637UiLWtBRUu-uQjaKW_GFnZplKkhLMm3h0-ch65fczHafJozQnVbdv4F-eyFxUbJuJoIzb9Anvw";
+
+        let deks = open_sealed_deks(sealed, &pk, &sk, 1)
+            .expect("worker-sealed box must open with dryoc");
+        assert_eq!(deks.len(), 1);
+        assert_eq!(&deks[0][..], &expected[..], "decrypted DEK mismatch — wire incompatibility");
     }
 
     #[test]

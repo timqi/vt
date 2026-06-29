@@ -29,6 +29,13 @@
     return s.length > max ? s.slice(0, max) + '…' : s;
   }
 
+  function cacheTtlLabel(s) {
+    if (typeof s !== 'number' || s <= 0) return '—';
+    if (s % 3600 === 0) return (s / 3600) + 'h';
+    if (s % 60 === 0) return (s / 60) + 'm';
+    return s + 's';
+  }
+
   // Column summary for the multi-line command body
   // (`op: …\nfile: …\ncmd: …\nreason: …`). Prefer the `cmd:` line (the actual
   // shell command, e.g. for `inject`); otherwise fall back to the first line.
@@ -47,9 +54,27 @@
     tr.appendChild(td);
   }
 
+  // Friendly type label. DEK-cache events share op_kind='cache'; the status
+  // distinguishes them (approved=hit, miss, cleared).
+  function opKindLabel(row) {
+    if (row.op_kind === 'cache') {
+      if (row.status === 'approved') return 'DEK缓存自动审批';
+      if (row.status === 'write_failed') return 'DEK缓存写入失败';
+      return 'DEK缓存';
+    }
+    return row.op_kind || '';
+  }
+
   function statusBadge(row) {
     var span = document.createElement('span');
     var s = row.status || '—';
+    // Cache rows render a distinct, self-explaining badge instead of a bare
+    // "approved" (which would look like a normal phone approval).
+    if (row.op_kind === 'cache') {
+      span.className = 'badge badge-' + (s === 'write_failed' ? 'rejected' : 'approved');
+      span.textContent = (s === 'write_failed') ? '缓存写入失败' : '缓存命中';
+      return span;
+    }
     span.className = 'badge badge-' + s;
     span.textContent = s + (row.verify_failures ? ' ⚠' + row.verify_failures : '');
     return span;
@@ -72,10 +97,58 @@
       cell(tr, commandSummary(r.command, 48));
       cell(tr, r.ip);
       cell(tr, r.salts);
+      // 缓存列: live → TTL label; armed-but-elapsed → grey 过期; never armed → —.
+      var cc = document.createElement('td');
+      if (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) {
+        if (hasLiveCache(r)) {
+          cc.textContent = cacheTtlLabel(r.cache_ttl_s);
+        } else {
+          cc.textContent = '过期';
+          cc.className = 'cache-expired';
+        }
+      } else {
+        cc.textContent = '—';
+      }
+      tr.appendChild(cc);
       cell(tr, r.latency_ms);
+      // 操作: a "清除缓存" button on approvals that armed a still-live cache.
+      var act = document.createElement('td');
+      if (hasLiveCache(r)) {
+        var btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'danger small'; btn.textContent = '清除缓存';
+        btn.addEventListener('click', function (e) { e.stopPropagation(); clearOrigin(r.token_id, btn); });
+        act.appendChild(btn);
+      }
+      tr.appendChild(act);
       tr.addEventListener('click', function () { openDetail(r.id); });
       tbody.appendChild(tr);
     });
+  }
+
+  // A row "has a live cache" when it armed one (cache_ttl_s>0) and that window
+  // hasn't elapsed. Cache-event rows (op_kind='cache') themselves are excluded.
+  function hasLiveCache(r) {
+    return r.op_kind !== 'cache'
+      && typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0
+      && typeof r.finalized_ms === 'number'
+      && (r.finalized_ms + r.cache_ttl_s * 1000 > Date.now());
+  }
+
+  async function clearOrigin(tokenId, btn) {
+    if (btn) btn.disabled = true;
+    try {
+      var resp = await fetch('/' + seg + '/api/cache-clear-origin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ token_id: tokenId }),
+      });
+      if (!resp.ok) { setStatus('清除缓存失败 HTTP ' + resp.status, 'error'); if (btn) btn.disabled = false; return; }
+      var json = await resp.json();
+      setStatus('✓ 已清除该请求的 ' + (json && json.cleared != null ? json.cleared : '?') + ' 条缓存', 'ok');
+    } catch (e) {
+      setStatus('网络错误：' + (e.message || e), 'error');
+      if (btn) btn.disabled = false;
+    }
   }
 
   // ── Detail card ─────────────────────────────────────────────────────────
@@ -90,27 +163,48 @@
     dl.appendChild(dt); dl.appendChild(dd);
   }
 
+  // Row with a clickable link (opens a new tab). href set via property (no
+  // inline handler), so it's CSP-safe and same-origin.
+  function addLinkRow(dl, label, url, text) {
+    var dt = document.createElement('dt'); dt.textContent = label;
+    var dd = document.createElement('dd');
+    var a = document.createElement('a');
+    a.href = url; a.target = '_blank'; a.rel = 'noopener';
+    a.textContent = text || url;
+    dd.appendChild(a);
+    dl.appendChild(dt); dl.appendChild(dd);
+  }
+
   function openDetail(id) {
     var r = byId[id];
     if (!r) return;
     var dl = document.getElementById('detail-dl');
     dl.innerHTML = '';
     addRow(dl, '状态', r.status + (r.verify_failures ? '（验证失败 ' + r.verify_failures + ' 次）' : ''));
-    addRow(dl, '类型', r.op_kind);
+    addRow(dl, '类型', opKindLabel(r));
     addRow(dl, '主机', r.host);
     addRow(dl, '用户', r.user);
     addRow(dl, '目录', r.pwd);
     addRow(dl, '终端', r.tty);
     addRow(dl, '父进程', r.ppid_cmd);
+    if (r.ppid != null) addRow(dl, '父进程PID', r.ppid);
     addRow(dl, 'SSH 来源', r.ssh_client);
     addRow(dl, 'IP', r.ip);
     addRow(dl, 'DEK 数', r.salts);
+    if (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) addRow(dl, '缓存 TTL', cacheTtlLabel(r.cache_ttl_s));
     addRow(dl, '命令', r.command, true);
     addRow(dl, '原因', r.reason);
     addRow(dl, '创建时间', fmtTime(r.created_ms));
     addRow(dl, '终态时间', fmtTime(r.finalized_ms));
     addRow(dl, '延迟(ms)', r.latency_ms);
     addRow(dl, 'token', r.token_id);
+    // Approve URL: token_id IS the full approve_token (12-byte / 16-char) for
+    // ceremony rows, so /a/{token_id} is the approval page. Only actionable while
+    // pending; shown for non-cache rows. Cache events have a synthetic token_id.
+    if (r.op_kind !== 'cache' && r.token_id) {
+      var approveUrl = location.origin + '/a/' + r.token_id;
+      addLinkRow(dl, '审批链接', approveUrl, approveUrl);
+    }
     backdrop.hidden = false;
   }
 
@@ -152,7 +246,39 @@
   document.getElementById('apply').addEventListener('click', function () {
     oldestId = null; exhausted = false; load(false);
   });
+  // Quick filter: show only cache-related records (hits + armed approvals).
+  document.getElementById('filter-cache').addEventListener('click', function () {
+    document.getElementById('f-status').value = 'cache';
+    oldestId = null; exhausted = false; load(false);
+  });
   document.getElementById('more').addEventListener('click', function () { if (!exhausted) load(true); });
+
+  document.getElementById('clear-all-cache').addEventListener('click', async function () {
+    if (!confirm('删除全部已缓存 DEK？此后解密将重新需要手机审批。')) return;
+    setStatus('清空缓存中…');
+    try {
+      var resp = await fetch('/' + seg + '/api/clear-cache', { method: 'POST', headers: { 'Accept': 'application/json' } });
+      if (!resp.ok) { setStatus('清空缓存失败 HTTP ' + resp.status, 'error'); return; }
+      var json = await resp.json();
+      setStatus('✓ 已清空 ' + (json && json.cleared != null ? json.cleared : '?') + ' 条 DEK 缓存', 'ok');
+    } catch (e) {
+      setStatus('网络错误：' + (e.message || e), 'error');
+    }
+  });
+
+  document.getElementById('clear-audit').addEventListener('click', async function () {
+    if (!confirm('清空全部审计日志？此操作不可恢复。')) return;
+    setStatus('清空审计中…');
+    try {
+      var resp = await fetch('/' + seg + '/api/clear-audit', { method: 'POST', headers: { 'Accept': 'application/json' } });
+      if (!resp.ok) { setStatus('清空审计失败 HTTP ' + resp.status, 'error'); return; }
+      oldestId = null; exhausted = false;
+      load(false);
+      setStatus('✓ 已清空全部审计日志', 'ok');
+    } catch (e) {
+      setStatus('网络错误：' + (e.message || e), 'error');
+    }
+  });
 
   load(false);
 })();

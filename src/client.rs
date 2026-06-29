@@ -537,8 +537,16 @@ impl VTClient {
             }
         }
 
+        // Fast path: try the opt-in DEK cache first (no phone if all salts are
+        // cached for this IP+ppid within the approved TTL). The full meta is sent
+        // so a cache HIT is audited with the same context as a ceremony decrypt.
+        // On any miss / cache disabled / transport hiccup, fall through to the
+        // full phone ceremony.
         let meta = cf::collect_meta("decrypt", command, "");
-        let deks = cf::get_deks(&config, &salts, meta).await?;
+        let deks = match cf::try_cache(&config, &salts, &meta).await? {
+            Some(d) => d,
+            None => cf::get_deks(&config, &salts, meta).await?,
+        };
 
         let mut out = Vec::with_capacity(urls.len());
         let mut dek_idx = 0usize;

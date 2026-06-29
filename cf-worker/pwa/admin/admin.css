@@ -73,6 +73,13 @@ h2 { font-size: 15px; margin: 18px 0 8px; }
 section { margin: 14px 0; }
 label { display: inline-flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); margin-right: 14px; }
 
+/* Filter bar: controls + button bottom-aligned on one row */
+#filters { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
+#filters label { margin-right: 0; }
+#filters button { margin: 0; }
+#filters .filter-spacer { flex: 1 1 auto; }
+td.cache-expired { color: var(--muted); }
+
 /* Page header */
 .page-head { margin-bottom: 4px; }
 .page-head .hint { margin-top: 4px; }
@@ -121,6 +128,9 @@ button.ghost {
   background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
 }
 button.ghost:hover { filter: none; background: var(--border); }
+button.danger { background: #c0392b; color: #fff; }
+button.danger:hover { filter: brightness(1.08); }
+button.small { padding: 4px 10px; font-size: 12px; margin: 0; }
 
 #actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 #actions #status { margin-top: 0; }
@@ -190,8 +200,8 @@ pre.cmd {
 /* Channels: numbered Slack setup steps + a link that inherits the accent */
 ol.steps { margin: 8px 0 12px; padding-left: 22px; color: var(--muted); font-size: 13px; }
 ol.steps li { margin: 4px 0; line-height: 1.55; }
-.hint a, ol.steps a { color: var(--accent); text-decoration: none; }
-.hint a:hover, ol.steps a:hover { text-decoration: underline; }
+.hint a, ol.steps a, #detail-dl a { color: var(--accent); text-decoration: none; }
+.hint a:hover, ol.steps a:hover, #detail-dl a:hover { text-decoration: underline; }
 /* Channel cards: header control cluster (badge + enable switch) and the
    body that collapses when the channel is disabled. */
 .channel .card-head { margin-bottom: 0; }

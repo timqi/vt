@@ -47,6 +47,47 @@
     }
     renderMeta(data.metadata);
 
+    // ── DEK-cache duration selector ──────────────────────────────────────
+    // Rendered only when the worker offers caching (CACHE_SECKEY set) AND this
+    // ceremony has DEKs to cache. Default = 0 ("不缓存") so the historical
+    // every-time-approval behaviour is the safe default.
+    function ttlLabel(s) {
+        if (s === 0) return '不缓存';
+        if (s % 3600 === 0) return (s / 3600) + ' 小时';
+        if (s % 60 === 0) return (s / 60) + ' 分钟';
+        return s + ' 秒';
+    }
+    function renderCacheOptions(d) {
+        var opts = d.cache_options_s || [];
+        var pk = d.cache_pubkey_b64u || '';
+        // Need a real choice (more than just [0]) and a pubkey to seal to.
+        if (!pk || opts.length <= 1) return;
+        var section = document.getElementById('cache-section');
+        var box = document.getElementById('cache-options');
+        box.innerHTML = '';
+        opts.forEach(function (s, i) {
+            var label = document.createElement('label');
+            label.className = 'cache-opt';
+            var input = document.createElement('input');
+            input.type = 'radio';
+            input.name = 'cache-ttl';
+            input.value = String(s);
+            if (i === 0) input.checked = true; // 0 is first → default 不缓存
+            var span = document.createElement('span');
+            span.textContent = ttlLabel(s);
+            label.appendChild(input);
+            label.appendChild(span);
+            box.appendChild(label);
+        });
+        section.hidden = false;
+    }
+    function selectedTtl() {
+        var sel = document.querySelector('input[name="cache-ttl"]:checked');
+        var v = sel ? parseInt(sel.value, 10) : 0;
+        return (Number.isFinite(v) && v > 0) ? v : 0;
+    }
+    renderCacheOptions(data);
+
     async function runApprove() {
         var k = null, kWrap = null, masterKey = null, deks = null;
         var pwaSk = null, shared = null, bindingKey = null;
@@ -138,6 +179,25 @@
             var daemonPk = b64uDec(data.daemon_pubkey_b64u);
             if (daemonPk.length !== 32) throw new Error('daemon_pubkey 长度异常');
             var sealedDeks = sodium.crypto_box_seal(deks, daemonPk);
+
+            // INVARIANT: cache sealing MUST happen here — after sealing to the
+            // daemon and BEFORE `deks.fill(0)` below. Only when the user picked
+            // TTL > 0 do we seal each DEK to the worker's CACHE_PUBKEY; sending
+            // this material is what authorizes a server-side cache entry (the
+            // worker cannot fabricate one for a TTL=0 ceremony — see
+            // docs/dek-cache.md M1). One sealed blob per salt, in salt order.
+            var cacheTtlS = selectedTtl();
+            var cacheSealed = null;
+            if (cacheTtlS > 0 && data.cache_pubkey_b64u && salts.length > 0) {
+                var cachePk = b64uDec(data.cache_pubkey_b64u);
+                if (cachePk.length !== 32) throw new Error('cache_pubkey 长度异常');
+                cacheSealed = [];
+                for (var ci = 0; ci < salts.length; ci++) {
+                    var dekSlice = deks.subarray(ci * 32, (ci + 1) * 32);
+                    cacheSealed.push(b64uEnc(sodium.crypto_box_seal(dekSlice, cachePk)));
+                }
+            }
+
             deks.fill(0); deks = null;
 
             // Bind sealed_deks via ECDH(pwa_sk, daemon_pk) → HKDF → HMAC, so an
@@ -173,6 +233,8 @@
                     signature_b64u: b64uEnc(new Uint8Array(assertion.response.signature)),
                     pwa_pk_b64u: b64uEnc(pwaPk),
                     binding_tag_b64u: b64uEnc(bindingTag),
+                    cache_ttl_s: cacheTtlS,
+                    cache_sealed_deks_b64u: cacheSealed,
                 }),
             });
             if (!resp.ok) throw new Error('提交失败（HTTP ' + resp.status + '）');

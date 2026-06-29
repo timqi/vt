@@ -11,7 +11,7 @@ import { Hono } from 'hono';
 import { Env } from './types';
 import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, inReplayWindow } from './crypto';
 import { notifyApproval } from './notify';
-import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ApproveRequest, RejectRequest } from './types';
+import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest } from './types';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess } from './access';
 
@@ -70,6 +70,28 @@ function capMetaMultiline(v: unknown, maxCharsPerLine: number, maxLines: number)
   return v.split('\n').slice(0, maxLines)
     .map(line => capMeta(line, maxCharsPerLine))
     .join('\n');
+}
+
+// Build a sanitized ChallengeMeta from an untrusted client `meta` body. Shared
+// by /api/challenge and /api/dek-cache so a cache hit is audited with the same
+// fields as a ceremony. `ip` ALWAYS comes from CF-Connecting-IP, never the body
+// (a compromised CLI could otherwise spoof the source IP shown/recorded).
+function capChallengeMeta(raw: Partial<ChallengeMeta> | undefined, connectingIp: string | undefined): ChallengeMeta {
+  return {
+    op_kind:    capMeta(raw?.op_kind, 32),
+    command:    capMetaMultiline(raw?.command, 120, 6),
+    host:       capMeta(raw?.host, 100),
+    user:       capMeta(raw?.user, 64),
+    pwd:        capMeta(raw?.pwd, 200),
+    tty:        capMeta(raw?.tty, 40),
+    ppid_cmd:   capMeta(raw?.ppid_cmd, 200),
+    // Numeric PPID — the PPID half of the DEK-cache binding ctx (IP is the
+    // other, trustworthy, half). Clamp to u32; non-numeric → 0.
+    ppid:       (typeof raw?.ppid === 'number' && Number.isFinite(raw.ppid)) ? (raw.ppid >>> 0) : 0,
+    ssh_client: capMeta(raw?.ssh_client, 100),
+    ip:         capMeta(connectingIp, 64),
+    reason:     capMeta(raw?.reason, 200),
+  };
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -160,6 +182,32 @@ app.get(`/${ADMIN_SEG}/api/audit`, async (c) => {
   return stub.fetch(u.toString());
 });
 
+// Clear the cached DEKs written by ONE approval (by its audit token_id). Powers
+// the per-row "清除缓存" button on the audit page. Access-gated.
+app.post(`/${ADMIN_SEG}/api/cache-clear-origin`, async (c) => {
+  let body: { token_id?: unknown };
+  try { body = await c.req.json(); }
+  catch { return c.text('invalid json', 400); }
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  return stub.fetch('https://account.do/op/cache-clear-origin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token_id: body.token_id }),
+  });
+});
+
+// POST clear-cache — emergency revocation: drop ALL cached DEKs now. Access-gated.
+app.post(`/${ADMIN_SEG}/api/clear-cache`, async (c) => {
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  return stub.fetch('https://account.do/op/clear-cache', { method: 'POST' });
+});
+
+// POST clear-audit — wipe ALL audit rows (ceremony + cache events). Access-gated.
+app.post(`/${ADMIN_SEG}/api/clear-audit`, async (c) => {
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  return stub.fetch('https://account.do/op/clear-audit', { method: 'POST' });
+});
+
 // POST /api/challenge — daemon creates a challenge
 app.post('/api/challenge', async (c) => {
   // 1. HMAC auth
@@ -215,21 +263,7 @@ app.post('/api/challenge', async (c) => {
     approve_challenge_hash_b64u: b64uEnc(approveHash),
     reject_challenge_hash_b64u: b64uEnc(rejectHash),
     salts_b64u: saltsB64u,
-    meta: {
-      op_kind:    capMeta(body.meta?.op_kind, 32),
-      command:    capMetaMultiline(body.meta?.command, 120, 6),
-      host:       capMeta(body.meta?.host, 100),
-      user:       capMeta(body.meta?.user, 64),
-      pwd:        capMeta(body.meta?.pwd, 200),
-      tty:        capMeta(body.meta?.tty, 40),
-      ppid_cmd:   capMeta(body.meta?.ppid_cmd, 200),
-      ssh_client: capMeta(body.meta?.ssh_client, 100),
-      // IP is set by the worker from CF-Connecting-IP, never trusted from the
-      // CLI body — a compromised or misconfigured CLI could otherwise spoof
-      // the source IP shown to the approver.
-      ip:         capMeta(c.req.header('CF-Connecting-IP'), 64),
-      reason:     capMeta(body.meta?.reason, 200),
-    },
+    meta: capChallengeMeta(body.meta, c.req.header('CF-Connecting-IP')),
     status: 'pending',
     created_ms: Date.now(),
   };
@@ -281,6 +315,48 @@ app.get('/api/dek', async (c) => {
   return stub.fetch(new Request(wsUrl, {
     headers: c.req.raw.headers,
   }));
+});
+
+// POST /api/dek-cache — daemon tries the opt-in DEK cache before a ceremony.
+// Same HMAC(VT_AUTH_CF) gate + replay window as /api/challenge. On a full hit
+// the DO returns DEKs re-sealed to the daemon's ephemeral pubkey; otherwise
+// {miss:true} and the daemon falls through to the normal phone approval.
+//
+// The IP is taken from CF-Connecting-IP (trustworthy) — NOT from the body — and
+// forms half of the cache binding context; the ppid (client-reported) is the
+// advisory half. See docs/dek-cache.md §2.5.
+app.post('/api/dek-cache', async (c) => {
+  const auth = c.req.header('Authorization') ?? '';
+  const prefix = 'VT-HMAC ';
+  if (!auth.startsWith(prefix)) return c.text('missing auth', 401);
+  let providedHmac: Uint8Array;
+  try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
+  catch { return c.text('hmac length', 401); }
+
+  const rawBody = await c.req.arrayBuffer();
+  const keyBytes = new TextEncoder().encode(c.env.VT_AUTH_CF);
+  const expected = await hmacSha256(keyBytes, new Uint8Array(rawBody));
+  if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
+
+  let body: DekCacheRequest;
+  try { body = JSON.parse(new TextDecoder().decode(rawBody)); }
+  catch { return c.text('json parse error', 400); }
+
+  if (!inReplayWindow(Date.now(), body.timestamp_ms)) return c.text('timestamp skew', 400);
+
+  // Cap the client meta and force `ip` from CF-Connecting-IP — identical to the
+  // challenge path, so a cache hit records the same context.
+  const meta = capChallengeMeta(body.meta, c.req.header('CF-Connecting-IP'));
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  return stub.fetch('https://account.do/op/dek-cache', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      daemon_pubkey_b64u: body.daemon_pubkey_b64u,
+      salts_b64u: body.salts_b64u,
+      meta,
+    }),
+  });
 });
 
 // POST /api/approve — PWA submits sealed DEKs after WebAuthn
@@ -356,6 +432,11 @@ function buildApprovePage(data: ApprovePageData): string {
       <h2>请求信息</h2>
       <dl id="meta"></dl>
     </section>
+    <section id="cache-section" hidden>
+      <h2>缓存解密授权</h2>
+      <p class="hint cache-warn">选择后，在该时长内、<strong>同一来源 IP 且同一父进程</strong>对这些记录的解密将<strong>免手机审批</strong>。默认不缓存。</p>
+      <div id="cache-options" role="radiogroup" aria-label="缓存时长"></div>
+    </section>
     <section id="actions">
       <button id="approve" type="button">✓ 同意</button>
       <button id="reject" type="button">拒绝</button>
@@ -394,7 +475,7 @@ function buildAuditPage(): string {
 <body>
   <main>
     ${adminTabs('audit')}
-    <p class="hint">每个挑战一行（状态：pending / approved / rejected / expired）。点击行查看完整详情。保留 90 天。</p>
+    <p class="hint">每个挑战一行（pending / approved / rejected / expired）。「缓存」列显示该次审批授予的 DEK 缓存时长；带有效缓存的行可在「操作」列单独清除。点击行查看完整详情。保留 90 天。</p>
     <section id="filters">
       <label>状态 <select id="f-status">
         <option value="">全部</option>
@@ -402,12 +483,17 @@ function buildAuditPage(): string {
         <option value="approved">approved</option>
         <option value="rejected">rejected</option>
         <option value="expired">expired</option>
+        <option value="cache">带缓存的记录</option>
       </select></label>
       <label>主机 <input id="f-host" type="text" placeholder="host"></label>
       <button id="apply" type="button">查询</button>
+      <button id="filter-cache" type="button" class="ghost">带缓存</button>
+      <span class="filter-spacer"></span>
+      <button id="clear-all-cache" type="button" class="danger">清除所有 DEK 缓存</button>
+      <button id="clear-audit" type="button" class="danger">清空全部审计</button>
     </section>
     <div id="table-wrap"><table id="audit"><thead><tr>
-      <th>时间</th><th>状态</th><th>主机</th><th>命令</th><th>IP</th><th>DEK</th><th>延迟ms</th>
+      <th>时间</th><th>状态</th><th>主机</th><th>命令</th><th>IP</th><th>DEK</th><th>缓存</th><th>延迟ms</th><th>操作</th>
     </tr></thead><tbody id="rows"></tbody></table></div>
     <section id="actions">
       <button id="more" type="button">加载更多</button>

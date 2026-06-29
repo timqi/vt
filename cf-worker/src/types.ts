@@ -5,6 +5,14 @@ export interface Env {
   ASSETS: Fetcher;
   VT_AUTH_CF: string;
   CREDENTIALS_JSON: string;
+  /**
+   * base64url 32-byte X25519 secret key for the opt-in DEK cache. The PWA seals
+   * each cached DEK to the matching public key (derived at runtime via
+   * crypto_scalarmult_base, so operators configure ONE secret and cannot mismatch
+   * the pair); the Worker opens it on a cache hit and re-seals to the requester's
+   * ephemeral pubkey. Empty/absent → DEK caching is disabled and every decrypt
+   * requires a phone approval (the historical behaviour). NEVER logged. */
+  CACHE_SECKEY: string;
   /** JSON: {"app_token":"…","user_key":"…"}. Empty/invalid → Pushover disabled. */
   PUSHOVER_JSON: string;
   /** JSON: {"webhook_url":"https://hooks.slack.com/services/…"}. Empty/invalid → Slack disabled. */
@@ -40,11 +48,21 @@ export interface AuditRow {
   salts: number | null;
   latency_ms: number | null;
   verify_failures: number;
+  /** DEK-cache TTL (seconds) the approver chose; 0/null = not cached. */
+  cache_ttl_s: number | null;
+  /** Numeric parent PID. Set for ceremony rows (from meta) and DEK-cache rows
+   *  (op_kind='cache'). */
+  ppid: number | null;
 }
 
 export interface AuditQueryResponse {
   rows: AuditRow[];
 }
+
+// DEK-cache events (hit / miss / clear) are NOT a separate table — they are
+// rows in `audit` with op_kind='cache' and status ∈ {approved=hit, miss,
+// cleared}. One unified audit surface.
+
 
 // ── Challenge stored in DO ─────────────────────────────────────────────────
 
@@ -90,6 +108,13 @@ export interface ChallengeMeta {
   tty: string;
   /** Parent process command line — which shell / script invoked vt */
   ppid_cmd: string;
+  /** Numeric parent PID (libc::getppid()) reported by the CLI. Used (with the
+   *  worker-derived IP) to scope the DEK cache: a later /api/dek-cache request
+   *  must carry the SAME ppid AND originate from the SAME IP, or it misses.
+   *  CLIENT-REPORTED, so it is advisory (blast-radius reduction), not a hard
+   *  boundary — a fully-compromised local host can spoof it. The IP is the
+   *  trustworthy half of the binding. */
+  ppid: number;
   /** SSH_CLIENT / SSH_CONNECTION env if the session is remote */
   ssh_client: string;
   ip: string;
@@ -131,6 +156,19 @@ export interface ApproveRequest {
   pwa_pk_b64u: string;
   /** HMAC-SHA256 tag over the binding transcript (see do_account.ts opApprove) */
   binding_tag_b64u: string;
+  /**
+   * DEK-cache TTL in seconds, chosen by the approver. Absent or 0 → DO NOT
+   * cache (historical behaviour). When > 0, `cache_sealed_deks_b64u` MUST be
+   * present. Server validates against a whitelist. INVARIANT (M1): the Worker
+   * can only create a cache entry when the PHONE sends cache material — which
+   * the PWA produces solely when the human picks TTL > 0. A compromised CLI or
+   * Worker cannot manufacture a cache entry for a TTL=0 ceremony. */
+  cache_ttl_s?: number;
+  /**
+   * One entry per salt, in the same order as the challenge's salts_b64u: each is
+   * crypto_box_seal(DEK_i, CACHE_PUBKEY) produced by the PWA. Only sent when
+   * cache_ttl_s > 0. */
+  cache_sealed_deks_b64u?: string[];
 }
 
 // ── Inbound from PWA via POST /api/reject ─────────────────────────────────
@@ -162,6 +200,48 @@ export interface ApprovePageData {
   rp_id: string;
   allow_credentials: Array<{ id_b64u: string; h_b64u: string; k_b64u: string }>;
   metadata: ChallengeMeta;
+  /** TTL options (seconds) the PWA renders as cache-duration radios. Always
+   *  includes 0 ("不缓存", the default). Empty (only [0]) when caching disabled. */
+  cache_options_s: number[];
+  /** base64url 32-byte X25519 public key the PWA seals cached DEKs to. Empty
+   *  string when CACHE_SECKEY is unset (caching disabled — PWA hides the UI). */
+  cache_pubkey_b64u: string;
+}
+
+// ── DEK cache (opt-in, IP+PPID-scoped) ─────────────────────────────────────
+
+/** Inbound from daemon via POST /api/dek-cache — the fast path tried before a
+ *  ceremony. HMAC(VT_AUTH_CF)-gated like /api/challenge. */
+export interface DekCacheRequest {
+  daemon_pubkey_b64u: string;
+  /** salts to look up; empty array is rejected (returns miss). */
+  salts_b64u: string[];
+  timestamp_ms: number;
+  /** Full display meta (same shape as the challenge request). `meta.ppid` is the
+   *  PPID half of the cache binding ctx; the rest is stored on the hit audit row
+   *  so a cache hit carries the same context as a ceremony decrypt. */
+  meta?: Partial<ChallengeMeta>;
+}
+
+/** Outbound from /api/dek-cache. The `source:'cache'` discriminant is asserted
+ *  by the Rust client BEFORE it skips verify_binding, so a normal ceremony
+ *  response can never be mistaken for a cache response (and vice-versa). */
+export type DekCacheResponse =
+  | { source: 'cache'; sealed_deks_b64u: string }
+  | { miss: true };
+
+/** A single cached DEK in DO storage, keyed `dek:{ctx}:{salt_b64u}` where
+ *  ctx = b64u(SHA-256("vt-dek-ctx-v1" || ip || 0x00 || u32le(ppid))). */
+export interface CacheEntry {
+  /** crypto_box_seal(DEK_raw, CACHE_PUBKEY) — Worker opens with CACHE_SECKEY. */
+  sealed_to_cache_b64u: string;
+  expires_ms: number;
+  /** audit: which approval (audit token_id) wrote this entry. */
+  origin_token_id: string;
+  /** binding context, stored redundantly for audit/forensics. */
+  ip: string;
+  ppid: number;
+  ppid_cmd: string;
 }
 
 // ── Internal DO op bodies ──────────────────────────────────────────────────
@@ -179,6 +259,17 @@ export interface DoApproveOp {
   signature_b64u: string;
   pwa_pk_b64u: string;
   binding_tag_b64u: string;
+  cache_ttl_s?: number;
+  cache_sealed_deks_b64u?: string[];
+}
+
+/** Internal DO op for POST /api/dek-cache. The Worker builds `meta` (capping the
+ *  client-supplied fields and overwriting `meta.ip` from CF-Connecting-IP, never
+ *  trusting the body's IP). `meta.ip` + `meta.ppid` form the cache binding ctx. */
+export interface DoDekCacheOp {
+  daemon_pubkey_b64u: string;
+  salts_b64u: string[];
+  meta: ChallengeMeta;
 }
 
 export interface DoRejectOp {
