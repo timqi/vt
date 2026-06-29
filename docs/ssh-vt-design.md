@@ -90,16 +90,19 @@ Layout (default, overridable):
 ~/.config/vt/git-ssh.pub    # the OpenSSH public key line (cleartext, mode 0644)
 ```
 
-Overrides: `--key-file <path>` on both subcommands, or `VT_GIT_SSH_KEYFILE=<path>`.
-The public key may also be supplied via `VT_GIT_SSH_PUB` (cleartext is harmless).
-Note: the env var, if used, holds a **path or the cleartext pubkey** — never a
-`vt://`. Writing the `vt://` (ciphertext) to disk is fine; only the plaintext seed
-must never touch disk.
+Overrides: `keygen` writes to `--key-file <path>` or the default. `connect` reads
+the **raw `vt://` record** from `VT_GIT_SSH_PRIVATE_KEY` (env value, not a path),
+falling back to the default key file. The public key may likewise be supplied as
+the raw OpenSSH line via `VT_GIT_SSH_PUB` (cleartext is harmless).
+Note: `VT_GIT_SSH_PRIVATE_KEY` holds the **`vt://` ciphertext** record — env
+exposure is equivalent to the 0600 ciphertext file, since decryption still
+requires the ceremony (Touch ID / phone passkey). Only the plaintext seed must
+never touch disk or env.
 
-**Deployment note (round-3 N4):** the key file must exist on every host where
-`git push` runs (copy it, or point `--key-file`/`VT_GIT_SSH_KEYFILE` at a shared
-path). The file is ciphertext, so distributing it is safe. `keygen` docs/help must
-state this.
+**Deployment note (round-3 N4):** every host where `git push` runs must reach the
+key material — either the ciphertext file at the default path (copy it; safe to
+distribute) or `VT_GIT_SSH_PRIVATE_KEY=<vt:// record>` (+ `VT_GIT_SSH_PUB` when the
+`.pub` is not copied). `keygen` docs/help must state this.
 
 ## 5. clap / platform structure (B5 — implementation prerequisite)
 
@@ -212,8 +215,8 @@ Decrypt routing = free two-tier (§3.2). One decrypt = one tap per push.
 |---|---|---|
 | D1 | storage / type byte | `SecretType::RAW` (`vt://0`), plaintext = `BASE64_URL_SAFE_NO_PAD(seed)`. No core.rs change. |
 | D2 | key representation | 32-byte seed (base64url at rest; `Zeroizing<[u8;32]>` in use). |
-| D3 | `vt://` location | **a file** (`~/.config/vt/git-ssh`, 0600), NOT an env value. pubkey in sibling `.pub` / `VT_GIT_SSH_PUB`. |
-| D4 | overrides / multi-key | `--key-file` / `VT_GIT_SSH_KEYFILE`. single key v1; host→key map deferred. |
+| D3 | `vt://` location | default **file** (`~/.config/vt/git-ssh`, 0600), or raw `vt://` via `VT_GIT_SSH_PRIVATE_KEY` env (ciphertext — same exposure as the file). pubkey in sibling `.pub` / `VT_GIT_SSH_PUB`. |
+| D4 | overrides / multi-key | `keygen --key-file`; `connect` via `VT_GIT_SSH_PRIVATE_KEY` (raw record). single key v1; host→key map deferred. |
 | D5 | keygen import | generate-only v1. |
 | D6 | signer impl | ephemeral agent + exec system `ssh`. |
 | D7 | op_kind | keygen → `"encrypt"`; sign → `"ssh-sign"`. |

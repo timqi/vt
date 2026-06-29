@@ -219,8 +219,8 @@ and the plaintext seed never touches disk.
 # and ~/.config/vt/git-ssh.pub, and prints the public key to add to GitHub.
 vt ssh keygen -l github
 
-# On each host that runs git push (copy the ciphertext key file there, or point
-# VT_GIT_SSH_KEYFILE at it), wire git to sign through vt:
+# On each host that runs git push (copy the ciphertext key file there, or set
+# VT_GIT_SSH_PRIVATE_KEY to the raw vt:// record), wire git to sign through vt:
 git config core.sshCommand "vt ssh connect"
 git push        # signs via the existing ceremony: Touch ID locally, phone passkey on headless hosts
 ```

@@ -96,9 +96,10 @@ async fn keygen_unix(
     println!("On each host that runs `git push`:");
     println!("  git config core.sshCommand \"vt ssh connect\"");
     println!(
-        "  # copy {} to the host (it is ciphertext), or set VT_GIT_SSH_KEYFILE=<path>",
+        "  # copy {} to the host (it is ciphertext), or set VT_GIT_SSH_PRIVATE_KEY=<vt:// record>",
         key_path.display()
     );
+    println!("  #   (and VT_GIT_SSH_PUB=<openssh public key line> when not copying the .pub)");
     Ok(())
 }
 
@@ -108,18 +109,35 @@ fn default_key_path() -> Result<std::path::PathBuf> {
     Ok(home.join(DEFAULT_REL_PATH))
 }
 
-/// Resolve the key-file path: explicit flag > `VT_GIT_SSH_KEYFILE` > default.
+/// Resolve the *output* key-file path for `keygen`: explicit `--key-file` flag >
+/// default. The raw-content env vars (`VT_GIT_SSH_PRIVATE_KEY` /
+/// `VT_GIT_SSH_PUB`) are read sources for `connect`, never write destinations.
 #[cfg(unix)]
 fn resolve_key_path(flag: Option<String>) -> Result<std::path::PathBuf> {
     if let Some(p) = flag {
         return Ok(std::path::PathBuf::from(p));
     }
-    if let Ok(p) = std::env::var("VT_GIT_SSH_KEYFILE") {
-        if !p.is_empty() {
-            return Ok(std::path::PathBuf::from(p));
+    default_key_path()
+}
+
+/// Load the ciphertext `vt://` record for `connect`: the raw
+/// `VT_GIT_SSH_PRIVATE_KEY` env value takes precedence; otherwise read the
+/// default key file (`~/.config/vt/git-ssh`).
+#[cfg(unix)]
+async fn load_private_record() -> Result<String> {
+    if let Ok(v) = std::env::var("VT_GIT_SSH_PRIVATE_KEY") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Ok(v.to_string());
         }
     }
-    default_key_path()
+    let key_path = default_key_path()?;
+    let s = tokio::fs::read_to_string(&key_path)
+        .await
+        .with_context(|| {
+            format!("read {} (or set VT_GIT_SSH_PRIVATE_KEY)", key_path.display())
+        })?;
+    Ok(s.trim().to_string())
 }
 
 /// `<key>` -> `<key>.pub`.
@@ -194,17 +212,13 @@ async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
     use ssh_key::public::PublicKey;
 
     // 1. Load ciphertext vt:// + cleartext public key (connect has no flags of
-    //    its own — argv belongs to the system ssh; key file via env/default).
-    let key_path = resolve_key_path(None)?;
-    let vt_url = tokio::fs::read_to_string(&key_path)
-        .await
-        .with_context(|| format!("read {}", key_path.display()))?
-        .trim()
-        .to_string();
+    //    its own — argv belongs to the system ssh; key material via raw env or
+    //    the default file).
+    let vt_url = load_private_record().await?;
     if !vt_url.starts_with("vt://") {
-        bail!("{} does not contain a vt:// record", key_path.display());
+        bail!("VT_GIT_SSH_PRIVATE_KEY / default key file does not contain a vt:// record");
     }
-    let pub_line = load_pubkey_line(&key_path).await?;
+    let pub_line = load_pubkey_line().await?;
     let pubkey = PublicKey::from_openssh(pub_line.trim()).context("parse OpenSSH public key")?;
     let key_data = pubkey.key_data().clone();
     let comment = pubkey.comment().to_string();
@@ -273,14 +287,17 @@ async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// Load the OpenSSH public-key line for `connect`: the raw `VT_GIT_SSH_PUB` env
+/// value takes precedence; otherwise read the sibling `.pub` of the default key
+/// file (`~/.config/vt/git-ssh.pub`).
 #[cfg(unix)]
-async fn load_pubkey_line(key_path: &std::path::Path) -> Result<String> {
+async fn load_pubkey_line() -> Result<String> {
     if let Ok(p) = std::env::var("VT_GIT_SSH_PUB") {
         if !p.trim().is_empty() {
             return Ok(p);
         }
     }
-    let pub_path = pubkey_path(key_path);
+    let pub_path = pubkey_path(&default_key_path()?);
     tokio::fs::read_to_string(&pub_path)
         .await
         .with_context(|| format!("read {} (or set VT_GIT_SSH_PUB)", pub_path.display()))
