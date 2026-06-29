@@ -11,13 +11,13 @@ function truncate(s: string, max = 512): string {
   return s.length <= max ? s : s.slice(0, max - 1) + '…';
 }
 
-// Compose the human-facing approval message once; every channel reuses it.
-export function buildApprovalMessage(
-  opKind: string,
+// The shared context lines (who / pwd / cmd / ssh / ip / reason) that every
+// notification body carries. Approval and cache-hit notices differ only in their
+// title and trailing line, so they build on this common block — keeping the two
+// from silently drifting if a field is added later.
+function metaLines(
   meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
-  approveUrl: string,
-): { title: string; body: string } {
-  const title = opKind ? `VT 审批: ${opKind}` : 'VT 审批请求';
+): string[] {
   const who = [meta.user, meta.host].filter(Boolean).join('@');
   const lines: string[] = [];
   if (who) lines.push(who);
@@ -31,20 +31,47 @@ export function buildApprovalMessage(
   if (meta.ssh_client) lines.push(`ssh: ${meta.ssh_client}`);
   if (meta.ip) lines.push(`ip: ${meta.ip}`);
   if (meta.reason) lines.push(`reason: ${meta.reason}`);
+  return lines;
+}
+
+// Compose the human-facing approval message once; every channel reuses it.
+export function buildApprovalMessage(
+  opKind: string,
+  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
+  approveUrl: string,
+): { title: string; body: string } {
+  const title = opKind ? `VT 审批: ${opKind}` : 'VT 审批请求';
+  const lines = metaLines(meta);
   lines.push(approveUrl);
   return { title, body: lines.join('\n') };
 }
 
-// Fan out to every configured channel in parallel. Returns '' when every
-// enabled channel succeeded (and at least one was enabled), or a single
-// aggregated, channel-prefixed warning string otherwise.
-export async function notifyApproval(
+// Compose the cache-hit message. A DEK-cache hit serves a decrypt WITHOUT a
+// phone tap (the approver granted a TTL earlier), so this is a security-relevant
+// "FYI: auto-decrypt happened" notice, not an approval request — there is no
+// approve URL to tap and no action to take. The title is distinct so an operator
+// can tell at a glance it was served from cache.
+export function buildCacheHitMessage(
+  meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
+  salts: number,
+): { title: string; body: string } {
+  const title = meta.op_kind ? `VT 缓存命中(免审批): ${meta.op_kind}` : 'VT 缓存命中(免审批解密)';
+  const lines = metaLines(meta);
+  lines.push(`records: ${salts} (served from DEK cache, no phone approval)`);
+  return { title, body: lines.join('\n') };
+}
+
+// Fan out one composed message to every configured channel in parallel. Returns
+// '' when every enabled channel succeeded, or a single aggregated, channel-
+// prefixed warning string otherwise. `requireChannel` controls whether "no
+// channel configured" is itself surfaced as a warning (true for approvals, which
+// expect at least one channel; false for the best-effort cache-hit notice).
+async function fanOut(
   env: Env,
-  opKind: string,
-  meta: ChallengeMeta,
-  approveUrl: string,
+  title: string,
+  body: string,
+  requireChannel: boolean,
 ): Promise<string> {
-  const { title, body } = buildApprovalMessage(opKind, meta, approveUrl);
   const warnings: string[] = [];
 
   const po = parsePushoverConfig(env.PUSHOVER_JSON);
@@ -59,8 +86,37 @@ export async function notifyApproval(
   if (sl.config) {
     tasks.push(notifySlack(sl.config, title, body).then((w) => { if (w) warnings.push(`slack: ${w}`); }));
   }
-  if (tasks.length === 0 && warnings.length === 0) warnings.push('no notification channel configured');
+  if (requireChannel && tasks.length === 0 && warnings.length === 0) {
+    warnings.push('no notification channel configured');
+  }
 
   await Promise.all(tasks);
   return warnings.length ? truncate(warnings.join('; ')) : '';
+}
+
+// Fan out an approval request to every configured channel in parallel. Returns
+// '' when every enabled channel succeeded (and at least one was enabled), or a
+// single aggregated, channel-prefixed warning string otherwise.
+export async function notifyApproval(
+  env: Env,
+  opKind: string,
+  meta: ChallengeMeta,
+  approveUrl: string,
+): Promise<string> {
+  const { title, body } = buildApprovalMessage(opKind, meta, approveUrl);
+  return fanOut(env, title, body, true);
+}
+
+// Fan out a DEK-cache-hit notice to every configured channel. Best-effort and
+// non-fatal: a cache hit never has a phone in the loop, so this is the only
+// real-time signal an operator gets that a record was decrypted without an
+// approval. No channel configured is NOT a warning here (the audit row already
+// captures the hit). Returns the same aggregated warning string contract.
+export async function notifyCacheHit(
+  env: Env,
+  meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
+  salts: number,
+): Promise<string> {
+  const { title, body } = buildCacheHitMessage(meta, salts);
+  return fanOut(env, title, body, false);
 }
