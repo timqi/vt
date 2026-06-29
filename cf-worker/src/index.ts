@@ -23,6 +23,14 @@ export { AccountDO } from './do_account';
 const STRICT_CSP =
   "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
+// Shared favicon / app-icon links. Assets live in pwa/ and are served at /pwa/*.
+// Allowed under CSP `img-src 'self'` (same-origin). Minimal set: a vector
+// favicon (any tab size) + the 512 PNG for iOS home-screen / PWA install
+// (iOS does not accept SVG for apple-touch-icon).
+const FAVICON_TAGS =
+  '<link rel="icon" href="/pwa/icon.svg" type="image/svg+xml">' +
+  '<link rel="apple-touch-icon" href="/pwa/icon-512.png">';
+
 // URL segment for the admin surface. Deliberately non-obvious so scanners that
 // probe /admin, /dashboard, etc. miss it (the real gate is Cloudflare Access —
 // this is just to cut noise). Change to any value you like, but keep it in sync
@@ -118,9 +126,13 @@ app.get(`/${ADMIN_SEG}/audit`, (c) => {
   return resp;
 });
 
-// Setup page (pure client-side CREDENTIALS_JSON generator).
+// Setup page (client-side CREDENTIALS_JSON generator). The current
+// CREDENTIALS_JSON secret is injected into the page so add/revoke read it
+// directly from the env binding (no manual paste). It carries only wrapped
+// (encrypted) master-key material and public credential data, and the route is
+// Cloudflare-Access gated, so embedding it for the admin is acceptable.
 app.get(`/${ADMIN_SEG}/setup`, (c) => {
-  const resp = c.html(buildSetupPage(c.env.RP_ID));
+  const resp = c.html(buildSetupPage(c.env.RP_ID, c.env.CREDENTIALS_JSON ?? ''));
   resp.headers.set('Content-Security-Policy', STRICT_CSP);
   return resp;
 });
@@ -321,6 +333,7 @@ function buildApprovePage(data: ApprovePageData): string {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>VT 审批请求</title>
+  ${FAVICON_TAGS}
   <link rel="stylesheet" href="${base}/approve.css">
 </head>
 <body>
@@ -354,7 +367,7 @@ function buildApprovePage(data: ApprovePageData): string {
 function adminTabs(active: 'audit' | 'setup'): string {
   const tab = (href: string, key: 'audit' | 'setup', label: string) =>
     `<a class="tab${key === active ? ' active' : ''}" href="${href}"${key === active ? ' aria-current="page"' : ''}>${label}</a>`;
-  return `<nav class="tabs">${tab(`/${ADMIN_SEG}/audit`, 'audit', '审计')}${tab(`/${ADMIN_SEG}/setup`, 'setup', 'Setup')}</nav>`;
+  return `<nav class="tabs">${tab(`/${ADMIN_SEG}/audit`, 'audit', '审计')}${tab(`/${ADMIN_SEG}/setup`, 'setup', 'Passkey')}</nav>`;
 }
 
 function buildAuditPage(): string {
@@ -365,6 +378,7 @@ function buildAuditPage(): string {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>VT 审计</title>
+  ${FAVICON_TAGS}
   <link rel="stylesheet" href="${base}/pwa/admin.css">
 </head>
 <body>
@@ -399,48 +413,96 @@ function buildAuditPage(): string {
 </html>`;
 }
 
-function buildSetupPage(rpId: string): string {
+function buildSetupPage(rpId: string, credentialsJson: string): string {
   const adminBase = `/${ADMIN_SEG}`;
   const pwaBase = `/pwa`;
-  const dataJson = escapeJsonForHtml({ rp_id: rpId });
+  // `credentials` is the raw CREDENTIALS_JSON secret (or '' on very first
+  // setup). The page parses it client-side for add/revoke; bootstrap ignores
+  // it. Only wrapped (encrypted) key material is exposed — never a plaintext
+  // master.
+  const dataJson = escapeJsonForHtml({ rp_id: rpId, credentials: credentialsJson });
   return `<!doctype html>
 <html lang="zh">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>VT Setup — 生成 CREDENTIALS_JSON</title>
+  <title>VT — Passkey 管理</title>
+  ${FAVICON_TAGS}
   <link rel="stylesheet" href="${adminBase}/pwa/admin.css">
 </head>
 <body>
   <script type="application/json" id="vt-data">${dataJson}</script>
   <main>
     ${adminTabs('setup')}
-    <p class="hint">纯本地生成 <code>CREDENTIALS_JSON</code>。master_key 不离开此浏览器；生成后请手动 <code>wrangler secret put CREDENTIALS_JSON</code>。</p>
-    <section id="modes">
-      <label><input type="radio" name="mode" value="bootstrap" checked> 首个 Passkey（bootstrap）</label>
-      <label><input type="radio" name="mode" value="add"> 新增 Passkey</label>
-      <label><input type="radio" name="mode" value="revoke"> 吊销 Passkey</label>
+    <header class="page-head">
+      <h1>Passkey</h1>
+      <p class="hint">管理 phone 审批 ceremony 用的 Passkey（<code>CREDENTIALS_JSON</code>）。首个 Passkey 的 master 必须等于 macOS <code>mac_key</code>；新增 / 吊销自动读取当前环境变量。生成后手动 <code>wrangler secret put CREDENTIALS_JSON</code> 并 <code>deploy</code>。</p>
+    </header>
+
+    <section id="current-section" class="card">
+      <div class="card-head">
+        <h2>当前 Passkey</h2>
+        <span id="current-meta" class="badge"></span>
+      </div>
+      <ul id="current-list" class="cred-list"></ul>
     </section>
-    <section id="existing-section" hidden>
-      <h2>现有 CREDENTIALS_JSON</h2>
-      <textarea id="existing" rows="6" placeholder="粘贴当前 CREDENTIALS_JSON（add / revoke 需要）"></textarea>
+
+    <div id="modes" role="tablist" aria-label="操作模式">
+      <label><input type="radio" name="mode" value="bootstrap" checked><span>首个（bootstrap）</span></label>
+      <label><input type="radio" name="mode" value="add"><span>新增</span></label>
+      <label><input type="radio" name="mode" value="revoke"><span>吊销</span></label>
+    </div>
+
+    <section id="bootstrap-section" class="card">
+      <div class="card-head"><h2>从 macOS Master Key 引导</h2></div>
+      <p class="hint">浏览器无法独立完成这一步：master 必须取自 Mac keychain 的 <code>mac_key</code>。在 <strong>Mac 本机</strong> 执行（Touch ID 门控），按提示设置一个一次性导出口令：</p>
+      <pre class="cmd"><code>vt secret export</code></pre>
+      <p class="hint">把输出的 base64 与导出口令填入下方——解密只在本浏览器进行，<code>mac_key</code> 不上传。建议直接在 Mac 的浏览器里完成本页，避免跨设备复制。</p>
+      <div class="field">
+        <label for="master-blob">导出串（base64）</label>
+        <textarea id="master-blob" rows="3" placeholder="vt secret export 的输出，60 字节 base64url"></textarea>
+      </div>
+      <div class="field">
+        <label for="master-pass">导出口令</label>
+        <input id="master-pass" type="password" placeholder="export 时设置的一次性口令">
+      </div>
     </section>
-    <section id="label-section">
-      <label>标签 <input id="label" type="text" placeholder="如 iphone-icloud"></label>
+
+    <section id="existing-section" class="card" hidden>
+      <div class="card-head">
+        <h2>现有 CREDENTIALS_JSON</h2>
+        <span class="badge">自动读取自环境变量</span>
+      </div>
+      <p class="hint">已从环境变量预填，通常无需改动；为空时可手动粘贴。</p>
+      <textarea id="existing" rows="6" placeholder="环境变量 CREDENTIALS_JSON 为空；如需可手动粘贴"></textarea>
     </section>
-    <section id="revoke-section" hidden>
-      <label>吊销条目 <select id="revoke-pick"></select></label>
+
+    <section id="label-section" class="field">
+      <label for="label">标签</label>
+      <input id="label" type="text" placeholder="便于识别，如 iphone-icloud">
+    </section>
+
+    <section id="revoke-section" class="card" hidden>
+      <div class="field">
+        <label for="revoke-pick">吊销条目</label>
+        <select id="revoke-pick"></select>
+      </div>
       <p class="warn">⚠️ 吊销 ≠ 密钥轮换：仅从允许列表移除，master_key 不变。若该 Passkey 的密文与 PRF 曾泄露，仍可离线解出同一 master_key。</p>
     </section>
+
     <section id="actions">
       <button id="run" type="button">生成</button>
-      <button id="selfcheck" type="button" hidden>自检（逐条验证）</button>
+      <button id="selfcheck" type="button" class="ghost" hidden>自检（逐条验证）</button>
     </section>
     <p id="status" role="status" aria-live="polite"></p>
-    <section id="output-section" hidden>
-      <h2>输出</h2>
+
+    <section id="output-section" class="card" hidden>
+      <div class="card-head">
+        <h2>输出</h2>
+        <button id="copy" type="button" class="ghost">复制</button>
+      </div>
       <textarea id="output" rows="10" readonly></textarea>
-      <button id="copy" type="button">复制</button>
+      <p class="hint">复制后执行 <code>wrangler secret put CREDENTIALS_JSON</code> 再 <code>wrangler deploy</code> 生效。</p>
     </section>
   </main>
   <script src="${pwaBase}/common.js"></script>

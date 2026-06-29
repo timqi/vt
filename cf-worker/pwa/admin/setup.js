@@ -126,6 +126,35 @@
     return mk;
   }
 
+  // Recover the macOS mac_key from a `vt secret export` blob. Byte format MUST
+  // match src/server_macos/admin.rs::export_secret + core/crypto.rs::encrypt:
+  //   blob   = b64u( nonce(12) || ct(32) || tag(16) )   (60 bytes, no AAD)
+  //   key    = SHA-256(SHA-256(utf8(passphrase)))
+  //   mac_key = AES-GCM-decrypt(key, nonce, ct||tag)     (32 bytes)
+  // The recovered mac_key becomes the passkey-domain master, so v2 records made
+  // on macOS and via the phone ceremony cross-decrypt.
+  async function importMasterFromExport(blobB64u, passphrase) {
+    var blob = vt.b64uDec((blobB64u || '').trim());
+    if (blob.length !== 60) {
+      throw new Error('导出串长度异常: ' + blob.length + ' 字节（应为 60，确认完整复制了 `vt secret export` 的输出）');
+    }
+    var iv = blob.slice(0, 12);
+    var ctTag = blob.slice(12); // 48 = ct(32) || tag(16)
+    var h1 = await vt.sha256(ENC.encode(passphrase || ''));
+    var keyBytes = await vt.sha256(h1);
+    var key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+    var mk;
+    try {
+      mk = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ctTag));
+    } catch (e) {
+      vt.zeroize(keyBytes); vt.zeroize(h1);
+      throw new Error('解密失败：导出口令或导出串不正确');
+    }
+    vt.zeroize(keyBytes); vt.zeroize(h1);
+    if (mk.length !== 32) { vt.zeroize(mk); throw new Error('mac_key 长度异常: ' + mk.length); }
+    return mk;
+  }
+
   function buildEntry(credId, cose, k, h, label) {
     return {
       h: h,
@@ -137,9 +166,17 @@
     };
   }
 
+  // Current CREDENTIALS_JSON injected by the Worker from its env binding (or
+  // '' on first setup). add/revoke read this directly — no manual paste.
+  function envCredentials() {
+    // Worker always injects a string (or undefined on first setup).
+    return (data.credentials || '').trim();
+  }
+
   function parseExisting() {
-    var raw = document.getElementById('existing').value.trim();
-    if (!raw) throw new Error('请粘贴现有 CREDENTIALS_JSON');
+    var raw = (document.getElementById('existing').value || '').trim();
+    if (!raw) raw = envCredentials();
+    if (!raw) throw new Error('环境变量 CREDENTIALS_JSON 为空，且未手动粘贴；add / revoke 需要现有凭据');
     var blob;
     try { blob = JSON.parse(raw); } catch (e) { throw new Error('JSON 解析失败: ' + (e.message || e)); }
     if (blob.v !== 1 || !Array.isArray(blob.c)) throw new Error('CREDENTIALS_JSON 格式不符 (需 v=1, c[])');
@@ -151,7 +188,14 @@
   var lastBlob = null;
 
   async function runBootstrap(label) {
-    var masterKey = randomBytes(32);
+    // First setup MUST bind to the macOS mac_key — never a fresh random master,
+    // otherwise the passkey domain would be a separate vault that can't decrypt
+    // macOS-created records.
+    var blobB64 = document.getElementById('master-blob').value;
+    var pass = document.getElementById('master-pass').value;
+    if (!(blobB64 || '').trim()) throw new Error('请先在 Mac 上执行 `vt secret export` 并粘贴其输出');
+    if (!pass) throw new Error('请输入 `vt secret export` 时设置的导出口令');
+    var masterKey = await importMasterFromExport(blobB64, pass);
     try {
       vt.setStatus('① 注册新 Passkey…（请完成生物识别）');
       var pk = await createPasskey(label);
@@ -228,6 +272,7 @@
 
   function refreshModeUI() {
     var m = mode();
+    document.getElementById('bootstrap-section').hidden = (m !== 'bootstrap');
     document.getElementById('existing-section').hidden = (m === 'bootstrap');
     document.getElementById('label-section').hidden = (m === 'revoke');
     document.getElementById('revoke-section').hidden = (m !== 'revoke');
@@ -302,5 +347,53 @@
     );
   });
 
+  // Render the current registered Passkeys from the env-injected blob. Uses
+  // textContent everywhere (labels are operator-controlled at registration).
+  function renderCurrent() {
+    var host = document.getElementById('current-list');
+    var meta = document.getElementById('current-meta');
+    if (!host) return;
+    host.innerHTML = '';
+    function emptyRow(text) {
+      var li = document.createElement('li');
+      li.className = 'cred-empty';
+      li.textContent = text;
+      host.appendChild(li);
+    }
+    var raw = envCredentials();
+    if (!raw) { if (meta) meta.textContent = '尚未 bootstrap'; emptyRow('还没有任何 Passkey，请用「首个（bootstrap）」注册。'); return; }
+    var blob;
+    try { blob = JSON.parse(raw); }
+    catch (e) { if (meta) meta.textContent = '解析失败'; return; }
+    if (blob.v !== 1 || !Array.isArray(blob.c)) { if (meta) meta.textContent = '格式不符'; return; }
+    if (meta) meta.textContent = blob.c.length + ' 个 · epoch ' + (blob.epoch != null ? blob.epoch : 1);
+    blob.c.forEach(function (e) {
+      var li = document.createElement('li');
+      var name = document.createElement('strong');
+      name.textContent = e.l || '(无标签)';
+      var detail = document.createElement('span');
+      detail.className = 'mono';
+      var when = '';
+      if (typeof e.t === 'number' && e.t > 0) {
+        try { when = new Date(e.t * 1000).toISOString().slice(0, 10); } catch (_) {}
+      }
+      detail.textContent = ' · ' + String(e.i || '').slice(0, 12) + '…' + (when ? ' · ' + when : '');
+      li.appendChild(name);
+      li.appendChild(detail);
+      host.appendChild(li);
+    });
+  }
+
+  // Pre-fill the existing-credentials box from the env-injected blob so
+  // add/revoke work without manual paste. Pretty-print when parseable.
+  (function prefillExisting() {
+    var env = envCredentials();
+    if (!env) return;
+    var ta = document.getElementById('existing');
+    try { ta.value = JSON.stringify(JSON.parse(env), null, 2); }
+    catch (_) { ta.value = env; }
+  })();
+
+  renderCurrent();
   refreshModeUI();
 })();

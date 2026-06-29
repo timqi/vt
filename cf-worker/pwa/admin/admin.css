@@ -11,6 +11,7 @@
   --err: #c0392b;
   --warn: #b7791f;
   --border: #d8dee6;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -45,8 +46,9 @@ main {
 }
 
 .hint { color: var(--muted); margin: 8px 0 16px; font-size: 13px; }
-.warn { color: var(--warn); font-size: 13px; }
+.warn { color: var(--warn); font-size: 13px; margin: 10px 0 0; }
 code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+h1 { font-size: 20px; margin: 14px 0 4px; }
 h2 { font-size: 15px; margin: 18px 0 8px; }
 
 /* Tabs (audit / setup) — equal weight */
@@ -70,18 +72,55 @@ h2 { font-size: 15px; margin: 18px 0 8px; }
 /* Forms */
 section { margin: 14px 0; }
 label { display: inline-flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); margin-right: 14px; }
-#modes label, #revoke-section label { flex-direction: row; align-items: center; gap: 6px; color: var(--fg); }
-input[type="text"], select, textarea {
+
+/* Page header */
+.page-head { margin-bottom: 4px; }
+.page-head .hint { margin-top: 4px; }
+
+/* Cards */
+.card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  padding: 16px 18px; margin: 14px 0;
+}
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+.card-head h2 { margin: 0; }
+.card-head .badge, .card-head button { margin: 0; }
+.card > .hint:first-of-type { margin-top: 0; }
+
+/* Fields: label above control */
+.field { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
+.field > label { margin: 0; }
+.field textarea, .field input[type="text"], .field input[type="password"], .field select { width: 100%; min-width: 0; }
+
+/* Segmented mode switch */
+#modes {
+  display: inline-flex; flex-wrap: wrap; gap: 2px; margin: 16px 0;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 3px;
+}
+#modes label { flex-direction: row; align-items: center; margin: 0; cursor: pointer; }
+#modes input { position: absolute; opacity: 0; width: 0; height: 0; }
+#modes span {
+  display: block; padding: 6px 14px; border-radius: 8px; white-space: nowrap;
+  font-size: 13px; font-weight: 600; color: var(--muted);
+}
+#modes input:checked + span { background: var(--panel); color: var(--accent); box-shadow: 0 1px 2px rgba(0,0,0,.10); }
+#modes input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+input[type="text"], input[type="password"], select, textarea {
   background: var(--panel); color: var(--fg); border: 1px solid var(--border);
   border-radius: 8px; padding: 8px 10px; font: inherit; min-width: 180px;
 }
-textarea { width: 100%; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+textarea { width: 100%; min-width: 0; font-family: var(--mono); font-size: 12px; }
 button {
   background: var(--accent); color: #fff; border: 0; border-radius: 8px;
   padding: 9px 16px; font: inherit; cursor: pointer; margin-right: 8px;
 }
 button:hover { filter: brightness(1.08); }
 button:disabled { opacity: .5; cursor: default; }
+button.ghost {
+  background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
+}
+button.ghost:hover { filter: none; background: var(--border); }
 
 #actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 #actions #status { margin-top: 0; }
@@ -98,7 +137,7 @@ tbody tr:hover { background: var(--panel-2); }
 
 tbody tr.clickable { cursor: pointer; }
 
-.badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+.badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; background: var(--panel-2); color: var(--muted); }
 .badge-pending { background: #e7eaef; color: #5b6573; }
 .badge-approved { background: #d7f5e3; color: #15803d; }
 .badge-rejected { background: #fde0e6; color: #be123c; }
@@ -132,7 +171,21 @@ tbody tr.clickable { cursor: pointer; }
 #detail-dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
 #detail-dl dt { color: var(--muted); font-size: 13px; }
 #detail-dl dd { margin: 0; font-size: 13px; word-break: break-word; }
-#detail-dl dd.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+#detail-dl dd.mono { font-family: var(--mono); white-space: pre-wrap; }
+
+/* Setup: current Passkey list + CLI command block */
+.cred-list { list-style: none; margin: 0 0 16px; padding: 0; }
+.cred-list li {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px;
+  padding: 8px 10px; border: 1px solid var(--border, #2a2a2a); border-radius: 8px; margin-bottom: 6px;
+}
+.cred-list li:empty { display: none; }
+.cred-list li.cred-empty { color: var(--muted); font-size: 13px; border-style: dashed; }
+.cred-list .mono { font-family: var(--mono); color: var(--muted); font-size: 12px; }
+pre.cmd {
+  background: rgba(127,127,127,.12); border-radius: 8px; padding: 10px 12px; margin: 8px 0;
+  overflow-x: auto; font-family: var(--mono); font-size: 13px;
+}
 
 @media (max-width: 640px) {
   label { display: flex; margin-right: 0; }
