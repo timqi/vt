@@ -120,24 +120,28 @@ fn resolve_key_path(flag: Option<String>) -> Result<std::path::PathBuf> {
     default_key_path()
 }
 
-/// Load the ciphertext `vt://` record for `connect`: the raw
-/// `VT_GIT_SSH_PRIVATE_KEY` env value takes precedence; otherwise read the
-/// default key file (`~/.config/vt/git-ssh`).
+/// Load the OPTIONAL ciphertext `vt://` record for `connect`. The raw
+/// `VT_GIT_SSH_PRIVATE_KEY` env value (if non-empty) takes precedence;
+/// otherwise read the default key file (`~/.config/vt/git-ssh`).
+///
+/// Returns `Ok(None)` when neither source exists (`ErrorKind::NotFound` on the
+/// default file) — the normal case on a macOS Keychain-backed host that signs
+/// via `sign@vt`. Any OTHER IO error (e.g. permission denied) stays fatal.
 #[cfg(unix)]
-async fn load_private_record() -> Result<String> {
+async fn load_private_record_opt() -> Result<Option<String>> {
     if let Ok(v) = std::env::var("VT_GIT_SSH_PRIVATE_KEY") {
         let v = v.trim();
         if !v.is_empty() {
-            return Ok(v.to_string());
+            return Ok(Some(v.to_string()));
         }
     }
     let key_path = default_key_path()?;
-    let s = tokio::fs::read_to_string(&key_path)
-        .await
-        .with_context(|| {
-            format!("read {} (or set VT_GIT_SSH_PRIVATE_KEY)", key_path.display())
-        })?;
-    Ok(s.trim().to_string())
+    match tokio::fs::read_to_string(&key_path).await {
+        Ok(s) => Ok(Some(s.trim().to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("read {}", key_path.display()))),
+    }
 }
 
 /// `<key>` -> `<key>.pub`.
@@ -209,19 +213,30 @@ pub async fn connect(vt_client: VTClient, args: Vec<String>) -> Result<()> {
 
 #[cfg(unix)]
 async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
+    use ssh_agent_lib::ssh_encoding::Encode;
     use ssh_key::public::PublicKey;
 
-    // 1. Load ciphertext vt:// + cleartext public key (connect has no flags of
-    //    its own — argv belongs to the system ssh; key material via raw env or
-    //    the default file).
-    let vt_url = load_private_record().await?;
-    if !vt_url.starts_with("vt://") {
-        bail!("VT_GIT_SSH_PRIVATE_KEY / default key file does not contain a vt:// record");
-    }
+    // 1. The public key is REQUIRED: connect advertises it to the system ssh and
+    //    uses it to tell the agent which key to sign with. The ciphertext vt://
+    //    record is OPTIONAL — a macOS Keychain-backed host has none (it signs via
+    //    `sign@vt`); an agent-less host has one (decrypt-then-sign fallback).
     let pub_line = load_pubkey_line().await?;
     let pubkey = PublicKey::from_openssh(pub_line.trim()).context("parse OpenSSH public key")?;
     let key_data = pubkey.key_data().clone();
     let comment = pubkey.comment().to_string();
+    // SSH wire encoding of the advertised KeyData, sent to the agent so it can
+    // decode + fingerprint it identically to its stored keys (no format drift).
+    let mut pubkey_bytes = Vec::new();
+    key_data
+        .encode(&mut pubkey_bytes)
+        .context("encode advertised public key")?;
+
+    let vt_url = load_private_record_opt().await?;
+    if let Some(ref u) = vt_url {
+        if !u.starts_with("vt://") {
+            bail!("VT_GIT_SSH_PRIVATE_KEY / default key file does not contain a vt:// record");
+        }
+    }
 
     // 2. Best-effort audit context from our own argv (we are git's child).
     //    op_kind stays "decrypt" (decrypt's existing meta); the human-meaningful
@@ -247,6 +262,7 @@ async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
         client: vt_client,
         vt_url,
         pubkey: key_data,
+        pubkey_bytes,
         comment,
         host,
         command,
@@ -361,12 +377,16 @@ fn parse_ssh_host(args: &[String]) -> Option<String> {
 #[cfg(unix)]
 struct SignerInner {
     client: VTClient,
-    vt_url: String,
+    /// Ciphertext `vt://` record for the decrypt-then-sign fallback. `None` on a
+    /// Keychain-backed host (signs via `sign@vt`); the fallback then hard-fails.
+    vt_url: Option<String>,
     pubkey: ssh_key::public::KeyData,
+    /// SSH wire-encoded `pubkey`, sent in `sign@vt` to identify the agent key.
+    pubkey_bytes: Vec<u8>,
     comment: String,
     host: String,
     command: String,
-    /// Decrypted seed, initialized once per process via the existing ceremony.
+    /// Decrypted seed (fallback path only), initialized once per process.
     key: tokio::sync::OnceCell<zeroize::Zeroizing<[u8; 32]>>,
 }
 
@@ -397,6 +417,37 @@ fn sign_err(msg: impl Into<String>) -> ssh_agent_lib::error::AgentError {
     ssh_agent_lib::error::AgentError::other(std::io::Error::other(msg.into()))
 }
 
+/// Pure routing decision for `SignerSession::sign`, extracted so the fallback
+/// policy (guardrail G3) is unit-testable without a live agent socket.
+#[cfg(unix)]
+#[derive(Debug)]
+enum SignRoute {
+    /// `sign@vt` succeeded — use this `(algorithm, signature)`.
+    Use(String, Vec<u8>),
+    /// Fall back to local decrypt-then-sign (a `vt://` record is available).
+    Fallback,
+    /// Hard fail with this message — NO fallback.
+    Fail(String),
+}
+
+/// Decide what `sign()` does given the `sign_vt` outcome and whether a `vt://`
+/// record exists for the fallback path. G3: only `Ok(None)` (agent absent / key
+/// not held / recoverable) may fall back, and only if a record exists; an `Err`
+/// (AuthRejected / BadRequest) NEVER falls back, even when a record exists.
+#[cfg(unix)]
+fn decide_sign_route(outcome: Result<Option<(String, Vec<u8>)>>, has_vt_url: bool) -> SignRoute {
+    match outcome {
+        Ok(Some((alg, sig))) => SignRoute::Use(alg, sig),
+        Ok(None) if has_vt_url => SignRoute::Fallback,
+        Ok(None) => SignRoute::Fail(
+            "no vt agent holds this key and no vt:// record is configured \
+             (set VT_GIT_SSH_PRIVATE_KEY or place the record at ~/.config/vt/git-ssh)"
+                .to_string(),
+        ),
+        Err(e) => SignRoute::Fail(e.to_string()),
+    }
+}
+
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl ssh_agent_lib::agent::Session for SignerSession {
@@ -424,6 +475,35 @@ impl ssh_agent_lib::agent::Session for SignerSession {
             return Err(AgentError::Failure);
         }
 
+        // 1. Agent-internal sign with vt context (e.g. macOS Keychain key): the
+        //    private key never leaves the agent. The fallback policy (G3) is in
+        //    the pure `decide_sign_route` so it can be unit-tested.
+        let outcome = self
+            .inner
+            .client
+            .sign_vt(
+                &self.inner.host,
+                &self.inner.command,
+                &self.inner.pubkey_bytes,
+                &request.data,
+                request.flags,
+            )
+            .await;
+        let vt_url = match decide_sign_route(outcome, self.inner.vt_url.is_some()) {
+            SignRoute::Use(alg, sig) => {
+                let algorithm = Algorithm::new(&alg).map_err(AgentError::other)?;
+                return Signature::new(algorithm, sig).map_err(AgentError::other);
+            }
+            SignRoute::Fail(msg) => return Err(sign_err(msg)),
+            // Fallback implies `vt_url.is_some()`, so this clone always yields Some.
+            SignRoute::Fallback => self
+                .inner
+                .vt_url
+                .clone()
+                .expect("Fallback route requires a vt:// record"),
+        };
+
+        // 2. Fallback path: decrypt-then-sign locally with the vt:// record.
         // Decrypt the seed once (get_or_try_init: errors are NOT cached, so a
         // rejected Touch ID / passkey can be retried on a later request).
         let seed = self
@@ -433,7 +513,7 @@ impl ssh_agent_lib::agent::Session for SignerSession {
                 let inner = &self.inner;
                 let res = inner
                     .client
-                    .decrypt(&inner.host, &inner.command, std::slice::from_ref(&inner.vt_url))
+                    .decrypt(&inner.host, &inner.command, std::slice::from_ref(&vt_url))
                     .await
                     .map_err(|e| sign_err(e.to_string()))?;
                 if res.is_empty() || !res[0].err_message.is_empty() {
@@ -496,5 +576,71 @@ mod tests {
         let dec = BASE64_URL_SAFE_NO_PAD.decode("AAAA").unwrap(); // 3 bytes
         let r: Result<[u8; 32], _> = dec.try_into();
         assert!(r.is_err());
+    }
+
+    // ── sign@vt routing (guardrail G3) ───────────────────────────────────────
+
+    #[test]
+    fn sign_route_uses_agent_signature() {
+        match super::decide_sign_route(Ok(Some(("ssh-ed25519".into(), vec![1, 2, 3]))), true) {
+            super::SignRoute::Use(alg, sig) => {
+                assert_eq!(alg, "ssh-ed25519");
+                assert_eq!(sig, vec![1, 2, 3]);
+            }
+            other => panic!("expected Use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sign_route_falls_back_when_none_and_record_present() {
+        assert!(matches!(
+            super::decide_sign_route(Ok(None), true),
+            super::SignRoute::Fallback
+        ));
+    }
+
+    #[test]
+    fn sign_route_hard_fails_when_none_and_no_record() {
+        match super::decide_sign_route(Ok(None), false) {
+            super::SignRoute::Fail(m) => assert!(m.contains("no vt agent")),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    // G3 core: a sign@vt error (AuthRejected / BadRequest) must NEVER fall back,
+    // even when a vt:// record is available — otherwise a declined Touch ID
+    // would silently re-prompt via the decrypt path.
+    #[test]
+    fn sign_route_err_never_falls_back_even_with_record() {
+        let err = Err(anyhow::anyhow!("vt: authentication rejected"));
+        match super::decide_sign_route(err, true) {
+            super::SignRoute::Fail(m) => assert!(m.contains("authentication rejected")),
+            other => panic!("expected Fail (no fallback), got {other:?}"),
+        }
+    }
+
+    // The pubkey connect encodes (Encode) must decode (Decode) on the agent to a
+    // KeyData with the SAME SHA256 fingerprint — the contract `sign@vt` lookup
+    // relies on (no format drift between the cross-platform client and the agent).
+    #[test]
+    fn pubkey_wire_roundtrip_preserves_fingerprint() {
+        use ssh_agent_lib::ssh_encoding::{Decode, Encode};
+        use ssh_key::public::{Ed25519PublicKey, KeyData, PublicKey};
+        use ssh_key::{Fingerprint, HashAlg};
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let kd = KeyData::Ed25519(Ed25519PublicKey(sk.verifying_key().to_bytes()));
+
+        let mut wire = Vec::new();
+        kd.encode(&mut wire).unwrap();
+        let decoded = KeyData::decode(&mut wire.as_slice()).unwrap();
+
+        let fp_orig = Fingerprint::new(HashAlg::Sha256, &kd).to_string();
+        let fp_decoded = Fingerprint::new(HashAlg::Sha256, &decoded).to_string();
+        assert_eq!(fp_orig, fp_decoded);
+
+        // …and equals the fingerprint of the advertised OpenSSH public key.
+        let pk = PublicKey::new(kd, "");
+        assert_eq!(pk.fingerprint(HashAlg::Sha256).to_string(), fp_decoded);
     }
 }

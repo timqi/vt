@@ -24,7 +24,7 @@ use crate::core::wire::{
 };
 use crate::core::{
     legacy_decrypt, AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, EncryptReq,
-    EncryptResItem, RunReq, RunRes, SALT_LEN,
+    EncryptResItem, RunReq, RunRes, SignReq, SignRes, SALT_LEN,
 };
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
@@ -38,6 +38,7 @@ pub const EXT_ENCRYPT: &str = "encrypt@vt";
 pub const EXT_DECRYPT: &str = "decrypt@vt";
 pub const EXT_AUTH: &str = "auth@vt";
 pub const EXT_RUN: &str = "run@vt";
+pub const EXT_SIGN: &str = "sign@vt";
 
 fn agent_err(e: anyhow::Error) -> AgentError {
     AgentError::Other(Box::new(std::io::Error::new(
@@ -617,6 +618,88 @@ fn load_all_keys() -> Result<HashMap<String, PrivateKey>> {
 fn fingerprint_str(key_data: &KeyData) -> String {
     let fp = ssh_key::Fingerprint::new(HashAlg::Sha256, key_data);
     fp.to_string()
+}
+
+/// Pure signing core: given an unlocked `PrivateKey`, sign `data` honoring the
+/// SSH `flags` (RSA SHA2 selection). No auth, no lookup, no cache — callers do
+/// that. Shared by the standard `Session::sign` and the `sign@vt` extension so
+/// their algorithm coverage cannot drift.
+fn sign_data_with_privkey(
+    privkey: &PrivateKey,
+    data: &[u8],
+    flags: u32,
+) -> Result<Signature, AgentError> {
+    match privkey.key_data() {
+        KeypairData::Ed25519(ref key) => {
+            use ed25519_dalek::Signer;
+            let signing_key: ed25519_dalek::SigningKey =
+                key.try_into().map_err(AgentError::other)?;
+            let sig = signing_key.sign(data);
+            Signature::new(Algorithm::Ed25519, sig.to_bytes().to_vec()).map_err(AgentError::other)
+        }
+        KeypairData::Rsa(ref key) => {
+            use rsa::pkcs1v15::SigningKey;
+            use rsa::signature::{RandomizedSigner, SignatureEncoding};
+            use ssh_agent_lib::proto::signature;
+
+            let private_key: rsa::RsaPrivateKey = key.try_into().map_err(AgentError::other)?;
+            let mut rng = rand::thread_rng();
+
+            if flags & signature::RSA_SHA2_512 != 0 {
+                let sig = SigningKey::<sha2::Sha512>::new(private_key).sign_with_rng(&mut rng, data);
+                Signature::new(
+                    Algorithm::new("rsa-sha2-512").map_err(AgentError::other)?,
+                    sig.to_bytes().to_vec(),
+                )
+                .map_err(AgentError::other)
+            } else if flags & signature::RSA_SHA2_256 != 0 {
+                let sig = SigningKey::<sha2::Sha256>::new(private_key).sign_with_rng(&mut rng, data);
+                Signature::new(
+                    Algorithm::new("rsa-sha2-256").map_err(AgentError::other)?,
+                    sig.to_bytes().to_vec(),
+                )
+                .map_err(AgentError::other)
+            } else {
+                let sig = SigningKey::<sha1::Sha1>::new(private_key).sign_with_rng(&mut rng, data);
+                Signature::new(
+                    Algorithm::new("ssh-rsa").map_err(AgentError::other)?,
+                    sig.to_bytes().to_vec(),
+                )
+                .map_err(AgentError::other)
+            }
+        }
+        KeypairData::Ecdsa(ref key) => {
+            use ssh_key::EcdsaCurve;
+            match key.curve() {
+                EcdsaCurve::NistP256 => {
+                    use p256::ecdsa::{signature::Signer, SigningKey};
+                    let secret_key = p256::SecretKey::from_slice(key.private_key_bytes())
+                        .map_err(AgentError::other)?;
+                    let signing_key = SigningKey::from(secret_key);
+                    let sig: p256::ecdsa::DerSignature = signing_key.sign(data);
+                    Signature::new(
+                        Algorithm::new("ecdsa-sha2-nistp256").map_err(AgentError::other)?,
+                        sig.as_bytes().to_vec(),
+                    )
+                    .map_err(AgentError::other)
+                }
+                EcdsaCurve::NistP384 => {
+                    use p384::ecdsa::{signature::Signer, SigningKey};
+                    let secret_key = p384::SecretKey::from_slice(key.private_key_bytes())
+                        .map_err(AgentError::other)?;
+                    let signing_key = SigningKey::from(secret_key);
+                    let sig: p384::ecdsa::DerSignature = signing_key.sign(data);
+                    Signature::new(
+                        Algorithm::new("ecdsa-sha2-nistp384").map_err(AgentError::other)?,
+                        sig.as_bytes().to_vec(),
+                    )
+                    .map_err(AgentError::other)
+                }
+                _ => Err(AgentError::Failure),
+            }
+        }
+        _ => Err(AgentError::Failure),
+    }
 }
 
 /// Get the peer PID from a Unix stream using macOS LOCAL_PEERPID.
@@ -1278,6 +1361,76 @@ impl VtSshSession {
             (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
         })?))
     }
+
+    /// `sign@vt`: VT_AUTH-gated signing with a Keychain-held key, displaying vt
+    /// execution context (host/command/meta) in the Touch ID prompt. Unlike the
+    /// standard `SIGN_REQUEST` path, the request is authenticated by the
+    /// auth-cipher envelope and carries human context. The private key never
+    /// leaves the agent. v1 ALWAYS prompts (no cache — see docs/sign-vt-design.md).
+    async fn handle_sign_vt(
+        &self,
+        decrypted: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+        use ssh_agent_lib::ssh_encoding::Decode;
+
+        let req: SignReq = serde_json::from_slice(decrypted)
+            .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
+        if req.command.len() > PROMPT_DISPLAY_MAX_BYTES {
+            return Err((ErrKind::BadRequest, Some(DETAIL_DISPLAY_FIELD_TOO_LARGE)));
+        }
+
+        // Decode the requested pubkey → KeyData → fingerprint (same fn as
+        // storage, so the lookup key matches what the client advertised).
+        // `&[u8]: Reader`, so `decode(&mut &[u8])` is the correct call pattern.
+        let key_data = KeyData::decode(&mut req.pubkey.as_slice())
+            .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_SIGN_BAD_PUBKEY)))?;
+        let fp_str = fingerprint_str(&key_data);
+
+        // Look up the key. "Not in this agent" is FALLBACK-ELIGIBLE (Generic),
+        // NOT BadRequest — an agent-less/other-key host must be able to fall
+        // back to decrypt-then-sign. Clone the PrivateKey out so the keys
+        // read-lock is not held across the Touch ID prompt.
+        self.ensure_keys_loaded()
+            .await
+            .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_KEYS_LOAD)))?;
+        let privkey = {
+            let keys = self.keys.read().await;
+            match keys.get(&fp_str) {
+                Some(k) => k.clone(),
+                None => return Err((ErrKind::Generic, Some(DETAIL_SIGN_KEY_NOT_IN_AGENT))),
+            }
+        };
+
+        // Rich prompt from vt context (mirrors handle_decrypt formatting).
+        let who = who_at_host(&req.meta.user, &req.host);
+        let mut auth_message = header_with_who("ssh-sign", "for", &who);
+        let body = sanitize_prompt_multiline(
+            &req.command,
+            PROMPT_COMMAND_MAX_LINE_LEN,
+            PROMPT_COMMAND_MAX_LINES,
+        );
+        if !body.is_empty() {
+            auth_message.push('\n');
+            auth_message.push_str(&body);
+        }
+        append_meta_lines(&mut auth_message, &req.meta);
+
+        // v1: ALWAYS PROMPT (no cache). Distinguish reject vs unavailable so the
+        // client gets the right ErrKind (AuthRejected => no fallback, G3).
+        if let Some(kind) = outcome_to_err_strict(authenticate(&auth_message)) {
+            return Err((kind, auth_outcome_detail(kind)));
+        }
+
+        let sig = sign_data_with_privkey(&privkey, &req.data, req.flags)
+            .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_FAILED)))?;
+        let res = SignRes {
+            algorithm: sig.algorithm().to_string(),
+            signature: sig.as_bytes().to_vec(),
+        };
+        serde_json::to_vec(&res)
+            .map(Zeroizing::new)
+            .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))
+    }
 }
 
 /// Spawn `exe` with `args` as a detached background process. Returns the
@@ -1374,6 +1527,12 @@ const DETAIL_RUN_ARGV_TOO_LARGE: &str = "run@vt argv exceeds size cap";
 const DETAIL_DISPLAY_FIELD_TOO_LARGE: &str = "display field exceeds size cap";
 const DETAIL_RUN_NOT_ALLOWLISTED: &str = "run@vt program is not in the agent's allowlist";
 const DETAIL_RUN_SPAWN_FAILED: &str = "run@vt failed to spawn the program";
+// sign@vt-specific failure reasons. All strings are static program info
+// (no key/host/user data) and therefore safe to surface to the client.
+const DETAIL_SIGN_BAD_PUBKEY: &str = "sign@vt request public key could not be decoded";
+const DETAIL_SIGN_KEYS_LOAD: &str = "sign@vt could not load agent keys";
+const DETAIL_SIGN_KEY_NOT_IN_AGENT: &str = "this agent does not hold the requested key";
+const DETAIL_SIGN_FAILED: &str = "sign@vt signing operation failed";
 
 /// Map the three auth-outcome-derived [`ErrKind`]s to their canonical
 /// detail strings. Defined alongside the `DETAIL_*` constants so the
@@ -1477,81 +1636,7 @@ impl Session for VtSshSession {
             return Err(AgentError::Failure);
         }
 
-        match privkey.key_data() {
-            KeypairData::Ed25519(ref key) => {
-                use ed25519_dalek::Signer;
-                let signing_key: ed25519_dalek::SigningKey =
-                    key.try_into().map_err(AgentError::other)?;
-                let sig = signing_key.sign(&request.data);
-                Signature::new(Algorithm::Ed25519, sig.to_bytes().to_vec())
-                    .map_err(AgentError::other)
-            }
-            KeypairData::Rsa(ref key) => {
-                use rsa::pkcs1v15::SigningKey;
-                use rsa::signature::{RandomizedSigner, SignatureEncoding};
-                use ssh_agent_lib::proto::signature;
-
-                let private_key: rsa::RsaPrivateKey = key.try_into().map_err(AgentError::other)?;
-                let mut rng = rand::thread_rng();
-
-                if request.flags & signature::RSA_SHA2_512 != 0 {
-                    let sig = SigningKey::<sha2::Sha512>::new(private_key)
-                        .sign_with_rng(&mut rng, &request.data);
-                    Signature::new(
-                        Algorithm::new("rsa-sha2-512").map_err(AgentError::other)?,
-                        sig.to_bytes().to_vec(),
-                    )
-                    .map_err(AgentError::other)
-                } else if request.flags & signature::RSA_SHA2_256 != 0 {
-                    let sig = SigningKey::<sha2::Sha256>::new(private_key)
-                        .sign_with_rng(&mut rng, &request.data);
-                    Signature::new(
-                        Algorithm::new("rsa-sha2-256").map_err(AgentError::other)?,
-                        sig.to_bytes().to_vec(),
-                    )
-                    .map_err(AgentError::other)
-                } else {
-                    let sig = SigningKey::<sha1::Sha1>::new(private_key)
-                        .sign_with_rng(&mut rng, &request.data);
-                    Signature::new(
-                        Algorithm::new("ssh-rsa").map_err(AgentError::other)?,
-                        sig.to_bytes().to_vec(),
-                    )
-                    .map_err(AgentError::other)
-                }
-            }
-            KeypairData::Ecdsa(ref key) => {
-                use ssh_key::EcdsaCurve;
-                match key.curve() {
-                    EcdsaCurve::NistP256 => {
-                        use p256::ecdsa::{signature::Signer, SigningKey};
-                        let secret_key = p256::SecretKey::from_slice(key.private_key_bytes())
-                            .map_err(AgentError::other)?;
-                        let signing_key = SigningKey::from(secret_key);
-                        let sig: p256::ecdsa::DerSignature = signing_key.sign(&request.data);
-                        Signature::new(
-                            Algorithm::new("ecdsa-sha2-nistp256").map_err(AgentError::other)?,
-                            sig.as_bytes().to_vec(),
-                        )
-                        .map_err(AgentError::other)
-                    }
-                    EcdsaCurve::NistP384 => {
-                        use p384::ecdsa::{signature::Signer, SigningKey};
-                        let secret_key = p384::SecretKey::from_slice(key.private_key_bytes())
-                            .map_err(AgentError::other)?;
-                        let signing_key = SigningKey::from(secret_key);
-                        let sig: p384::ecdsa::DerSignature = signing_key.sign(&request.data);
-                        Signature::new(
-                            Algorithm::new("ecdsa-sha2-nistp384").map_err(AgentError::other)?,
-                            sig.as_bytes().to_vec(),
-                        )
-                        .map_err(AgentError::other)
-                    }
-                    _ => Err(AgentError::Failure),
-                }
-            }
-            _ => Err(AgentError::Failure),
-        }
+        sign_data_with_privkey(privkey, &request.data, request.flags)
     }
 
     async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
@@ -1569,7 +1654,7 @@ impl Session for VtSshSession {
         // Only handle vt custom protocol extensions; ignore standard SSH extensions
         if !matches!(
             extension.name.as_str(),
-            EXT_ENCRYPT | EXT_DECRYPT | EXT_AUTH | EXT_RUN
+            EXT_ENCRYPT | EXT_DECRYPT | EXT_AUTH | EXT_RUN | EXT_SIGN
         ) {
             return Ok(None);
         }
@@ -1619,6 +1704,7 @@ impl Session for VtSshSession {
                 }
                 EXT_AUTH => self.handle_auth(&decrypted).await,
                 EXT_RUN => self.handle_run(&decrypted).await,
+                EXT_SIGN => self.handle_sign_vt(&decrypted).await,
                 _ => unreachable!(),
             };
 
@@ -1973,6 +2059,31 @@ pub async fn start_ssh_agent(
 mod tests {
     use super::*;
     use crate::core::session::AuthMethod;
+
+    // sign@vt's signing core: an Ed25519 PrivateKey signs `data` and the
+    // signature verifies under its own public key, tagged `ssh-ed25519`. This is
+    // the same code path the standard `Session::sign` now uses (shared helper),
+    // so it also guards against algorithm/encoding drift after the refactor.
+    #[test]
+    fn sign_data_with_privkey_ed25519_signs_and_verifies() {
+        use ed25519_dalek::{Signature as DalekSig, Verifier, VerifyingKey};
+        use ssh_key::private::PrivateKey;
+
+        let privkey =
+            PrivateKey::random(&mut rand::rngs::OsRng, Algorithm::Ed25519).expect("gen key");
+        let data = b"sign@vt test payload";
+        let sig = sign_data_with_privkey(&privkey, data, 0).expect("sign");
+        assert_eq!(sig.algorithm().to_string(), "ssh-ed25519");
+
+        let pub_bytes: [u8; 32] = match privkey.public_key().key_data() {
+            KeyData::Ed25519(k) => k.0,
+            _ => unreachable!("generated an Ed25519 key"),
+        };
+        let vk = VerifyingKey::from_bytes(&pub_bytes).expect("vk");
+        let sig_arr: [u8; 64] = sig.as_bytes().try_into().expect("64-byte ed25519 sig");
+        vk.verify(data, &DalekSig::from_bytes(&sig_arr))
+            .expect("signature must verify under the key's own public key");
+    }
 
     #[test]
     fn test_ssh_key_entry_serde_roundtrip() {

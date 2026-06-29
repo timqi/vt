@@ -252,6 +252,39 @@ pub struct RunRes {
     pub pid: u32,
 }
 
+/// Request: client → agent for `sign@vt`. The agent looks up the Keychain key
+/// identified by `pubkey` (SSH wire-encoded `KeyData`), prompts with vt
+/// context, and signs `data` in-agent. The private key never leaves the agent.
+/// See `docs/sign-vt-design.md`.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SignReq {
+    /// Display/audit only; never trusted (caller-asserted, esp. under `ssh -A`).
+    pub host: String,
+    /// Human label, e.g. "ssh-sign: push -> github.com". Bounded + sanitized
+    /// agent-side like `DecryptReq::command`.
+    pub command: String,
+    /// SSH wire-encoded public key (`KeyData`) selecting WHICH Keychain key to
+    /// sign with. The agent decodes it and computes the fingerprint with the
+    /// same `fingerprint_str` used for stored keys, so lookup cannot drift.
+    pub pubkey: Vec<u8>,
+    /// Bytes to sign (the blob from the system ssh SIGN_REQUEST).
+    pub data: Vec<u8>,
+    /// SSH-agent signature flags (RSA SHA2 selection). Ed25519/ECDSA ignore.
+    #[serde(default)]
+    pub flags: u32,
+    #[serde(default)]
+    pub meta: ClientMeta,
+}
+
+/// Response for `sign@vt`: the SSH signature, algorithm-tagged so the client
+/// rebuilds an `ssh_key::Signature` without assuming the key type. Not secret.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SignRes {
+    /// e.g. "ssh-ed25519", "rsa-sha2-512", "ecdsa-sha2-nistp256".
+    pub algorithm: String,
+    pub signature: Vec<u8>,
+}
+
 // ---- v2 URL parsing ---------------------------------------------------------
 
 /// Parsed `vt://...` URL. Strict parser (no `url::Url`, no normalization).
@@ -555,6 +588,39 @@ mod tests {
         let mac_key = [0x42u8; 32];
         let salt = [0x11u8; SALT_LEN];
         derive_dek(&mac_key, &salt)
+    }
+
+    #[test]
+    fn sign_req_res_roundtrip() {
+        let req = SignReq {
+            host: "g1".into(),
+            command: "ssh-sign: push -> github.com".into(),
+            pubkey: vec![0u8, 1, 2, 3, 255],
+            data: vec![9u8; 40],
+            flags: 4,
+            meta: ClientMeta::default(),
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let back: SignReq = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.host, req.host);
+        assert_eq!(back.command, req.command);
+        assert_eq!(back.pubkey, req.pubkey);
+        assert_eq!(back.data, req.data);
+        assert_eq!(back.flags, req.flags);
+
+        // `flags` and `meta` default when absent (older client compatibility).
+        let minimal = serde_json::json!({
+            "host": "g1", "command": "x", "pubkey": [1,2], "data": [3,4]
+        });
+        let parsed: SignReq = serde_json::from_value(minimal).unwrap();
+        assert_eq!(parsed.flags, 0);
+        assert!(parsed.meta.user.is_empty());
+
+        let res = SignRes { algorithm: "ssh-ed25519".into(), signature: vec![7u8; 64] };
+        let rb = serde_json::to_vec(&res).unwrap();
+        let rback: SignRes = serde_json::from_slice(&rb).unwrap();
+        assert_eq!(rback.algorithm, "ssh-ed25519");
+        assert_eq!(rback.signature, vec![7u8; 64]);
     }
 
     #[test]

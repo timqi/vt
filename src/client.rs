@@ -14,7 +14,7 @@ use crate::core::{
     client_decrypt_v2, client_encrypt_v2, collapse_whitespace, has_vt_url, iter_vt_urls,
     redact_vt_urls, sanitize_for_display, AuthReq, AuthRes, CryptoResItem, DecryptInput,
     DecryptReq, DecryptResItem, EncryptItem, EncryptReq, EncryptResItem, RunReq, RunRes,
-    SecretType, VtUrl, SALT_LEN,
+    SecretType, SignReq, SignRes, VtUrl, SALT_LEN,
 };
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -489,6 +489,55 @@ impl VTClient {
         {
             let _ = req;
             Err(anyhow::anyhow!("vt decrypt requires Unix (SSH agent socket)"))
+        }
+    }
+
+    /// `sign@vt`: ask the agent to sign `data` with the Keychain key identified
+    /// by `pubkey` (SSH wire-encoded `KeyData`), displaying the vt context in
+    /// the Touch ID prompt. See `docs/sign-vt-design.md`.
+    ///
+    /// - `Ok(Some((alg, sig)))` — the agent signed; the private key never left
+    ///   the agent.
+    /// - `Ok(None)` — the caller should fall back to decrypt-then-sign: socket
+    ///   missing/refused, an old agent that doesn't know `sign@vt`, or any
+    ///   recoverable agent error per [`should_fallback_to_cf`] (including
+    ///   `Generic` = "this agent does not hold that key").
+    /// - `Err(_)` — `AuthRejected` (user declined) or `BadRequest` (malformed):
+    ///   do NOT fall back (guardrail G3).
+    #[cfg(unix)]
+    pub async fn sign_vt(
+        &self,
+        host: &str,
+        command: &str,
+        pubkey: &[u8],
+        data: &[u8],
+        flags: u32,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        let req = SignReq {
+            host: host.to_string(),
+            command: command.to_string(),
+            pubkey: pubkey.to_vec(),
+            data: data.to_vec(),
+            flags,
+            meta: cf::collect_client_meta(),
+        };
+        let payload = serde_json::to_vec(&req)?;
+        let auth_token = self.auth_token.clone();
+        // Same blocking + classification as `agent_call_or_fallback`, but
+        // WITHOUT the "falling back to phone passkey" eprintln: our fallback is
+        // local decrypt-then-sign, not necessarily the CF ceremony.
+        let result = tokio::task::spawn_blocking(move || {
+            Self::try_agent_extension(&auth_token, "sign@vt", &payload)
+        })
+        .await?;
+        match result {
+            Ok(Some(bytes)) => {
+                let res: SignRes = serde_json::from_slice(&bytes)?;
+                Ok(Some((res.algorithm, res.signature)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) if should_fallback_to_cf(&e) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
