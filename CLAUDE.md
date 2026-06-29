@@ -25,6 +25,7 @@ src/
 │   ├── session.rs   AuthOutcome / SessionFlags
 │   └── wire.rs      ExtResponse / ErrKind
 ├── tty.rs           password prompt
+├── ssh_sign.rs      portable SSH identity: `vt ssh keygen` / `vt ssh connect` (cross-platform; see docs/ssh-vt-design.md)
 └── server_macos/    macOS Keychain + Touch ID + SSH agent (cfg-gated)
 
 cf-worker/            TypeScript Cloudflare Worker + PWA

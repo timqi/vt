@@ -21,6 +21,7 @@ mod client;
 mod core;
 #[cfg(target_os = "macos")]
 mod server_macos;
+mod ssh_sign;
 mod tty;
 
 #[derive(Parser)]
@@ -135,8 +136,8 @@ enum Commands {
     #[cfg(target_os = "macos")]
     #[command(subcommand)]
     Secret(SecretCommands),
-    /// (Mac only) SSH agent and key management
-    #[cfg(target_os = "macos")]
+    /// SSH agent + key management (agent/add/list/... are macOS-only;
+    /// keygen/connect are cross-platform)
     #[command(subcommand)]
     Ssh(SshCommands),
     /// (Mac only) Manage FIDO2 (YubiKey) credentials for Touch ID fallback
@@ -178,10 +179,37 @@ pub enum SecretCommands {
     },
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Subcommand, PartialEq)]
 pub enum SshCommands {
+    /// Generate a portable Ed25519 SSH identity stored as a vt:// record
+    /// (cross-platform). Prints the OpenSSH public key for GitHub.
+    Keygen {
+        #[arg(short = 'l', long = "label", help = "Label/comment for the key")]
+        label: Option<String>,
+        #[arg(
+            short = 'c',
+            long = "comment",
+            help = "OpenSSH comment (overrides --label)"
+        )]
+        comment: Option<String>,
+        #[arg(
+            long = "key-file",
+            help = "Where to write the vt:// record (default ~/.config/vt/git-ssh); .pub written alongside"
+        )]
+        key_file: Option<String>,
+    },
+    /// Git SSH driver (cross-platform). Set `GIT_SSH_COMMAND="vt ssh connect"`.
+    /// Signs with the vt:// identity via an ephemeral in-process agent + system ssh.
+    Connect {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            help = "Arguments passed through to the system ssh (host + remote command)"
+        )]
+        args: Vec<String>,
+    },
     /// Start the SSH agent (listens on ~/.ssh/vt.sock)
+    #[cfg(target_os = "macos")]
     Agent {
         #[arg(
             short = 't',
@@ -228,6 +256,7 @@ pub enum SshCommands {
         run_allow: String,
     },
     /// Add an SSH private key to the keychain
+    #[cfg(target_os = "macos")]
     Add {
         #[arg(short = 'f', long = "file", help = "Path to the SSH private key file")]
         file: Option<String>,
@@ -239,15 +268,19 @@ pub enum SshCommands {
         comment: Option<String>,
     },
     /// List stored SSH keys
+    #[cfg(target_os = "macos")]
     List,
     /// Remove an SSH key by fingerprint
+    #[cfg(target_os = "macos")]
     Remove {
         #[arg(help = "Fingerprint (or prefix) of the key to remove")]
         fingerprint: String,
     },
     /// Remove all stored SSH keys
+    #[cfg(target_os = "macos")]
     RemoveAll,
     /// Change the comment of a stored SSH key
+    #[cfg(target_os = "macos")]
     Comment {
         #[arg(help = "Fingerprint (or prefix) of the key to update")]
         fingerprint: String,
@@ -255,6 +288,7 @@ pub enum SshCommands {
         comment: String,
     },
     /// Show the public key for a stored SSH key
+    #[cfg(target_os = "macos")]
     Show {
         #[arg(help = "Fingerprint (or prefix) of the key to show")]
         fingerprint: String,
@@ -277,8 +311,22 @@ async fn run(cli: Cli) -> Result<()> {
                 server_macos::admin::rotate_passcode(bin_absolute_path.clone()).await
             }
         },
-        #[cfg(target_os = "macos")]
         Commands::Ssh(ssh_command) => match ssh_command {
+            SshCommands::Keygen {
+                label,
+                comment,
+                key_file,
+            } => {
+                let auth = require_auth(&cli.auth)?;
+                let vt_client = VTClient::new(auth)?;
+                ssh_sign::keygen(vt_client, label.clone(), comment.clone(), key_file.clone()).await
+            }
+            SshCommands::Connect { args } => {
+                let auth = require_auth(&cli.auth)?;
+                let vt_client = VTClient::new(auth)?;
+                ssh_sign::connect(vt_client, args.clone()).await
+            }
+            #[cfg(target_os = "macos")]
             SshCommands::Agent {
                 timeout,
                 auth_cache_mode,
@@ -306,14 +354,20 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await
             }
+            #[cfg(target_os = "macos")]
             SshCommands::Add { file, comment } => server_macos::ssh_cli::ssh_add(file.clone(), comment.clone()),
+            #[cfg(target_os = "macos")]
             SshCommands::List => server_macos::ssh_cli::ssh_list(),
+            #[cfg(target_os = "macos")]
             SshCommands::Remove { fingerprint } => server_macos::ssh_cli::ssh_remove(fingerprint),
+            #[cfg(target_os = "macos")]
             SshCommands::RemoveAll => server_macos::ssh_cli::ssh_remove_all(),
+            #[cfg(target_os = "macos")]
             SshCommands::Comment {
                 fingerprint,
                 comment,
             } => server_macos::ssh_cli::ssh_comment(fingerprint, comment),
+            #[cfg(target_os = "macos")]
             SshCommands::Show { fingerprint } => server_macos::ssh_cli::ssh_show(fingerprint),
         },
         #[cfg(target_os = "macos")]

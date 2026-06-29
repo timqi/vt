@@ -11,6 +11,7 @@ A simple KMS solution based on macOS keychain. No plaintext secrets, explicit au
 - Environment variable and file injection with automatic cleanup
 - SSH agent with Touch ID gated signing (Ed25519, RSA, ECDSA P-256/P-384) and optional per-session/per-app auth caching
 - Remote sudo via Touch ID through SSH agent forwarding
+- Portable SSH identity for `git push`: one Ed25519 key stored as a `vt://` record and used on macOS / Linux / CI via `vt ssh keygen` + `vt ssh connect` — signing reuses the existing approval ceremony (Touch ID locally, phone passkey on headless hosts), and the private key never lives in plaintext on disk
 
 ## Installation
 
@@ -122,6 +123,8 @@ Older installs (pre-1.0.0) used four separate keychain items. The current single
 | `ssh remove <fingerprint>` | (macOS) Remove an SSH key by fingerprint |
 | `ssh remove-all` | (macOS) Remove all stored SSH keys |
 | `ssh show <fingerprint>` | (macOS) Show the public key for a stored key |
+| `ssh keygen [-l <label>] [--key-file <path>]` | Generate a portable Ed25519 identity stored as a `vt://` record; prints the OpenSSH public key (cross-platform) |
+| `ssh connect [ssh args...]` | Git SSH driver — `GIT_SSH_COMMAND="vt ssh connect"`; signs with the `vt://` identity (cross-platform) |
 
 ### Inject Command
 
@@ -203,6 +206,31 @@ By default, Touch ID is required for every sign/decrypt request. You can enable 
 | Per-app | `per-app` | Shared within same application (e.g., Terminal.app) |
 
 `--ssh-auth-cache-duration <SECONDS>` controls how long a grant lasts (default: 300s). The cache is cleared when the agent is locked.
+
+### Portable SSH identity for git (`vt://`)
+
+Unlike `vt ssh add` (which stores keys in the macOS keychain, macOS-only), `vt ssh keygen`
+mints an Ed25519 key whose private seed is stored as an ordinary `vt://` record — the same
+encrypted format as every other secret. One key works on macOS, Linux, and headless/CI hosts,
+and the plaintext seed never touches disk.
+
+```
+# Generate once (on any host). Writes ~/.config/vt/git-ssh (ciphertext, 0600)
+# and ~/.config/vt/git-ssh.pub, and prints the public key to add to GitHub.
+vt ssh keygen -l github
+
+# On each host that runs git push (copy the ciphertext key file there, or point
+# VT_GIT_SSH_KEYFILE at it), wire git to sign through vt:
+git config core.sshCommand "vt ssh connect"
+git push        # signs via the existing ceremony: Touch ID locally, phone passkey on headless hosts
+```
+
+How it works: `vt ssh connect` is a `GIT_SSH_COMMAND` driver. It starts an ephemeral in-process
+SSH agent (answering identity requests from the cleartext public key, no prompt), execs the system
+`ssh` (which keeps doing transport + `known_hosts`), and on each signature decrypts the seed on
+demand via the normal `vt://` decrypt path — SSH agent (`$SSH_AUTH_SOCK`, incl. a forwarded laptop
+agent) first, CF passkey ceremony as fallback. The remote host needs `VT_AUTH` set to use a forwarded
+agent; otherwise it goes straight to the phone passkey. See `docs/ssh-vt-design.md` for the full design.
 
 ### Remote sudo via Touch ID
 

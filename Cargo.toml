@@ -25,7 +25,13 @@ exec = "0.3.1"
 libc = "0.2.174"
 hostname = "0.4.1"
 dirs = "5"
-ssh-agent-lib = { version = "0.5", default-features = false }
+# `agent`+`codec` enable the server-side Agent/Session traits used by the
+# cross-platform ephemeral signer in `vt ssh connect` (must be on all unix).
+ssh-agent-lib = { version = "0.5", default-features = false, features = ["agent", "codec"] }
+async-trait = "0.1"
+# Cross-platform SSH identity (vt ssh keygen/connect). macOS adds more features below.
+ssh-key = { version = "0.6", features = ["ed25519"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 hkdf = "0.12"
 hmac = "0.12"
 zeroize = { version = "1", features = ["zeroize_derive"] }
