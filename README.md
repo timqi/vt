@@ -24,59 +24,6 @@ cargo build --release
 cp target/release/vt /usr/local/bin/
 ```
 
-## Upgrade Warning
-
-### v2.0.0 — protocol redesign (BREAKING)
-
-v2.0.0 switches the client ↔ agent wire protocol to **envelope encryption**: the agent never sees plaintext on encrypt and never sees stored ciphertext on decrypt — it only releases a per-record DEK after Touch ID. The `vt://` URL format also changes: new secrets are emitted as `vt://0…` / `vt://1…` (no `mac/` segment); old `vt://mac/…` URLs continue to be readable for migration. See `src/core.rs` and the v2.0.0 release notes for full protocol details.
-
-This is a **breaking protocol change**. The client and the running `vt ssh agent` must upgrade in lockstep — an old client speaking to a new agent will fail with `unknown variant ... expected V2 or Legacy`. To upgrade:
-
-1. Build/install the new binary: `cargo install --path .` (or copy `target/release/vt` to your PATH location).
-2. Stop the running agent: `pkill -f 'vt ssh agent'`.
-3. Restart the agent from the new binary (in a fresh shell so PATH resolves correctly): `vt ssh agent`.
-4. **Migrate stored secrets** (recommended): legacy `vt://mac/…` URLs in your dotfiles / env files can be bulk-migrated to v2 with the built-in `vt rewrap` subcommand:
-   ```bash
-   vt rewrap path/to/file …                  # dry-run preview
-   vt rewrap --no-dry-run path/to/file …     # actually rewrite
-   vt rewrap --no-dry-run --backup path/to/file …   # also leave *.vt-rewrap-backup
-   ```
-   `vt rewrap` handles RAW and TOTP types (TOTP migration uses a one-time legacy-path trick to recover the seed). One Touch ID covers the whole batch.
-5. Once all secrets are migrated, restart the agent with `--no-legacy-decrypt` to permanently retire the legacy code path:
-   ```bash
-   vt ssh agent --no-legacy-decrypt
-   ```
-
-### `vt inject` — `-i` / `-o` removed
-
-Earlier versions accepted `--input-file` / `--output-file` to decrypt to stdout
-or to a separate path. These were dropped in favor of Unix composition through
-the trailing command: the same effects are now `vt inject -r FILE -- cat FILE`
-(stdout) and `vt inject -r FILE -- cp FILE OUT` (another path). Scripts using
-`-i` / `-o` will fail to parse; migrate them to `-r ... -- <cmd>` form. See
-[Inject Command](#inject-command).
-
-### `vt inject` — restore now runs in a detached supervisor process
-
-The cleanup-after-timeout that used to run as an in-process forked child now
-runs as a self-exec'd `vt _internal-restore-after` subprocess, detached via
-`setsid` + `SIG_IGN` for HUP/INT/TERM/PIPE/QUIT. Two observable changes for
-operators:
-
-- `vt inject -r FILE -t 0` is rejected at parse time (`--timeout` must be
-  ≥ 1). Previously `-t 0` meant "skip cleanup".
-- `ps aux | grep vt` will show a `vt _internal-restore-after …` process for
-  the duration of the timeout window. Process-count alerts, `pkill -f vt`
-  cleanup hooks, AppArmor/SELinux profiles, and similar tooling may need
-  to whitelist this process name.
-
-See [vt inject in CLAUDE.md](CLAUDE.md#vt-inject--transient-in-place-decryption)
-for the full plaintext-exposure protocol and supervisor design.
-
-### Earlier breaking change — keychain consolidation
-
-Older installs (pre-1.0.0) used four separate keychain items. The current single `rusty.vault.store` layout requires `vt secret export` with the old version, then `vt secret import` after installing. See [Secret Management](#secret-management) for the full upgrade path.
-
 ## Quick Start
 
 1. Initialize the vault (creates the `rusty.vault.store` keychain item):
@@ -100,7 +47,7 @@ Older installs (pre-1.0.0) used four separate keychain items. The current single
    vt create
 
    # Read/decrypt a vt protocol string
-   vt read vt://mac/0xxxxx
+   vt read vt://0xxxxx
    ```
 
 ## Commands
@@ -111,6 +58,7 @@ Older installs (pre-1.0.0) used four separate keychain items. The current single
 | `init` | (macOS) Initialize passcode and passphrase in keychain |
 | `create` | Read plaintext from stdin, output encrypted vt protocol |
 | `read <vt>` | Decrypt a vt protocol string |
+| `rewrap [--no-dry-run] [--backup] <file>...` | Re-encrypt legacy `vt://mac/...` URLs in files to the current envelope format (one Touch ID per batch) |
 | `inject [-r FILE] -- cmd...` | Transiently decrypt `vt://` in the file / env / argv, then exec the command |
 | `auth [--reason <text>]` | Trigger bio auth via SSH agent forwarding (for PAM/sudo) |
 | `secret export` | (macOS) Export the encrypted master secret |
@@ -296,14 +244,15 @@ Or configure manually:
 ## VT Protocol Format
 
 ```
-vt://{location}/{type}{data}
+vt://{type}{data}
 ```
 
-- **location**: Secret storage location (`mac` for macOS keychain)
 - **type**: `0` for raw secrets, `1` for TOTP
-- **data**: Base64 URL-safe encoded encrypted data
+- **data**: Base64 URL-safe encoded AES-256-GCM envelope (per-record DEK derived from the master key + a salt carried in the URL)
 
-Example: `vt://mac/0SGVsbG8gV29ybGQ`
+Example: `vt://0SGVsbG8gV29ybGQ`
+
+> Legacy `vt://mac/…` records (pre-2.0) remain readable for migration; convert them to the current envelope format with `vt rewrap`.
 
 ## Environment Variables
 
@@ -324,87 +273,11 @@ VT stores all secrets in a **single keychain item**: `rusty.vault.store`. The bl
 
 One item means one keychain ACL. After the binary's first run is granted "Always Allow", subsequent rebuilds signed with the same code-signing identity reuse that grant — no repeated login-password prompts.
 
-### Breaking Change: Legacy Keychain Layout
-
-Earlier versions of vt used four separate keychain items: `rusty.vault.passcode`, `rusty.vault.passphrase`, `rusty.vault.ssh_keys`, and `rusty.vault.fido2_credentials`. This version does **not** include an automatic migration tool for that layout.
-
-Before upgrading from a version that uses the four-item layout, export the master secret with the old binary:
-
-```bash
-vt secret export
-```
-
-After installing the new version, import that exported master secret:
-
-```bash
-vt secret import
-```
-
-This preserves the ability to decrypt existing `vt://mac/...` secret values because those values are protected by the master secret. The import creates a fresh `rusty.vault.store`, fresh passcode, and fresh `VT_AUTH`; update your shell profile or secret manager with the new token printed by `vt secret import`.
-
-SSH keys and FIDO2 credentials are not part of `secret export`, so re-add them after the import:
-
-```bash
-vt ssh add -f ~/.ssh/id_ed25519
-vt fido2 register --label yubikey
-```
-
-After verifying `vt read`, `vt ssh list`, and `vt fido2 list`, remove the legacy keychain items manually in Keychain Access:
-
-- `rusty.vault.passcode`
-- `rusty.vault.passphrase`
-- `rusty.vault.ssh_keys`
-- `rusty.vault.fido2_credentials`
-
-If `rusty.vault.store` already exists, `vt init` and `vt secret import` refuse to overwrite it. Delete `rusty.vault.store` in Keychain Access first if you need to re-import.
-
 ### Security Requirements
 
 - Run `vt ssh agent` from the same user who ran `vt init`
 - Keep the `vt` binary at the same absolute path as during `vt init`
 - The agent requires Touch ID or local authentication for decrypt operations
-
-## Migrating from versions with HTTP transport
-
-Earlier versions of `vt` exposed an HTTP server (`vt serve`) on `127.0.0.1:5757` with `/encrypt` and `/decrypt` endpoints. **The HTTP transport has been removed; the SSH agent at `~/.ssh/vt.sock` is now the only way clients reach the keychain.**
-
-### Why
-
-`VTClient` already preferred the SSH agent socket and only fell back to HTTP when the socket was unavailable. The agent extensions (`encrypt@vt`, `decrypt@vt`, `auth@vt`) cover every operation the HTTP endpoints did, with the same `VT_AUTH`-keyed double-encryption model. Keeping a second transport meant:
-
-- An extra long-running TCP listener (even if loopback-bound)
-- ~50+ transitive crates pulled by `axum` + `reqwest`
-- A second auth-middleware code path to maintain
-- Doubled wire-format decisions whenever the protocol evolves (error responses, retry semantics, etc.)
-
-Removing it is net-negative LOC, fewer dependencies, and a single canonical path.
-
-### What was removed
-
-| Item | Replacement |
-|---|---|
-| `vt serve` subcommand | `vt ssh agent` |
-| `--addr` flag and `VT_ADDR` env var | (removed; not needed) |
-| `--enable-http` flag on `serve` | (removed) |
-| HTTP fallback inside `VTClient` | SSH-agent-only; errors out if the socket is unreachable |
-| `axum`, `reqwest` crates | (gone) |
-| `src/serve.rs` | (deleted) |
-
-### What was preserved
-
-- Secret encryption format and existing `vt://mac/...` values remain usable after exporting/importing the master secret
-- `VT_AUTH` still keys the auth cipher (now used to encrypt SSH-agent extension payloads)
-- All `vt ssh agent` flags work identically: `--timeout`, `--ssh-auth-cache-mode`, `--ssh-auth-cache-duration`
-
-### Steps to upgrade
-
-1. **Update your LaunchAgent / supervisor.** Replace `vt serve` invocations with `vt ssh agent`. The flags `--ssh-idle-timeout` / `--ssh-auth-cache-mode` / `--ssh-auth-cache-duration` from `vt serve` map directly to `--timeout` / `--ssh-auth-cache-mode` / `--ssh-auth-cache-duration` on `vt ssh agent`.
-2. **Unset `VT_ADDR`** from shell profiles. It's now an unrecognized flag and will fail clap parsing.
-3. **Verify the agent socket.** Run `ls -l ~/.ssh/vt.sock` after starting `vt ssh agent`. Clients fail with `SSH agent not available — set SSH_AUTH_SOCK or run \`vt ssh agent\`` if the socket is missing.
-
-### Behavior change
-
-If your local `SSH_AUTH_SOCK` points to a non-vt agent (e.g. forwarded from a host without `vt`), client commands previously fell back to HTTP. They now fail with the agent-unavailable error. Either set `SSH_AUTH_SOCK=~/.ssh/vt.sock` for `vt` clients, or unset it so the client uses the default path.
 
 ## Architecture
 

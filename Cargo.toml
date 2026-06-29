@@ -2,6 +2,9 @@
 name = "vt"
 version = "2.0.0"
 edition = "2021"
+license = "MIT"
+description = "Single-binary KMS with Touch ID / passkey approval — no plaintext secrets at rest, explicit authentication everywhere."
+repository = "https://github.com/timqi/vt"
 
 [[bin]]
 name = "vt"
