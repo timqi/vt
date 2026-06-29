@@ -1,4 +1,4 @@
-// Pushover notification delivery.
+// Pushover notification channel: config parsing + delivery.
 
 function pctEncode(s: string): string {
   let out = '';
@@ -19,8 +19,32 @@ function buildFormBody(params: Record<string, string>): string {
     .join('&');
 }
 
+export interface PushoverConfig {
+  appToken: string;
+  userKey: string;
+}
+
+// Parse the PUSHOVER_JSON secret. Returns {config:null,error:null} when the
+// secret is absent (channel simply not enabled), {config:null,error:…} when it
+// is present but malformed, and {config,error:null} on success.
+export function parsePushoverConfig(raw: string | undefined): {
+  config: PushoverConfig | null;
+  error: string | null;
+} {
+  if (!raw || !raw.trim()) return { config: null, error: null };
+  let obj: unknown;
+  try { obj = JSON.parse(raw); } catch { return { config: null, error: 'invalid JSON' }; }
+  if (typeof obj !== 'object' || obj === null) return { config: null, error: 'not an object' };
+  const o = obj as Record<string, unknown>;
+  const appToken = o['app_token'];
+  const userKey = o['user_key'];
+  if (typeof appToken !== 'string' || !appToken) return { config: null, error: 'missing app_token' };
+  if (typeof userKey !== 'string' || !userKey) return { config: null, error: 'missing user_key' };
+  return { config: { appToken, userKey }, error: null };
+}
+
 // Returns [status, body] on HTTP success; throws on transport error.
-export async function sendPush(
+async function sendPush(
   appToken: string,
   userKey: string,
   title: string,
@@ -36,63 +60,24 @@ export async function sendPush(
   return [resp.status, text];
 }
 
-export interface PushoverSecrets {
-  appToken: string;
-  userToken: string;
-}
-
-// Truncate untrusted strings before they're surfaced upstream.
-function truncate(s: string, max = 256): string {
-  return s.length <= max ? s : s.slice(0, max - 1) + '…';
-}
-
-// Fire a Pushover notification. Returns an empty string on success or an error
-// description on non-fatal failure (missing secrets, HTTP error, no devices).
-export async function notifyApproval(
-  secrets: PushoverSecrets | null,
-  opKind: string,
-  meta: {
-    command: string;
-    host: string;
-    user?: string;
-    pwd?: string;
-    ssh_client?: string;
-    ip: string;
-    reason: string;
-  },
-  approveUrl: string,
+// Deliver one notification. Returns '' on success or a short error description
+// on non-fatal failure (HTTP error, delivery warning, bad response).
+export async function notifyPushover(
+  config: PushoverConfig,
+  title: string,
+  body: string,
 ): Promise<string> {
-  if (!secrets) return truncate('missing Pushover secrets');
-
-  const title = opKind ? `VT 审批: ${opKind}` : 'VT 审批请求';
-  const who = [meta.user, meta.host].filter(Boolean).join('@');
-  const lines: string[] = [];
-  if (who) lines.push(who);
-  if (meta.pwd) lines.push(`pwd: ${meta.pwd}`);
-  if (meta.command) {
-    // The CLI now sends `command` as a self-labelled multi-line body
-    // (`op: …\nfile: …\ncmd: …\nreason: …`); prefixing with another `cmd:`
-    // would just duplicate the labels. Inline single-line legacy commands.
-    lines.push(meta.command.includes('\n') ? meta.command : `cmd: ${meta.command}`);
-  }
-  if (meta.ssh_client) lines.push(`ssh: ${meta.ssh_client}`);
-  if (meta.ip) lines.push(`ip: ${meta.ip}`);
-  if (meta.reason) lines.push(`reason: ${meta.reason}`);
-  lines.push(approveUrl);
-  const message = lines.join('\n');
-
-  let status: number, body: string;
+  let status: number, text: string;
   try {
-    [status, body] = await sendPush(secrets.appToken, secrets.userToken, title, message);
+    [status, text] = await sendPush(config.appToken, config.userKey, title, body);
   } catch (e) {
-    return truncate(`pushover transport error: ${e}`);
+    return `transport error: ${e}`;
   }
-
-  if (status < 200 || status >= 300) return truncate(`pushover http ${status}: ${body}`);
+  if (status < 200 || status >= 300) return `http ${status}: ${text}`;
   let parsed: Record<string, unknown>;
-  try { parsed = JSON.parse(body); } catch { return truncate(`pushover invalid json: ${body}`); }
-  if (parsed['status'] !== 1) return truncate(`pushover status != 1: ${body}`);
+  try { parsed = JSON.parse(text); } catch { return `invalid json: ${text}`; }
+  if (parsed['status'] !== 1) return `status != 1: ${text}`;
   const info = parsed['info'];
-  if (typeof info === 'string' && info) return truncate(`pushover delivery warning: ${info}`);
+  if (typeof info === 'string' && info) return `delivery warning: ${info}`;
   return '';
 }

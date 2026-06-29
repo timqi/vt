@@ -10,7 +10,7 @@
 import { Hono } from 'hono';
 import { Env } from './types';
 import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, inReplayWindow } from './crypto';
-import { notifyApproval } from './pushover';
+import { notifyApproval } from './notify';
 import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ApproveRequest, RejectRequest } from './types';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess } from './access';
@@ -137,6 +137,18 @@ app.get(`/${ADMIN_SEG}/setup`, (c) => {
   return resp;
 });
 
+// Channels page (client-side notification-secret generator). Unlike Passkey,
+// the live PUSHOVER_JSON / SLACK_JSON secrets are plaintext credentials and are
+// NEVER injected — only booleans indicating whether each is currently set, so
+// the page can show a configured/not-configured badge without echoing tokens.
+app.get(`/${ADMIN_SEG}/channels`, (c) => {
+  const pushoverSet = !!(c.env.PUSHOVER_JSON && c.env.PUSHOVER_JSON.trim());
+  const slackSet = !!(c.env.SLACK_JSON && c.env.SLACK_JSON.trim());
+  const resp = c.html(buildChannelsPage(pushoverSet, slackSet));
+  resp.headers.set('Content-Security-Policy', STRICT_CSP);
+  return resp;
+});
+
 // Audit data API — forwards a read-only cursor query to the DO.
 app.get(`/${ADMIN_SEG}/api/audit`, async (c) => {
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
@@ -233,15 +245,12 @@ app.post('/api/challenge', async (c) => {
   });
   if (!doResp.ok) return c.text(`do create: ${await doResp.text()}`, 500);
 
-  // 9. Pushover (non-fatal)
+  // 9. Notifications — Pushover and/or Slack, both opt-in and non-fatal.
   const origin = c.env.WORKER_ORIGIN;
   const approveUrl = `${origin}/a/${approveToken}`;
 
-  const secrets = (c.env.PUSHOVER_APP_TOKEN && c.env.PUSHOVER_USER_TOKEN)
-    ? { appToken: c.env.PUSHOVER_APP_TOKEN, userToken: c.env.PUSHOVER_USER_TOKEN }
-    : null;
-  const pushWarning = await notifyApproval(secrets, ch.meta.op_kind, ch.meta, approveUrl);
-  if (pushWarning) logErr('pushover.failed', pushWarning, { at: tokenPrefix(approveToken) });
+  const pushWarning = await notifyApproval(c.env, ch.meta.op_kind, ch.meta, approveUrl);
+  if (pushWarning) logErr('notify.failed', pushWarning, { at: tokenPrefix(approveToken) });
 
   log('challenge.created', {
     at: tokenPrefix(approveToken),
@@ -362,12 +371,13 @@ function buildApprovePage(data: ApprovePageData): string {
 
 // ── Admin HTML templates ──────────────────────────────────────────────────
 
-// Tab bar shared by audit + setup. Both tabs carry equal weight; `active`
-// ∈ {'audit','setup'} marks the current one.
-function adminTabs(active: 'audit' | 'setup'): string {
-  const tab = (href: string, key: 'audit' | 'setup', label: string) =>
+// Tab bar shared by all admin pages. Every tab carries equal weight; `active`
+// marks the current one.
+type AdminTab = 'audit' | 'setup' | 'channels';
+function adminTabs(active: AdminTab): string {
+  const tab = (href: string, key: AdminTab, label: string) =>
     `<a class="tab${key === active ? ' active' : ''}" href="${href}"${key === active ? ' aria-current="page"' : ''}>${label}</a>`;
-  return `<nav class="tabs">${tab(`/${ADMIN_SEG}/audit`, 'audit', '审计')}${tab(`/${ADMIN_SEG}/setup`, 'setup', 'Passkey')}</nav>`;
+  return `<nav class="tabs">${tab(`/${ADMIN_SEG}/audit`, 'audit', '审计')}${tab(`/${ADMIN_SEG}/setup`, 'setup', 'Passkey')}${tab(`/${ADMIN_SEG}/channels`, 'channels', '推送渠道')}</nav>`;
 }
 
 function buildAuditPage(): string {
@@ -508,6 +518,93 @@ function buildSetupPage(rpId: string, credentialsJson: string): string {
   <script src="${pwaBase}/common.js"></script>
   <script src="${adminBase}/pwa/cbor.js"></script>
   <script src="${adminBase}/pwa/setup.js"></script>
+</body>
+</html>`;
+}
+
+// Notification-channel generator page. Pure client-side: the operator ticks the
+// channels they want, fills the fields, and the page emits the JSON secret(s) to
+// paste into `wrangler secret put`. Nothing is POSTed back to the Worker.
+function buildChannelsPage(pushoverSet: boolean, slackSet: boolean): string {
+  const adminBase = `/${ADMIN_SEG}`;
+  const pwaBase = `/pwa`;
+  const dataJson = escapeJsonForHtml({ pushover_set: pushoverSet, slack_set: slackSet });
+  const badge = (set: boolean) =>
+    set ? `<span class="badge badge-approved">已配置</span>` : `<span class="badge">未配置</span>`;
+  return `<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>VT — 推送渠道</title>
+  ${FAVICON_TAGS}
+  <link rel="stylesheet" href="${adminBase}/pwa/admin.css">
+</head>
+<body>
+  <script type="application/json" id="vt-data">${dataJson}</script>
+  <main>
+    ${adminTabs('channels')}
+    <header class="page-head">
+      <h1>推送渠道</h1>
+      <p class="hint">审批请求会推送到此处<strong>启用并配置</strong>的所有渠道——两个渠道相互独立，可只用其一，也可同时启用。每个卡片右上角的开关控制是否启用，启用后展开填写。本页只在浏览器内生成 JSON：填好字段点「生成」，再把结果 <code>wrangler secret put</code> 成对应的环境变量。<strong>现有 secret 的明文不会回显到本页</strong>。</p>
+    </header>
+
+    <section id="pushover-card" class="card channel">
+      <div class="card-head">
+        <h2>Pushover</h2>
+        <div class="channel-ctrl">
+          ${badge(pushoverSet)}
+          <label class="switch" title="启用 Pushover"><input type="checkbox" id="chk-pushover"${pushoverSet ? ' checked' : ''}><span class="slider"></span></label>
+        </div>
+      </div>
+      <div class="channel-body" id="pushover-body"${pushoverSet ? '' : ' hidden'}>
+        ${pushoverSet ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : ''}
+        <p class="hint">在 <a href="https://pushover.net" target="_blank" rel="noopener">pushover.net</a> 登录后：① 主页顶部的 <strong>Your User Key</strong> 即 <code>user_key</code>；② 在 <strong>Create an Application/API Token</strong> 新建一个应用，拿到 <strong>API Token</strong> 作为 <code>app_token</code>。手机装 Pushover App 并登录同一账号即可收推送。</p>
+        <div class="field">
+          <label for="po-app">API Token（app_token）</label>
+          <input id="po-app" type="text" placeholder="axxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="po-user">User Key（user_key）</label>
+          <input id="po-user" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+    </section>
+
+    <section id="slack-card" class="card channel">
+      <div class="card-head">
+        <h2>Slack</h2>
+        <div class="channel-ctrl">
+          ${badge(slackSet)}
+          <label class="switch" title="启用 Slack"><input type="checkbox" id="chk-slack"${slackSet ? ' checked' : ''}><span class="slider"></span></label>
+        </div>
+      </div>
+      <div class="channel-body" id="slack-body"${slackSet ? '' : ' hidden'}>
+        ${slackSet ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : ''}
+        <p class="hint">用 <strong>Incoming Webhook</strong> 方式——这是单向通知（真正的「同意」仍在审批页用 Passkey 完成），所以只需一个 Webhook URL，无需 bot、无需把机器人拉进频道：</p>
+        <ol class="steps">
+          <li>打开 <a href="https://api.slack.com/apps" target="_blank" rel="noopener">api.slack.com/apps</a> → <strong>Create New App</strong> → <strong>From scratch</strong>，填个名字（如 <code>vt-approval</code>）并选择目标 workspace。</li>
+          <li>左侧 <strong>Incoming Webhooks</strong> → 打开 <strong>Activate Incoming Webhooks</strong> 开关。</li>
+          <li>页面底部 <strong>Add New Webhook to Workspace</strong> → 选择接收审批通知的频道（如 <code>#vt-approvals</code>）→ <strong>Allow</strong>。</li>
+          <li>复制生成的 <strong>Webhook URL</strong>（形如 <code>https://hooks.slack.com/services/T…/B…/…</code>），粘贴到下方。</li>
+        </ol>
+        <p class="hint">所需「权限」就是激活 Incoming Webhooks 时自动添加的 <code>incoming-webhook</code> scope，仅能向你授权的那个频道发消息，无其它权限。换频道就重做第 3 步再换 URL 即可。</p>
+        <div class="field">
+          <label for="sl-webhook">Webhook URL（webhook_url）</label>
+          <input id="sl-webhook" type="text" placeholder="https://hooks.slack.com/services/T…/B…/…" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+    </section>
+
+    <section id="actions">
+      <button id="run" type="button">生成</button>
+    </section>
+    <p id="status" role="status" aria-live="polite"></p>
+
+    <section id="output-section" hidden></section>
+  </main>
+  <script src="${pwaBase}/common.js"></script>
+  <script src="${adminBase}/pwa/channels.js"></script>
 </body>
 </html>`;
 }

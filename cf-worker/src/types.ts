@@ -5,8 +5,10 @@ export interface Env {
   ASSETS: Fetcher;
   VT_AUTH_CF: string;
   CREDENTIALS_JSON: string;
-  PUSHOVER_APP_TOKEN: string;
-  PUSHOVER_USER_TOKEN: string;
+  /** JSON: {"app_token":"…","user_key":"…"}. Empty/invalid → Pushover disabled. */
+  PUSHOVER_JSON: string;
+  /** JSON: {"webhook_url":"https://hooks.slack.com/services/…"}. Empty/invalid → Slack disabled. */
+  SLACK_JSON: string;
   WORKER_ORIGIN: string;
   RP_ID: string;
   /** Cloudflare Access team domain, e.g. "myteam.cloudflareaccess.com". Empty → admin surface fails closed. */

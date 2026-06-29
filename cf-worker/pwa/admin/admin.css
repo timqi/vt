@@ -187,6 +187,35 @@ pre.cmd {
   overflow-x: auto; font-family: var(--mono); font-size: 13px;
 }
 
+/* Channels: numbered Slack setup steps + a link that inherits the accent */
+ol.steps { margin: 8px 0 12px; padding-left: 22px; color: var(--muted); font-size: 13px; }
+ol.steps li { margin: 4px 0; line-height: 1.55; }
+.hint a, ol.steps a { color: var(--accent); text-decoration: none; }
+.hint a:hover, ol.steps a:hover { text-decoration: underline; }
+/* Channel cards: header control cluster (badge + enable switch) and the
+   body that collapses when the channel is disabled. */
+.channel .card-head { margin-bottom: 0; }
+.channel-ctrl { display: flex; align-items: center; gap: 10px; }
+.channel-body { margin-top: 12px; }
+.channel-body[hidden] { display: none; }
+.channel-body > .hint:first-child { margin-top: 0; }
+.keep-note { color: var(--ok); }
+
+/* iOS-style enable switch */
+.switch { position: relative; display: inline-block; width: 42px; height: 24px; margin: 0; flex: none; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch .slider {
+  position: absolute; cursor: pointer; inset: 0;
+  background: var(--border); border-radius: 999px; transition: background .15s;
+}
+.switch .slider::before {
+  content: ''; position: absolute; height: 18px; width: 18px; left: 3px; top: 3px;
+  background: #fff; border-radius: 50%; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.25);
+}
+.switch input:checked + .slider { background: var(--accent); }
+.switch input:checked + .slider::before { transform: translateX(18px); }
+.switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 @media (max-width: 640px) {
   label { display: flex; margin-right: 0; }
   #detail-dl { grid-template-columns: 1fr; gap: 2px 0; }
