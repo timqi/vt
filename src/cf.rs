@@ -121,18 +121,18 @@ pub struct ChallengeMeta {
     pub pwd: String,
     pub tty: String,
     pub ppid_cmd: String,
-    /// Numeric parent PID. Half of the DEK-cache binding context recorded at
-    /// approval time; a later /api/dek-cache request must report the same ppid
-    /// (and come from the same IP) to hit the cache. See docs/dek-cache.md.
+    /// Numeric parent PID. Recorded on the approval + every cache event purely
+    /// for FORENSICS (audit display) — it is NOT part of the DEK-cache binding
+    /// context, which is keyed on the worker-derived IP alone. See docs/dek-cache.md.
     pub ppid: u32,
     pub ssh_client: String,
     pub reason: String,
 }
 
 /// Numeric parent PID of the current process (libc::getppid). 0 where
-/// unavailable. Reported to the worker so the DEK cache can be scoped to the
-/// same parent process; advisory only (client-reported, spoofable by a
-/// fully-compromised host) — the worker-derived IP is the trustworthy half.
+/// unavailable. Reported to the worker for audit/forensics only — the DEK cache
+/// is bound to the worker-derived IP alone, not to the PID (ppid was both
+/// spoofable and unstable across orchestrated shells, so it was dropped).
 #[cfg(unix)]
 pub fn current_ppid() -> u32 {
     let p = unsafe { libc::getppid() };
@@ -266,7 +266,8 @@ struct DekCacheReq<'a> {
     timestamp_ms: u64,
     /// Full display meta (host/user/command/ppid/…), same shape as the challenge
     /// request — so a cache HIT is audited with the same context as a ceremony
-    /// decrypt. `meta.ppid` is also the PPID half of the cache binding ctx.
+    /// decrypt. The cache binding ctx is keyed on the worker-derived IP alone;
+    /// `meta.ppid` here is forensic-only and not part of the key.
     meta: &'a ChallengeMeta,
 }
 

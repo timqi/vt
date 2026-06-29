@@ -6,16 +6,23 @@ on-demand via a phone WebAuthn ceremony.
 
 **Opt-in DEK cache (off by default).** The approver may grant a short TTL
 (8m / 20m / 2h) at approval time; within that window, decrypt requests for the
-same records from the **same source IP and parent PID** are served from a
-server-side cache **without a phone approval**. This deliberately trades the
-"every decrypt needs the phone" guarantee for convenience: in the window, those
-records collapse to a single factor (possession of `VT_PASSKEY_TOKEN`) for a
-caller behind the same egress IP. IP binding (worker-derived, unspoofable)
-defeats token exfiltration to another host; PPID binding (client-reported) is
-advisory blast-radius reduction. Default is 0 (no cache, historical behaviour);
-caching is fully disabled unless the `CACHE_SECKEY` worker secret is set. Every
-cache read (hit/miss) is audited. See `docs/dek-cache.md` for the full design,
-threat model, and `wrangler secret put CACHE_SECKEY` setup.
+same records from the **same source IP** are served from a server-side cache
+**without a phone approval**. This deliberately trades the "every decrypt needs
+the phone" guarantee for convenience: in the window, those records collapse to a
+single factor (possession of `VT_PASSKEY_TOKEN`) for a caller behind the same
+egress IP. IP binding (worker-derived from `CF-Connecting-IP`, unspoofable by
+the client) is the sole binding factor and defeats token exfiltration to another
+host. (A previous build also folded in the client-reported parent PID as
+advisory blast-radius reduction; it was **removed** — PPID is both spoofable, so
+it never widened the real boundary, and unstable across orchestrated callers
+like Claude Code / CI / make that spawn a fresh shell per command, so the cache
+never hit. The reported `ppid` is now forensic-only: stored on each entry + audit
+row, not part of the cache key.) On the cache hit, a real-time notice is also
+pushed to any configured Pushover/Slack channel (best-effort, fire-and-forget).
+Default is 0 (no cache, historical behaviour); caching is fully disabled unless
+the `CACHE_SECKEY` worker secret is set. Every cache read (hit/miss) is audited.
+See `docs/dek-cache.md` for the full design, threat model, and `wrangler secret
+put CACHE_SECKEY` setup.
 
 ## Build
 

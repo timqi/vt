@@ -41,33 +41,38 @@ DEK 之所以 worker 拿不到，是因为 PWA 用 `crypto_box_seal(deks, daemon
 
 > 决策点①：是否接受该取舍？若不可接受，应改为**客户端本地缓存**（见 §7 备选 B），但那与"另一进程免审批"和"服务端 KV"诉求冲突，需要重新对齐需求。
 
-## 2.5 缓存绑定 IP + PPID（收窄取舍，用户要求）
+## 2.5 缓存绑定仅 IP（曾含 PPID，已移除）
 
-缓存条目不再只按 salt 全局有效，而是**绑定到首次审批时发起方的 (源 IP, 父进程 PPID)**。`/api/dek-cache` 命中要求请求方的 **IP 且 PPID 都与审批时记录的一致**（合取：任一不同即视为未命中，回退手机审批）。
+缓存条目不再只按 salt 全局有效，而是**绑定到首次审批时发起方的源 IP**。`/api/dek-cache` 命中要求请求方的 **IP 与审批时记录的一致**（不同即视为未命中，回退手机审批）。
 
-**两者可信度不同，必须分清（否则会高估 PPID 的安全性）：**
+**为什么只挂 IP（曾经的 PPID 已移除）：**
 
 | 绑定项 | 来源 | 可信度 | 实际防住什么 |
 |---|---|---|---|
-| **IP** | worker 从 `CF-Connecting-IP` 取（**客户端无法伪造**，沿用 `index.ts:230` 的现有做法） | **强** | token 被偷到**另一台机器/另一个出口 IP** 后无法命中缓存——这是真正有意义的边界 |
-| **PPID** | 客户端在请求体里上报的数字（worker 无法独立核验调用方的父进程） | **弱（advisory）** | 防**同主机上无关进程/cron 误用缓存**、缩小爆炸半径；但对"已读到 token 又能读 `/proc` 的本机攻击者"挡不住——他能照样上报正确 PPID |
+| **IP** | worker 从 `CF-Connecting-IP` 取（**客户端无法伪造**，沿用 `index.ts` 现有做法） | **强（硬边界）** | token 被偷到**另一台机器/另一个出口 IP** 后无法命中缓存——这是真正有意义的边界 |
+| **~~PPID~~（已移除）** | ~~客户端在请求体里上报的数字~~ | ~~弱（advisory）~~ | 移除原因见下 |
 
-诚实结论：**IP 绑定是硬边界**（击败 token 远程外泄）；**PPID 绑定是纵深防御/范围收窄**，不是抗本机完全攻陷的保证。合在一起，实际攻击面从"任何持 token 者"收窄为"位于同一出口 IP、且能复现同一 PPID 的进程"。对最常见的"token 被 copy 到攻击者笔记本"场景，IP 绑定直接拦死。
+**PPID 被移除的两个原因**：
+1. **不可信**：客户端在请求体里上报、worker 无法独立核验，本机攻击者能照样上报正确值 → 从未真正扩大边界，只是制造「有额外保护」的错觉。
+2. **不稳定**：编排器（Claude Code / CI / make / tmux）每条命令都 fork 一个新 shell，`getppid()` 每次都变 → 同一逻辑会话内缓存几乎永远不命中（实测:无 tty、每命令 `setsid`,`getppid`/`getsid` 全变,唯一稳定的只有内核 audit sessionid 与 IP）。
+
+诚实结论:**IP 绑定是唯一也是真正的硬边界**。去掉 PPID 后,窗口内有效保证 = **同一 egress IP + 持有 `VT_PASSKEY_TOKEN` + TTL 未过**——这正是本文档一贯声明的那条保证,实现与模型现在完全对齐。
+
+**接受的取舍**:窗口内绑定粒度 = 整个 egress IP,**不再区分同主机内的进程**。即同主机上另一个持有 token 的进程,在 TTL 窗口内能免审批命中同一批记录。但它既然持有 token 本就能自行发起审批,缓存只是省掉那一次手机点击,而授予 TTL 的审批者已显式接受此权衡。要收紧爆炸半径,用更短的 TTL 或事后在审计页「清除缓存」。
 
 **命中条件的运维注意（否则会"缓存不生效"）：**
-- **同一父进程**：两次 `vt read` 必须有相同的父进程 PID 才会命中。在同一个交互式 shell 里连续跑两次 → 父进程都是该 shell → 命中。但 `ssh host 'vt read ...'` 跑两次属于两个一次性会话、父进程是两个不同的 sshd → PPID 不同 → 不命中（按设计如此，PPID 即用于此收窄）。要利用缓存，请在同一个持续的 shell 会话内操作。
-- **稳定的出口 IP 族**：cache ctx 绑定 `CF-Connecting-IP`。双栈主机若在两次请求间在 IPv4/IPv6 间漂移，worker 看到的 IP 不同 → ctx 不同 → 不命中。客户端已统一通过 `cf_post()` 固定走 IPv4（IPv6-only 主机自动回退 IPv6），消除这种漂移。
+- **稳定的出口 IP 族**：cache ctx 绑定 `CF-Connecting-IP`。双栈主机若在两次请求间在 IPv4/IPv6 间漂移，worker 看到的 IP 不同 → ctx 不同 → 不命中。客户端已统一通过 `cf_post()` 固定走 IPv4（IPv6-only 主机自动回退 IPv6），消除这种漂移。**IP 现在是唯一绑定项,这条比以往更关键。**
 - **必须配置 `CACHE_SECKEY` 且审批时选了 >0 时长**：未配置 secret 时审批页根本不显示时长选项、缓存全程禁用；默认 0 不缓存。
-- 诊断：缓存命中/清除/写入失败都在 admin「审计」页（类型=DEK缓存\*，op_kind='cache'），授予过缓存的审批行在「缓存」列显示 TTL/「过期」、并带「清除缓存」按钮；「带缓存」过滤一键筛出。对照审批行与命中行的 IP/PPID 即可定位不命中。（注：未命中**不**写审计，只进 CF 日志 `cache.miss`。）
+- 诊断：缓存命中/清除/写入失败都在 admin「审计」页（类型=DEK缓存\*，op_kind='cache'），授予过缓存的审批行在「缓存」列显示 TTL/「过期」、并带「清除缓存」按钮；「带缓存」过滤一键筛出。审计行仍展示 IP/PPID（PPID 仅供取证,不参与绑定）。（注：未命中**不**写审计，只进 CF 日志 `cache.miss`。）
 
-绑定上下文取自**首次 `/api/challenge` 的客户端**（不是手机）：审批时把 `ch.meta.ip` 与新增的 `ch.meta.ppid` 一起写进缓存条目。
+绑定上下文取自**首次 `/api/challenge` 的客户端**（不是手机）：审批时把 `ch.meta.ip` 写进缓存条目（`ch.meta.ppid` 仍冗余存,仅审计用）。
 
 ## 3. 缓存键、粒度与存储位置
 
-- **缓存单元 = 单个 DEK，键含上下文：`dek:{ctx}:{salt_b64u}`**，其中 `ctx = b64u(SHA-256("vt-dek-ctx-v1" || ip_utf8 || 0x00 || ppid_le))`。
+- **缓存单元 = 单个 DEK，键含上下文：`dek:{ctx}:{salt_b64u}`**，其中 `ctx = b64u(SHA-256("vt-dek-ctx-v2" || ip_utf8))`（tag 由 v1→v2:旧版含 ppid_le,现已移除）。
   - `DEK = HKDF(master_key, salt, "vt-dek-v2")`，salt（vt:// URL 里携带，16 字节随机）唯一决定 DEK，按 salt 收敛到被审批记录。
-  - 把 (IP,PPID) 编进键的好处：(1) 不同上下文不会相互覆盖；(2) 读取时直接按"本次请求的 ctx + salt"取，命中即天然满足绑定，无需"取出再比对"的分支；(3) 不同 ctx 下的同一 salt 一律表现为 miss，**不产生 oracle**。
-  - 条目里仍冗余存原始 `ip`/`ppid`/`ppid_cmd` 供审计展示。
+  - 把 IP 编进键的好处：(1) 不同 IP 上下文不会相互覆盖；(2) 读取时直接按"本次请求的 ctx + salt"取，命中即天然满足绑定，无需"取出再比对"的分支；(3) 不同 ctx 下的同一 salt 一律表现为 miss，**不产生 oracle**。
+  - 条目里仍冗余存原始 `ip`/`ppid`/`ppid_cmd` 供审计展示（`ppid` 仅取证,不参与键）。
 - **只对解密有意义。** 加密每次生成新随机 salt（`client.rs:500`），永远不会命中缓存；auth-only（`salts=[]`）无 DEK，不涉及。符合需求"请求解密时先查缓存"。
 - **存储位置：优先 DO storage，不用 KV。** 理由：
   - `AccountDO` 是账号级单例，已有 storage + alarm 清扫器 + SQLite 审计表，TTL 清理可直接复用 `alarm()`（`do_account.ts:226`）。
@@ -120,8 +125,8 @@ DEK 之所以 worker 拿不到，是因为 PWA 用 `crypto_box_seal(deks, daemon
 客户端 `cf_decrypt`（`client.rs:515`）在走 ceremony 之前，先尝试缓存：
 
 1. 生成临时 X25519 keypair（同现在）。
-2. **新增**：`POST /api/dek-cache`（HMAC 鉴权，body：`{daemon_pubkey_b64u, salts_b64u, timestamp_ms, ppid}`）。`ppid` 由客户端上报（`libc::getppid()`）；IP 由 worker 从 `CF-Connecting-IP` 取，**不信任请求体里的 IP**。
-3. worker → DO：先用本次请求的 `ctx = SHA-256(ip||ppid)` + 每个 salt 拼出键，**用批量 `storage.get([...keys])` 一次性取回（M2）**，再统一判定，避免顺序查找的时序侧信道。全部命中且未过期才算成功（IP/PPID 不符则对应键根本不存在 → 自然 miss）：
+2. **新增**：`POST /api/dek-cache`（HMAC 鉴权，body：`{daemon_pubkey_b64u, salts_b64u, timestamp_ms, ppid}`）。`ppid` 由客户端上报（`libc::getppid()`），仅供审计展示、不参与绑定；IP 由 worker 从 `CF-Connecting-IP` 取，**不信任请求体里的 IP**。
+3. worker → DO：先用本次请求的 `ctx = SHA-256("vt-dek-ctx-v2" || ip)` + 每个 salt 拼出键，**用批量 `storage.get([...keys])` 一次性取回（M2）**，再统一判定，避免顺序查找的时序侧信道。全部命中且未过期才算成功（IP 不符则对应键根本不存在 → 自然 miss）：
    - 用 `CACHE_SECKEY` `crypto_box_seal_open` 解出明文 DEK（解封失败按 miss 处理 + 惰性删除，见 M3）；
    - 再 `crypto_box_seal(DEK, daemon_pubkey)` 重新封给**本次客户端临时公钥**；
    - 拼成与现有 `sealed_deks` 相同的 `n*32+48` 布局返回 `{source:"cache", sealed_deks_b64u}`。
@@ -168,7 +173,7 @@ DEK 之所以 worker 拿不到，是因为 PWA 用 `crypto_box_seal(deks, daemon
   - 调用方先 `try_cache`，miss 再走 ceremony；ephemeral keypair 生成提取复用。
 - `src/client.rs`
   - `cf_decrypt`：先 `try_cache`，命中直接用；miss 回退 `get_deks`。**不加 no-cache 开关。**
-- 文档：更新 `CLAUDE.md` 顶部"No master_key cache"表述，明确缓存是 opt-in、有窗口期、绑定 IP+PPID、削弱了哪条保证。
+- 文档：更新 `CLAUDE.md` 顶部"No master_key cache"表述，明确缓存是 opt-in、有窗口期、绑定 IP（仅）、削弱了哪条保证。
 
 ## 6. approve 页 UI
 
@@ -191,8 +196,8 @@ DEK 之所以 worker 拿不到，是因为 PWA 用 `crypto_box_seal(deks, daemon
 
 ## 8. 威胁模型小结
 
-- **token 被偷到另一台机器（远程外泄）**：**被 IP 绑定拦死**——攻击者的出口 IP 不同，缓存键 ctx 不同，一律 miss，必须重新走手机审批。这是 IP+PPID 绑定带来的最实在收益。
-- **服务器在缓存窗口内被本机攻陷**：能读 token + 读 `/proc` 拿到正确 PPID + 同一出口 IP 的本机攻击者，仍可对已缓存 salt 免审批解密（PPID 是 advisory，挡不住）。缓解：默认 0、短 TTL、IP/PPID 收窄、随时轮换 `CACHE_SECKEY` 清空缓存、审计记录每次审批 `cache_ttl_s` 与每次缓存读取。
+- **token 被偷到另一台机器（远程外泄）**：**被 IP 绑定拦死**——攻击者的出口 IP 不同，缓存键 ctx 不同，一律 miss，必须重新走手机审批。这是 IP 绑定带来的最实在收益（也是唯一的硬边界）。
+- **服务器在缓存窗口内被本机攻陷**：能读 token + 同一出口 IP 的本机攻击者，可对已缓存 salt 免审批解密。**注：曾经的 PPID 绑定已移除**（见 §2.5：它可伪造又不稳定，从未真正收窄本机攻击面）。缓解：默认 0、短 TTL、随时轮换 `CACHE_SECKEY` 清空缓存、审计记录每次审批 `cache_ttl_s` 与每次缓存读取。
 - **DO storage / 备份泄露（无 CACHE_SECKEY）**：拿不到明文 DEK（§3 纵深防御）。
 - **网络 MITM**：TLS + sealed_box（封给发起方临时公钥）保证只有发起方能解开下发。
 - **被篡改的 TTL**：worker 端对 `ttl_s` 做白名单校验。
@@ -216,7 +221,7 @@ DEK 之所以 worker 拿不到，是因为 PWA 用 `crypto_box_seal(deks, daemon
 1. ✅ 接受 §2 核心安全取舍。
 2. ✅ 保留详细审计（审批 `cache_ttl_s` + 每次缓存读取 hit/miss）。
 3. ✅ 不加单独 no-cache 开关，TTL=0 即不缓存。
-4. ✅ 缓存绑定 IP+PPID，任一不符即不走缓存（合取），回退手机审批。
+4. ✅ 缓存绑定 IP（最初为 IP+PPID，**后续移除 PPID**，见 §2.5）；IP 不符即不走缓存，回退手机审批。
 5. 待定（不阻塞）：时长是否就 `0/8m/20m/2h`、是否要全局最大 TTL 上限。
 
 ## 11. 最终实现状态（权威，与上文计划如有出入以此为准）
@@ -224,7 +229,7 @@ DEK 之所以 worker 拿不到，是因为 PWA 用 `crypto_box_seal(deks, daemon
 ### 密码学 / 存储
 - **单一 secret `CACHE_SECKEY`**（32 字节 X25519，b64u）。公钥运行时由 `nacl.scalarMult.base(sk)` 推导，无需配第二个 secret。未配置 → 缓存全程禁用、审批页不显示时长选项。
 - Worker 用 **tweetnacl（NaCl box / X25519）+ blakejs（BLAKE2b nonce）** 复刻 libsodium `crypto_box_seal`/`seal_open`（`cf-worker/src/cache_crypto.ts`）。原因：`libsodium-wrappers` 的 ESM 包在 wrangler/esbuild 下无法解析 `./libsodium.mjs`。线缆兼容由 `src/cf.rs` 单测 `worker_sealed_box_opens_with_dryoc` 交叉验证（Node 封盒 → Rust dryoc 开盒）。
-- 缓存条目 `dek:{ctx}:{salt_b64u}`，`ctx = b64u(SHA-256("vt-dek-ctx-v1" || ip_utf8 || 0x00 || u32le(ppid)))`；条目存 `sealed_to_cache_b64u, expires_ms, origin_token_id, ip, ppid, ppid_cmd`。读取批量 `storage.get`、惰性过期、解封失败当 miss。
+- 缓存条目 `dek:{ctx}:{salt_b64u}`，`ctx = b64u(SHA-256("vt-dek-ctx-v2" || ip_utf8))`（**仅 IP**；tag v1→v2，旧版含 `0x00 || u32le(ppid)`，PPID 已移除，见 §2.5）；条目仍存 `sealed_to_cache_b64u, expires_ms, origin_token_id, ip, ppid, ppid_cmd`（`ppid`/`ppid_cmd` 仅审计）。读取批量 `storage.get`、惰性过期、解封失败当 miss。
 
 ### IP 一致性修复（关键）
 - 客户端 `src/cf.rs` 的两条 worker POST（`/api/challenge` 写、`/api/dek-cache` 读）统一走 `cf_post()`：**固定 IPv4 出口**，连接失败再回退无约束（IPv6-only 主机）。否则双栈主机在两次独立进程间漂移 IPv4/IPv6 → `CF-Connecting-IP` 不同 → ctx 不同 → 永久不命中。
@@ -233,6 +238,11 @@ DEK 之所以 worker 拿不到，是因为 PWA 用 `crypto_box_seal(deks, daemon
 - DEK 缓存事件就是 `audit` 表的行：`op_kind='cache'`，`status ∈ {approved=命中, write_failed=授予了TTL但写入失败}`。命中行带完整 meta（host/user/command/…，与 ceremony 行同样丰富）。审计表新增数字 `ppid` 列（ceremony 行也填）。
 - **只记有取证价值的事件**：命中（免审批取走 DEK）、写入失败（配置问题）。**未命中**（常规回退，ceremony 自身已审计）与**缓存清除**（管理员主动操作、不涉密钥泄露）都**不入审计**，仅写 CF 日志（`cache.miss` / `cache.cleared` / `cache.cleared_by_origin`）。授予缓存的审批行通过 `cache_ttl_s` 列携带 TTL。
 - 迁移：构造器对老库 `ALTER ADD cache_ttl_s` / `ALTER ADD ppid`，并 `DROP TABLE IF EXISTS cache_audit`（清掉早期分支的独立表）。
+
+### 命中实时通知（Pushover / Slack）
+- 缓存命中意味着「**没有手机在环**就取走了 DEK」，所以除了入审计表，`opDekCache` 在命中后通过 `notifyCacheHit()` 复用审批用的同一批 opt-in 通道（`PUSHOVER_JSON` / `SLACK_JSON`），给操作者一条实时「已免审批解密」提示。标题与审批请求区分（`VT 缓存命中(免审批)`），正文带 host/user/cmd/ip/记录数，**无审批链接**（命中无可点的动作）。
+- **尽力而为、绝不阻塞**：通过 DO 的 `this.ctx.waitUntil()` fire-and-forget 触发，投递失败（或未配置任何通道）都不影响 DEK 响应；失败仅记 `notify.cachehit_failed` CF 日志。审计行才是持久记录。
+- 未配置通道 ≠ 警告（与审批不同）：命中通知是纯增益信号，无通道时静默。
 
 ### 管理界面（已删除独立「DEK 缓存」tab，全部并入「审计」页）
 - 「缓存」列：有效缓存显示 TTL（如 `8m`）、过期显示灰色「过期」、从未授予显示 `—`。
@@ -244,7 +254,8 @@ DEK 之所以 worker 拿不到，是因为 PWA 用 `crypto_box_seal(deks, daemon
 
 ### 客户端
 - `vt read`（`cf_decrypt`）解密前先 `cf::try_cache(config, salts, current_ppid())`：命中（响应 `source=="cache"`，**跳过 binding**）直接解密;否则回退 `get_deks` 手机审批。无 `--no-cache` 开关（TTL=0 即不缓存）。
-- ⚠️ 客户端改了 `cf.rs`，部署缓存功能必须**重新编译并安装 `vt` 二进制**（旧二进制无 `try_cache`、且不发 numeric ppid → 表现为 ppid=0、永不命中）。
+- ⚠️ 客户端改了 `cf.rs`，部署缓存功能必须**重新编译并安装 `vt` 二进制**（旧二进制无 `try_cache`、走不到缓存快路径）。`ppid` 仍随请求上报但仅供审计,不再影响命中。
+- ⚠️ **绑定 ctx 从 v1(含 ppid)改为 v2(仅 IP)** → 部署新 worker 后,旧 worker 写入的缓存条目一律 miss(≤2h TTL 内过渡几次后自然消失);客户端无需改动即可受益(ppid 字段被忽略)。
 
 ### 部署
 ```bash
