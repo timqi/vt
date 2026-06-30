@@ -127,14 +127,32 @@ fn resolve_key_path(flag: Option<String>) -> Result<std::path::PathBuf> {
 /// Returns `Ok(None)` when neither source exists (`ErrorKind::NotFound` on the
 /// default file) — the normal case on a macOS Keychain-backed host that signs
 /// via `sign@vt`. Any OTHER IO error (e.g. permission denied) stays fatal.
+/// A present-but-non-`vt://` record is a configuration error and fails here, so
+/// the contract ("a record is a `vt://` URL") is enforced at load, not at use.
 #[cfg(unix)]
 async fn load_private_record_opt() -> Result<Option<String>> {
-    if let Ok(v) = std::env::var("VT_GIT_SSH_PRIVATE_KEY") {
+    let record = if let Ok(v) = std::env::var("VT_GIT_SSH_PRIVATE_KEY") {
         let v = v.trim();
-        if !v.is_empty() {
-            return Ok(Some(v.to_string()));
+        if v.is_empty() {
+            load_default_key_file().await?
+        } else {
+            Some(v.to_string())
+        }
+    } else {
+        load_default_key_file().await?
+    };
+    if let Some(ref u) = record {
+        if !u.starts_with("vt://") {
+            bail!("VT_GIT_SSH_PRIVATE_KEY / default key file does not contain a vt:// record");
         }
     }
+    Ok(record)
+}
+
+/// Read the default ciphertext key file (`~/.config/vt/git-ssh`), `Ok(None)` if
+/// absent. Other IO errors stay fatal.
+#[cfg(unix)]
+async fn load_default_key_file() -> Result<Option<String>> {
     let key_path = default_key_path()?;
     match tokio::fs::read_to_string(&key_path).await {
         Ok(s) => Ok(Some(s.trim().to_string())),
@@ -213,30 +231,12 @@ pub async fn connect(vt_client: VTClient, args: Vec<String>) -> Result<()> {
 
 #[cfg(unix)]
 async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
-    use ssh_agent_lib::ssh_encoding::Encode;
-    use ssh_key::public::PublicKey;
-
-    // 1. The public key is REQUIRED: connect advertises it to the system ssh and
-    //    uses it to tell the agent which key to sign with. The ciphertext vt://
-    //    record is OPTIONAL — a macOS Keychain-backed host has none (it signs via
-    //    `sign@vt`); an agent-less host has one (decrypt-then-sign fallback).
-    let pub_line = load_pubkey_line().await?;
-    let pubkey = PublicKey::from_openssh(pub_line.trim()).context("parse OpenSSH public key")?;
-    let key_data = pubkey.key_data().clone();
-    let comment = pubkey.comment().to_string();
-    // SSH wire encoding of the advertised KeyData, sent to the agent so it can
-    // decode + fingerprint it identically to its stored keys (no format drift).
-    let mut pubkey_bytes = Vec::new();
-    key_data
-        .encode(&mut pubkey_bytes)
-        .context("encode advertised public key")?;
-
-    let vt_url = load_private_record_opt().await?;
-    if let Some(ref u) = vt_url {
-        if !u.starts_with("vt://") {
-            bail!("VT_GIT_SSH_PRIVATE_KEY / default key file does not contain a vt:// record");
-        }
-    }
+    // 1. Resolve which identity/identities to advertise. An explicit pubkey
+    //    (VT_GIT_SSH_PUB / ~/.config/vt/git-ssh.pub) takes precedence and may
+    //    carry a vt:// record for the decrypt-then-sign fallback; otherwise, with
+    //    VT_AUTH set, discover ALL keys from the upstream vt agent (each signs via
+    //    `sign@vt`). See `resolve_identities` for the full precedence + errors.
+    let identities = resolve_identities(&vt_client).await?;
 
     // 2. Best-effort audit context from our own argv (we are git's child).
     //    op_kind stays "decrypt" (decrypt's existing meta); the human-meaningful
@@ -260,28 +260,37 @@ async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
     let sock_path = dir.join("agent.sock");
     let inner = std::sync::Arc::new(SignerInner {
         client: vt_client,
-        vt_url,
-        pubkey: key_data,
-        pubkey_bytes,
-        comment,
+        identities,
         host,
         command,
-        key: tokio::sync::OnceCell::new(),
     });
     let listener = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind {}", sock_path.display()))?;
     chmod_0600(&sock_path)?;
 
-    // 4. Run the agent + child ssh concurrently. The child gets SSH_AUTH_SOCK
-    //    via Command::env ONLY; the parent env keeps the original (possibly
-    //    forwarded) agent so the signer's decrypt resolves it. NEVER env::set_var
-    //    (would make the signer's decrypt connect to itself — D14 / round-3 B1).
+    // 4. Run the agent + child ssh concurrently. The child must talk to OUR
+    //    ephemeral signer socket so the `sign@vt` context (host/command) is
+    //    injected. We pin it two ways:
+    //      - `-o IdentityAgent=<sock>` on the command line — HIGHEST precedence,
+    //        so it beats any `IdentityAgent` in the user's ~/.ssh/config (e.g.
+    //        `IdentityAgent ~/.ssh/vt.sock`, the natural vt setup, which would
+    //        otherwise hijack the child straight to the real agent and bypass
+    //        the shim → context-less standard sign).
+    //      - `SSH_AUTH_SOCK` via Command::env as belt-and-suspenders (lowest
+    //        precedence; loses to a config IdentityAgent, hence the `-o`).
+    //    The PARENT env keeps the original (possibly forwarded) agent so the
+    //    signer's own decrypt/sign@vt resolves it. NEVER env::set_var (would make
+    //    the signer connect to itself — D14 / round-3 B1).
+    //    Our `-o` precedes git's args and ssh takes the FIRST IdentityAgent
+    //    value, so it wins regardless of what git appends.
     let factory = SignerFactory { inner };
 
     // Run the agent + child ssh concurrently; capture the outcome so the
     // socket/dir are cleaned up exactly once regardless of which arm wins.
     let outcome: Result<std::process::ExitStatus> = async {
         let mut child = tokio::process::Command::new("ssh")
+            .arg("-o")
+            .arg(format!("IdentityAgent={}", sock_path.display()))
             .args(&args)
             .env("SSH_AUTH_SOCK", &sock_path)
             .spawn()
@@ -303,20 +312,112 @@ async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Load the OpenSSH public-key line for `connect`: the raw `VT_GIT_SSH_PUB` env
-/// value takes precedence; otherwise read the sibling `.pub` of the default key
-/// file (`~/.config/vt/git-ssh.pub`).
+/// Load the OPTIONAL OpenSSH public-key line for `connect`: the raw
+/// `VT_GIT_SSH_PUB` env value takes precedence; otherwise read the sibling
+/// `.pub` of the default key file (`~/.config/vt/git-ssh.pub`).
+///
+/// Returns `Ok(None)` when neither source exists (so `resolve_identities` can
+/// fall through to agent discovery). Any other IO error (e.g. permission
+/// denied) stays fatal. Mirrors `load_private_record_opt`.
 #[cfg(unix)]
-async fn load_pubkey_line() -> Result<String> {
+async fn load_pubkey_line_opt() -> Result<Option<String>> {
     if let Ok(p) = std::env::var("VT_GIT_SSH_PUB") {
         if !p.trim().is_empty() {
-            return Ok(p);
+            return Ok(Some(p));
         }
     }
     let pub_path = pubkey_path(&default_key_path()?);
-    tokio::fs::read_to_string(&pub_path)
-        .await
-        .with_context(|| format!("read {} (or set VT_GIT_SSH_PUB)", pub_path.display()))
+    match tokio::fs::read_to_string(&pub_path).await {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("read {} (or set VT_GIT_SSH_PUB)", pub_path.display()))),
+    }
+}
+
+/// Resolve the identity/identities `connect` advertises to system `ssh`.
+///
+/// Precedence:
+/// 1. **Explicit pubkey** (`VT_GIT_SSH_PUB` env, else `~/.config/vt/git-ssh.pub`):
+///    one identity, optionally carrying a `vt://` record for decrypt-then-sign.
+/// 2. **Agent discovery** — only when `VT_AUTH` is set (`sign@vt` needs it):
+///    list ALL keys the upstream vt agent holds and advertise every one
+///    (`vt_url: None`). Signing routes through `sign@vt` per key.
+/// 3. Otherwise an actionable error.
+#[cfg(unix)]
+async fn resolve_identities(client: &VTClient) -> Result<Vec<SignerIdentity>> {
+    use ssh_key::public::PublicKey;
+
+    // 1. Explicit pubkey — reproducible pin, highest precedence.
+    if let Some(pub_line) = load_pubkey_line_opt().await? {
+        let pubkey =
+            PublicKey::from_openssh(pub_line.trim()).context("parse OpenSSH public key")?;
+        let vt_url = load_private_record_opt().await?;
+        return Ok(vec![make_signer_identity(
+            pubkey.key_data().clone(),
+            pubkey.comment().to_string(),
+            vt_url,
+        )?]);
+    }
+
+    // No explicit pubkey. A record without a pubkey is unusable here — warn so
+    // it's not silently ignored before we fall through to discovery.
+    if std::env::var("VT_GIT_SSH_PRIVATE_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        tracing::warn!(
+            "VT_GIT_SSH_PRIVATE_KEY is set but no public key was found; set \
+             VT_GIT_SSH_PUB to use the private key record — falling back to agent discovery"
+        );
+    }
+
+    // 2. Agent discovery — gated on VT_AUTH (sign@vt needs the derived key;
+    //    discovery from a foreign $SSH_AUTH_SOCK agent would only fail at sign
+    //    time). list_agent_identities is BLOCKING → spawn_blocking.
+    if client.has_auth_token() {
+        let client = client.clone();
+        let ids = tokio::task::spawn_blocking(move || client.list_agent_identities())
+            .await
+            .context("agent identity discovery task panicked")??;
+        if !ids.is_empty() {
+            return ids
+                .into_iter()
+                .map(|id| make_signer_identity(id.pubkey, id.comment, None))
+                .collect();
+        }
+    }
+
+    // 3. Nothing to advertise.
+    bail!(
+        "no SSH identity for `vt ssh connect`: set VT_GIT_SSH_PUB (or write \
+         ~/.config/vt/git-ssh.pub), or start `vt ssh agent` with a key loaded and \
+         VT_AUTH set so connect can discover it. If $SSH_AUTH_SOCK points at a \
+         non-vt agent, unset it."
+    )
+}
+
+/// Build a `SignerIdentity`, wire-encoding `pubkey` so the agent decodes +
+/// fingerprints it identically to its stored keys (no format drift). Shared by
+/// both `resolve_identities` branches (explicit pubkey + agent discovery).
+#[cfg(unix)]
+fn make_signer_identity(
+    pubkey: ssh_key::public::KeyData,
+    comment: String,
+    vt_url: Option<String>,
+) -> Result<SignerIdentity> {
+    use ssh_agent_lib::ssh_encoding::Encode;
+    let mut pubkey_bytes = Vec::new();
+    pubkey
+        .encode(&mut pubkey_bytes)
+        .context("encode public key")?;
+    Ok(SignerIdentity {
+        pubkey,
+        pubkey_bytes,
+        comment,
+        vt_url,
+        key: tokio::sync::OnceCell::new(),
+    })
 }
 
 #[cfg(unix)]
@@ -374,20 +475,33 @@ fn parse_ssh_host(args: &[String]) -> Option<String> {
     None
 }
 
+/// One advertisable identity. `connect` advertises either a single explicitly
+/// configured key (env/file, may carry a `vt_url` record for the decrypt-then-
+/// sign fallback) or ALL keys discovered from the upstream agent (each with
+/// `vt_url: None`, since discovery has no record — those sign via `sign@vt` or
+/// hard-fail per G3).
 #[cfg(unix)]
-struct SignerInner {
-    client: VTClient,
-    /// Ciphertext `vt://` record for the decrypt-then-sign fallback. `None` on a
-    /// Keychain-backed host (signs via `sign@vt`); the fallback then hard-fails.
-    vt_url: Option<String>,
+struct SignerIdentity {
     pubkey: ssh_key::public::KeyData,
     /// SSH wire-encoded `pubkey`, sent in `sign@vt` to identify the agent key.
     pubkey_bytes: Vec<u8>,
     comment: String,
-    host: String,
-    command: String,
+    /// Ciphertext `vt://` record for the decrypt-then-sign fallback. `None` on a
+    /// Keychain-backed host (signs via `sign@vt`) and on every discovered key;
+    /// the fallback then hard-fails (G3).
+    vt_url: Option<String>,
     /// Decrypted seed (fallback path only), initialized once per process.
     key: tokio::sync::OnceCell<zeroize::Zeroizing<[u8; 32]>>,
+}
+
+#[cfg(unix)]
+struct SignerInner {
+    client: VTClient,
+    /// Identities advertised to the system `ssh`. One when an explicit pubkey is
+    /// configured; one-or-more when discovered from the upstream agent.
+    identities: Vec<SignerIdentity>,
+    host: String,
+    command: String,
 }
 
 #[cfg(unix)]
@@ -441,7 +555,8 @@ fn decide_sign_route(outcome: Result<Option<(String, Vec<u8>)>>, has_vt_url: boo
         Ok(None) if has_vt_url => SignRoute::Fallback,
         Ok(None) => SignRoute::Fail(
             "no vt agent holds this key and no vt:// record is configured \
-             (set VT_GIT_SSH_PRIVATE_KEY or place the record at ~/.config/vt/git-ssh)"
+             (set VT_GIT_SSH_PRIVATE_KEY or place the record at ~/.config/vt/git-ssh, \
+             or ensure the vt agent at $SSH_AUTH_SOCK / ~/.ssh/vt.sock holds this key)"
                 .to_string(),
         ),
         Err(e) => SignRoute::Fail(e.to_string()),
@@ -454,10 +569,15 @@ impl ssh_agent_lib::agent::Session for SignerSession {
     async fn request_identities(
         &mut self,
     ) -> Result<Vec<ssh_agent_lib::proto::Identity>, ssh_agent_lib::error::AgentError> {
-        Ok(vec![ssh_agent_lib::proto::Identity {
-            pubkey: self.inner.pubkey.clone(),
-            comment: self.inner.comment.clone(),
-        }])
+        Ok(self
+            .inner
+            .identities
+            .iter()
+            .map(|id| ssh_agent_lib::proto::Identity {
+                pubkey: id.pubkey.clone(),
+                comment: id.comment.clone(),
+            })
+            .collect())
     }
 
     async fn sign(
@@ -470,10 +590,23 @@ impl ssh_agent_lib::agent::Session for SignerSession {
         use ssh_key::{Algorithm, Signature};
         use zeroize::Zeroizing;
 
-        // Only sign for the identity we advertised.
-        if request.pubkey != self.inner.pubkey {
-            return Err(AgentError::Failure);
-        }
+        // Resolve the advertised identity by INDEX (never hold a `find()`
+        // reference across the awaits below — that would make this future
+        // non-`Send` and `agent::listen` would reject it). Clone the small
+        // fields we need before the first await.
+        let idx = self
+            .inner
+            .identities
+            .iter()
+            .position(|id| id.pubkey == request.pubkey)
+            .ok_or(AgentError::Failure)?;
+        // Extract what we need from the matched identity BEFORE any await; the
+        // borrow is dropped here so it can't make this future non-`Send`. The
+        // `key` OnceCell is re-indexed after the await (OnceCell is Send+Sync).
+        let (pubkey_bytes, vt_url_opt) = {
+            let id = &self.inner.identities[idx];
+            (id.pubkey_bytes.clone(), id.vt_url.clone())
+        };
 
         // 1. Agent-internal sign with vt context (e.g. macOS Keychain key): the
         //    private key never leaves the agent. The fallback policy (G3) is in
@@ -484,30 +617,30 @@ impl ssh_agent_lib::agent::Session for SignerSession {
             .sign_vt(
                 &self.inner.host,
                 &self.inner.command,
-                &self.inner.pubkey_bytes,
+                &pubkey_bytes,
                 &request.data,
                 request.flags,
             )
             .await;
-        let vt_url = match decide_sign_route(outcome, self.inner.vt_url.is_some()) {
+        let vt_url = match decide_sign_route(outcome, vt_url_opt.is_some()) {
             SignRoute::Use(alg, sig) => {
                 let algorithm = Algorithm::new(&alg).map_err(AgentError::other)?;
                 return Signature::new(algorithm, sig).map_err(AgentError::other);
             }
             SignRoute::Fail(msg) => return Err(sign_err(msg)),
-            // Fallback implies `vt_url.is_some()`, so this clone always yields Some.
-            SignRoute::Fallback => self
-                .inner
-                .vt_url
-                .clone()
-                .expect("Fallback route requires a vt:// record"),
+            // Fallback implies `vt_url.is_some()`, so this unwrap always yields Some.
+            SignRoute::Fallback => {
+                vt_url_opt.expect("Fallback route requires a vt:// record")
+            }
         };
 
         // 2. Fallback path: decrypt-then-sign locally with the vt:// record.
         // Decrypt the seed once (get_or_try_init: errors are NOT cached, so a
         // rejected Touch ID / passkey can be retried on a later request).
+        // `&OnceCell` borrowed across the await is fine (OnceCell: Send+Sync).
         let seed = self
             .inner
+            .identities[idx]
             .key
             .get_or_try_init(|| async {
                 let inner = &self.inner;

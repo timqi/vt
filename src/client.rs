@@ -157,6 +157,7 @@ fn parse_envelope(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     }
 }
 
+#[derive(Clone)]
 pub struct VTClient {
     auth_token: String,
 }
@@ -178,6 +179,13 @@ impl VTClient {
             );
         }
         Ok(VTClient { auth_token })
+    }
+
+    /// True when the SSH-agent path is configured (`VT_AUTH` was set). Gates
+    /// agent-identity discovery in `vt ssh connect`: `sign@vt` needs this key,
+    /// so discovery only makes sense when it's present.
+    pub(crate) fn has_auth_token(&self) -> bool {
+        !self.auth_token.is_empty()
     }
 
     /// Try to send an extension request via the SSH agent socket.
@@ -203,8 +211,6 @@ impl VTClient {
         name: &str,
         payload: &[u8],
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        use std::os::unix::net::UnixStream;
-
         // No VT_AUTH → caller hasn't opted in to the SSH-agent path; skip it
         // and let agent_call_or_fallback route to the CF passkey ceremony.
         // This also avoids decoding an empty auth token when $SSH_AUTH_SOCK
@@ -213,18 +219,9 @@ impl VTClient {
             return Ok(None);
         }
 
-        let socket_path = if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
-            std::path::PathBuf::from(sock)
-        } else {
-            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
-            home.join(".ssh").join("vt.sock")
-        };
-
-        let stream = match UnixStream::connect(&socket_path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(None),
-            Err(e) => return Err(transport(e)),
+        let stream = match Self::connect_agent_socket()? {
+            Some(s) => s,
+            None => return Ok(None),
         };
 
         let auth_key = decode_auth_cipher_from_b64(auth_token).map_err(transport)?;
@@ -259,6 +256,55 @@ impl VTClient {
                 "Agent returned empty extension response"
             ))),
         }
+    }
+
+    /// Connect to the agent socket (`$SSH_AUTH_SOCK` if set, else
+    /// `~/.ssh/vt.sock`). `Ok(None)` when the socket is missing/refused (no agent
+    /// running) so callers can degrade gracefully; other IO errors propagate.
+    /// Shared by `try_agent_extension` and `list_agent_identities`.
+    #[cfg(unix)]
+    fn connect_agent_socket() -> Result<Option<std::os::unix::net::UnixStream>> {
+        use std::os::unix::net::UnixStream;
+        let socket_path = if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+            std::path::PathBuf::from(sock)
+        } else {
+            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
+            home.join(".ssh").join("vt.sock")
+        };
+        match UnixStream::connect(&socket_path) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(None),
+            Err(e) => Err(transport(e)),
+        }
+    }
+
+    /// List the identities the agent holds via the standard
+    /// `SSH_AGENTC_REQUEST_IDENTITIES` request (unencrypted, no Touch ID). Used
+    /// by `vt ssh connect` to discover which key(s) to advertise when no
+    /// explicit public key is configured.
+    ///
+    /// Returns `Ok(vec![])` when the socket is missing/refused (no agent), so
+    /// callers can emit an actionable "configure a key / start the agent" error
+    /// rather than a transport failure. Other IO/protocol errors propagate.
+    ///
+    /// This is a BLOCKING socket call — callers on an async context MUST invoke
+    /// it via `tokio::task::spawn_blocking` (see `sign_vt`).
+    ///
+    /// NOTE: the listing is unauthenticated and does NOT require `VT_AUTH`, but
+    /// the discovered keys can only be *signed* via `sign@vt`, which DOES need
+    /// `VT_AUTH`. Callers must gate discovery on [`has_auth_token`] (as
+    /// `resolve_identities` does) or the keys will fail at sign time.
+    #[cfg(unix)]
+    pub(crate) fn list_agent_identities(&self) -> Result<Vec<ssh_agent_lib::proto::Identity>> {
+        let stream = match Self::connect_agent_socket()? {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+        let mut client = ssh_agent_lib::blocking::Client::new(stream);
+        client
+            .request_identities()
+            .map_err(|e| transport(anyhow::anyhow!("{}", e)))
     }
 
     /// Wrap `try_agent_extension` with the `auto`-mode fallback policy:

@@ -169,8 +169,8 @@ git invokes: `vt ssh connect [ssh-opts] [user@]host 'git-receive-pack …'`.
    `op_kind="ssh-sign"`, `command="push → <host>:<repo>"` (reuse `cf::collect_client_meta`).
 3. Start an ephemeral in-process signer agent on a private temp unix socket:
    - temp dir `0700`; socket explicitly `chmod 0600` after bind (not umask — N4).
-   - `REQUEST_IDENTITIES` → answer from cleartext pubkey (file/`VT_GIT_SSH_PUB`), no
-     decrypt, no tap (no integrity gap — wrong pubkey → auth failure only, round 1 focus 4).
+   - `REQUEST_IDENTITIES` → answer with the resolved identity/identities (see §B.1),
+     no decrypt, no tap (no integrity gap — wrong pubkey → auth failure only, round 1 focus 4).
    - `SIGN_REQUEST(T)` → read the key file with `tokio::fs` (or inside `spawn_blocking`
      — never a blocking `std::fs` read on the tokio thread, round-3 N2) → decrypt the
      `vt://` via `VTClient::decrypt` → `BASE64_URL_SAFE_NO_PAD` decode →
@@ -191,6 +191,47 @@ git invokes: `vt ssh connect [ssh-opts] [user@]host 'git-receive-pack …'`.
    harmless — ECONNREFUSED → `Ok(None)`, N3). Zeroize key material.
 
 Decrypt routing = free two-tier (§3.2). One decrypt = one tap per push.
+
+### B.1 Identity resolution & client config (UPDATED)
+
+`connect` resolves the identity/identities it advertises in this precedence
+(`resolve_identities` in `src/ssh_sign.rs`):
+
+1. **Explicit pubkey** — `VT_GIT_SSH_PUB` (env), else `~/.config/vt/git-ssh.pub`
+   (file). One identity; may carry a `vt://` record (`VT_GIT_SSH_PRIVATE_KEY` /
+   `~/.config/vt/git-ssh`) for the decrypt-then-sign fallback. Reproducible pin.
+2. **Agent discovery** — if no explicit pubkey AND `VT_AUTH` is set: list **all**
+   keys the upstream `vt ssh agent` holds (standard `REQUEST_IDENTITIES`, no Touch
+   ID, via `VTClient::list_agent_identities` in `spawn_blocking`) and advertise
+   every one. Each signs via `sign@vt` (no record → no decrypt-then-sign
+   fallback). Makes the agent-present case zero-config.
+3. Otherwise → actionable error (set `VT_GIT_SSH_PUB`, write the `.pub`, or start
+   the agent with `VT_AUTH`).
+
+Notes / limitations:
+- Discovery is gated on `VT_AUTH` because `sign@vt` needs that key; if
+  `$SSH_AUTH_SOCK` points at a **non-vt** agent, its keys advertise but every
+  sign then fails — unset it or pin `VT_GIT_SSH_PUB`.
+- `VT_GIT_SSH_PRIVATE_KEY` set without a pubkey is unusable here (logs a warning,
+  then falls through to discovery).
+- Advertising many keys can trip ssh's `Too many authentication failures`; pin
+  with `VT_GIT_SSH_PUB` to avoid it.
+- SSH **certificate** keys (decoded as `KeyData::Other`) can't be matched for
+  `sign@vt` and hard-fail (no signing without Touch ID — safe, but unsupported).
+
+**Required client config:**
+```
+git config --global core.sshCommand "vt ssh connect"
+git config --global ssh.variant ssh   # else git can't pass -p to non-default-port remotes
+```
+`ssh.variant ssh` is needed because git auto-detects an unknown `core.sshCommand`
+as the `simple` variant, which refuses `-p <port>` (and other options); `vt ssh
+connect` forwards all args to real `ssh`, so declaring `ssh` is correct.
+
+`connect` also pins the child to its ephemeral socket with `-o
+IdentityAgent=<sock>` (highest precedence), so a user's `IdentityAgent
+~/.ssh/vt.sock` in `~/.ssh/config` can't hijack the child straight to the real
+agent and bypass the context-injecting shim.
 
 ### C. Worker / audit — UNCHANGED (confirmed round 1 focus 6)
 
