@@ -536,6 +536,13 @@ const RUN_REQ_ARGV_MAX_BYTES: usize = 8 * 1024;
 /// the few-hundred-char display caps so we never reject legitimate input.
 const PROMPT_DISPLAY_MAX_BYTES: usize = 8 * 1024;
 
+/// Cap on the number of items in a single encrypt@vt / decrypt@vt batch. A
+/// peer holding `VT_AUTH` can call these without a Touch ID gate (encrypt) or
+/// before one (decrypt parse), so an unbounded batch is a CPU/RAM
+/// amplification vector (e.g. 500k HKDF+AES ops, ~24 MB response). Generous
+/// vs. any real file/env scan, so legitimate batches are never rejected.
+const MAX_CRYPTO_BATCH: usize = 4096;
+
 /// Environment variables passed through to the spawned child. The list is
 /// deliberately short: it MUST NOT include any vt credentials (VT_AUTH,
 /// VT_PASSKEY_*), the forwarded SSH agent socket (SSH_AUTH_SOCK,
@@ -1180,6 +1187,9 @@ impl VtSshSession {
         // Touch ID.
         let req: EncryptReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
+        if req.types.len() > MAX_CRYPTO_BATCH {
+            return Err((ErrKind::BadRequest, Some(DETAIL_BATCH_TOO_LARGE)));
+        }
         let (_mac_cipher, mac_key) = load_mac_cipher(store, passphrase_cipher)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
         let mut result: Vec<EncryptResItem> = Vec::with_capacity(req.types.len());
@@ -1228,6 +1238,9 @@ impl VtSshSession {
 
         if req.command.len() > PROMPT_DISPLAY_MAX_BYTES {
             return Err((ErrKind::BadRequest, Some(DETAIL_DISPLAY_FIELD_TOO_LARGE)));
+        }
+        if req.items.len() > MAX_CRYPTO_BATCH {
+            return Err((ErrKind::BadRequest, Some(DETAIL_BATCH_TOO_LARGE)));
         }
 
         // Reject `SecretType::UNKNOWN` v2 items: serde would otherwise
@@ -1613,7 +1626,28 @@ impl VtSshSession {
 
         // v1: ALWAYS PROMPT (no cache). Distinguish reject vs unavailable so the
         // client gets the right ErrKind (AuthRejected => no fallback, G3).
-        if let Some(kind) = outcome_to_err_strict(authenticate(&auth_message)) {
+        let t0 = Instant::now();
+        let outcome = authenticate(&auth_message);
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        // Audit the decision (op_kind="ssh-sign", same as the CF ceremony sign
+        // path) — without this, agent-side `vt ssh connect` signing left no
+        // audit row, a visibility gap vs every other handler.
+        let outcome_str = match outcome {
+            AuthOutcome::Success(_) => "approved",
+            AuthOutcome::Rejected => "rejected",
+            AuthOutcome::Unavailable(_) => "unavailable",
+        };
+        self.emit_audit(
+            "ssh-sign",
+            outcome_str,
+            &req.host,
+            &req.meta,
+            &req.command,
+            "",
+            0,
+            latency_ms,
+        );
+        if let Some(kind) = outcome_to_err_strict(outcome) {
             return Err((kind, auth_outcome_detail(kind)));
         }
 
@@ -1721,6 +1755,7 @@ const DETAIL_RUN_DISABLED: &str = "run@vt disabled (--run-allow not set on agent
 const DETAIL_RUN_ARGV_EMPTY: &str = "run@vt argv is empty";
 const DETAIL_RUN_ARGV_TOO_LARGE: &str = "run@vt argv exceeds size cap";
 const DETAIL_DISPLAY_FIELD_TOO_LARGE: &str = "display field exceeds size cap";
+const DETAIL_BATCH_TOO_LARGE: &str = "batch exceeds the per-request item cap";
 const DETAIL_RUN_NOT_ALLOWLISTED: &str = "run@vt program is not in the agent's allowlist";
 const DETAIL_RUN_SPAWN_FAILED: &str = "run@vt failed to spawn the program";
 // sign@vt-specific failure reasons. All strings are static program info
@@ -1808,8 +1843,15 @@ impl Session for VtSshSession {
 
         let fp_str = fingerprint_str(&request.pubkey);
 
-        let keys = self.keys.read().await;
-        let privkey = keys.get(&fp_str).ok_or(AgentError::Failure)?;
+        // Clone the key out and drop the read-lock BEFORE the Touch ID prompt.
+        // Holding the `keys` read-guard across check_or_prompt_auth (which can
+        // block on a human for up to ~30s) would starve every writer
+        // (add/remove/unlock) for the prompt's duration — a non-VT_AUTH peer can
+        // trigger SIGN_REQUESTs to weaponize this. (Mirrors handle_sign_vt.)
+        let privkey = {
+            let keys = self.keys.read().await;
+            keys.get(&fp_str).ok_or(AgentError::Failure)?.clone()
+        };
         let comment = privkey.comment();
         let proc_name = self
             .peer_pid
@@ -1852,7 +1894,7 @@ impl Session for VtSshSession {
             return Err(AgentError::Failure);
         }
 
-        sign_data_with_privkey(privkey, &request.data, request.flags)
+        sign_data_with_privkey(&privkey, &request.data, request.flags)
     }
 
     async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {

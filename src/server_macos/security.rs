@@ -112,14 +112,20 @@ mod cgsession {
 }
 
 fn notify_macos(title: &str, body: &str) {
-    let safe: String = body
-        .chars()
-        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
-        .take(150)
-        .collect();
+    // Sanitize BOTH fields identically before interpolating into AppleScript.
+    // All current callers pass static titles, but sanitizing the title too
+    // removes a latent injection if a future caller ever passes dynamic text.
+    let sanitize = |s: &str, max: usize| -> String {
+        s.chars()
+            .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+            .take(max)
+            .collect()
+    };
+    let safe = sanitize(body, 150);
+    let safe_title = sanitize(title, 100);
     let script = format!(
         r#"display notification "{}" with title "{}""#,
-        safe, title
+        safe, safe_title
     );
     let _ = std::process::Command::new("osascript")
         .arg("-e")
