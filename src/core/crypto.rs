@@ -40,11 +40,17 @@ pub fn derive_dek(mac_key: &[u8; 32], salt: &[u8; 16]) -> [u8; 32] {
 /// `base64(passcode):$USER:bin_path`)). `bin_path` defaults to
 /// `current_exe()` when not supplied.
 pub fn derive_passphrase_secret(passcode: &[u8; 32], bin_path: Option<&str>) -> Result<[u8; 32]> {
-    let passcode = BASE64_URL_SAFE_NO_PAD.encode(&passcode);
-    let bin_path = bin_path
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| env::current_exe().unwrap().to_string_lossy().to_string());
-    let derived_str = format!("{}:{}:{}", passcode, env::var("USER")?, bin_path,);
+    // The b64 passcode and the concatenated derivation string both carry the
+    // master secret; keep them in scrubbed memory so they don't linger on the
+    // heap after the SHA-256 collapse.
+    let passcode = Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(passcode));
+    let bin_path = match bin_path {
+        Some(s) => s.to_string(),
+        // `?` rather than `.unwrap()`: current_exe() can fail in restricted /
+        // containerized contexts, and this is on the key-derivation path.
+        None => env::current_exe()?.to_string_lossy().to_string(),
+    };
+    let derived_str = Zeroizing::new(format!("{}:{}:{}", passcode.as_str(), env::var("USER")?, bin_path));
     let hash = Sha256::digest(&Sha256::digest(derived_str.as_bytes()));
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash[..32]);
@@ -54,8 +60,9 @@ pub fn derive_passphrase_secret(passcode: &[u8; 32], bin_path: Option<&str>) -> 
 /// Decode a base64-url-no-pad auth token (as exported by `vt init` in
 /// `VT_AUTH`) and double-SHA256 it into a 32-byte AES-GCM key.
 pub fn decode_auth_cipher_from_b64(b64_token: &str) -> Result<[u8; 32]> {
-    let token_bytes = BASE64_URL_SAFE_NO_PAD.decode(b64_token)?;
-    let hash = Sha256::digest(&Sha256::digest(token_bytes));
+    // The decoded bytes are the raw VT_AUTH secret; scrub them after hashing.
+    let token_bytes = Zeroizing::new(BASE64_URL_SAFE_NO_PAD.decode(b64_token)?);
+    let hash = Sha256::digest(&Sha256::digest(token_bytes.as_slice()));
     let mut token = [0u8; 32];
     token.copy_from_slice(&hash[..32]);
     Ok(token)

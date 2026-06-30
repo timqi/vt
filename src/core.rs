@@ -413,6 +413,13 @@ pub fn client_decrypt_v2(
         cipher.decrypt_with_nonce_and_aad(&nonce, inner_ct, &aad)?;
     match t {
         SecretType::RAW => {
+            // KNOWN LIMITATION: the returned `String` is the recovered secret
+            // in plain (non-`Zeroizing`) heap memory. The `plaintext` buffer
+            // here is scrubbed on drop, but the owned copy handed back to the
+            // caller is not — callers print/consume it immediately. Containing
+            // this would require threading a `Zeroizing<String>`/`SecretString`
+            // return type through every caller; deferred (same class of
+            // residual as the TOTP arm below).
             let s = String::from_utf8(plaintext.to_vec())
                 .map_err(|e| anyhow::anyhow!("v2 raw plaintext utf8 error: {}", e))?;
             Ok(s)
