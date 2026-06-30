@@ -127,12 +127,20 @@ fn notify_macos(title: &str, body: &str) {
         .status();
 }
 
+/// The `reason` we get is the full Touch ID prompt body — now multi-line
+/// (`decrypt 5 secrets on WHO\nop: inject\nfile: …\n…`). Notifications only
+/// have room for a couple of lines, and the user just saw the whole prompt
+/// before rejecting, so the header alone is what's useful here.
+fn first_line(s: &str) -> &str {
+    s.split('\n').next().unwrap_or(s)
+}
+
 fn notify_touch_id_rejected(reason: &str) {
     if !notify_throttle_should_fire(NotifyKind::TouchIdRejected) {
         tracing::debug!("Touch ID rejection notification suppressed (throttled)");
         return;
     }
-    notify_macos("vt", &format!("Touch ID rejected: {}", reason));
+    notify_macos("vt", &format!("Touch ID rejected: {}", first_line(reason)));
 }
 
 fn notify_locked_rejected(reason: &str) {
@@ -142,7 +150,7 @@ fn notify_locked_rejected(reason: &str) {
     }
     notify_macos(
         "vt: cannot authenticate",
-        &format!("screen locked or session inactive — {}", reason),
+        &format!("screen locked or session inactive — {}", first_line(reason)),
     );
 }
 
