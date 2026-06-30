@@ -32,6 +32,7 @@ use super::security::{
     authenticate, derive_passcode_ciphers, load_mac_cipher, local_authentication,
 };
 use super::store::KeychainStore;
+use super::audit::{self, AgentAuditEntry, AuditPushConfig};
 
 /// SSH agent extension names used by vt.
 pub const EXT_ENCRYPT: &str = "encrypt@vt";
@@ -751,6 +752,9 @@ pub struct VtSshAgentFactory {
     /// must approve or reject each in sequence. Critically, run@vt has
     /// no auth cache (same rule as auth@vt — see check_or_prompt_run).
     run_prompt_sem: Arc<Semaphore>,
+    /// Fire-and-forget audit push config. Cloned per session like `run_allow`.
+    /// Disabled config = audit push is a no-op.
+    audit_push: Arc<AuditPushConfig>,
 }
 
 impl VtSshAgentFactory {
@@ -760,6 +764,7 @@ impl VtSshAgentFactory {
         decrypt_cache: AuthCacheConfig,
         disable_legacy_decrypt: bool,
         run_allow: RunAllowlist,
+        audit_push: Arc<AuditPushConfig>,
     ) -> Self {
         Self {
             keys: Arc::new(RwLock::new(keys)),
@@ -774,6 +779,7 @@ impl VtSshAgentFactory {
             disable_legacy_decrypt,
             run_allow: Arc::new(run_allow),
             run_prompt_sem: Arc::new(Semaphore::new(1)),
+            audit_push,
         }
     }
 }
@@ -840,6 +846,7 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             decrypt_auth_cache: Arc::clone(&self.decrypt_auth_cache),
             run_allow: Arc::clone(&self.run_allow),
             run_prompt_sem: Arc::clone(&self.run_prompt_sem),
+            audit_push: Arc::clone(&self.audit_push),
             peer_pid,
             sign_cache_context,
             decrypt_cache_context,
@@ -863,6 +870,8 @@ struct VtSshSession {
     run_allow: Arc<RunAllowlist>,
     /// Shared across all sessions so run@vt prompts serialize globally.
     run_prompt_sem: Arc<Semaphore>,
+    /// Shared fire-and-forget audit push config (disabled = no-op).
+    audit_push: Arc<AuditPushConfig>,
     peer_pid: Option<i32>,
     /// Resolved once at session creation. `None` = always prompt for sign.
     sign_cache_context: Option<CacheContext>,
@@ -871,7 +880,101 @@ struct VtSshSession {
     disable_legacy_decrypt: bool,
 }
 
+/// Outcome of a `sign` authorization, carrying enough to audit it. Replaces
+/// the old `bool` so the emit point in `Session::sign` can distinguish a
+/// silent cache hit from a fresh approval and from a denial.
+enum AuthDecision {
+    CacheHit,
+    Approved,
+    Rejected,
+    Unavailable,
+}
+
+impl AuthDecision {
+    /// True when signing should proceed.
+    fn is_ok(&self) -> bool {
+        matches!(self, AuthDecision::CacheHit | AuthDecision::Approved)
+    }
+    fn outcome(&self) -> &'static str {
+        match self {
+            AuthDecision::CacheHit => "cache_hit",
+            AuthDecision::Approved => "approved",
+            AuthDecision::Rejected => "rejected",
+            AuthDecision::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Outcome of a `decrypt@vt` batch authorization. Carries the structured
+/// `ErrKind` on the failure arm so the existing client-facing error mapping
+/// (`SessionLocked`/`NoGuiSession` → the right `DETAIL_*`) is preserved
+/// (NEW-1): a bare `Unavailable` would collapse that distinction.
+enum DecryptDecision {
+    CacheHit,
+    Approved,
+    Rejected,
+    Err(ErrKind),
+}
+
+impl DecryptDecision {
+    fn outcome(&self) -> &'static str {
+        match self {
+            DecryptDecision::CacheHit => "cache_hit",
+            DecryptDecision::Approved => "approved",
+            DecryptDecision::Rejected => "rejected",
+            DecryptDecision::Err(_) => "unavailable",
+        }
+    }
+}
+
+/// Map a single `authenticate()` outcome (the always-prompt, no-cache path)
+/// onto a `DecryptDecision`, preserving the structured `ErrKind` for the
+/// failure arms. `Rejected` is its own variant; a `None` from
+/// `outcome_to_err_strict` (future enum variant) fails closed to `Generic`.
+fn decrypt_decision_from_authenticate(outcome: AuthOutcome) -> DecryptDecision {
+    match outcome {
+        AuthOutcome::Success(_) => DecryptDecision::Approved,
+        AuthOutcome::Rejected => DecryptDecision::Rejected,
+        AuthOutcome::Unavailable(reason) => DecryptDecision::Err(
+            outcome_to_err_strict(AuthOutcome::Unavailable(reason)).unwrap_or(ErrKind::Generic),
+        ),
+    }
+}
+
 impl VtSshSession {
+    /// Build an `AgentAuditEntry` from the post-decision context and hand it to
+    /// the fire-and-forget pusher. No-op when audit push is disabled. Holds NO
+    /// cache lock; never blocks (spawn_push returns immediately).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_audit(
+        &self,
+        op_kind: &str,
+        outcome: &str,
+        host: &str,
+        meta: &crate::core::ClientMeta,
+        command: &str,
+        reason: &str,
+        salts: usize,
+        latency_ms: u64,
+    ) {
+        if !self.audit_push.enabled {
+            return;
+        }
+        let entry = AgentAuditEntry::build(
+            op_kind,
+            outcome,
+            host,
+            meta,
+            command,
+            reason,
+            self.peer_pid,
+            salts,
+            latency_ms,
+            self.audit_push.agent_id(),
+        );
+        audit::spawn_push(Arc::clone(&self.audit_push), entry);
+    }
+
     /// Ensure keys are loaded. If they were cleared by the idle sweeper,
     /// silently reload from keychain. Touch ID is enforced per sign/extension
     /// request via `check_or_prompt_auth()` using the normal cache rules.
@@ -906,7 +1009,9 @@ impl VtSshSession {
         *last = Instant::now();
     }
 
-    /// Check auth cache or prompt the user. Returns true if authorized.
+    /// Check auth cache or prompt the user. Returns an [`AuthDecision`]
+    /// distinguishing a silent cache hit from a fresh approval / denial so the
+    /// `Session::sign` call site can audit the outcome.
     ///
     /// Used for `sign` (SSH authentication). `auth@vt` always prompts because
     /// forwarded agents share one local process. `decrypt@vt` has its own
@@ -915,11 +1020,17 @@ impl VtSshSession {
     /// All three success methods (Biometric, FIDO2, Password) are cached:
     /// FIDO2 (YubiKey touch) is treated as equivalent to Touch ID for
     /// authorization purposes — a deliberate policy choice.
-    async fn check_or_prompt_auth(&self, fingerprint: &str, auth_message: &str) -> bool {
+    async fn check_or_prompt_auth(&self, fingerprint: &str, auth_message: &str) -> AuthDecision {
         // If we couldn't resolve a cache context at session creation (no
-        // peer PID, no TTY, missing proc info), always prompt.
+        // peer PID, no TTY, missing proc info), always prompt. `local_authentication`
+        // returns only a bool, so we cannot distinguish reject vs unavailable
+        // on this path — a false maps to Rejected.
         let Some(context) = self.sign_cache_context else {
-            return local_authentication(auth_message);
+            return if local_authentication(auth_message) {
+                AuthDecision::Approved
+            } else {
+                AuthDecision::Rejected
+            };
         };
 
         // Check cache (read lock, released before auth prompt)
@@ -931,21 +1042,21 @@ impl VtSshSession {
                     context,
                     fingerprint
                 );
-                return true;
+                return AuthDecision::CacheHit;
             }
         }
 
         // Prompt (no locks held)
         let method = match authenticate(auth_message) {
             AuthOutcome::Success(m) => m,
-            AuthOutcome::Rejected => return false,
+            AuthOutcome::Rejected => return AuthDecision::Rejected,
             AuthOutcome::Unavailable(reason) => {
                 tracing::warn!(
                     "Auth unavailable for fingerprint={} reason={:?}",
                     fingerprint,
                     reason
                 );
-                return false;
+                return AuthDecision::Unavailable;
             }
         };
 
@@ -960,7 +1071,7 @@ impl VtSshSession {
             );
         }
 
-        true
+        AuthDecision::Approved
     }
 
     /// Cache-aware authorization for a `decrypt@vt` batch.
@@ -971,25 +1082,28 @@ impl VtSshSession {
     /// full hit skips Touch ID; partial hit prompts once and grants only the
     /// previously-missing items so existing strict TTLs are not refreshed.
     ///
-    /// Returns `None` on success, `Some(kind)` on failure so the caller can
-    /// build a structured `ExtResponse::Err` envelope. Both failure arms
-    /// `return` before any `cache.grant` call, preserving the invariant that
-    /// failure paths never extend or create cache entries.
+    /// Returns a [`DecryptDecision`]: `CacheHit`/`Approved` allow the decrypt,
+    /// `Rejected`/`Err(kind)` block it (the caller maps those to the structured
+    /// `ExtResponse::Err` envelope). Both failure arms `return` before any
+    /// `cache.grant` call, preserving the invariant that failure paths never
+    /// extend or create cache entries.
     async fn check_or_prompt_decrypt_batch(
         &self,
         v2_items: &[(crate::core::SecretType, [u8; SALT_LEN])],
         has_legacy: bool,
         host: &str,
         auth_message: &str,
-    ) -> Option<ErrKind> {
+    ) -> DecryptDecision {
         // Cacheable iff there's a resolved context AND the batch is non-empty
         // pure-v2; everything else falls through to the always-prompt path.
         let context = match self.decrypt_cache_context {
             Some(c) if !has_legacy && !v2_items.is_empty() => c,
-            // Fail closed: if `outcome_to_err` somehow returns `None` for
-            // a non-`Success` outcome (future enum variant), treat it as
-            // an authorization failure rather than silently allowing.
-            _ => return outcome_to_err_strict(authenticate(auth_message)),
+            // No cache eligibility: prompt once. Preserve the structured
+            // ErrKind via `outcome_to_err_strict` so the client-facing error
+            // (SessionLocked/NoGuiSession) is not flattened (NEW-1). Fail
+            // closed: a `None` for a non-Success outcome (future enum variant)
+            // becomes an Err rather than a silent allow.
+            _ => return decrypt_decision_from_authenticate(authenticate(auth_message)),
         };
 
         let keys: Vec<String> = v2_items
@@ -1011,15 +1125,18 @@ impl VtSshSession {
                 context,
                 v2_items.len()
             );
-            return None;
+            return DecryptDecision::CacheHit;
         }
 
         let method = match authenticate(auth_message) {
             AuthOutcome::Success(m) => m,
-            AuthOutcome::Rejected => return Some(ErrKind::AuthRejected),
+            AuthOutcome::Rejected => return DecryptDecision::Rejected,
             AuthOutcome::Unavailable(reason) => {
                 tracing::warn!("decrypt@vt unavailable: {:?}", reason);
-                return outcome_to_err_strict(AuthOutcome::Unavailable(reason));
+                return DecryptDecision::Err(
+                    outcome_to_err_strict(AuthOutcome::Unavailable(reason))
+                        .unwrap_or(ErrKind::Generic),
+                );
             }
         };
 
@@ -1036,7 +1153,7 @@ impl VtSshSession {
             );
         }
 
-        None
+        DecryptDecision::Approved
     }
 
     // ---- Structured-envelope dispatch helpers --------------------------------
@@ -1084,6 +1201,19 @@ impl VtSshSession {
         for item in result.iter_mut() {
             item.dek.zeroize();
         }
+        // encrypt@vt has no Touch ID gate; record the mint as `approved` so the
+        // audit shows "agent minted N DEKs". EncryptReq carries no client meta,
+        // so host/meta are empty. latency 0 (no prompt).
+        self.emit_audit(
+            "encrypt",
+            "approved",
+            "",
+            &crate::core::ClientMeta::default(),
+            "",
+            "",
+            req.types.len(),
+            0,
+        );
         Ok(Zeroizing::new(bytes))
     }
 
@@ -1149,16 +1279,37 @@ impl VtSshSession {
         // a full hit; any legacy item disables caching for the entire batch.
         // Failure paths inside `check_or_prompt_decrypt_batch` never grant
         // cache entries (verified by inspection of the helper).
-        if let Some(kind) = self
+        let t0 = Instant::now();
+        let decision = self
             .check_or_prompt_decrypt_batch(
                 &v2_inputs,
                 legacy_count > 0,
                 &req.host,
                 &local_auth_message,
             )
-            .await
-        {
-            return Err((kind, auth_outcome_detail(kind)));
+            .await;
+        // Cache hits never prompted → 0 latency; otherwise prompt→decision.
+        let latency_ms = if matches!(decision, DecryptDecision::CacheHit) {
+            0
+        } else {
+            t0.elapsed().as_millis() as u64
+        };
+        self.emit_audit(
+            "decrypt",
+            decision.outcome(),
+            &req.host,
+            &req.meta,
+            &req.command,
+            "",
+            req.items.len(),
+            latency_ms,
+        );
+        match decision {
+            DecryptDecision::CacheHit | DecryptDecision::Approved => {}
+            DecryptDecision::Rejected => {
+                return Err((ErrKind::AuthRejected, auth_outcome_detail(ErrKind::AuthRejected)))
+            }
+            DecryptDecision::Err(kind) => return Err((kind, auth_outcome_detail(kind))),
         }
         let (mac_cipher, mac_key) = load_mac_cipher(store, passphrase_cipher)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
@@ -1227,7 +1378,25 @@ impl VtSshSession {
         // Always prompt Touch ID — no auth caching for auth@vt. Over
         // forwarded agents, all remote sessions share the same local
         // process, so caching would approve all sudo from any session.
-        match authenticate(&auth_message) {
+        let t0 = Instant::now();
+        let outcome = authenticate(&auth_message);
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        let outcome_str = match &outcome {
+            AuthOutcome::Success(_) => "approved",
+            AuthOutcome::Rejected => "rejected",
+            AuthOutcome::Unavailable(_) => "unavailable",
+        };
+        self.emit_audit(
+            "auth",
+            outcome_str,
+            &req.host,
+            &req.meta,
+            "",
+            &req.reason,
+            0,
+            latency_ms,
+        );
+        match outcome {
             AuthOutcome::Success(_) => {}
             AuthOutcome::Rejected => {
                 return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
@@ -1325,18 +1494,38 @@ impl VtSshSession {
         // because a forwarded agent socket is shared across all remote
         // sessions, and any cache here would let one session's approval
         // be reused by another to run arbitrary allowlisted programs.
-        match authenticate(&auth_message) {
+        // run@vt: exe + argv joined as the audit `command` (reuses the prompt
+        // builders above). All emit points carry it.
+        let run_command = format!("exe: {}\nargv: {}", exe_display, argv_for_prompt);
+        let run_reason = req.reason.as_deref().unwrap_or("");
+        let t0 = Instant::now();
+        let outcome = authenticate(&auth_message);
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        match outcome {
             AuthOutcome::Success(_) => {}
             AuthOutcome::Rejected => {
+                self.emit_audit(
+                    "run", "rejected", &req.host, &req.meta, &run_command, run_reason, 0,
+                    latency_ms,
+                );
                 return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
             }
             AuthOutcome::Unavailable(reason) => {
                 tracing::warn!("run@vt unavailable: {:?}", reason);
                 let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
                     .unwrap_or(ErrKind::Generic);
+                self.emit_audit(
+                    "run", "unavailable", &req.host, &req.meta, &run_command, run_reason, 0,
+                    latency_ms,
+                );
                 return Err((kind, auth_outcome_detail(kind)));
             }
         }
+        // Q5: emit `approved` at the human tap, BEFORE the spawn attempt, so a
+        // denied launch (below) is distinguishable from a failed one (two rows).
+        self.emit_audit(
+            "run", "approved", &req.host, &req.meta, &run_command, run_reason, 0, latency_ms,
+        );
 
         // Spawn detached. `setsid` makes the child a new session leader so it
         // survives agent exit; closing fds 3..1024 prevents the child from
@@ -1345,10 +1534,17 @@ impl VtSshSession {
         // the agent's UID and macOS TCC grants — that is intentional for a
         // GUI launcher (e.g. `zed` needs disk access) but documented here so
         // future maintainers don't accidentally widen what `run@vt` is.
-        let pid = spawn_detached(&resolved, &req.argv[1..]).map_err(|e| {
-            tracing::warn!("run@vt spawn failed: {}", e);
-            (ErrKind::Generic, Some(DETAIL_RUN_SPAWN_FAILED))
-        })?;
+        let pid = match spawn_detached(&resolved, &req.argv[1..]) {
+            Ok(pid) => pid,
+            Err(e) => {
+                tracing::warn!("run@vt spawn failed: {}", e);
+                // Second row: the launch was approved but failed to spawn.
+                self.emit_audit(
+                    "run", "spawn_failed", &req.host, &req.meta, &run_command, run_reason, 0, 0,
+                );
+                return Err((ErrKind::Generic, Some(DETAIL_RUN_SPAWN_FAILED)));
+            }
+        };
         tracing::info!(
             "run@vt: spawned pid={} exe={} from={}",
             pid,
@@ -1632,7 +1828,27 @@ impl Session for VtSshSession {
         };
 
         // Check auth cache or prompt Touch ID
-        if !self.check_or_prompt_auth(&fp_str, &auth_message).await {
+        let t0 = Instant::now();
+        let decision = self.check_or_prompt_auth(&fp_str, &auth_message).await;
+        let latency_ms = if matches!(decision, AuthDecision::CacheHit) {
+            0
+        } else {
+            t0.elapsed().as_millis() as u64
+        };
+        // Session::sign is the raw SSH auth path (op_kind='sign', distinct from
+        // auth@vt) — it carries no vt ClientMeta, so use the prompt label as the
+        // audit `command` and leave meta empty.
+        self.emit_audit(
+            "sign",
+            decision.outcome(),
+            "",
+            &crate::core::ClientMeta::default(),
+            &auth_message,
+            "",
+            0,
+            latency_ms,
+        );
+        if !decision.is_ok() {
             return Err(AgentError::Failure);
         }
 
@@ -1913,6 +2129,7 @@ pub async fn run_ssh_agent(
     decrypt_cache: AuthCacheConfig,
     disable_legacy_decrypt: bool,
     run_allow: RunAllowlist,
+    audit_push: Arc<AuditPushConfig>,
 ) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
 
@@ -1940,13 +2157,18 @@ pub async fn run_ssh_agent(
     }
 
     let run_allow_empty = run_allow.is_empty();
+    let audit_enabled = audit_push.enabled;
     let factory = VtSshAgentFactory::new(
         keys,
         sign_cache,
         decrypt_cache,
         disable_legacy_decrypt,
         run_allow,
+        audit_push,
     );
+    if audit_enabled {
+        tracing::info!("Agent audit push enabled");
+    }
     if disable_legacy_decrypt {
         tracing::info!("Legacy decrypt path disabled — only v2 envelope URLs accepted");
     }
@@ -2043,6 +2265,7 @@ pub async fn start_ssh_agent(
     decrypt_cache: AuthCacheConfig,
     disable_legacy_decrypt: bool,
     run_allow: RunAllowlist,
+    audit_push: Arc<AuditPushConfig>,
 ) -> Result<()> {
     run_ssh_agent(
         true,
@@ -2051,6 +2274,7 @@ pub async fn start_ssh_agent(
         decrypt_cache,
         disable_legacy_decrypt,
         run_allow,
+        audit_push,
     )
     .await
 }

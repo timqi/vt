@@ -1,7 +1,8 @@
 // vt-passkey v2 Worker — Hono router.
 //
 // Endpoints sit at the root (no secret path prefix). Security rests on:
-//   • /api/challenge        — HMAC(VT_AUTH_CF) over the request body
+//   • /api/challenge, /api/dek-cache — HMAC(VT_AUTH_CF) over the request body
+//   • /api/audit-ingest     — HMAC(HKDF(VT_AUTH_CF, agent_id)) over the request body
 //   • /a/:token, approve    — 12-byte (96-bit) unguessable approve/poll tokens + WebAuthn
 //   • /<ADMIN_SEG>/*        — Cloudflare Access (edge) + Worker JWT verification
 //
@@ -9,9 +10,9 @@
 
 import { Hono } from 'hono';
 import { Env } from './types';
-import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, inReplayWindow } from './crypto';
+import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, hkdfSha256, inReplayWindow } from './crypto';
 import { notifyApproval } from './notify';
-import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest } from './types';
+import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp } from './types';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess } from './access';
 
@@ -175,7 +176,7 @@ app.get(`/${ADMIN_SEG}/channels`, (c) => {
 app.get(`/${ADMIN_SEG}/api/audit`, async (c) => {
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   const u = new URL('https://account.do/op/audit-query');
-  for (const k of ['limit', 'before_id', 'status', 'host']) {
+  for (const k of ['limit', 'before_id', 'status', 'host', 'source']) {
     const v = c.req.query(k);
     if (v) u.searchParams.set(k, v);
   }
@@ -359,6 +360,81 @@ app.post('/api/dek-cache', async (c) => {
   });
 });
 
+// POST /api/audit-ingest — the SSH agent pushes one audit record per decision.
+// Unlike /api/challenge (HMAC keyed on VT_AUTH_CF directly), this is keyed on a
+// PER-AGENT HKDF subkey: the agent never holds the master. The Worker reads the
+// (still-unverified) `agent_id` from the body, derives the same subkey, then
+// verifies the VT-HMAC over the raw body. A forged agent_id only yields a key
+// that won't verify — parsing it before verification is safe. One HKDF per
+// request is negligible; the 64 KB cap + 401-on-bad-HMAC bound abuse.
+const AUDIT_INGEST_MAX_BYTES = 64 * 1024;
+app.post('/api/audit-ingest', async (c) => {
+  // 0. Reject oversized bodies before reading/parsing (cheap Content-Length
+  //    check first; the arrayBuffer length is re-checked below in case the
+  //    header lied).
+  const clen = c.req.header('Content-Length');
+  if (clen && Number(clen) > AUDIT_INGEST_MAX_BYTES) return c.text('body too large', 413);
+
+  const auth = c.req.header('Authorization') ?? '';
+  const prefix = 'VT-HMAC ';
+  if (!auth.startsWith(prefix)) return c.text('missing auth', 401);
+  let providedHmac: Uint8Array;
+  try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
+  catch { return c.text('hmac length', 401); }
+
+  const rawBuf = await c.req.arrayBuffer();
+  if (rawBuf.byteLength > AUDIT_INGEST_MAX_BYTES) return c.text('body too large', 413);
+  const rawBody = new Uint8Array(rawBuf);
+
+  // 1. Parse the body to get agent_id (UNVERIFIED — it only selects the key).
+  let body: AgentAuditIngestRequest;
+  try { body = JSON.parse(new TextDecoder().decode(rawBody)); }
+  catch { return c.text('json parse error', 400); }
+  if (typeof body.agent_id !== 'string' || !body.agent_id) return c.text('missing agent_id', 400);
+  // Defensive cap before the HKDF salt step (agent_id is the hostname, ≤255 per
+  // RFC 1123). A forged value can't verify anyway, but bound the input.
+  if (body.agent_id.length > 256) return c.text('agent_id too long', 400);
+
+  // 2. Derive the per-agent key and 3. verify the HMAC over the raw body.
+  const enc = new TextEncoder();
+  const key = await hkdfSha256(
+    enc.encode(c.env.VT_AUTH_CF), enc.encode(body.agent_id), enc.encode('vt-agent-audit-v1'), 32);
+  const expected = await hmacSha256(key, rawBody);
+  if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
+
+  // 4. Replay window on the body timestamp.
+  if (typeof body.timestamp_ms !== 'number' || !inReplayWindow(Date.now(), body.timestamp_ms))
+    return c.text('timestamp skew', 400);
+
+  // 5. Validate + cap the entry. capChallengeMeta sanitizes the display fields
+  //    and FORCES ip from CF-Connecting-IP (the body never carries a usable ip).
+  const entry = body.entry;
+  if (!entry || typeof entry !== 'object') return c.text('missing entry', 400);
+  const tokenId = capMeta(entry.token_id, 80);
+  if (!tokenId) return c.text('missing token_id', 400);
+
+  const clampInt = (v: unknown): number =>
+    (typeof v === 'number' && Number.isFinite(v) && v >= 0) ? Math.floor(v) : 0;
+  const tsMs = (typeof entry.ts_ms === 'number' && Number.isFinite(entry.ts_ms))
+    ? entry.ts_ms : body.timestamp_ms;
+
+  const op: DoAuditIngestOp = {
+    token_id: tokenId,
+    outcome: capMeta(entry.outcome, 32),
+    salts: clampInt(entry.salts),
+    latency_ms: clampInt(entry.latency_ms),
+    ts_ms: tsMs,
+    meta: capChallengeMeta(entry.meta, c.req.header('CF-Connecting-IP')),
+  };
+
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  return stub.fetch('https://account.do/op/audit-ingest', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(op),
+  });
+});
+
 // POST /api/approve — PWA submits sealed DEKs after WebAuthn
 app.post('/api/approve', async (c) => {
   let body: ApproveRequest;
@@ -486,6 +562,12 @@ function buildAuditPage(): string {
         <option value="cache">带缓存的记录</option>
       </select></label>
       <label>主机 <input id="f-host" type="text" placeholder="host"></label>
+      <label>来源 <select id="f-source">
+        <option value="">全部</option>
+        <option value="ceremony">ceremony</option>
+        <option value="cache">cache</option>
+        <option value="agent">agent</option>
+      </select></label>
       <button id="apply" type="button">查询</button>
       <button id="filter-cache" type="button" class="ghost">带缓存</button>
       <span class="filter-spacer"></span>
@@ -493,7 +575,7 @@ function buildAuditPage(): string {
       <button id="clear-audit" type="button" class="danger">清空全部审计</button>
     </section>
     <div id="table-wrap"><table id="audit"><thead><tr>
-      <th>时间</th><th>状态</th><th>主机</th><th>命令</th><th>IP</th><th>DEK</th><th>缓存</th><th>延迟ms</th><th>操作</th>
+      <th>时间</th><th>状态</th><th>来源</th><th>主机</th><th>命令</th><th>IP</th><th>DEK</th><th>缓存</th><th>延迟ms</th><th>操作</th>
     </tr></thead><tbody id="rows"></tbody></table></div>
     <section id="actions">
       <button id="more" type="button">加载更多</button>

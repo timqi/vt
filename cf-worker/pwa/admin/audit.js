@@ -93,6 +93,7 @@
       tr.setAttribute('data-id', r.id);
       cell(tr, fmtTime(r.created_ms));
       var st = document.createElement('td'); st.appendChild(statusBadge(r)); tr.appendChild(st);
+      cell(tr, r.source || 'ceremony');
       cell(tr, r.host);
       cell(tr, commandSummary(r.command, 48));
       cell(tr, r.ip);
@@ -181,6 +182,7 @@
     var dl = document.getElementById('detail-dl');
     dl.innerHTML = '';
     addRow(dl, '状态', r.status + (r.verify_failures ? '（验证失败 ' + r.verify_failures + ' 次）' : ''));
+    addRow(dl, '来源', r.source || 'ceremony');
     addRow(dl, '类型', opKindLabel(r));
     addRow(dl, '主机', r.host);
     addRow(dl, '用户', r.user);
@@ -220,8 +222,10 @@
     u.searchParams.set('limit', '100');
     var st = document.getElementById('f-status').value;
     var host = document.getElementById('f-host').value.trim();
+    var src = document.getElementById('f-source').value;
     if (st) u.searchParams.set('status', st);
     if (host) u.searchParams.set('host', host);
+    if (src) u.searchParams.set('source', src);
     if (more && oldestId !== null) u.searchParams.set('before_id', String(oldestId));
     return u.toString();
   }

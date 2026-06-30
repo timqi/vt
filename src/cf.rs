@@ -77,16 +77,23 @@ pub fn load_config() -> Result<CfConfig> {
     Ok(CfConfig { worker_url, worker_auth })
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(key)
         .expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().into()
 }
 
-fn hmac_auth_header(worker_auth: &str, body: &[u8]) -> String {
-    let mac = hmac_sha256(worker_auth.as_bytes(), body);
+/// Build the `VT-HMAC <b64u>` Authorization header for `body` signed with a
+/// raw byte key. The agent audit path signs with an HKDF-derived 32-byte key
+/// (not a UTF-8 string), so the signing primitive must accept raw bytes.
+pub(crate) fn hmac_auth_header_raw(key: &[u8], body: &[u8]) -> String {
+    let mac = hmac_sha256(key, body);
     format!("VT-HMAC {}", URL_SAFE_NO_PAD.encode(mac))
+}
+
+fn hmac_auth_header(worker_auth: &str, body: &[u8]) -> String {
+    hmac_auth_header_raw(worker_auth.as_bytes(), body)
 }
 
 fn decode_b64u_exact<const N: usize>(b64u: &str, what: &str) -> Result<[u8; N]> {
@@ -292,7 +299,20 @@ struct DekCacheResp {
 /// records, so IPv4 connects whenever the host has any IPv4 egress; on an
 /// IPv6-only host the IPv4 connect fails and we retry without the pin (both
 /// requests then consistently use IPv6).
-async fn cf_post(url: &str, auth_header: &str, body: &[u8]) -> Result<reqwest::Response> {
+pub(crate) async fn cf_post(url: &str, auth_header: &str, body: &[u8]) -> Result<reqwest::Response> {
+    cf_post_with_timeout(url, auth_header, body, 30).await
+}
+
+/// Same IPv4-pinned-with-fallback POST as [`cf_post`], but with a caller-chosen
+/// timeout (seconds). The fire-and-forget agent audit push needs a short (5 s)
+/// budget so it can never block the agent — the default `cf_post` 30 s ceiling
+/// would let a single retried row stall up to a minute.
+pub(crate) async fn cf_post_with_timeout(
+    url: &str,
+    auth_header: &str,
+    body: &[u8],
+    secs: u64,
+) -> Result<reqwest::Response> {
     async fn send_once(client: reqwest::Client, url: &str, auth_header: &str, body: &[u8])
         -> reqwest::Result<reqwest::Response>
     {
@@ -306,7 +326,7 @@ async fn cf_post(url: &str, auth_header: &str, body: &[u8]) -> Result<reqwest::R
     }
 
     let v4 = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(secs))
         .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         .build()?;
     match send_once(v4, url, auth_header, body).await {
@@ -315,7 +335,7 @@ async fn cf_post(url: &str, auth_header: &str, body: &[u8]) -> Result<reqwest::R
         // requests consistently fall back to IPv6.
         Err(e) if e.is_connect() || e.is_builder() => {
             let any = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(secs))
                 .build()?;
             Ok(send_once(any, url, auth_header, body).await?)
         }

@@ -16,6 +16,43 @@ fn require_auth(auth: &Option<String>) -> Result<String> {
     Ok(auth.clone().unwrap_or_default())
 }
 
+/// Build the agent's audit-push config from the `--audit-*` flags. Returns a
+/// disabled config (audit push is a no-op) when `--audit-url` is unset,
+/// `--no-audit-push` is given, or `--audit-key` is empty. `agent_id` is the
+/// machine hostname; the agent derives its per-host audit subkey from the master
+/// (`--audit-key`, == VT_AUTH_CF) + that hostname ONCE here at startup, so the
+/// raw master is not retained — only the 32-byte subkey lives in the config.
+#[cfg(target_os = "macos")]
+fn build_audit_push_config(
+    audit_url: &Option<String>,
+    audit_key: &Option<String>,
+    no_audit_push: bool,
+) -> server_macos::audit::AuditPushConfig {
+    use server_macos::audit::AuditPushConfig;
+
+    let Some(url) = audit_url else {
+        return AuditPushConfig::disabled();
+    };
+    if no_audit_push {
+        return AuditPushConfig::disabled();
+    }
+    let master = match audit_key {
+        Some(k) if !k.trim().is_empty() => k.trim(),
+        _ => {
+            tracing::warn!("audit push disabled: --audit-key not set");
+            return AuditPushConfig::disabled();
+        }
+    };
+    // agent_id = hostname. The Worker re-derives HKDF(VT_AUTH_CF, hostname) to
+    // verify, so the wire stays per-host-keyed and the Worker is unchanged.
+    let hostname = client::get_hostname();
+    // Derive the per-host subkey once; pass the Zeroizing<[u8;32]> straight in so
+    // no plain heap copy of the key ever exists.
+    let key = audit::derive_agent_audit_key(master.as_bytes(), &hostname);
+    AuditPushConfig::new(url.clone(), key, hostname)
+}
+
+mod audit;
 mod cf;
 mod client;
 mod core;
@@ -254,6 +291,22 @@ pub enum SshCommands {
             help = "Comma-separated allowlist for `run@vt` (e.g. `zed,code,/Applications/Zed.app/Contents/MacOS/cli`). Bare names match argv[0] without `/` and are resolved via the agent's own PATH; entries containing `/` must be absolute and match argv[0] post-canonicalization. Empty (the default) disables run@vt entirely."
         )]
         run_allow: String,
+        #[arg(
+            long = "audit-url",
+            help = "Worker base URL for agent audit push, e.g. https://vt-passkey.example.com. Unset (the default) disables audit push."
+        )]
+        audit_url: Option<String>,
+        #[arg(
+            long = "audit-key",
+            help = "Worker master key for agent audit push (VT_AUTH_CF, == VT_PASSKEY_TOKEN). The agent derives its per-host audit subkey from this + the hostname on startup. NOTE: on the command line → visible in the process list; avoid on shared hosts. Unset (the default) disables audit push."
+        )]
+        audit_key: Option<String>,
+        #[arg(
+            long = "no-audit-push",
+            default_value_t = false,
+            help = "Disable audit push even when --audit-url is set."
+        )]
+        no_audit_push: bool,
     },
     /// Add an SSH private key to the keychain
     #[cfg(target_os = "macos")]
@@ -335,10 +388,15 @@ async fn run(cli: Cli) -> Result<()> {
                 decrypt_auth_cache_duration,
                 no_legacy_decrypt,
                 run_allow,
+                audit_url,
+                audit_key,
+                no_audit_push,
             } => {
                 use server_macos::ssh_agent::{AuthCacheConfig, RunAllowlist};
                 let run_allow = RunAllowlist::parse(run_allow)
                     .map_err(|e| anyhow::anyhow!("--run-allow: {}", e))?;
+                let audit_push =
+                    build_audit_push_config(audit_url, audit_key, *no_audit_push);
                 server_macos::ssh_agent::start_ssh_agent(
                     *timeout,
                     AuthCacheConfig {
@@ -351,6 +409,7 @@ async fn run(cli: Cli) -> Result<()> {
                     },
                     *no_legacy_decrypt,
                     run_allow,
+                    std::sync::Arc::new(audit_push),
                 )
                 .await
             }

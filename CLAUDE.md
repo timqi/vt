@@ -123,6 +123,36 @@ Routing rules:
 
 There is no config file. The previous `~/.config/vt/cf_config.json` has been removed.
 
+### Agent audit push (opt-in)
+
+`vt ssh agent` can push one audit record per Touch ID decision (encrypt@vt /
+decrypt@vt / auth@vt / run@vt / sign, including auth-cache hits) to the Worker,
+which stores it in the same `audit` table the phone ceremony uses, marked
+`source='agent'`. Fire-and-forget — never blocks the decision. Opt-in via agent
+flags (no new env vars, no new worker secret — it reuses `VT_AUTH_CF`):
+
+| agent flag | meaning |
+|---|---|
+| `--audit-url <URL>` | Worker base URL, e.g. `https://vt.example.com`. Unset = audit push off. |
+| `--audit-key <KEY>` | the worker master (`VT_AUTH_CF`, == `VT_PASSKEY_TOKEN`). The agent derives its per-host audit subkey from this + the hostname at startup. On the command line → visible in `ps`; avoid on shared hosts. |
+| `--no-audit-push` | disable even when `--audit-url` is set. |
+
+Zero-token: no pre-derivation, no per-agent file. `agent_id` is the hostname; the
+agent computes `HKDF(VT_AUTH_CF, hostname)` itself (Worker verifies the same).
+
+```bash
+vt ssh agent --audit-url https://vt.example.com --audit-key "$VT_PASSKEY_TOKEN"
+```
+
+Tradeoff: this puts the worker master on the agent host — a compromised agent can
+forge any host's audit rows and make authenticated worker requests: `/api/challenge`
+is still phone-gated, but `/api/dek-cache` returns cached DEKs with no phone in the
+loop within the TTL window for the same egress IP (same IP binding as the CLI). It
+still cannot decrypt secrets that aren't cached — the vault master stays on the
+phone. See `docs/agent-audit.md`.
+
+See `docs/agent-audit.md` for the full design and threat model.
+
 ## run@vt — remote-triggered local command launcher
 
 `vt run -- <argv...>` (typically run on a remote host with the SSH agent

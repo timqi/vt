@@ -53,6 +53,10 @@ export interface AuditRow {
   /** Numeric parent PID. Set for ceremony rows (from meta) and DEK-cache rows
    *  (op_kind='cache'). */
   ppid: number | null;
+  /** Origin of the row: 'ceremony' (phone approval), 'cache' (DEK-cache event),
+   *  or 'agent' (SSH-agent Touch ID decision pushed by the Mac). The column is
+   *  NOT NULL DEFAULT 'ceremony', so a read always has a value. */
+  source: string;
 }
 
 export interface AuditQueryResponse {
@@ -242,6 +246,54 @@ export interface CacheEntry {
   ip: string;
   ppid: number;
   ppid_cmd: string;
+}
+
+// ── Agent audit push (SSH-agent → Worker) ──────────────────────────────────
+
+/** One agent-side audit record — the `entry` field of an ingest request. The
+ *  agent emits one per decision (approve / reject / unavailable / cache_hit /
+ *  spawn_failed) across encrypt@vt / decrypt@vt / auth@vt / run@vt / sign.
+ *
+ *  `meta` carries the full ChallengeMeta display shape so `capChallengeMeta`
+ *  has every field it expects. `meta.ip` is ABSENT on the wire by design — the
+ *  Worker always overwrites it from CF-Connecting-IP. `meta.op_kind` duplicates
+ *  the sibling `op_kind`. */
+export interface AgentAuditEntry {
+  /** encrypt | decrypt | auth | run | sign */
+  op_kind: string;
+  /** approved | rejected | unavailable | cache_hit | spawn_failed */
+  outcome: string;
+  /** Decrypt batch size; 0 for auth/sign/run. */
+  salts: number;
+  /** Prompt-shown → decision, ms. 0 for cache hits. */
+  latency_ms: number;
+  /** Event time (epoch ms) — becomes created_ms AND finalized_ms. */
+  ts_ms: number;
+  /** `a_<agent_id>_<8 random bytes b64u>` — UNIQUE retry-dedup key. */
+  token_id: string;
+  meta?: Partial<ChallengeMeta>;
+}
+
+/** Inbound to POST /api/audit-ingest. Signed with `VT-HMAC` over the raw body
+ *  using the agent's HKDF-derived key (see crypto.ts hkdfSha256). `agent_id`
+ *  selects which key the Worker derives to verify; `hostname` is display-only. */
+export interface AgentAuditIngestRequest {
+  timestamp_ms: number;
+  agent_id: string;
+  hostname: string;
+  entry: AgentAuditEntry;
+}
+
+/** Internal DO op for /op/audit-ingest. The Worker has already verified the
+ *  HMAC, capped `meta` (forcing `ip` from CF-Connecting-IP), and bounded the
+ *  scalars. The DO inserts a row with source='agent'. */
+export interface DoAuditIngestOp {
+  token_id: string;
+  outcome: string;
+  salts: number;
+  latency_ms: number;
+  ts_ms: number;
+  meta: ChallengeMeta;
 }
 
 // ── Internal DO op bodies ──────────────────────────────────────────────────

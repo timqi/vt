@@ -15,7 +15,7 @@
 // same DO — no extra locking is needed.
 
 import { DurableObject } from 'cloudflare:workers';
-import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, WsMessage, AuditRow, AuditQueryResponse, CacheEntry, DekCacheResponse } from './types';
+import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AuditRow, AuditQueryResponse, CacheEntry, DekCacheResponse } from './types';
 import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, sha256 } from './crypto';
 import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
@@ -118,7 +118,8 @@ export class AccountDO extends DurableObject<Env> {
            latency_ms INTEGER,
            verify_failures INTEGER NOT NULL DEFAULT 0,
            cache_ttl_s INTEGER,
-           ppid INTEGER
+           ppid INTEGER,
+           source TEXT NOT NULL DEFAULT 'ceremony'
          )`,
       );
       // Additive migrations for older audit tables (token_id present but newer
@@ -135,6 +136,17 @@ export class AccountDO extends DurableObject<Env> {
       }
       if (auditCols.length > 0 && !hasCol('ppid')) {
         this.ctx.storage.sql.exec(`ALTER TABLE audit ADD COLUMN ppid INTEGER`);
+      }
+      // `source` distinguishes ceremony / cache / agent rows. SQLite DOES allow
+      // a NOT NULL DEFAULT <literal> on ALTER ADD COLUMN — the literal backfills
+      // existing rows (which are all ceremony rows), so no separate UPDATE is
+      // needed. (Surprises people; hence this note.) This reuses the `auditCols`/
+      // `hasCol` snapshot taken once above — fine because it is the LAST ALTER in
+      // this block. If a future migration is appended after it, re-run
+      // `PRAGMA table_info(audit)` rather than trusting this now-stale snapshot.
+      if (auditCols.length > 0 && !hasCol('source')) {
+        this.ctx.storage.sql.exec(
+          `ALTER TABLE audit ADD COLUMN source TEXT NOT NULL DEFAULT 'ceremony'`);
       }
       // Drop the short-lived standalone cache_audit table from an earlier build
       // of this branch — its events now live in the unified audit table.
@@ -158,10 +170,12 @@ export class AccountDO extends DurableObject<Env> {
   private auditCreate(ch: Challenge): void {
     const m = ch.meta ?? ({} as Challenge['meta']);
     try {
+      // source='ceremony' set explicitly (not relying on the column default) so
+      // a future schema change can never silently mis-categorize these rows.
       this.ctx.storage.sql.exec(
         `INSERT INTO audit
-           (token_id, created_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid)
-         VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           (token_id, created_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source)
+         VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ceremony')
          ON CONFLICT(token_id) DO NOTHING`,
         auditKey(ch.approve_token),
         ch.created_ms ?? Date.now(),
@@ -245,8 +259,8 @@ export class AccountDO extends DurableObject<Env> {
       const tokenId = 'c_' + b64uEnc(crypto.getRandomValues(new Uint8Array(9)));
       this.ctx.storage.sql.exec(
         `INSERT INTO audit
-           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid)
-         VALUES (?, ?, ?, ?, 'cache', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source)
+         VALUES (?, ?, ?, ?, 'cache', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cache')`,
         tokenId, now, now, status,
         meta.command ?? null, meta.reason ?? null, meta.host ?? null, meta.user ?? null,
         meta.pwd ?? null, meta.tty ?? null, meta.ppid_cmd ?? null, meta.ssh_client ?? null,
@@ -254,6 +268,28 @@ export class AccountDO extends DurableObject<Env> {
       );
     } catch (e) {
       logErr('audit.cacheevent_failed', e);
+    }
+  }
+
+  // Insert one SSH-agent decision row (source='agent'). The event is atomic —
+  // created_ms == finalized_ms == ts_ms. `ON CONFLICT(token_id) DO NOTHING`
+  // makes the agent's 1-retry idempotent. Best-effort: swallow + log.
+  private auditAgent(op: DoAuditIngestOp): void {
+    const m = op.meta;
+    try {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO audit
+           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, ppid, source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent')
+         ON CONFLICT(token_id) DO NOTHING`,
+        op.token_id, op.ts_ms, op.ts_ms, op.outcome,
+        m.op_kind ?? null, m.command ?? null, m.reason ?? null, m.host ?? null,
+        m.user ?? null, m.pwd ?? null, m.tty ?? null, m.ppid_cmd ?? null,
+        m.ssh_client ?? null, m.ip ?? null, op.salts, op.latency_ms,
+        typeof m.ppid === 'number' ? m.ppid : null,
+      );
+    } catch (e) {
+      logErr('audit.agent_failed', e);
     }
   }
 
@@ -271,6 +307,7 @@ export class AccountDO extends DurableObject<Env> {
       case 'approve':             return this.opApprove(request);
       case 'reject':              return this.opReject(request);
       case 'dek-cache':           return this.opDekCache(request);
+      case 'audit-ingest':        return this.opAuditIngest(request);
       case 'page':                return this.opPageData(url);
       case 'audit-query':         return this.opAuditQuery(url);
       case 'cache-clear-origin':  return this.opCacheClearByOrigin(request);
@@ -706,6 +743,22 @@ export class AccountDO extends DurableObject<Env> {
     return Response.json({ source: 'cache', sealed_deks_b64u: sealedB64u } satisfies DekCacheResponse);
   }
 
+  // Ingest one SSH-agent audit record. The Worker has already verified the
+  // per-agent HMAC, capped `meta`, and bounded the scalars; we just insert.
+  // Return 200 on success so the agent's 1-retry stops (a non-2xx would make it
+  // retry a row that already landed). Best-effort — auditAgent swallows DB errors.
+  private async opAuditIngest(request: Request): Promise<Response> {
+    let op: DoAuditIngestOp;
+    try { op = await request.json() as DoAuditIngestOp; }
+    catch { return badRequest('invalid json'); }
+    if (!op || typeof op.token_id !== 'string' || !op.token_id
+        || !op.meta || typeof op.meta !== 'object') {
+      return badRequest('invalid audit op');
+    }
+    this.auditAgent(op);
+    return Response.json({ ok: true });
+  }
+
   // Admin: clear the cached DEKs written by ONE approval, identified by its
   // audit token_id (cache entries store origin_token_id = the approval's
   // token_id). Powers the per-row "清除缓存" button on the audit page.
@@ -891,11 +944,14 @@ export class AccountDO extends DurableObject<Env> {
     else if (status) { conds.push('status = ?'); binds.push(status); }
     const host = q.get('host');
     if (host) { conds.push('host = ?'); binds.push(host); }
+    // Filter by row origin (ceremony / cache / agent). Independent of `status`.
+    const source = q.get('source');
+    if (source) { conds.push('source = ?'); binds.push(source); }
 
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     const sql =
       `SELECT id, token_id, created_ms, finalized_ms, status, op_kind, command, reason,
-              host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, verify_failures, cache_ttl_s, ppid
+              host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, verify_failures, cache_ttl_s, ppid, source
        FROM audit ${where} ORDER BY id DESC LIMIT ?`;
     binds.push(limit);
 

@@ -41,6 +41,19 @@ export async function hmacSha256(keyBytes: Uint8Array, data: Uint8Array): Promis
   return new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
 }
 
+// HKDF-SHA256 (RFC 5869, extract + expand). Used to derive the per-agent audit
+// key from VT_AUTH_CF: hkdfSha256(VT_AUTH_CF, agent_id, "vt-agent-audit-v1", 32).
+// MUST match the Rust `derive_agent_audit_key` (src/audit.rs) — both feed the
+// same ikm/salt/info, so a row signed by the agent verifies here.
+export async function hkdfSha256(
+  ikm: Uint8Array, salt: Uint8Array, info: Uint8Array, len: number,
+): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt, info }, key, len * 8);
+  return new Uint8Array(bits);
+}
+
 // challenge_hash = SHA-256(
 //   "vt-challenge-v2"        (15 bytes)
 //   || daemon_pubkey         (32 bytes)
