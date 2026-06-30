@@ -79,12 +79,22 @@ async function fanOut(
   if (po.error) warnings.push(`pushover config: ${po.error}`);
   if (sl.error) warnings.push(`slack config: ${sl.error}`);
 
+  // Each task is .catch()-guarded so a notification channel can never reject
+  // Promise.all and abort the awaited ceremony path (index.ts awaits
+  // notifyApproval on /api/challenge). Delivery is strictly best-effort.
   const tasks: Promise<void>[] = [];
   if (po.config) {
-    tasks.push(notifyPushover(po.config, title, body).then((w) => { if (w) warnings.push(`pushover: ${w}`); }));
+    tasks.push(notifyPushover(po.config, title, body)
+      .then((w) => { if (w) warnings.push(`pushover: ${w}`); })
+      // Static label, not the raw error: this guard is only reachable from a
+      // future .then() bug, and an interpolated error could in theory carry a
+      // URL/secret. notifyPushover already returns its own diagnostics.
+      .catch(() => { warnings.push('pushover: notify error'); }));
   }
   if (sl.config) {
-    tasks.push(notifySlack(sl.config, title, body).then((w) => { if (w) warnings.push(`slack: ${w}`); }));
+    tasks.push(notifySlack(sl.config, title, body)
+      .then((w) => { if (w) warnings.push(`slack: ${w}`); })
+      .catch(() => { warnings.push('slack: notify error'); }));
   }
   if (requireChannel && tasks.length === 0 && warnings.length === 0) {
     warnings.push('no notification channel configured');

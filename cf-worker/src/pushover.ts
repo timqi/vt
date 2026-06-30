@@ -1,5 +1,11 @@
 // Pushover notification channel: config parsing + delivery.
 
+// Bound every outbound notification fetch. notifyApproval is awaited on the
+// /api/challenge path, so without this a hung endpoint would stall the CLI's
+// ceremony for the platform default (~30s). On abort the catch returns a
+// non-fatal warning and the ceremony proceeds.
+const NOTIFY_TIMEOUT_MS = 6000;
+
 function pctEncode(s: string): string {
   let out = '';
   for (const b of new TextEncoder().encode(s)) {
@@ -51,13 +57,20 @@ async function sendPush(
   message: string,
 ): Promise<[number, string]> {
   const body = buildFormBody({ token: appToken, user: userKey, title, message });
-  const resp = await fetch('https://api.pushover.net/1/messages.json', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  });
-  const text = await resp.text();
-  return [resp.status, text];
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), NOTIFY_TIMEOUT_MS);
+  try {
+    const resp = await fetch('https://api.pushover.net/1/messages.json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+      signal: ctl.signal,
+    });
+    const text = await resp.text();
+    return [resp.status, text];
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Deliver one notification. Returns '' on success or a short error description
@@ -73,10 +86,14 @@ export async function notifyPushover(
   } catch (e) {
     return `transport error: ${e}`;
   }
-  if (status < 200 || status >= 300) return `http ${status}: ${text}`;
+  // Don't echo the API response body into the warning (which is logged): on an
+  // auth error Pushover names the offending credential field, narrowing a
+  // guesser's space for anyone who can read Worker logs. The status code alone
+  // is enough to diagnose.
+  if (status < 200 || status >= 300) return `http ${status}`;
   let parsed: Record<string, unknown>;
-  try { parsed = JSON.parse(text); } catch { return `invalid json: ${text}`; }
-  if (parsed['status'] !== 1) return `status != 1: ${text}`;
+  try { parsed = JSON.parse(text); } catch { return 'invalid json response'; }
+  if (parsed['status'] !== 1) return `delivery rejected (status ${parsed['status']})`;
   const info = parsed['info'];
   if (typeof info === 'string' && info) return `delivery warning: ${info}`;
   return '';
