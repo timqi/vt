@@ -649,7 +649,12 @@ impl VTClient {
             match item_res {
                 Err(e) => out.push(CryptoResItem { result: String::new(), err_message: e }),
                 Ok(Item { t, salt, inner_ct }) => {
-                    let dek = &deks[dek_idx];
+                    // Bounds-guard rather than index: open_sealed_deks already
+                    // enforces deks.len() == salts.len(), but never let a short
+                    // worker response panic the process here.
+                    let dek = deks.get(dek_idx).ok_or_else(|| {
+                        anyhow::anyhow!("internal: fewer DEKs returned than v2 records")
+                    })?;
                     dek_idx += 1;
                     let res = match client_decrypt_v2(t, dek, &salt, &inner_ct) {
                         Ok(pt) => CryptoResItem { result: pt, err_message: String::new() },
@@ -1043,18 +1048,34 @@ pub async fn rewrap(
         for (old, new) in &url_map {
             new_text = new_text.replace(old.as_str(), new.as_str());
         }
+        // Write sidecars with O_NOFOLLOW so a pre-planted symlink at the
+        // backup/tmp path can't redirect the write to overwrite an arbitrary
+        // target. create+truncate keeps rewrap re-runnable for a regular file.
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let nofollow_write = |path: &std::ffi::OsStr, data: &[u8]| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .with_context(|| {
+                    format!("Failed to open (refuses symlinks): {}", std::path::Path::new(path).display())
+                })?;
+            file.write_all(data).with_context(|| {
+                format!("Failed to write: {}", std::path::Path::new(path).display())
+            })?;
+            Ok(())
+        };
         if backup {
             let mut backup_path = f.clone().into_os_string();
             backup_path.push(".vt-rewrap-backup");
-            std::fs::copy(f, &backup_path).with_context(|| {
-                format!("Failed to write backup: {}", std::path::Path::new(&backup_path).display())
-            })?;
+            nofollow_write(&backup_path, text.as_bytes())?;
         }
         let mut tmp_path = f.clone().into_os_string();
         tmp_path.push(".vt-rewrap-tmp");
-        std::fs::write(&tmp_path, &new_text).with_context(|| {
-            format!("Failed to write temp: {}", std::path::Path::new(&tmp_path).display())
-        })?;
+        nofollow_write(&tmp_path, new_text.as_bytes())?;
         std::fs::rename(&tmp_path, f).with_context(|| {
             format!("Failed to atomically replace: {}", f.display())
         })?;
@@ -1174,14 +1195,45 @@ pub async fn inject(
         original_command.push_str(&sanitize_for_display(r, 200));
     }
 
+    // Open the target ONCE with O_NOFOLLOW, capture its mode, and read its
+    // content. The same in-memory bytes are reused as both the decrypt source
+    // and the ciphertext backup, so there is no second open to race: a
+    // directory-writable attacker can't swap the file between "what we
+    // decrypt" and "what we back up / restore". `orig_mode` carries the mode
+    // captured here to the backup-creation step below.
+    let mut orig_mode: u32 = 0o600;
     let replace_file_content = match replace_file.as_ref() {
         Some(file) => {
+            use std::io::Read;
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
             debug!("Reading file: {}", file);
-            std::fs::read_to_string(file)
-                .with_context(|| format!("Failed to read file: {}", file))?
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(file)
+                .with_context(|| {
+                    format!("Failed to open replace file (refuses symlinks): {}", file)
+                })?;
+            let meta = f
+                .metadata()
+                .with_context(|| format!("Failed to stat: {}", file))?;
+            if !meta.is_file() {
+                return Err(anyhow::anyhow!(
+                    "Refusing to replace non-regular file: {}",
+                    file
+                ));
+            }
+            orig_mode = meta.mode() & 0o7777;
+            let mut buf = String::new();
+            f.read_to_string(&mut buf)
+                .with_context(|| format!("Failed to read file: {}", file))?;
+            buf
         }
         None => String::new(),
     };
+    // Keep the original (ciphertext) bytes for the backup; the same bytes we
+    // just read and are about to decrypt. Cheap clone (empty when no -r file).
+    let orig_file_bytes = replace_file_content.clone().into_bytes();
     args.push(replace_file_content);
 
     // Scan env vars locally for vt:// patterns — only those values enter the
@@ -1196,12 +1248,18 @@ pub async fn inject(
     let mut decrypted_args = decrypt_from_multi_str(vt_client, args, original_command).await?;
 
     // Pop decrypted env var values (in reverse push order) and set only those.
+    // decrypt_from_multi_str preserves length 1:1, so these pops always
+    // succeed; guard anyway so a future contract change can't panic here.
     for (key, _) in env_vt_vars.iter().rev() {
-        let decrypted_value = decrypted_args.pop().unwrap();
+        let decrypted_value = decrypted_args
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("internal: decrypted arg count underflow"))?;
         env::set_var(key, decrypted_value);
     }
 
-    let decrypted_file_content = decrypted_args.pop().unwrap();
+    let decrypted_file_content = decrypted_args
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("internal: decrypted file content missing"))?;
 
     // Plaintext exposure protocol when -r is set:
     //   1. Open target with O_NOFOLLOW, stat to capture mode + reject non-regular.
@@ -1221,7 +1279,8 @@ pub async fn inject(
     // after timeout still brings everything home (modulo SIGKILL / reboot).
     let armed: Option<(String, std::path::PathBuf)> = if let Some(replace_file_path) = &replace_file
     {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
 
         let orig_path = std::path::Path::new(replace_file_path);
         let dir = orig_path
@@ -1234,27 +1293,6 @@ pub async fn inject(
             .to_string_lossy()
             .into_owned();
 
-        let mut src = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(replace_file_path)
-            .with_context(|| {
-                format!(
-                    "Failed to open replace file (refuses symlinks): {}",
-                    replace_file_path
-                )
-            })?;
-        let meta = src
-            .metadata()
-            .with_context(|| format!("Failed to stat: {}", replace_file_path))?;
-        if !meta.is_file() {
-            return Err(anyhow::anyhow!(
-                "Refusing to replace non-regular file: {}",
-                replace_file_path
-            ));
-        }
-        let orig_mode = meta.mode() & 0o7777;
-
         let mut rnd = [0u8; 8];
         {
             use rand::RngCore;
@@ -1264,7 +1302,9 @@ pub async fn inject(
         let backup_path = dir.join(format!(".{}.vt-backup-{}", file_name, suffix));
         let tmp_path = dir.join(format!(".{}.vt-tmp-{}", file_name, suffix));
 
-        // Step 2: write backup (ciphertext copy of target).
+        // Step 2: write backup from the in-memory ORIGINAL bytes (captured at
+        // the single O_NOFOLLOW open above) — NOT a fresh re-read of the target,
+        // which would be a TOCTOU window for a directory-writable attacker.
         {
             let mut backup_file = std::fs::OpenOptions::new()
                 .write(true)
@@ -1275,7 +1315,7 @@ pub async fn inject(
                 .with_context(|| {
                     format!("Failed to create backup file: {}", backup_path.display())
                 })?;
-            std::io::copy(&mut src, &mut backup_file).with_context(|| {
+            backup_file.write_all(&orig_file_bytes).with_context(|| {
                 format!(
                     "Failed to copy content to backup: {}",
                     backup_path.display()
@@ -1283,7 +1323,6 @@ pub async fn inject(
             })?;
             backup_file.sync_all().ok();
         }
-        drop(src);
         debug!("Created backup at: {}", backup_path.display());
 
         // Step 3: arm supervisor before any plaintext touches disk.

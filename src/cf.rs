@@ -367,8 +367,8 @@ pub async fn get_deks(
     let challenge_url = format!("{}/api/challenge", config.worker_url);
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
 
     let req_body = serde_json::to_vec(&ChallengeReq {
         daemon_pubkey_b64u: pk_b64u.clone(),
@@ -394,6 +394,15 @@ pub async fn get_deks(
     let worker_nonce: [u8; 16] = decode_b64u_exact(&ch.worker_nonce_b64u, "worker_nonce")?;
     let approve_challenge_hash =
         compute_approve_challenge_hash(&pk, &worker_nonce, ts_ms, salts);
+
+    // poll_token is worker-controlled and interpolated into the WS query string;
+    // restrict it to the b64url alphabet so a compromised worker can't inject
+    // extra URL/query/fragment structure into the connect target.
+    if ch.poll_token.is_empty()
+        || !ch.poll_token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("challenge: malformed poll_token");
+    }
 
     if !ch.push_warning.is_empty() {
         eprintln!("vt: push warning: {}", ch.push_warning);
@@ -449,7 +458,10 @@ pub async fn get_deks(
                             &binding_tag,
                         )?;
 
-                        return open_sealed_deks(sealed_b64u, &pk, &*sk, n_deks);
+                        // Open the SAME decoded bytes the binding tag committed
+                        // to — never re-decode the b64u string, so the bound and
+                        // opened byte sequences are identical by construction.
+                        return open_sealed_deks(&sealed_deks_bytes, &pk, &*sk, n_deks);
                     }
                     "rejected" => bail!("approval rejected by user"),
                     "expired"  => bail!("approval request expired"),
@@ -493,8 +505,8 @@ pub async fn try_cache(
     let salts_b64u: Vec<String> = salts.iter().map(|s| URL_SAFE_NO_PAD.encode(s)).collect();
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
 
     let req_body = match serde_json::to_vec(&DekCacheReq {
         daemon_pubkey_b64u: pk_b64u,
@@ -537,19 +549,17 @@ pub async fn try_cache(
 
     // Cache hit: open the sealed box sealed to our ephemeral pubkey. No binding
     // verification on this path (see SECURITY note above).
-    let deks = open_sealed_deks(&sealed, &pk, &*sk, salts.len())?;
+    let ct = URL_SAFE_NO_PAD.decode(&sealed).context("sealed_deks b64u decode")?;
+    let deks = open_sealed_deks(&ct, &pk, &*sk, salts.len())?;
     Ok(Some(deks))
 }
 
 fn open_sealed_deks(
-    sealed_b64u: &str,
+    ct: &[u8],
     pk: &PublicKey,
     sk: &SecretKey,
     n_deks: usize,
 ) -> Result<Vec<Zeroizing<[u8; 32]>>> {
-    let ct = URL_SAFE_NO_PAD.decode(sealed_b64u)
-        .context("sealed_deks b64u decode")?;
-
     // sealed_box overhead = 48 bytes (ephemeral pk 32 + mac 16)
     // plaintext = max(n_deks, 1) * 32 bytes (at least 1 even for auth-only)
     let n = n_deks.max(1);
@@ -559,7 +569,7 @@ fn open_sealed_deks(
     }
 
     let mut pt = vec![0u8; n * 32];
-    crypto_box_seal_open(&mut pt, &ct, pk, sk)
+    crypto_box_seal_open(&mut pt, ct, pk, sk)
         .map_err(|_| anyhow!("sealed_box open failed — possible MITM or wrong key"))?;
 
     // Auth-only: n_deks == 0, we just needed the approval — return no DEKs.
@@ -708,7 +718,8 @@ mod tests {
         let expected: Vec<u8> = (0u8..32).collect();
         let sealed = "JEYfUWAkbFlSTgjZD-GXcSHkANGFWCT637UiLWtBRUu-uQjaKW_GFnZplKkhLMm3h0-ch65fczHafJozQnVbdv4F-eyFxUbJuJoIzb9Anvw";
 
-        let deks = open_sealed_deks(sealed, &pk, &sk, 1)
+        let ct = URL_SAFE_NO_PAD.decode(sealed).unwrap();
+        let deks = open_sealed_deks(&ct, &pk, &sk, 1)
             .expect("worker-sealed box must open with dryoc");
         assert_eq!(deks.len(), 1);
         assert_eq!(&deks[0][..], &expected[..], "decrypted DEK mismatch — wire incompatibility");
