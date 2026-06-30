@@ -34,7 +34,13 @@
     throw new Error('CBOR: 64-bit length unsupported');
   }
 
-  function read(buf, off) {
+  // Bound nesting so a crafted (deeply-nested) attestation object can't blow the
+  // call stack. COSE keys / attestationObjects are shallow; 32 is ample.
+  var MAX_DEPTH = 32;
+
+  function read(buf, off, depth) {
+    depth = depth || 0;
+    if (depth > MAX_DEPTH) throw new Error('CBOR: nesting too deep');
     if (off >= buf.length) throw new Error('CBOR: out of bounds');
     var ib = buf[off++];
     var major = ib >> 5;
@@ -60,7 +66,7 @@
       var ra = readLen(buf, off, ai);
       var curA = ra.off;
       var arr = [];
-      for (var i = 0; i < ra.n; i++) { var ia = read(buf, curA); arr.push(ia.value); curA = ia.end; }
+      for (var i = 0; i < ra.n; i++) { var ia = read(buf, curA, depth + 1); arr.push(ia.value); curA = ia.end; }
       return { value: arr, end: curA };
     }
     if (major === 5) {                          // map
@@ -68,8 +74,8 @@
       var curM = rm.off;
       var m = new Map();
       for (var j = 0; j < rm.n; j++) {
-        var k = read(buf, curM); curM = k.end;
-        var v = read(buf, curM); curM = v.end;
+        var k = read(buf, curM, depth + 1); curM = k.end;
+        var v = read(buf, curM, depth + 1); curM = v.end;
         var key = (typeof k.value === 'object') ? JSON.stringify(k.value) : k.value;
         m.set(key, v.value);
       }
