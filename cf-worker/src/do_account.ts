@@ -260,7 +260,8 @@ export class AccountDO extends DurableObject<Env> {
       this.ctx.storage.sql.exec(
         `INSERT INTO audit
            (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source)
-         VALUES (?, ?, ?, ?, 'cache', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cache')`,
+         VALUES (?, ?, ?, ?, 'cache', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cache')
+         ON CONFLICT(token_id) DO NOTHING`,
         tokenId, now, now, status,
         meta.command ?? null, meta.reason ?? null, meta.host ?? null, meta.user ?? null,
         meta.pwd ?? null, meta.tty ?? null, meta.ppid_cmd ?? null, meta.ssh_client ?? null,
@@ -468,7 +469,11 @@ export class AccountDO extends DurableObject<Env> {
     let pwaPkBytes: Uint8Array;
     try {
       body = await request.json() as DoApproveOp;
-      if (typeof body.approve_token !== 'string' || !body.approve_token) throw new Error('approve_token');
+      // Length-cap before the token becomes a DO storage key (2048-byte limit):
+      // an over-long key throws synchronously, surfacing as a 500 instead of a
+      // controlled 404. Ceremony tokens are 16 chars; 128 is generous.
+      if (typeof body.approve_token !== 'string' || !body.approve_token
+          || body.approve_token.length > 128) throw new Error('approve_token');
       if (!isB64uString(body.credential_id_b64u)) throw new Error('credential_id_b64u');
       if (!isB64uString(body.sealed_deks_b64u)) throw new Error('sealed_deks_b64u');
       if (!isB64uString(body.client_data_json_b64u)) throw new Error('client_data_json_b64u');
@@ -811,7 +816,8 @@ export class AccountDO extends DurableObject<Env> {
     let body: DoRejectOp;
     try {
       body = await request.json() as DoRejectOp;
-      if (typeof body.approve_token !== 'string' || !body.approve_token) throw new Error('approve_token');
+      if (typeof body.approve_token !== 'string' || !body.approve_token
+          || body.approve_token.length > 128) throw new Error('approve_token');
       if (!isB64uString(body.credential_id_b64u)) throw new Error('credential_id_b64u');
       if (!isB64uString(body.client_data_json_b64u)) throw new Error('client_data_json_b64u');
       if (!isB64uString(body.authenticator_data_b64u)) throw new Error('authenticator_data_b64u');

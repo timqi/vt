@@ -8,7 +8,7 @@
 //
 // Admin landing redirects to the audit view; Setup is a sibling tab.
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { Env } from './types';
 import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, hkdfSha256, inReplayWindow } from './crypto';
 import { notifyApproval } from './notify';
@@ -415,7 +415,11 @@ app.post('/api/audit-ingest', async (c) => {
 
   const clampInt = (v: unknown): number =>
     (typeof v === 'number' && Number.isFinite(v) && v >= 0) ? Math.floor(v) : 0;
-  const tsMs = (typeof entry.ts_ms === 'number' && Number.isFinite(entry.ts_ms))
+  // ts_ms must itself be within the replay window — otherwise an HMAC-verified
+  // (but buggy/compromised) agent could write a far-future ts_ms that escapes
+  // the 90-day retention sweep, or a ts_ms=0 row that's swept immediately.
+  const tsMs = (typeof entry.ts_ms === 'number' && Number.isFinite(entry.ts_ms)
+    && inReplayWindow(Date.now(), entry.ts_ms))
     ? entry.ts_ms : body.timestamp_ms;
 
   const op: DoAuditIngestOp = {
@@ -435,10 +439,25 @@ app.post('/api/audit-ingest', async (c) => {
   });
 });
 
+// Cap on the (unauthenticated) approve/reject bodies. The dominant fields are
+// the sealed-DEK blobs; 256 KB covers thousands of records while bounding the
+// CPU/parse/DO-storage cost of an oversized POST to these public endpoints.
+const CEREMONY_POST_MAX_BYTES = 256 * 1024;
+
+async function readCappedBody(c: Context): Promise<Uint8Array | null> {
+  const clen = c.req.header('Content-Length');
+  if (clen && Number(clen) > CEREMONY_POST_MAX_BYTES) return null;
+  const buf = await c.req.arrayBuffer();
+  if (buf.byteLength > CEREMONY_POST_MAX_BYTES) return null;
+  return new Uint8Array(buf);
+}
+
 // POST /api/approve — PWA submits sealed DEKs after WebAuthn
 app.post('/api/approve', async (c) => {
+  const raw = await readCappedBody(c);
+  if (!raw) return c.text('body too large', 413);
   let body: ApproveRequest;
-  try { body = await c.req.json<ApproveRequest>(); }
+  try { body = JSON.parse(new TextDecoder().decode(raw)); }
   catch { return c.text('invalid json', 400); }
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   return stub.fetch('https://account.do/op/approve', {
@@ -450,8 +469,10 @@ app.post('/api/approve', async (c) => {
 
 // POST /api/reject — PWA rejects
 app.post('/api/reject', async (c) => {
+  const raw = await readCappedBody(c);
+  if (!raw) return c.text('body too large', 413);
   let body: RejectRequest;
-  try { body = await c.req.json<RejectRequest>(); }
+  try { body = JSON.parse(new TextDecoder().decode(raw)); }
   catch { return c.text('invalid json', 400); }
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   return stub.fetch('https://account.do/op/reject', {
