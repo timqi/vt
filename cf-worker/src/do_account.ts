@@ -20,6 +20,7 @@ import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, sha256 } from './crypt
 import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
 import { seal, openToCache, cachePublicKey } from './cache_crypto';
+import { notifyCacheHit } from './notify';
 import { log, logErr, tokenPrefix } from './log';
 
 const TTL_MS = 5 * 60 * 1000;
@@ -33,18 +34,26 @@ const AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 // absence of a write. The PWA's radio options are [0, ...this] (see opPageData).
 const CACHE_TTL_WHITELIST = new Set([8 * 60, 20 * 60, 2 * 60 * 60]);
 
-// DEK cache entry key. ctx binds the entry to (IP, PPID): a lookup recomputes
-// ctx from the requester's worker-derived IP + reported PPID, so a mismatch
-// simply finds no key (a clean miss, no oracle).
-async function cacheCtx(ip: string, ppid: number): Promise<string> {
+// DEK cache entry key. ctx binds the entry to the requester's worker-derived IP
+// ONLY (CF-Connecting-IP — unspoofable by the client). A lookup recomputes ctx
+// from that same IP, so a different egress IP finds no key (a clean miss, no
+// oracle).
+//
+// History: ctx used to also fold in the client-reported parent PID as an
+// advisory same-host blast-radius reducer. That input was dropped (tag bumped
+// v1→v2) because PPID is BOTH spoofable (client-reported, so it never widened
+// the real boundary) AND unstable — orchestrators (Claude Code, CI, make, tmux)
+// spawn a fresh shell per command, so getppid() changes every call and the
+// cache never hit. The effective guarantee is now exactly what docs always
+// promised: within the TTL, possession of VT_PASSKEY_TOKEN behind the SAME
+// egress IP. ppid is still recorded on each entry + audit row for forensics.
+async function cacheCtx(ip: string): Promise<string> {
   const enc = new TextEncoder();
-  const tag = enc.encode('vt-dek-ctx-v1');
+  const tag = enc.encode('vt-dek-ctx-v2');
   const ipBytes = enc.encode(ip);
-  const buf = new Uint8Array(tag.length + ipBytes.length + 1 + 4);
+  const buf = new Uint8Array(tag.length + ipBytes.length);
   buf.set(tag, 0);
   buf.set(ipBytes, tag.length);
-  buf[tag.length + ipBytes.length] = 0x00;
-  new DataView(buf.buffer).setUint32(tag.length + ipBytes.length + 1, ppid >>> 0, true);
   return b64uEnc(await sha256(buf));
 }
 
@@ -581,8 +590,10 @@ export class AccountDO extends DurableObject<Env> {
     }
 
     const ip = ch.meta.ip ?? '';
+    // ppid is no longer part of the binding ctx (IP-only) — kept solely as a
+    // forensic field stored on each cache entry + audit row.
     const ppid = typeof ch.meta.ppid === 'number' ? ch.meta.ppid : 0;
-    const ctx = await cacheCtx(ip, ppid);
+    const ctx = await cacheCtx(ip);
     const expires = Date.now() + ttlS * 1000;
     const writes: Record<string, CacheEntry> = {};
     for (let i = 0; i < salts.length; i++) {
@@ -600,7 +611,7 @@ export class AccountDO extends DurableObject<Env> {
     log('cache.written', { at: tokenPrefix(ch.approve_token), ttl_s: ttlS, n: salts.length });
   }
 
-  // Fast path: look up cached DEKs for (IP, PPID, salts). All-or-nothing — any
+  // Fast path: look up cached DEKs for (IP, salts). All-or-nothing — any
   // missing/expired/undecryptable salt yields a uniform miss (no oracle for
   // which salts are cached). On a full hit, re-seal each DEK to the requester's
   // ephemeral daemon pubkey so only this caller can open the response. Skips the
@@ -618,8 +629,8 @@ export class AccountDO extends DurableObject<Env> {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
     const meta = body.meta;
-    // ip + ppid (both already sanitized by the Worker's capChallengeMeta; ip is
-    // worker-derived from CF-Connecting-IP) form the cache binding ctx.
+    // ip (worker-derived from CF-Connecting-IP, already forced by capChallengeMeta)
+    // is the sole cache binding ctx. ppid is forensic-only (logged/audited).
     const ip = meta.ip ?? '';
     const ppid = (typeof meta.ppid === 'number' ? meta.ppid : 0) >>> 0;
     const salts = body.salts_b64u;
@@ -635,7 +646,7 @@ export class AccountDO extends DurableObject<Env> {
     if (!this.env.CACHE_SECKEY || !this.env.CACHE_SECKEY.trim()) return miss();
     for (const s of salts) { if (!isB64uString(s)) return miss(); }
 
-    const ctx = await cacheCtx(ip, ppid);
+    const ctx = await cacheCtx(ip);
     // Batch the lookups (M2): one storage.get over all keys, so response timing
     // does not leak the position of the first miss.
     const keys = salts.map(s => cacheKey(ctx, s));
@@ -682,6 +693,16 @@ export class AccountDO extends DurableObject<Env> {
     // detail dialog is as rich as a ceremony decrypt.
     this.auditCacheEvent(meta, salts.length, 'approved');
     log('cache.hit', { n: salts.length, ip, ppid });
+
+    // Real-time notice: a cache hit serves a decrypt with NO phone in the loop,
+    // so push the same opt-in channels used for approvals. Fire-and-forget via
+    // waitUntil — delivery is best-effort and must never delay or fail the DEK
+    // response (the audit row above is the durable record).
+    this.ctx.waitUntil(
+      notifyCacheHit(this.env, meta, salts.length)
+        .then((w) => { if (w) logErr('notify.cachehit_failed', w); })
+        .catch((e) => logErr('notify.cachehit_failed', e)),
+    );
     return Response.json({ source: 'cache', sealed_deks_b64u: sealedB64u } satisfies DekCacheResponse);
   }
 
