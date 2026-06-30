@@ -121,7 +121,17 @@ Routing rules:
 - `VT_AUTH` unset → skip agent, go straight to passkey.
 - Neither configured → CLI refuses at startup with an actionable error.
 
-There is no config file. The previous `~/.config/vt/cf_config.json` has been removed.
+**Config-file fallback.** Env vars are primary and always win. As a fallback,
+any unset `VT_*` variable is loaded from a flat TOML file at
+`~/.config/vt/config.toml` (override the path with `$VT_CONFIG`). Only keys
+matching `^VT_[A-Z0-9_]+$` are honoured; a set env var is never overridden.
+Loading happens once in `main()` (`src/config.rs::hydrate_env_from_file`) before
+`Cli::parse()` and before the tokio runtime is built, by populating `std::env`,
+so every existing read (including clap's `env = "VT_AUTH"`) transparently picks
+up file values. Malformed/absent file → silent no-op (env path still works); a
+group/other-readable file logs a `chmod 600` warning since it holds secrets. See
+`config.example.toml` for the template. (The previous JSON file
+`~/.config/vt/cf_config.json` was removed; this TOML fallback replaces it.)
 
 ### Agent audit push (opt-in)
 

@@ -55,6 +55,7 @@ fn build_audit_push_config(
 mod audit;
 mod cf;
 mod client;
+mod config;
 mod core;
 #[cfg(target_os = "macos")]
 mod server_macos;
@@ -512,6 +513,13 @@ fn main() {
         .with_writer(std::io::stderr)
         .compact()
         .init();
+
+    // Fallback layer: populate any unset VT_* env var from
+    // ~/.config/vt/config.toml (override path via $VT_CONFIG). Env vars always
+    // win. Must run before Cli::parse() (clap reads VT_AUTH from env) and while
+    // still single-threaded (before the tokio runtime is built).
+    config::hydrate_env_from_file();
+
     let cli = Cli::parse();
 
     let rt = tokio::runtime::Builder::new_multi_thread()

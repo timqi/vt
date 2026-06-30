@@ -1,0 +1,32 @@
+# vt config — fallback for the VT_* environment variables.
+#
+# Copy this file to ~/.config/vt/config.toml and fill in your values:
+#
+#     mkdir -p ~/.config/vt
+#     cp config.example.toml ~/.config/vt/config.toml
+#     chmod 600 ~/.config/vt/config.toml      # holds secrets
+#
+# Precedence: an environment variable ALWAYS wins. A key here is used only
+# when its matching VT_* env var is unset. Override the file location with the
+# $VT_CONFIG environment variable.
+#
+# Only keys matching ^VT_[A-Z0-9_]+$ are honoured. Leave a line commented out
+# (or delete it) to leave that variable unset.
+
+# --- CF passkey ceremony (Linux servers + macOS fallback) -------------------
+# Worker base URL for the phone-approval ceremony.
+# VT_PASSKEY_URL = "https://vt.example.com"
+
+# HMAC key signing /api/challenge requests. Must equal the worker's VT_AUTH_CF
+# secret. SENSITIVE — keep this file mode 600.
+# VT_PASSKEY_TOKEN = "your-passkey-token"
+
+# --- SSH-agent path (macOS workstations running `vt ssh agent`) -------------
+# When set, the CLI tries the local SSH agent (Touch ID) first and falls back
+# to the passkey ceremony. Leave unset on Linux servers. SENSITIVE.
+# VT_AUTH = "your-ssh-agent-token"
+
+# --- git SSH signing identity (optional) ------------------------------------
+# Encrypted private key record and its matching public key.
+# VT_GIT_SSH_PRIVATE_KEY = "vt://0..."
+# VT_GIT_SSH_PUB = "ssh-ed25519 AAAA... vt-dev"

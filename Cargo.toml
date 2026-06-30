@@ -22,6 +22,7 @@ base64 = "0.22.1"
 sha2 = "0.10.9"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.128", features = ["raw_value"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 totp-rs = "5.7.0"
 rpassword = "7.4.0"
 exec = "0.3.1"
