@@ -8,6 +8,9 @@ export function b64uEnc(bytes: Uint8Array): string {
 }
 
 export function b64uDec(s: string): Uint8Array {
+  // length ≡ 1 (mod 4) is not a valid base64 encoding of any byte sequence;
+  // reject explicitly rather than feed atob a malformed 3-pad string.
+  if (s.length % 4 === 1) throw new Error('invalid base64url length');
   const pad = s.length % 4 === 0 ? s : s + '='.repeat(4 - (s.length % 4));
   const bin = atob(pad.replace(/-/g, '+').replace(/_/g, '/'));
   const out = new Uint8Array(bin.length);

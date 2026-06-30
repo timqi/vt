@@ -33,6 +33,21 @@ export interface CredentialsBlob {
 export function parseCredentials(raw: string): CredentialsBlob {
   const blob = JSON.parse(raw) as CredentialsBlob;
   if (blob.v !== 1) throw new Error(`unsupported credentials version ${blob.v}`);
+  // `as CredentialsBlob` is a compile-time-only assertion; validate the runtime
+  // shape so a malformed CREDENTIALS_JSON fails loudly here instead of throwing
+  // an opaque error deep inside assertion verification.
+  if (!Array.isArray(blob.c)) throw new Error('credentials: `c` must be an array');
+  for (const e of blob.c) {
+    if (
+      !e ||
+      typeof e.h !== 'string' ||
+      typeof e.i !== 'string' ||
+      typeof e.k !== 'string' ||
+      typeof e.p !== 'string'
+    ) {
+      throw new Error('credentials: entry missing required string field(s)');
+    }
+  }
   return blob;
 }
 

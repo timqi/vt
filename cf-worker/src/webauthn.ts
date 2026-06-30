@@ -38,7 +38,9 @@ export async function verifyAssertion(opts: {
   if (typeof clientData.origin !== 'string' || clientData.origin !== expectedOrigin) {
     throw new Error('origin mismatch');
   }
-  if (clientData.crossOrigin === true) {
+  if (clientData.crossOrigin) {
+    // truthy check, not `=== true`: reject "true"/1/etc. too (defense-in-depth;
+    // the origin check above is the primary guard).
     throw new Error('crossOrigin assertion rejected');
   }
 
@@ -71,8 +73,13 @@ async function verifyCoseSignature(
 ): Promise<void> {
   const map = decodeCborMap(coseKey);
   const alg = map.get(3); // alg
+  const kty = map.get(1); // key type
+  const crv = map.get(-1); // curve
   if (alg === -7) {
-    // ES256 — P-256 ECDSA with SHA-256
+    // ES256 — P-256 ECDSA with SHA-256. Pin kty=EC2(2) + crv=P-256(1) so an
+    // enrolled key's material can't be reinterpreted under the wrong algorithm.
+    if (kty !== 2) throw new Error('COSE: ES256 requires kty=EC2');
+    if (crv !== 1) throw new Error('COSE: ES256 requires crv=P-256');
     const xBytes = expectBytes(map.get(-2), 'x');
     const yBytes = expectBytes(map.get(-3), 'y');
     const uncompressed = new Uint8Array(65);
@@ -86,7 +93,9 @@ async function verifyCoseSignature(
       { name: 'ECDSA', hash: 'SHA-256' }, key, rawSig, signedData);
     if (!ok) throw new Error('P-256 signature verification failed');
   } else if (alg === -8) {
-    // EdDSA — Ed25519
+    // EdDSA — Ed25519. Pin kty=OKP(1) + crv=Ed25519(6).
+    if (kty !== 1) throw new Error('COSE: EdDSA requires kty=OKP');
+    if (crv !== 6) throw new Error('COSE: EdDSA requires crv=Ed25519');
     const xBytes = expectBytes(map.get(-2), 'x');
     const key = await crypto.subtle.importKey(
       'raw', xBytes, { name: 'Ed25519' }, false, ['verify']);
@@ -103,26 +112,32 @@ function derToRaw(der: Uint8Array): Uint8Array {
   let offset = 0;
   if (der[offset++] !== 0x30) throw new Error('DER: not a SEQUENCE');
   // Length (skip long-form)
-  const lenByte = der[offset++]!;
+  const lenByte = der[offset++];
+  if (lenByte === undefined) throw new Error('DER: truncated');
   if (lenByte & 0x80) offset += lenByte & 0x7f;
 
+  // Read one INTEGER, returning its big-endian value bytes (≤ 32). Bounds-
+  // checked throughout: a malformed length can never produce a negative
+  // TypedArray offset (which would throw RangeError) nor read past the buffer.
+  // Stripping leading-zero pad bytes and shrinking len keeps `offset` invariant
+  // (start+len is unchanged), so the next INTEGER is parsed at the right place.
+  const readInt = (): Uint8Array => {
+    if (der[offset++] !== 0x02) throw new Error('DER: expected INTEGER');
+    let len = der[offset++];
+    if (len === undefined || len < 1) throw new Error('DER: bad INTEGER length');
+    let start = offset;
+    while (len > 1 && der[start] === 0x00) { start++; len--; } // strip leading zero pad
+    if (len > 32) throw new Error('DER: INTEGER exceeds 32 bytes');
+    if (start + len > der.length) throw new Error('DER: INTEGER out of bounds');
+    offset = start + len;
+    return der.slice(start, start + len);
+  };
+
+  const r = readInt();
+  const s = readInt();
   const raw = new Uint8Array(64);
-
-  // Parse r
-  if (der[offset++] !== 0x02) throw new Error('DER: expected INTEGER for r');
-  let rLen = der[offset++]!;
-  let rStart = offset;
-  if (der[rStart] === 0x00) { rStart++; rLen--; } // strip leading zero
-  raw.set(der.slice(rStart, rStart + rLen), 32 - rLen);
-  offset = rStart + rLen;
-
-  // Parse s
-  if (der[offset++] !== 0x02) throw new Error('DER: expected INTEGER for s');
-  let sLen = der[offset++]!;
-  let sStart = offset;
-  if (der[sStart] === 0x00) { sStart++; sLen--; } // strip leading zero
-  raw.set(der.slice(sStart, sStart + sLen), 64 - sLen);
-
+  raw.set(r, 32 - r.length); // left-pad to 32 bytes (len ≤ 32 guaranteed above)
+  raw.set(s, 64 - s.length);
   return raw;
 }
 
