@@ -31,8 +31,7 @@ directory = "pwa"
 # ASSETS.fetch() from the worker at /pwa/* and /<ADMIN_SEG>/pwa/*.
 # run_worker_first disables Cloudflare's default static-first routing so all
 # requests hit the worker (admin assets stay behind Cloudflare Access).
-# Place pwa/libsodium.js before deploying (copy from sodium.js npm package or
-# download the pre-built sumo bundle from libsodium.gitbook.io).
+# pwa/libsodium.js is vendored/committed (ISC); see pwa/libsodium.README to refresh it.
 binding = "ASSETS"
 run_worker_first = true
 

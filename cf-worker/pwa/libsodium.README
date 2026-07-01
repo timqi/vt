@@ -1,10 +1,17 @@
-Place libsodium.js (sumo build) here before deploying.
+libsodium.js is vendored (committed) in this directory as `libsodium.js`.
 
-Download: https://github.com/jedisct1/libsodium.js/releases
-File: sodium.js from the "sumo" package (includes crypto_box_seal).
+It is the "sumo" build of libsodium.js (includes crypto_box_seal), used by
+approve.js to seal DEKs to the daemon's X25519 public key.
 
-Or install via npm and copy:
+- Upstream:  https://github.com/jedisct1/libsodium.js
+- Package:   libsodium-wrappers-sumo
+- License:   ISC — see THIRD_PARTY_LICENSES in this directory.
+- Size:      ~2MB (minified bundle).
+
+To refresh it from upstream:
+
   npm install libsodium-wrappers-sumo
   cp node_modules/libsodium-wrappers-sumo/dist/modules/libsodium-wrappers-sumo.js ./libsodium.js
 
-The file is ~2MB and not committed to the repo.
+(Or download sodium.js from the "sumo" package at
+https://github.com/jedisct1/libsodium.js/releases and place it here.)

@@ -71,7 +71,7 @@ cf-worker/            TypeScript Cloudflare Worker + PWA
     ├── icon.svg      key-themed app icon (vector master + tab favicon)
     ├── icon-512.png  512×512 app icon (iOS home-screen / PWA install)
     ├── admin/        audit + Passkey pages (Access-gated): audit.js, setup.js, cbor.js, admin.css
-    └── libsodium.js  (not committed — see pwa/libsodium.README)
+    └── libsodium.js  (vendored/committed, ISC — see pwa/libsodium.README + THIRD_PARTY_LICENSES)
 ```
 
 The admin tab labelled **Passkey** (route `/<ADMIN_SEG>/setup`, `setup.js`)
@@ -318,7 +318,7 @@ secret is protected.
 ```bash
 cd cf-worker
 npm install
-# Place pwa/libsodium.js (see pwa/libsodium.README)
+# pwa/libsodium.js is vendored/committed (see pwa/libsodium.README to refresh it)
 wrangler deploy
 # Set secrets (once):
 wrangler secret put VT_AUTH_CF
