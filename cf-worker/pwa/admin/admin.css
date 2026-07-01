@@ -77,7 +77,17 @@ label { display: inline-flex; flex-direction: column; gap: 4px; font-size: 13px;
 #filters { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
 #filters label { margin-right: 0; }
 #filters button { margin: 0; }
+/* Unify the height of every control on the filter bar (selects, text input,
+   buttons) so the left-side inputs and the right-side buttons line up. */
+#filters select, #filters input[type="text"], #filters button {
+  height: 38px; padding-top: 0; padding-bottom: 0;
+}
 #filters .filter-spacer { flex: 1 1 auto; }
+/* Keep the two destructive buttons together as one unit: they wrap to the
+   next line together (right-aligned) instead of one button orphaning onto its
+   own line. */
+#filters .filter-danger { display: flex; gap: 8px; margin-left: auto; }
+#filters .filter-danger button { margin: 0; }
 td.cache-expired { color: var(--muted); }
 
 /* Page header */
@@ -150,11 +160,11 @@ tbody tr:hover { background: var(--panel-2); }
    max-width on the inline-block span works regardless of table-layout; the
    full value is still in the detail dialog + the native title tooltip. */
 .trunc { display: inline-block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; max-width: 100%; }
-.trunc.col-host { max-width: 180px; }
-.trunc.col-cmd  { max-width: 420px; }
+.trunc.col-host { max-width: 120px; }
+.trunc.col-cmd  { max-width: 240px; }
 @media (max-width: 640px) {
-  .trunc.col-host { max-width: 120px; }
-  .trunc.col-cmd  { max-width: 200px; }
+  .trunc.col-host { max-width: 90px; }
+  .trunc.col-cmd  { max-width: 150px; }
 }
 
 tbody tr.clickable { cursor: pointer; }

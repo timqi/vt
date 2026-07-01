@@ -590,20 +590,16 @@ function buildAuditPage(): string {
         <option value="cache">带缓存的记录</option>
       </select></label>
       <label>主机 <input id="f-host" type="text" placeholder="host"></label>
-      <label>来源 <select id="f-source">
-        <option value="">全部</option>
-        <option value="ceremony">ceremony</option>
-        <option value="cache">cache</option>
-        <option value="agent">agent</option>
-      </select></label>
       <button id="apply" type="button">查询</button>
       <button id="filter-cache" type="button" class="ghost">带缓存</button>
       <span class="filter-spacer"></span>
-      <button id="clear-all-cache" type="button" class="danger">清除所有 DEK 缓存</button>
-      <button id="clear-audit" type="button" class="danger">清空全部审计</button>
+      <div class="filter-danger">
+        <button id="clear-all-cache" type="button" class="danger">清除 DEK 缓存</button>
+        <button id="clear-audit" type="button" class="danger">清空审计</button>
+      </div>
     </section>
     <div id="table-wrap"><table id="audit"><thead><tr>
-      <th>时间</th><th>状态</th><th>来源</th><th>主机</th><th>命令</th><th>IP</th><th>DEK</th><th>缓存</th><th>延迟ms</th><th>操作</th>
+      <th>时间</th><th>状态</th><th>主机</th><th>命令</th><th>IP</th><th>DEK</th><th>缓存</th><th>操作</th>
     </tr></thead><tbody id="rows"></tbody></table></div>
     <section id="actions">
       <button id="more" type="button">加载更多</button>

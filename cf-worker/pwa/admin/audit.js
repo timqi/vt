@@ -123,7 +123,6 @@
       tr.setAttribute('data-id', r.id);
       cell(tr, fmtTime(r.created_ms));
       var st = document.createElement('td'); st.appendChild(statusBadge(r)); tr.appendChild(st);
-      cell(tr, r.source || 'ceremony');
       cellClipped(tr, r.host, 'col-host');
       cellClipped(tr, commandSummary(r.command, 200), 'col-cmd');
       cell(tr, r.ip);
@@ -141,7 +140,6 @@
         cc.textContent = '—';
       }
       tr.appendChild(cc);
-      cell(tr, r.latency_ms);
       // 操作: a "清除缓存" button on approvals that armed a still-live cache.
       var act = document.createElement('td');
       if (hasLiveCache(r)) {
@@ -252,10 +250,8 @@
     u.searchParams.set('limit', '100');
     var st = document.getElementById('f-status').value;
     var host = document.getElementById('f-host').value.trim();
-    var src = document.getElementById('f-source').value;
     if (st) u.searchParams.set('status', st);
     if (host) u.searchParams.set('host', host);
-    if (src) u.searchParams.set('source', src);
     if (more && oldestId !== null) u.searchParams.set('before_id', String(oldestId));
     return u.toString();
   }

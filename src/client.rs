@@ -1197,7 +1197,13 @@ pub async fn inject(
         let normalized = collapse_whitespace(&raw_command);
         let redacted = redact_vt_urls(&normalized, "vt://***");
         original_command.push_str("\ncmd: ");
-        original_command.push_str(&sanitize_for_display(&redacted, 80));
+        // Keep the full command in the audit/approval record (the detail dialog
+        // renders it verbatim). The Touch ID prompt re-caps per line
+        // (PROMPT_COMMAND_MAX_LINE_LEN) and the whole request body is bounded by
+        // PROMPT_DISPLAY_MAX_BYTES (8 KiB) / CEREMONY_POST_MAX_BYTES, so a
+        // generous cap here shows real commands in full without truncating to
+        // "gh api…".
+        original_command.push_str(&sanitize_for_display(&redacted, 1024));
     }
     if let Some(r) = reason {
         original_command.push_str("\nreason: ");
