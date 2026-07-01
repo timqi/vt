@@ -1,6 +1,6 @@
 [package]
 name = "vt"
-version = "2.0.1"
+version = "2.3.0"
 edition = "2021"
 license = "MIT"
 description = "Single-binary KMS with Touch ID / passkey approval — no plaintext secrets at rest, explicit authentication everywhere."
