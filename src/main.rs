@@ -152,9 +152,9 @@ enum Commands {
     },
 
     /// AI-agent command hook. Reads an agent's proposed shell command and,
-    /// per the `[[hook.rules]]` whitelist in config.toml, accepts it, blocks
-    /// it, or rewrites it to run under `vt inject` so vt:// secrets in the
-    /// environment are transparently decrypted. See `docs/hook.md`.
+    /// per the `[[rules]]` whitelist in ~/.config/vt/agent.toml, accepts it,
+    /// blocks it, or rewrites it to run under `vt inject` so vt:// secrets in
+    /// the environment are transparently decrypted. See `docs/hook.md`.
     #[command(subcommand)]
     Hook(HookCommands),
 
@@ -226,8 +226,9 @@ pub enum HookCommands {
         )]
         argv: Vec<String>,
     },
-    /// Generate PATH shims (one per command named in agent.toml) that route
-    /// through `vt hook exec`, then print the line to prepend to PATH. Works in
+    /// Generate PATH shims (symlinks to vt, one per command and per launcher
+    /// leading token in ~/.config/vt/agent.toml) that route through the
+    /// exec-gateway, then print the line to prepend to PATH. Works in
     /// interactive shells, scripts, and non-interactive (agent) shells.
     InstallShims {
         #[arg(
