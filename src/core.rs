@@ -61,6 +61,23 @@ pub fn sanitize_for_display(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// Like `sanitize_for_display_multiline` but WITHOUT length / line-count caps:
+/// strips control chars and preserves `\n` only, never truncates or appends an
+/// ellipsis. Used for the `command` field so a long command is shown in full on
+/// the approval / audit surfaces. The overall ceremony request body is already
+/// bounded (256 KiB, `CEREMONY_POST_MAX_BYTES` on the Worker), which is the real
+/// size guard — so this cannot be abused into an unbounded payload.
+pub fn sanitize_for_display_uncapped(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.extend(line.chars().filter(|c| !c.is_control()));
+    }
+    out
+}
+
 /// Like `sanitize_for_display` but preserves `\n`. Caps line count to bound
 /// the rendered dialog height against a hostile peer pushing it off-screen.
 pub fn sanitize_for_display_multiline(

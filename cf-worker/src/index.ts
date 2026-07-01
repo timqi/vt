@@ -39,6 +39,13 @@ const FAVICON_TAGS =
 // pwa/admin/ regardless of this value.
 const ADMIN_SEG = 'kestrel';
 
+// Cache-busting token appended (?v=…) to admin/PWA asset URLs. Bump on any
+// change to a shipped .css/.js so browsers fetch the new file instead of a
+// stale far-future-cached copy. (Workers Assets serves static files with a
+// cacheable response; without a versioned URL a changed audit.js can refresh
+// while admin.css stays stale, which desyncs markup from styles.)
+const ASSET_VER = '20260701-2';
+
 // Escape a JSON string for safe embedding in a <script type="application/json"> block.
 function escapeJsonForHtml(obj: unknown): string {
   return JSON.stringify(obj)
@@ -62,15 +69,15 @@ function capMeta(v: unknown, max: number): string {
   return cleaned.length <= max ? cleaned : cleaned.slice(0, max) + '…';
 }
 
-// Variant that preserves `\n` for the multi-line `command` body the CLI
-// builds (`op: …\nfile: …\ncmd: …\nreason: …`). Per-line cap + total line
-// cap mirror the SSH-agent's `PROMPT_COMMAND_MAX_*` so the same input
-// renders the same height on Touch ID and on the approval page.
-function capMetaMultiline(v: unknown, maxCharsPerLine: number, maxLines: number): string {
+// For the multi-line `command` body the CLI builds (`op: …\ncmd: …\nreason: …`):
+// sanitize but do NOT truncate — strip control chars EXCEPT newline (0x0a), so a
+// long command renders in full on the approval / audit surfaces. The ceremony
+// request body is already bounded (CEREMONY_POST_MAX_BYTES = 256 KiB), which is
+// the real size guard — so this is not an unbounded-payload risk.
+function sanitizeMultilineUncapped(v: unknown): string {
   if (typeof v !== 'string') return '';
-  return v.split('\n').slice(0, maxLines)
-    .map(line => capMeta(line, maxCharsPerLine))
-    .join('\n');
+  // eslint-disable-next-line no-control-regex
+  return v.replace(/[\x00-\x09\x0b-\x1f\x7f\u2028\u2029]/g, '');
 }
 
 // Build a sanitized ChallengeMeta from an untrusted client `meta` body. Shared
@@ -80,7 +87,7 @@ function capMetaMultiline(v: unknown, maxCharsPerLine: number, maxLines: number)
 function capChallengeMeta(raw: Partial<ChallengeMeta> | undefined, connectingIp: string | undefined): ChallengeMeta {
   return {
     op_kind:    capMeta(raw?.op_kind, 32),
-    command:    capMetaMultiline(raw?.command, 120, 6),
+    command:    sanitizeMultilineUncapped(raw?.command),
     host:       capMeta(raw?.host, 100),
     user:       capMeta(raw?.user, 64),
     pwd:        capMeta(raw?.pwd, 200),
@@ -567,7 +574,7 @@ function buildAuditPage(): string {
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>VT 审计</title>
   ${FAVICON_TAGS}
-  <link rel="stylesheet" href="${base}/pwa/admin.css">
+  <link rel="stylesheet" href="${base}/pwa/admin.css?v=${ASSET_VER}">
 </head>
 <body>
   <main>
@@ -607,7 +614,7 @@ function buildAuditPage(): string {
     <button id="detail-close" type="button" aria-label="关闭">×</button>
     <dl id="detail-dl"></dl>
   </div></div>
-  <script src="${base}/pwa/audit.js"></script>
+  <script src="${base}/pwa/audit.js?v=${ASSET_VER}"></script>
 </body>
 </html>`;
 }
@@ -627,7 +634,7 @@ function buildSetupPage(rpId: string, credentialsJson: string): string {
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>VT — Passkey 管理</title>
   ${FAVICON_TAGS}
-  <link rel="stylesheet" href="${adminBase}/pwa/admin.css">
+  <link rel="stylesheet" href="${adminBase}/pwa/admin.css?v=${ASSET_VER}">
 </head>
 <body>
   <script type="application/json" id="vt-data">${dataJson}</script>
@@ -705,8 +712,8 @@ function buildSetupPage(rpId: string, credentialsJson: string): string {
     </section>
   </main>
   <script src="${pwaBase}/common.js"></script>
-  <script src="${adminBase}/pwa/cbor.js"></script>
-  <script src="${adminBase}/pwa/setup.js"></script>
+  <script src="${adminBase}/pwa/cbor.js?v=${ASSET_VER}"></script>
+  <script src="${adminBase}/pwa/setup.js?v=${ASSET_VER}"></script>
 </body>
 </html>`;
 }
@@ -727,7 +734,7 @@ function buildChannelsPage(pushoverSet: boolean, slackSet: boolean): string {
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>VT — 推送渠道</title>
   ${FAVICON_TAGS}
-  <link rel="stylesheet" href="${adminBase}/pwa/admin.css">
+  <link rel="stylesheet" href="${adminBase}/pwa/admin.css?v=${ASSET_VER}">
 </head>
 <body>
   <script type="application/json" id="vt-data">${dataJson}</script>
@@ -793,7 +800,7 @@ function buildChannelsPage(pushoverSet: boolean, slackSet: boolean): string {
     <section id="output-section" hidden></section>
   </main>
   <script src="${pwaBase}/common.js"></script>
-  <script src="${adminBase}/pwa/channels.js"></script>
+  <script src="${adminBase}/pwa/channels.js?v=${ASSET_VER}"></script>
 </body>
 </html>`;
 }

@@ -145,6 +145,18 @@ th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--bor
 th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel-2); }
 tbody tr:hover { background: var(--panel-2); }
 
+/* Cap the 主机 / 命令 columns so a long host or command truncates with an
+   ellipsis instead of widening the table into horizontal scroll. Fixed px
+   max-width on the inline-block span works regardless of table-layout; the
+   full value is still in the detail dialog + the native title tooltip. */
+.trunc { display: inline-block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; max-width: 100%; }
+.trunc.col-host { max-width: 180px; }
+.trunc.col-cmd  { max-width: 420px; }
+@media (max-width: 640px) {
+  .trunc.col-host { max-width: 120px; }
+  .trunc.col-cmd  { max-width: 200px; }
+}
+
 tbody tr.clickable { cursor: pointer; }
 
 .badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; background: var(--panel-2); color: var(--muted); }

@@ -36,6 +36,20 @@
     return s + 's';
   }
 
+  // Cosmetic, FRONTEND-ONLY: if the command's leading program is an absolute
+  // path (`/usr/bin/foo …`), show just its basename (`foo …`) in the list
+  // column. The stored command keeps the full path — the detail dialog still
+  // renders it verbatim. Only argv[0] is trimmed; path-valued args are left
+  // intact so the command stays unambiguous.
+  function basenameLeadingProgram(s) {
+    var m = /^(\s*)(\/\S*)(.*)$/.exec(s);
+    if (!m) return s;
+    var prog = m[2];
+    var base = prog.slice(prog.lastIndexOf('/') + 1);
+    if (base === '') return s;           // "/" or trailing-slash — leave untouched
+    return m[1] + base + m[3];
+  }
+
   // Column summary for the multi-line command body
   // (`op: …\nfile: …\ncmd: …\nreason: …`). Prefer the `cmd:` line (the actual
   // shell command, e.g. for `inject`); otherwise fall back to the first line.
@@ -43,14 +57,30 @@
     if (!cmd) return '';
     var lines = String(cmd).split('\n');
     for (var i = 0; i < lines.length; i++) {
-      if (lines[i].indexOf('cmd:') === 0) return clip(lines[i].slice(4).trim(), max);
+      if (lines[i].indexOf('cmd:') === 0) return clip(basenameLeadingProgram(lines[i].slice(4).trim()), max);
     }
-    return clip(lines[0], max);
+    return clip(basenameLeadingProgram(lines[0]), max);
   }
 
   function cell(tr, text) {
     var td = document.createElement('td');
     td.textContent = (text === null || text === undefined) ? '' : String(text);
+    tr.appendChild(td);
+  }
+
+  // Width-capped cell: wraps the text in an inline-block span with a fixed
+  // max-width (see .trunc.* in admin.css) so a long host / command truncates
+  // with an ellipsis instead of widening the table into a horizontal scroll.
+  // The full value stays available in the row's detail dialog. `title` gives a
+  // native hover tooltip with the full text.
+  function cellClipped(tr, text, cls) {
+    var td = document.createElement('td');
+    var span = document.createElement('span');
+    span.className = 'trunc ' + cls;
+    var s = (text === null || text === undefined) ? '' : String(text);
+    span.textContent = s;
+    if (s) span.title = s;
+    td.appendChild(span);
     tr.appendChild(td);
   }
 
@@ -94,8 +124,8 @@
       cell(tr, fmtTime(r.created_ms));
       var st = document.createElement('td'); st.appendChild(statusBadge(r)); tr.appendChild(st);
       cell(tr, r.source || 'ceremony');
-      cell(tr, r.host);
-      cell(tr, commandSummary(r.command, 48));
+      cellClipped(tr, r.host, 'col-host');
+      cellClipped(tr, commandSummary(r.command, 200), 'col-cmd');
       cell(tr, r.ip);
       cell(tr, r.salts);
       // 缓存列: live → TTL label; armed-but-elapsed → grey 过期; never armed → —.
