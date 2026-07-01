@@ -1,6 +1,55 @@
 [tools]
 wrangler = "latest"
 
-[env]
-CLOUDFLARE_API_TOKEN = "vt://0k9C3y3bqpxt0DnH-gSF7tKrOOhR-vusdgxrCI2RswByL9XeaGbu_YZO4R2dKC1ZVwM-65o_Nb4I5c_qfQJFJ9TicWwmguPcrJZqLlWakdZ1zGG1fOQ"
-CLOUDFLARE_ACCOUNT_ID = "vt://0-CuqtzN8ln25ZsuSM-sHNT1c06uDq-u6gWR48pnmms47iMOmuOdZdMd2UxeYn0Vf99TVcosakUSazsjs8NVZqg"
+[tasks.init-linux]
+run = """
+sudo apt update -y
+sudo apt install -y musl-tools build-essential pkg-config
+rustup target add x86_64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-gnu
+"""
+
+[tasks.build]
+run = "cargo build --release --bin vt"
+
+# Fully static Linux build via musl. Output: target/x86_64-unknown-linux-musl/release/vt
+# CC lets `ring` (via rustls) compile its C/asm for musl. Do NOT override the
+# LINKER to musl-gcc: rustc's self-contained musl linking already bundles the
+# correct musl CRT + rust-lld; adding musl-gcc injects gcc's own Scrt1.o, the
+# binary then double-inits the C runtime and segfaults on TLS before main.
+[tasks.build-musl]
+description = "Static Linux build via musl → target/x86_64-unknown-linux-musl/release/vt"
+env = { CC_x86_64_unknown_linux_musl = "musl-gcc" }
+run = "cargo build --release --bin vt --target x86_64-unknown-linux-musl"
+
+[tasks.install]
+run = """
+if [ "$(uname -s)" = "Linux" ]; then
+  mise run build-musl
+  BIN=target/x86_64-unknown-linux-musl/release/vt
+else
+  mise run build
+  BIN=target/release/vt
+fi
+mkdir -p ~/.local/bin
+rm -f ~/.local/bin/vt
+cp "$BIN" ~/.local/bin/vt
+echo "installed: ~/.local/bin/vt ($(du -h ~/.local/bin/vt | cut -f1))"
+"""
+
+[tasks.check]
+run = """
+cargo check
+cargo check --target x86_64-unknown-linux-gnu
+"""
+
+[tasks.deploy-worker]
+dir = "cf-worker"
+run = "wrangler deploy"
+
+[tasks.ssh]
+run = """
+ssh -A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
+  -i .vagrant/machines/default/libvirt/private_key \\
+  vagrant@192.168.121.242
+"""
