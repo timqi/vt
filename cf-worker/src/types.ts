@@ -221,9 +221,11 @@ export interface DekCacheRequest {
   /** salts to look up; empty array is rejected (returns miss). */
   salts_b64u: string[];
   timestamp_ms: number;
-  /** Full display meta (same shape as the challenge request). `meta.ppid` is the
-   *  PPID half of the cache binding ctx; the rest is stored on the hit audit row
-   *  so a cache hit carries the same context as a ceremony decrypt. */
+  /** Full display meta (same shape as the challenge request). `meta.pwd` is the
+   *  client-reported half of the cache binding ctx (ctx = IP + pwd); IP is the
+   *  worker-derived hard boundary. `meta.ppid` is forensic-only. The rest is
+   *  stored on the hit audit row so a cache hit carries the same context as a
+   *  ceremony decrypt. */
   meta?: Partial<ChallengeMeta>;
 }
 
@@ -235,8 +237,9 @@ export type DekCacheResponse =
   | { miss: true };
 
 /** A single cached DEK in DO storage, keyed `dek:{ctx}:{salt_b64u}` where
- *  ctx = b64u(SHA-256("vt-dek-ctx-v2" || ip)). (v2 is IP-only; the v1 ppid
- *  component was removed — see docs/dek-cache.md §2.5.) */
+ *  ctx = b64u(SHA-256("vt-dek-ctx-v3" || len(ip) || ip || pwd)). (v3 binds IP +
+ *  pwd; v2 was IP-only; the v1 ppid component was removed — see
+ *  docs/dek-cache.md §2.5.) */
 export interface CacheEntry {
   /** crypto_box_seal(DEK_raw, CACHE_PUBKEY) — Worker opens with CACHE_SECKEY. */
   sealed_to_cache_b64u: string;

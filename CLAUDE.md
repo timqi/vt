@@ -6,18 +6,24 @@ on-demand via a phone WebAuthn ceremony.
 
 **Opt-in DEK cache (off by default).** The approver may grant a short TTL
 (8m / 20m / 2h) at approval time; within that window, decrypt requests for the
-same records from the **same source IP** are served from a server-side cache
-**without a phone approval**. This deliberately trades the "every decrypt needs
-the phone" guarantee for convenience: in the window, those records collapse to a
-single factor (possession of `VT_PASSKEY_TOKEN`) for a caller behind the same
-egress IP. IP binding (worker-derived from `CF-Connecting-IP`, unspoofable by
-the client) is the sole binding factor and defeats token exfiltration to another
-host. (A previous build also folded in the client-reported parent PID as
-advisory blast-radius reduction; it was **removed** — PPID is both spoofable, so
-it never widened the real boundary, and unstable across orchestrated callers
-like Claude Code / CI / make that spawn a fresh shell per command, so the cache
-never hit. The reported `ppid` is now forensic-only: stored on each entry + audit
-row, not part of the cache key.) On the cache hit, a real-time notice is also
+same records from the **same source IP and same working directory** are served
+from a server-side cache **without a phone approval**. This deliberately trades
+the "every decrypt needs the phone" guarantee for convenience: in the window,
+those records collapse to a single factor (possession of `VT_PASSKEY_TOKEN`) for
+a caller behind the same egress IP in the same cwd. The cache key `ctx` binds
+two factors: (1) **IP** (worker-derived from `CF-Connecting-IP`, unspoofable by
+the client) — the **hard boundary** that defeats token exfiltration to another
+host; and (2) the client-reported **`pwd`** — an **advisory** same-host
+blast-radius reducer, so a cached grant for one project tree does not serve a
+decrypt from an unrelated directory. `pwd` is client-reported (a fully
+compromised local host can spoof it, so it never widens the real IP boundary),
+but unlike the removed PPID it is **stable** across orchestrated callers (Claude
+Code / CI / make / tmux spawn a fresh shell per command from the same project
+dir), so the cache still hits. (A previous build folded in the client-reported
+parent PID instead of pwd; it was **removed** — PPID is both spoofable AND
+*unstable* — `getppid()` changed every call so the cache never hit. The reported
+`ppid` is now forensic-only: stored on each entry + audit row, not part of the
+cache key.) On the cache hit, a real-time notice is also
 pushed to any configured Pushover/Slack channel (best-effort, fire-and-forget).
 Default is 0 (no cache, historical behaviour); caching is fully disabled unless
 the `CACHE_SECKEY` worker secret is set. Every cache read (hit/miss) is audited.

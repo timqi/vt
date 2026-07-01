@@ -41,38 +41,40 @@ DEK 之所以 worker 拿不到，是因为 PWA 用 `crypto_box_seal(deks, daemon
 
 > 决策点①：是否接受该取舍？若不可接受，应改为**客户端本地缓存**（见 §7 备选 B），但那与"另一进程免审批"和"服务端 KV"诉求冲突，需要重新对齐需求。
 
-## 2.5 缓存绑定仅 IP（曾含 PPID，已移除）
+## 2.5 缓存绑定 IP + PWD（曾含 PPID，已移除）
 
-缓存条目不再只按 salt 全局有效，而是**绑定到首次审批时发起方的源 IP**。`/api/dek-cache` 命中要求请求方的 **IP 与审批时记录的一致**（不同即视为未命中，回退手机审批）。
+缓存条目不再只按 salt 全局有效，而是**绑定到首次审批时发起方的源 IP 及其工作目录（pwd）**。`/api/dek-cache` 命中要求请求方的 **IP 与审批时记录的一致，且 pwd 一致**（任一不同即视为未命中，回退手机审批）。
 
-**为什么只挂 IP（曾经的 PPID 已移除）：**
+**两个绑定项：**
 
 | 绑定项 | 来源 | 可信度 | 实际防住什么 |
 |---|---|---|---|
 | **IP** | worker 从 `CF-Connecting-IP` 取（**客户端无法伪造**，沿用 `index.ts` 现有做法） | **强（硬边界）** | token 被偷到**另一台机器/另一个出口 IP** 后无法命中缓存——这是真正有意义的边界 |
+| **PWD** | 客户端在请求体 `meta.pwd` 上报（`std::env::current_dir()`，`capChallengeMeta` 截断 200 字节） | **弱（advisory）** | 同主机上从**无关目录**发起的解密不再命中——把爆炸半径从「整个 egress IP」收窄到「该 IP + 该项目目录」 |
 | **~~PPID~~（已移除）** | ~~客户端在请求体里上报的数字~~ | ~~弱（advisory）~~ | 移除原因见下 |
 
-**PPID 被移除的两个原因**：
-1. **不可信**：客户端在请求体里上报、worker 无法独立核验，本机攻击者能照样上报正确值 → 从未真正扩大边界，只是制造「有额外保护」的错觉。
-2. **不稳定**：编排器（Claude Code / CI / make / tmux）每条命令都 fork 一个新 shell，`getppid()` 每次都变 → 同一逻辑会话内缓存几乎永远不命中（实测:无 tty、每命令 `setsid`,`getppid`/`getsid` 全变,唯一稳定的只有内核 audit sessionid 与 IP）。
+**PWD 与被移除的 PPID 有一处关键区别——稳定性：**
+- PWD 与 PPID **同样**是客户端上报、worker 无法独立核验的 advisory 值，本机攻击者都能伪造 → 都**不扩大** IP 这条真正的硬边界。
+- 但 PWD 在编排器（Claude Code / CI / make / tmux）下**稳定**：这些工具虽每条命令 fork 新 shell（`getppid()` 每次都变，导致 PPID 从不命中），但 cwd 通常固定在项目目录 → 同一逻辑会话内 pwd 不变，缓存正常命中。这正是 PPID 做不到、PWD 能做到的。
 
-诚实结论:**IP 绑定是唯一也是真正的硬边界**。去掉 PPID 后,窗口内有效保证 = **同一 egress IP + 持有 `VT_PASSKEY_TOKEN` + TTL 未过**——这正是本文档一贯声明的那条保证,实现与模型现在完全对齐。
+诚实结论:**IP 仍是唯一的硬边界**；PWD 只在同一 IP 内**进一步收窄**爆炸半径，绝不放宽。窗口内有效保证 = **同一 egress IP + 同一 pwd + 持有 `VT_PASSKEY_TOKEN` + TTL 未过**。
 
-**接受的取舍**:窗口内绑定粒度 = 整个 egress IP,**不再区分同主机内的进程**。即同主机上另一个持有 token 的进程,在 TTL 窗口内能免审批命中同一批记录。但它既然持有 token 本就能自行发起审批,缓存只是省掉那一次手机点击,而授予 TTL 的审批者已显式接受此权衡。要收紧爆炸半径,用更短的 TTL 或事后在审计页「清除缓存」。
+**接受的取舍**:窗口内绑定粒度 = egress IP + 工作目录。同主机、同 IP、**同目录**下另一个持有 token 的进程,在 TTL 窗口内仍能免审批命中同一批记录（它既然持有 token 本就能自行发起审批,缓存只是省掉那一次手机点击）。要收紧爆炸半径,用更短的 TTL 或事后在审计页「清除缓存」。
 
 **命中条件的运维注意（否则会"缓存不生效"）：**
-- **稳定的出口 IP 族**：cache ctx 绑定 `CF-Connecting-IP`。双栈主机若在两次请求间在 IPv4/IPv6 间漂移，worker 看到的 IP 不同 → ctx 不同 → 不命中。客户端已统一通过 `cf_post()` 固定走 IPv4（IPv6-only 主机自动回退 IPv6），消除这种漂移。**IP 现在是唯一绑定项,这条比以往更关键。**
+- **稳定的出口 IP 族**：cache ctx 绑定 `CF-Connecting-IP`。双栈主机若在两次请求间在 IPv4/IPv6 间漂移，worker 看到的 IP 不同 → ctx 不同 → 不命中。客户端已统一通过 `cf_post()` 固定走 IPv4（IPv6-only 主机自动回退 IPv6），消除这种漂移。
+- **稳定的 pwd**：审批与后续解密必须在**同一工作目录**发起。切换 cwd（或 pwd 超过 200 字节被截断后不一致）→ ctx 不同 → 不命中。审批与命中两侧都经 `capChallengeMeta(pwd, 200)`，取值一致。
 - **必须配置 `CACHE_SECKEY` 且审批时选了 >0 时长**：未配置 secret 时审批页根本不显示时长选项、缓存全程禁用；默认 0 不缓存。
-- 诊断：缓存命中/清除/写入失败都在 admin「审计」页（类型=DEK缓存\*，op_kind='cache'），授予过缓存的审批行在「缓存」列显示 TTL/「过期」、并带「清除缓存」按钮；「带缓存」过滤一键筛出。审计行仍展示 IP/PPID（PPID 仅供取证,不参与绑定）。（注：未命中**不**写审计，只进 CF 日志 `cache.miss`。）
+- 诊断：缓存命中/清除/写入失败都在 admin「审计」页（类型=DEK缓存\*，op_kind='cache'），授予过缓存的审批行在「缓存」列显示 TTL/「过期」、并带「清除缓存」按钮；「带缓存」过滤一键筛出。审计行展示 IP/PWD/PPID（PPID 仅供取证,不参与绑定）。（注：未命中**不**写审计，只进 CF 日志 `cache.miss`。）
 
-绑定上下文取自**首次 `/api/challenge` 的客户端**（不是手机）：审批时把 `ch.meta.ip` 写进缓存条目（`ch.meta.ppid` 仍冗余存,仅审计用）。
+绑定上下文取自**首次 `/api/challenge` 的客户端**（不是手机）：审批时把 `ch.meta.ip` 与 `ch.meta.pwd` 编进缓存键 ctx（`ch.meta.ppid` 仍冗余存,仅审计用）。
 
 ## 3. 缓存键、粒度与存储位置
 
-- **缓存单元 = 单个 DEK，键含上下文：`dek:{ctx}:{salt_b64u}`**，其中 `ctx = b64u(SHA-256("vt-dek-ctx-v2" || ip_utf8))`（tag 由 v1→v2:旧版含 ppid_le,现已移除）。
+- **缓存单元 = 单个 DEK，键含上下文：`dek:{ctx}:{salt_b64u}`**，其中 `ctx = b64u(SHA-256("vt-dek-ctx-v3" || len_be32(ip) || ip_utf8 || pwd_utf8))`（tag 演进 v1→v2→v3:v1 含 ppid_le 已移除,v2 仅 IP,v3 增加 pwd）。IP 做定长前缀避免 `(ip,pwd)` 拼接歧义。
   - `DEK = HKDF(master_key, salt, "vt-dek-v2")`，salt（vt:// URL 里携带，16 字节随机）唯一决定 DEK，按 salt 收敛到被审批记录。
-  - 把 IP 编进键的好处：(1) 不同 IP 上下文不会相互覆盖；(2) 读取时直接按"本次请求的 ctx + salt"取，命中即天然满足绑定，无需"取出再比对"的分支；(3) 不同 ctx 下的同一 salt 一律表现为 miss，**不产生 oracle**。
-  - 条目里仍冗余存原始 `ip`/`ppid`/`ppid_cmd` 供审计展示（`ppid` 仅取证,不参与键）。
+  - 把 IP + pwd 编进键的好处：(1) 不同 IP/目录上下文不会相互覆盖；(2) 读取时直接按"本次请求的 ctx + salt"取，命中即天然满足绑定，无需"取出再比对"的分支；(3) 不同 ctx 下的同一 salt 一律表现为 miss，**不产生 oracle**。
+  - 条目里仍冗余存原始 `ip`/`ppid`/`ppid_cmd` 供审计展示（`ppid` 仅取证,不参与键；pwd 已在键内，审计行由 challenge meta 展示）。
 - **只对解密有意义。** 加密每次生成新随机 salt（`client.rs:500`），永远不会命中缓存；auth-only（`salts=[]`）无 DEK，不涉及。符合需求"请求解密时先查缓存"。
 - **存储位置：优先 DO storage，不用 KV。** 理由：
   - `AccountDO` 是账号级单例，已有 storage + alarm 清扫器 + SQLite 审计表，TTL 清理可直接复用 `alarm()`（`do_account.ts:226`）。

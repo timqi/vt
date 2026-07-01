@@ -34,26 +34,42 @@ const AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 // absence of a write. The PWA's radio options are [0, ...this] (see opPageData).
 const CACHE_TTL_WHITELIST = new Set([8 * 60, 20 * 60, 2 * 60 * 60]);
 
-// DEK cache entry key. ctx binds the entry to the requester's worker-derived IP
-// ONLY (CF-Connecting-IP — unspoofable by the client). A lookup recomputes ctx
-// from that same IP, so a different egress IP finds no key (a clean miss, no
-// oracle).
+// DEK cache entry key. ctx binds the entry to (a) the requester's worker-derived
+// IP (CF-Connecting-IP — unspoofable by the client, the hard boundary) AND (b)
+// the client-reported working directory (pwd). A lookup recomputes ctx from the
+// same IP + pwd, so a request from a different egress IP OR a different cwd finds
+// no key (a clean miss, no oracle).
 //
-// History: ctx used to also fold in the client-reported parent PID as an
-// advisory same-host blast-radius reducer. That input was dropped (tag bumped
-// v1→v2) because PPID is BOTH spoofable (client-reported, so it never widened
-// the real boundary) AND unstable — orchestrators (Claude Code, CI, make, tmux)
-// spawn a fresh shell per command, so getppid() changes every call and the
-// cache never hit. The effective guarantee is now exactly what docs always
-// promised: within the TTL, possession of VT_PASSKEY_TOKEN behind the SAME
-// egress IP. ppid is still recorded on each entry + audit row for forensics.
-async function cacheCtx(ip: string): Promise<string> {
+// pwd is CLIENT-REPORTED, so — like the removed ppid — it is advisory: a fully
+// compromised local host can spoof it, so it does not widen the real (IP) hard
+// boundary. Its value is same-host blast-radius reduction: a process decrypting
+// from an UNRELATED directory misses the cache, so a cached grant for one project
+// tree does not silently serve another. Crucially — and unlike ppid — pwd is
+// STABLE across orchestrated callers (Claude Code, CI, make, tmux) that spawn a
+// fresh shell per command from the same project dir, so the cache still hits.
+//
+// History: ctx v1 folded in the client-reported parent PID; that was dropped
+// (v1→v2) because ppid is BOTH spoofable AND unstable (getppid() changes every
+// call under orchestrators, so the cache never hit). ppid is still recorded on
+// each entry + audit row for forensics. v2→v3 adds pwd. The effective hard
+// guarantee is unchanged: within the TTL, possession of VT_PASSKEY_TOKEN behind
+// the SAME egress IP; pwd only narrows it further, it never widens it.
+async function cacheCtx(ip: string, pwd: string): Promise<string> {
   const enc = new TextEncoder();
-  const tag = enc.encode('vt-dek-ctx-v2');
+  const tag = enc.encode('vt-dek-ctx-v3');
   const ipBytes = enc.encode(ip);
-  const buf = new Uint8Array(tag.length + ipBytes.length);
-  buf.set(tag, 0);
-  buf.set(ipBytes, tag.length);
+  const pwdBytes = enc.encode(pwd);
+  // Length-prefix the IP so (ip="a", pwd="bc") and (ip="ab", pwd="c") can't
+  // collide into the same digest. IP has no NUL, so a NUL separator is
+  // unambiguous, but an explicit u32 length is simplest and future-proof.
+  const lenPrefix = new Uint8Array(4);
+  new DataView(lenPrefix.buffer).setUint32(0, ipBytes.length, false);
+  const buf = new Uint8Array(tag.length + lenPrefix.length + ipBytes.length + pwdBytes.length);
+  let o = 0;
+  buf.set(tag, o); o += tag.length;
+  buf.set(lenPrefix, o); o += lenPrefix.length;
+  buf.set(ipBytes, o); o += ipBytes.length;
+  buf.set(pwdBytes, o);
   return b64uEnc(await sha256(buf));
 }
 
@@ -632,10 +648,10 @@ export class AccountDO extends DurableObject<Env> {
     }
 
     const ip = ch.meta.ip ?? '';
-    // ppid is no longer part of the binding ctx (IP-only) — kept solely as a
+    // ppid is not part of the binding ctx (ctx = IP + pwd) — kept solely as a
     // forensic field stored on each cache entry + audit row.
     const ppid = typeof ch.meta.ppid === 'number' ? ch.meta.ppid : 0;
-    const ctx = await cacheCtx(ip);
+    const ctx = await cacheCtx(ip, ch.meta.pwd ?? '');
     const expires = Date.now() + ttlS * 1000;
     const writes: Record<string, CacheEntry> = {};
     for (let i = 0; i < salts.length; i++) {
@@ -675,6 +691,7 @@ export class AccountDO extends DurableObject<Env> {
     // is the sole cache binding ctx. ppid is forensic-only (logged/audited).
     const ip = meta.ip ?? '';
     const ppid = (typeof meta.ppid === 'number' ? meta.ppid : 0) >>> 0;
+    const pwd = meta.pwd ?? '';
     const salts = body.salts_b64u;
     const miss = (): Response => {
       // No audit row for misses (per design): a miss is a routine fallback and
@@ -688,7 +705,7 @@ export class AccountDO extends DurableObject<Env> {
     if (!this.env.CACHE_SECKEY || !this.env.CACHE_SECKEY.trim()) return miss();
     for (const s of salts) { if (!isB64uString(s)) return miss(); }
 
-    const ctx = await cacheCtx(ip);
+    const ctx = await cacheCtx(ip, pwd);
     // Batch the lookups (M2): one storage.get over all keys, so response timing
     // does not leak the position of the first miss.
     const keys = salts.map(s => cacheKey(ctx, s));
