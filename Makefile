@@ -21,9 +21,15 @@ build:
 
 # Fully static Linux build via musl. Output: target/x86_64-unknown-linux-musl/release/vt
 # Requires: rustup target add x86_64-unknown-linux-musl, and musl-gcc on PATH.
+#
+# CC is set so `ring` (pulled in by rustls) can compile its C/asm for the musl
+# target. The LINKER is deliberately NOT overridden to musl-gcc: rustc's
+# self-contained musl linking already bundles the correct musl CRT + rust-lld,
+# and adding musl-gcc as the linker ALSO injects gcc's own Scrt1.o — the binary
+# then double-inits the C runtime (two arch_prctl(ARCH_SET_FS)/set_tid_address
+# at startup) and segfaults on TLS before main. Keep CC, let rustc link.
 build-musl:
 	CC_x86_64_unknown_linux_musl=musl-gcc \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
 	cargo build --release --bin vt --target x86_64-unknown-linux-musl
 
 install: $(INSTALL_DEP)
