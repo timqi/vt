@@ -238,6 +238,75 @@ Known gaps:
 - **No crash-recovery on reboot.** If the system reboots while the supervisor is sleeping, the supervisor dies and never restores. Plaintext stays at `target`, ciphertext sits at the orphaned `.{name}.vt-backup-*` sibling. Manual recovery is `mv .{name}.vt-backup-* target`. A future on-boot sweep (sidecar state files + `vt inject --recover`) is deferred.
 - **Snapshot / backup leakage.** If Time Machine, ZFS snapshots, restic, etc., run while the plaintext is exposed, the snapshot retains plaintext indefinitely even after the supervisor restores. Out of scope.
 
+## vt hook — transparent secrets for AI coding agents
+
+`vt hook claude` is a PreToolUse hook processor: it reads an agent's proposed
+shell command (JSON on stdin), matches it against a `[[hook.rules]]` whitelist
+in `config.toml`, and emits a decision on stdout — **accept** (no output),
+**block** (`permissionDecision: deny`), or **rewrite** (Claude Code's
+`hookSpecificOutput.updatedInput.command`). The rewrite wraps the command as
+`vt inject --only-env <vars> --reason 'vt hook: <prog>' -- bash -c '<orig>'`, so
+vt:// secrets in the environment are decrypted on-demand and the child sees
+plaintext. Goal: an agent keeps `KEY=vt://…` in its env and never knows the
+secret is protected.
+
+- **Whitelist** (`config.rs::HookConfig` / `load_hook_config`): rules live in a
+  DEDICATED file `~/.config/vt/agent.toml` (override `$VT_AGENT_CONFIG`), NOT in
+  `config.toml` — config.toml holds secrets (never synced) while hook rules
+  carry no secrets and are meant to be synced (symlink into dotfiles / point
+  `$VT_AGENT_CONFIG` at a checked-in copy). Template: `agent.example.toml`. Top-
+  level `[[rules]]`; each rule has `command` (matched by argv[0] **basename**),
+  optional `args` (a positional subcommand prefix, e.g. `["auth","token"]` →
+  `gh auth token`), `env_vars` (decrypted only when vt://-valued, via
+  `--only-env` — never leaks unrelated secrets), optional `block`/`reason`.
+  **Block rules win over inject rules** regardless of order, so a specific deny
+  (`gh auth token`) overrides a broad inject (`gh`).
+- **Env-var values** can be supplied centrally in the same file via
+  `[env.default]` (all PWDs) and per-directory `[env.dirs."<abs path>"]`
+  (longest CWD-prefix wins), so the agent need not export secrets. Per-var
+  precedence: **process env > `dirs` > `default`** (env always wins; config is a
+  fallback, matching config.toml's convention). Config-sourced values are
+  prepended to the rewrite as `NAME='vt://…'`; env-sourced values are used
+  as-is. env-first also makes shim+PreToolUse compose without double-injecting
+  (a var already plaintext in the env is not re-injected). CWD comes from the
+  PreToolUse event's `cwd` (else the hook's CWD).
+- **Compound commands**: the string paths (`claude`/`check`) split the command
+  at top-level `|`/`||`/`&&`/`;`/newline (`split_segments`, quote/escape/paren
+  aware) and evaluate each segment, so a target after an operator still injects
+  and a block can't be bypassed by `true && gh auth token`; multiple targets
+  union their env vars into one `bash -c` rewrite. Blind spots: `$(…)`/backtick/
+  `(subshell)` interiors and a background `cmd &` tail. The exec-gateway/shim
+  path is per-command (clean argv), so it needs no segmentation.
+- **Launchers**: a top-level `launchers = ["mise exec","env",…]` list peels
+  wrapper prefixes so `mise exec gh …` matches the `gh` rule (`effective_invocation`
+  skips launcher tokens + their options/`NAME=val`/`tool@ver`, honoring `--`,
+  then re-checks for nesting). The command runs verbatim; injected env
+  propagates through. First launcher token matched by basename; `sudo` excluded
+  (scrubs env). Full path already works everywhere (basename matching).
+- **Surfaces** (all share `decide()`): `vt hook claude` (PreToolUse JSON →
+  `updatedInput` rewrite); `vt hook check <cmd>` (dry-run ACCEPT/BLOCK/REWRITE);
+  `vt hook exec -- <argv>` (exec-gateway — execs argv, or `vt inject -- argv`,
+  or exits 126 on block; no shell/`bash -c` since argv is clean); `vt hook
+  install-shims [--dir]` (one PATH shim per command AND per launcher leading
+  token). Shims are **symlinks to the vt binary** (busybox-style): `main()`
+  dispatches any non-`vt` `argv[0]` to `hook::shim_main` → `run_exec`. When
+  re-execing the real tool, `resolve_real` skips PATH candidates that
+  canonicalize to the vt binary (self), so a shim never resolves to itself —
+  robust to symlinked PATH entries (`/home`→`/essd`); a `VT_HOOK_DEPTH` counter
+  is the loop backstop. The launcher shim (e.g. `mise`) is what catches
+  `mise exec <managed-tool>`, which bypasses `$PATH` and so wouldn't hit the
+  per-tool shim. Shells have no rewrite-capable pre-exec hook, so shims are the
+  universal (interactive + scripts + non-interactive) integration.
+- **Default policy is accept** — unlisted commands run unchanged (the hook is
+  additive, not a sandbox). The whitelist's real job is scoping *which* commands
+  may trigger a decryption approval (so `ls` with a stray vt:// env var doesn't
+  prompt the phone).
+- **Recursion guard:** a command whose leading program is `vt` is always
+  accepted, so a re-fired hook never re-wraps `vt inject …`.
+- **`bash -c "…"` is opaque** to argv[0] matching (documented limit). Logic
+  lives in `src/hook.rs` (`evaluate()` is the pure, unit-tested core);
+  `vt hook check <cmd>` is a dry-run. Full design + threat model: `docs/hook.md`.
+
 ## Worker deployment
 
 ```bash

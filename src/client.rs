@@ -1168,11 +1168,20 @@ async fn decrypt_from_multi_str(
 /// pays the cost of the full vt initialization.
 pub const SUPERVISOR_SUBCOMMAND: &str = "_internal-restore-after";
 
+/// Whether an environment variable enters the decrypt pipeline: its value must
+/// contain a `vt://` URL, and — when `--only-env` is given — its name must be in
+/// that allow-list. This is the scoping that keeps `vt hook` from handing a
+/// matched command every vt:// secret in the environment (confused-deputy guard).
+fn env_var_in_scope(key: &str, value: &str, only_env: Option<&[String]>) -> bool {
+    has_vt_url(value) && only_env.map_or(true, |allow| allow.iter().any(|a| a == key))
+}
+
 pub async fn inject(
     vt_client: VTClient,
     replace_file: Option<String>,
     timeout: u32,
     reason: Option<&str>,
+    only_env: Option<Vec<String>>,
     mut args: Vec<String>,
 ) -> Result<()> {
     let raw_command = args.join(" ");
@@ -1238,8 +1247,11 @@ pub async fn inject(
 
     // Scan env vars locally for vt:// patterns — only those values enter the
     // decrypt pipeline. Env var names and non-vt values never leave this process.
+    // When `--only-env` is given, restrict decryption to exactly those names:
+    // this is how `vt hook` keeps a matched command scoped to the secrets its
+    // rule authorizes, instead of every vt:// var in the environment.
     let env_vt_vars: Vec<(String, String)> = env::vars()
-        .filter(|(_, v)| has_vt_url(v))
+        .filter(|(k, v)| env_var_in_scope(k, v, only_env.as_deref()))
         .collect();
     for (_, value) in &env_vt_vars {
         args.push(value.clone());
@@ -1552,6 +1564,23 @@ mod tests {
     use super::*;
 
     use crate::core::wire::wrap_ok_envelope;
+
+    #[test]
+    fn only_env_scopes_decryption() {
+        let v = "vt://0abc"; // a vt:// ciphertext value
+        let plain = "ghp_plaintext";
+        // No --only-env: every vt:// var is in scope; non-vt values never are.
+        assert!(env_var_in_scope("GH_TOKEN", v, None));
+        assert!(env_var_in_scope("ANYTHING", v, None));
+        assert!(!env_var_in_scope("GH_TOKEN", plain, None));
+        // With --only-env: only named vt:// vars are in scope (confused-deputy guard).
+        let allow = [String::from("GH_TOKEN")];
+        assert!(env_var_in_scope("GH_TOKEN", v, Some(&allow)));
+        assert!(!env_var_in_scope("ANTHROPIC_API_KEY", v, Some(&allow))); // vt:// but not named → excluded
+        assert!(!env_var_in_scope("GH_TOKEN", plain, Some(&allow))); // named but not vt:// → excluded
+        // Empty allow-list excludes everything.
+        assert!(!env_var_in_scope("GH_TOKEN", v, Some(&[])));
+    }
 
     /// Reproduces the agent's `ErrEnvelope` serialization shape.
     fn fake_err_envelope(kind: &str, detail: Option<&str>) -> Vec<u8> {
