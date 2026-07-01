@@ -5,6 +5,8 @@ GEMINI.md
 .codex
 .wrangler/
 .vagrant/
+node_modules/
+.DS_Store
 
 # Real Cloudflare Worker config (secrets/ids) — use wrangler.toml.example as template
 cf-worker/wrangler.toml
