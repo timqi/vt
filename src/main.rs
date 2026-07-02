@@ -66,7 +66,7 @@ mod tty;
 #[derive(Parser)]
 #[command(
     author,
-    version,
+    version = env!("VT_VERSION"),
     about = "a simple kms. no plain, explicit auth everywhere"
 )]
 struct Cli {
@@ -226,14 +226,14 @@ pub enum HookCommands {
         )]
         argv: Vec<String>,
     },
-    /// Generate PATH shims (symlinks to vt, one per command and per launcher
-    /// leading token in ~/.config/vt/agent.toml) that route through the
-    /// exec-gateway, then print the line to prepend to PATH. Works in
-    /// interactive shells, scripts, and non-interactive (agent) shells.
+    /// Generate PATH shims (symlinks to vt, one per command in
+    /// ~/.config/vt/agent.toml) that route through the exec-gateway, then print
+    /// the line to prepend to PATH. Works in interactive shells, scripts, and
+    /// non-interactive (agent) shells.
     InstallShims {
         #[arg(
             long,
-            help = "Directory to write shims into (default: ~/.config/vt/shims)"
+            help = "Directory to write shims into (default: ~/.local/share/vt/shims)"
         )]
         dir: Option<String>,
     },
@@ -407,7 +407,8 @@ pub enum SshCommands {
 async fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         Commands::Version => {
-            println!("vt {}", env!("CARGO_PKG_VERSION"));
+            println!("vt {}", env!("VT_VERSION"));
+            println!("commit {} ({})", env!("VT_GIT_SHA"), env!("VT_COMMIT_DATE"));
             return Ok(());
         }
         #[cfg(target_os = "macos")]

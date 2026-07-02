@@ -47,6 +47,31 @@ cargo check --target x86_64-unknown-linux-gnu
 dir = "cf-worker"
 run = "wrangler deploy"
 
+# Cut a CalVer release: tag `vYYYYMMDD-<shorthash>` and push it, which triggers
+# the GitHub `Release` workflow (builds macOS arm64 + Linux amd64, publishes).
+# The short hash makes same-day releases unique and matches `vt version` output.
+[tasks.release]
+description = "Tag & push a release (vYYYYMMDD-<shorthash>) → GitHub Release workflow"
+run = """
+set -eu
+# The tag must point at a committed, reproducible state.
+if [ -n "$(git status --porcelain)" ]; then
+  echo "error: working tree not clean — commit or stash first" >&2
+  git status --short >&2
+  exit 1
+fi
+git fetch --tags --quiet
+TAG="v$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+  echo "error: tag $TAG already exists (nothing new to release)" >&2
+  exit 1
+fi
+git tag -a "$TAG" -m "release $TAG"
+git push origin "$TAG"
+echo "pushed $TAG — GitHub Release workflow will build & publish"
+echo "watch: gh run watch   |   https://github.com/timqi/vt/actions"
+"""
+
 [tasks.ssh]
 run = """
 ssh -A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\

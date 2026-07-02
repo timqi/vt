@@ -283,26 +283,21 @@ secret is protected.
   union their env vars into one `bash -c` rewrite. Blind spots: `$(…)`/backtick/
   `(subshell)` interiors and a background `cmd &` tail. The exec-gateway/shim
   path is per-command (clean argv), so it needs no segmentation.
-- **Launchers**: a top-level `launchers = ["mise exec","env",…]` list peels
-  wrapper prefixes so `mise exec gh …` matches the `gh` rule (`effective_invocation`
-  skips launcher tokens + their options/`NAME=val`/`tool@ver`, honoring `--`,
-  then re-checks for nesting). The command runs verbatim; injected env
-  propagates through. First launcher token matched by basename; `sudo` excluded
-  (scrubs env). Full path already works everywhere (basename matching).
+- **Program resolution**: `effective_invocation` skips leading `NAME=val`
+  assignments, then takes the next token as the program (basename-matched, so a
+  full path already works everywhere).
 - **Surfaces** (all share `decide()`): `vt hook claude` (PreToolUse JSON →
   `updatedInput` rewrite); `vt hook check <cmd>` (dry-run ACCEPT/BLOCK/REWRITE);
   `vt hook exec -- <argv>` (exec-gateway — execs argv, or `vt inject -- argv`,
   or exits 126 on block; no shell/`bash -c` since argv is clean); `vt hook
-  install-shims [--dir]` (one PATH shim per command AND per launcher leading
-  token). Shims are **symlinks to the vt binary** (busybox-style): `main()`
-  dispatches any non-`vt` `argv[0]` to `hook::shim_main` → `run_exec`. When
-  re-execing the real tool, `resolve_real` skips PATH candidates that
-  canonicalize to the vt binary (self), so a shim never resolves to itself —
-  robust to symlinked PATH entries (`/home`→`/essd`); a `VT_HOOK_DEPTH` counter
-  is the loop backstop. The launcher shim (e.g. `mise`) is what catches
-  `mise exec <managed-tool>`, which bypasses `$PATH` and so wouldn't hit the
-  per-tool shim. Shells have no rewrite-capable pre-exec hook, so shims are the
-  universal (interactive + scripts + non-interactive) integration.
+  install-shims [--dir]` (one PATH shim per command). Shims are **symlinks to
+  the vt binary** (busybox-style): `main()` dispatches any non-`vt` `argv[0]` to
+  `hook::shim_main` → `run_exec`. When re-execing the real tool, `resolve_real`
+  skips PATH candidates that canonicalize to the vt binary (self), so a shim
+  never resolves to itself — robust to symlinked PATH entries (`/home`→`/essd`);
+  a `VT_HOOK_DEPTH` counter is the loop backstop. Shells have no rewrite-capable
+  pre-exec hook, so shims are the universal (interactive + scripts +
+  non-interactive) integration.
 - **Default policy is accept** — unlisted commands run unchanged (the hook is
   additive, not a sandbox). The whitelist's real job is scoping *which* commands
   may trigger a decryption approval (so `ls` with a stray vt:// env var doesn't

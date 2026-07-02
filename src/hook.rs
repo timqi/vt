@@ -279,8 +279,6 @@ pub fn evaluate(
     get_env: impl Fn(&str) -> Option<String>,
     vt_bin: &str,
 ) -> Action {
-    let launchers = split_launchers(&cfg.launchers);
-
     // A Bash-tool command is an arbitrary shell snippet, so a target program
     // can sit after a `|`, `&&`, `;`, etc. Evaluate EACH top-level segment:
     //   * any segment that is a block rule ⇒ refuse the whole command
@@ -292,7 +290,7 @@ pub fn evaluate(
     let mut set_vars: Vec<(String, String)> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
     for seg in split_segments(command) {
-        let (prog, args) = match effective_invocation(&tokenize(&seg), &launchers) {
+        let (prog, args) = match effective_invocation(&tokenize(&seg)) {
             Some(p) => p,
             None => continue,
         };
@@ -374,10 +372,9 @@ fn run_exec(cfg: &HookConfig, vt_bin: &str, argv: &[String]) -> Result<()> {
     }
     std::env::set_var("VT_HOOK_DEPTH", (depth + 1).to_string());
 
-    // Peel launchers (mise exec, env, …) to find the program + its args for
-    // matching; the original argv is still what gets exec'd.
-    let launchers = split_launchers(&cfg.launchers);
-    let (prog, args) = effective_invocation(argv, &launchers)
+    // Find the program + its args for matching; the original argv is still
+    // what gets exec'd.
+    let (prog, args) = effective_invocation(argv)
         .unwrap_or_else(|| (basename(arg0), rest.to_vec()));
 
     // Recursion guard: a bare `vt …` (or renamed VT_HOOK_BIN) runs as-is.
@@ -483,18 +480,10 @@ fn is_executable(p: &Path) -> bool {
     }
 }
 
-/// The set of command basenames to shim: every rule's `command`, PLUS each
-/// launcher's leading token (e.g. `mise`). Shimming the launcher lets
-/// `mise exec <tool>` route through `vt hook exec` (which peels the launcher) —
-/// essential for version managers like mise that resolve their managed tools
-/// OUTSIDE `$PATH`, bypassing the per-tool shim. `vt` is never shimmed.
+/// The set of command basenames to shim: every rule's `command`. `vt` is never
+/// shimmed.
 fn shim_names(cfg: &HookConfig) -> BTreeSet<String> {
     let mut names: BTreeSet<String> = cfg.rules.iter().map(|r| basename(&r.command)).collect();
-    for l in &cfg.launchers {
-        if let Some(first) = l.split_whitespace().next() {
-            names.insert(basename(first));
-        }
-    }
     names.remove("vt");
     names
 }
@@ -509,7 +498,8 @@ fn install_shims(cfg: &HookConfig, vt_bin: &str, dir: Option<&str>) -> Result<()
         Some(d) => PathBuf::from(d),
         None => dirs::home_dir()
             .context("no home directory")?
-            .join(".config")
+            .join(".local")
+            .join("share")
             .join("vt")
             .join("shims"),
     };
@@ -610,91 +600,24 @@ fn vt_binary() -> String {
         .unwrap_or_else(|| "vt".to_string())
 }
 
-/// Parse a shell command string into `(program_basename, args)` with no
-/// launcher unwrapping (test helper / no-launcher base case).
+/// Parse a shell command string into `(program_basename, args)` (test helper).
 #[cfg(test)]
 fn parse_invocation(command: &str) -> Option<(String, Vec<String>)> {
-    effective_invocation(&tokenize(command), &[])
+    effective_invocation(&tokenize(command))
 }
 
-/// Find the *effective* program and its args from a token sequence, peeling any
-/// configured launcher prefixes (e.g. `mise exec`, `env`) so the real program
-/// is matched against the rules. `args` are the tokens after the program — so
-/// `mise exec gh auth token` yields `("gh", ["auth","token"])` and the
-/// `gh auth token` deny still fires. Leading `NAME=value` assignments are
-/// skipped. The command itself is still executed verbatim by the caller.
-fn effective_invocation(
-    tokens: &[String],
-    launchers: &[Vec<String>],
-) -> Option<(String, Vec<String>)> {
+/// Find the *effective* program and its args from a token sequence: skip any
+/// leading `NAME=value` assignments, then take the next token as the program.
+/// `args` are the tokens after the program — so `gh auth token` yields
+/// `("gh", ["auth","token"])`. The command itself is still executed verbatim
+/// by the caller.
+fn effective_invocation(tokens: &[String]) -> Option<(String, Vec<String>)> {
     let mut i = 0;
-    loop {
-        while i < tokens.len() && is_assignment(&tokens[i]) {
-            i += 1;
-        }
-        match launcher_prefix_len(&tokens[i..], launchers) {
-            Some(n) => {
-                i += n; // consume the launcher tokens
-                skip_launcher_args(tokens, &mut i); // advance to the candidate program
-                if i >= tokens.len() {
-                    return None; // launcher with no command
-                }
-                // loop again: the candidate may itself be a launcher (nested)
-            }
-            None => break,
-        }
+    while i < tokens.len() && is_assignment(&tokens[i]) {
+        i += 1;
     }
     let prog = tokens.get(i)?;
     Some((basename(prog), tokens[i + 1..].to_vec()))
-}
-
-/// Pre-split each launcher string into tokens (first token matched by basename).
-fn split_launchers(launchers: &[String]) -> Vec<Vec<String>> {
-    launchers
-        .iter()
-        .map(|l| l.split_whitespace().map(String::from).collect::<Vec<_>>())
-        .filter(|v| !v.is_empty())
-        .collect()
-}
-
-/// If `tokens` begins with any launcher's token sequence (first token by
-/// basename, the rest exact), return the longest such prefix length.
-fn launcher_prefix_len(tokens: &[String], launchers: &[Vec<String>]) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for l in launchers {
-        if l.is_empty() || tokens.len() < l.len() {
-            continue;
-        }
-        if basename(&tokens[0]) == l[0] && (1..l.len()).all(|k| tokens[k] == l[k]) {
-            best = Some(best.map_or(l.len(), |b| b.max(l.len())));
-        }
-    }
-    best
-}
-
-/// Advance `*i` past a launcher's own arguments to the real program: skip
-/// option flags (`-x`), `NAME=value` assignments, and `tool@version` specs;
-/// a `--` ends option parsing (everything after is the command).
-fn skip_launcher_args(tokens: &[String], i: &mut usize) {
-    while *i < tokens.len() {
-        let t = &tokens[*i];
-        if t == "--" {
-            *i += 1;
-            return;
-        }
-        if t.starts_with('-') || is_assignment(t) || is_tool_spec(t) {
-            *i += 1;
-            continue;
-        }
-        return; // bare token → the program
-    }
-}
-
-/// A `tool@version` spec (mise), e.g. `node@20`, `python@3.12` — contains `@`,
-/// and is neither a path (`/`) nor an assignment (`=`, handled separately), so
-/// `VAR=user@host` and `./a@b` aren't mistaken for tool specs.
-fn is_tool_spec(t: &str) -> bool {
-    t.contains('@') && !t.contains('/') && !t.contains('=')
 }
 
 /// True for a leading `NAME=value` shell assignment (name is a valid shell id).
@@ -865,9 +788,6 @@ mod tests {
     }
     fn cfg(rules: Vec<HookRule>) -> HookConfig {
         HookConfig { rules, ..Default::default() }
-    }
-    fn cfg_launchers(rules: Vec<HookRule>, launchers: &[&str]) -> HookConfig {
-        HookConfig { rules, launchers: strs(launchers), ..Default::default() }
     }
     fn rule(command: &str, env_vars: &[&str], block: bool) -> HookRule {
         HookRule {
@@ -1053,19 +973,16 @@ mod tests {
     }
 
     #[test]
-    fn shim_names_include_rules_and_launcher_leading_tokens() {
-        let c = cfg_launchers(
-            vec![rule("gh", &["GH_TOKEN"], false), rule("glab", &["GITLAB_TOKEN"], false)],
-            &["mise exec", "mise x", "nohup"],
-        );
+    fn shim_names_include_rule_commands_never_vt() {
+        let c = cfg(vec![
+            rule("gh", &["GH_TOKEN"], false),
+            rule("glab", &["GITLAB_TOKEN"], false),
+            rule("vt", &["X"], false),
+        ]);
         let names = shim_names(&c);
-        // rule commands + launcher leading tokens (mise dedup'd), never vt
         assert!(names.contains("gh"));
         assert!(names.contains("glab"));
-        assert!(names.contains("mise"));
-        assert!(names.contains("nohup"));
-        assert!(!names.contains("vt"));
-        assert!(!names.contains("exec")); // only the leading token, not subcommands
+        assert!(!names.contains("vt")); // vt is never shimmed
     }
 
     #[test]
@@ -1230,52 +1147,14 @@ mod tests {
     }
 
     #[test]
-    fn effective_invocation_peels_launchers() {
-        let l = split_launchers(&["mise exec".into(), "mise x".into(), "env".into(), "nohup".into()]);
-        let inv = |s: &str| effective_invocation(&tokenize(s), &l);
-        assert_eq!(inv("mise exec gh pr list"), Some(("gh".into(), argv("pr list"))));
-        assert_eq!(inv("mise exec -- gh pr list"), Some(("gh".into(), argv("pr list"))));
-        assert_eq!(inv("mise exec node@20 -- npm test"), Some(("npm".into(), argv("test"))));
-        assert_eq!(inv("mise x gh auth token"), Some(("gh".into(), argv("auth token"))));
-        assert_eq!(inv("env FOO=bar gh pr"), Some(("gh".into(), argv("pr"))));
-        assert_eq!(inv("nohup /usr/bin/gh pr"), Some(("gh".into(), argv("pr"))));
-        // nested launcher
-        assert_eq!(inv("nohup env gh x"), Some(("gh".into(), argv("x"))));
-        // launcher consumes only a tool spec, no command → None (→ Allow)
-        assert_eq!(inv("mise exec node@20"), None);
-        // launcher matched by basename of a pathed first token
-        let l2 = split_launchers(&["env".into()]);
-        assert_eq!(
-            effective_invocation(&tokenize("/usr/bin/env gh x"), &l2),
-            Some(("gh".into(), argv("x")))
-        );
-        // without launcher config, no peeling
-        assert_eq!(parse_invocation("mise exec gh"), Some(("mise".into(), argv("exec gh"))));
-    }
-
-    #[test]
-    fn launcher_unwrap_inject_and_block_end_to_end() {
-        let c = cfg_launchers(
-            vec![
-                rule("gh", &["GH_TOKEN"], false),
-                rule_args("gh", &["auth", "token"], true),
-            ],
-            &["mise exec", "mise x"],
-        );
-        let env = |_: &str| Some("vt://0abc".to_string());
-        // inject through mise exec; the executed command stays the original.
-        match evaluate("mise exec gh pr list", "/x", &c, env, "vt") {
-            Action::Rewrite(cmd) => {
-                assert!(cmd.contains("--only-env 'GH_TOKEN'"), "{cmd}");
-                assert!(cmd.contains("-- bash -c 'mise exec gh pr list'"), "{cmd}");
-            }
-            other => panic!("expected rewrite, got {other:?}"),
-        }
-        // block fires even when wrapped by mise exec
-        match evaluate("mise exec gh auth token", "/x", &c, env, "vt") {
-            Action::Deny(_) => {}
-            other => panic!("expected deny, got {other:?}"),
-        }
+    fn effective_invocation_skips_assignments_no_launcher_peeling() {
+        let inv = |s: &str| effective_invocation(&tokenize(s));
+        assert_eq!(inv("gh pr list"), Some(("gh".into(), argv("pr list"))));
+        assert_eq!(inv("FOO=bar gh pr"), Some(("gh".into(), argv("pr"))));
+        assert_eq!(inv("/usr/bin/gh pr"), Some(("gh".into(), argv("pr"))));
+        // no launcher peeling: the leading program is taken as-is.
+        assert_eq!(inv("mise exec gh"), Some(("mise".into(), argv("exec gh"))));
+        assert_eq!(inv("env FOO=bar gh pr"), Some(("env".into(), argv("FOO=bar gh pr"))));
     }
 
     #[test]

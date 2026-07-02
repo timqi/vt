@@ -204,15 +204,6 @@ pub struct HookConfig {
     pub rules: Vec<HookRule>,
     #[serde(default)]
     pub env: EnvConfig,
-    /// Launcher prefixes whose arguments should be "peeled" to find the real
-    /// program for rule matching, e.g. `["mise exec", "mise x", "env"]` so that
-    /// `mise exec gh pr list` matches a `gh` rule. The command is still
-    /// executed verbatim — injected env vars propagate through the launcher to
-    /// the child. Each entry is a whitespace-separated token sequence; the
-    /// first token matches by basename. NOTE: do NOT add `sudo` — it scrubs the
-    /// environment by default, so injected vars wouldn't reach the child.
-    #[serde(default)]
-    pub launchers: Vec<String>,
 }
 
 /// Resolve the agent-config file path: `$VT_AGENT_CONFIG` if set and non-empty,
@@ -290,8 +281,6 @@ mod tests {
     #[test]
     fn agent_config_deserializes_full_schema() {
         let toml = r#"
-launchers = ["mise exec", "mise x", "nohup"]
-
 [[rules]]
 command  = "gh"
 env_vars = ["GH_TOKEN"]
@@ -315,7 +304,6 @@ GH_TOKEN = "vt://0default"
 GH_TOKEN = "vt://0projA"
 "#;
         let cfg: HookConfig = toml::from_str(toml).expect("valid agent config parses");
-        assert_eq!(cfg.launchers, vec!["mise exec", "mise x", "nohup"]);
         assert_eq!(cfg.rules.len(), 3);
         // rule 0: inject
         assert_eq!(cfg.rules[0].command, "gh");
@@ -338,7 +326,7 @@ GH_TOKEN = "vt://0projA"
     #[test]
     fn empty_and_minimal_configs_default_cleanly() {
         let empty: HookConfig = toml::from_str("").unwrap();
-        assert!(empty.rules.is_empty() && empty.launchers.is_empty() && empty.env.default.is_empty());
+        assert!(empty.rules.is_empty() && empty.env.default.is_empty());
         // a rule with only `command` uses defaults for the rest
         let min: HookConfig = toml::from_str("[[rules]]\ncommand = \"gh\"\n").unwrap();
         assert_eq!(min.rules.len(), 1);

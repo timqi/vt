@@ -19,20 +19,6 @@
 #     the one subcommand that would print the secret back.
 #   * `bash -c "…"` is opaque (the real program is hidden); see docs/hook.md.
 
-# Launcher prefixes peeled to find the real program for matching, so that
-# `mise exec gh pr list` matches the `gh` rule below. The command runs verbatim
-# — injected env vars propagate through the launcher to the child. Each entry is
-# a whitespace-separated token sequence (first token matched by basename).
-# launchers = ["mise exec", "mise x", "nohup"]
-#
-# SAFETY: only list launchers that take NO option flag with a separate-word
-# value before the command. The arg scanner can't tell `nice -n 10 rm …` apart
-# (it would treat `10` as the program), which would silently SKIP a `rm` block
-# rule. So do NOT add `env -u`, `nice -n`, `/usr/bin/time -o`, etc.; and never
-# add `sudo` (it scrubs the environment, so injected vars wouldn't reach the
-# child). Prefer a `--` before the command. A bare command (no launcher) is
-# matched directly as before.
-
 [[rules]]
 command  = "gh"
 env_vars = ["GH_TOKEN"]

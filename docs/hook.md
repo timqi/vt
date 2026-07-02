@@ -93,35 +93,12 @@ reason  = "refusing `gh auth token`: it would reveal the injected GH_TOKEN"
 - `env_vars` are the names this rule authorizes for decryption. The rewrite
   passes them via `--only-env`, so a matched command receives **only** these
   secrets, never other `vt://` vars in the environment.
-
-### Launchers (`mise exec`, `env`, …)
-
-By default the program is the command's first token, so `mise exec gh pr list`
-would match a `mise` rule, not `gh`. List launcher prefixes to peel them:
-
-```toml
-launchers = ["mise exec", "mise x", "env", "nohup", "time", "nice"]
-```
-
-Now `mise exec gh pr list` matches the `gh` rule (yielding args `pr list`, so
-`mise exec gh auth token` is still blocked). The command is executed **verbatim**
-— injected env vars propagate through the launcher to the child, so nothing
-about the launcher needs rewriting. Each entry is a whitespace-separated token
-sequence; the first token is matched by basename (`/usr/bin/env` matches `env`).
-After the launcher, option flags, `NAME=value` assignments, and `tool@version`
-specs are skipped, and `--` ends option parsing. **Do not add `sudo`** — it
-scrubs the environment by default, so injected vars wouldn't reach the child.
-
-**Safety limitation — option flags that take a separate-word value.** The
-scanner can't know that `nice -n 10 rm …` has `10` as `-n`'s value, so it treats
-`10` as the program and finds no rule — which means a `rm` **block rule is
-silently skipped**. Only list launchers that take no such option before the
-command (`mise exec`, `mise x`, `nohup` are safe; **avoid `env -u`, `nice -n`,
-`/usr/bin/time -o`, and `sudo`**). Prefer a `--` before the command, which ends
-option parsing unambiguously.
 - `block = true` refuses the command outright.
 - `reason` is optional; it is shown to the agent on block and recorded in the
   vt audit row on inject.
+
+Leading `NAME=value` assignments are skipped when finding the program, so
+`FOO=bar gh pr list` still matches the `gh` rule.
 
 ### Supplying env-var values (`[env]`)
 
@@ -201,8 +178,8 @@ wrapper; `vt inject` execs the argv directly.
 Generate one shim per command named in `agent.toml` and put them first on PATH:
 
 ```bash
-vt hook install-shims                 # writes ~/.config/vt/shims/{gh,glab,…}
-export PATH="$HOME/.config/vt/shims:$PATH"
+vt hook install-shims                 # writes ~/.local/share/vt/shims/{gh,glab,…}
+export PATH="$HOME/.local/share/vt/shims:$PATH"
 ```
 
 Each shim is a **symlink to the `vt` binary** (busybox-style multi-call): when
@@ -215,19 +192,6 @@ the backstop. Now a bare `gh pr list` — typed, scripted, or run by an agent �
 transparently gets its secret, and `gh auth token` is refused. Re-run
 `install-shims` after editing the rules. (For a single interactive shell you can
 instead alias: `alias gh='vt hook exec -- gh'`.)
-
-`install-shims` also generates a shim for each **launcher** leading token
-(e.g. `mise`). This matters for version managers like **mise** that resolve
-their *managed* tools from their own install dirs, **bypassing `$PATH`** — so a
-plain `gh` shim wouldn't catch `mise exec gh`. With a `mise` shim, `mise exec gh`
-→ the shim → `vt hook exec` peels the `mise exec` launcher → matches `gh` →
-injects, then execs the real `mise` (mise runs the managed tool with the env
-already set). Non-managed commands under a launcher (e.g. `mise exec faketool`,
-`nohup gh`) are resolved via `$PATH` and already hit their own shim; the launcher
-shim is redundant-but-harmless there (env-first precedence prevents any double
-injection). Put the shim dir **before** mise's shims dir (`~/.local/share/mise/
-shims`) on PATH so bare `gh` chains vt → mise. Remaining gap: `mise run` tasks
-that invoke a *managed* tool (mise prepends the tool bin in the task env).
 
 ## Security properties & limits
 

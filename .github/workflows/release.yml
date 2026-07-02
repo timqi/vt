@@ -22,6 +22,9 @@ jobs:
 
     env:
       VERSION: ${{ github.ref_name }}
+      # Source of truth for the binary's own version: shallow CI checkouts may
+      # lack the tag object for `git describe`, so stamp it from the tag name.
+      VT_VERSION_OVERRIDE: ${{ github.ref_name }}
 
     runs-on: ${{ matrix.os }}
 
