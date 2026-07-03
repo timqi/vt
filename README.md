@@ -304,6 +304,17 @@ All keychain access (passcode, passphrase, SSH keys, FIDO2) routes through a sin
 
 The `vt` source tree is split into a cross-platform client (`create`/`read`/`inject`/`auth`) and a macOS-only server (`init`/`secret`/`ssh`/`fido2`, including the SSH agent itself). Both ship in the same binary; on Linux the macOS server is `cfg`-gated out, so the Linux build only contains the client commands.
 
+## Passkey Approval (Cloudflare Worker)
+
+For hosts without a macOS keychain (Linux servers, CI, headless boxes), `vt`
+decrypts `vt://` records through a phone WebAuthn ceremony served by the
+Cloudflare Worker in `cf-worker/`. The CLI reaches it via `VT_PASSKEY_URL` +
+`VT_PASSKEY_TOKEN`.
+
+See [docs/cf-worker-deploy.md](docs/cf-worker-deploy.md) for the full deployment
+guide (wrangler config, Cloudflare Access gate, secrets, first-Passkey
+bootstrap, and CLI wiring).
+
 ## License
 
 MIT
