@@ -14,7 +14,7 @@ import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256,
 import { notifyApproval } from './notify';
 import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp } from './types';
 import { log, logErr, tokenPrefix } from './log';
-import { requireAccess } from './access';
+import { requireAccess, type AccessVars } from './access';
 
 export { AccountDO } from './do_account';
 
@@ -44,7 +44,7 @@ const ADMIN_SEG = 'kestrel';
 // stale far-future-cached copy. (Workers Assets serves static files with a
 // cacheable response; without a versioned URL a changed audit.js can refresh
 // while admin.css stays stale, which desyncs markup from styles.)
-const ASSET_VER = '20260701-2';
+const ASSET_VER = '20260704-1';
 
 // Escape a JSON string for safe embedding in a <script type="application/json"> block.
 function escapeJsonForHtml(obj: unknown): string {
@@ -102,12 +102,17 @@ function capChallengeMeta(raw: Partial<ChallengeMeta> | undefined, connectingIp:
   };
 }
 
-const app = new Hono<{ Bindings: Env }>();
+const app = new Hono<{ Bindings: Env; Variables: AccessVars }>();
 
 // ── Global security headers ───────────────────────────────────────────────
 
 app.use('*', async (c, next) => {
   await next();
+  // WebSocket upgrades (101 Switching Protocols) carry a non-standard `webSocket`
+  // field that `new Response(body, init)` would drop, breaking the handshake —
+  // and HTTP security headers are meaningless on a 101. Leave it untouched.
+  // (Guards both /api/dek and the admin /api/audit-stream sockets.)
+  if (c.res.status === 101) return;
   // Responses from ASSETS.fetch / fetch() have immutable headers; rebuild
   // so the security headers below can be applied uniformly.
   c.res = new Response(c.res.body, c.res);
@@ -183,11 +188,25 @@ app.get(`/${ADMIN_SEG}/channels`, (c) => {
 app.get(`/${ADMIN_SEG}/api/audit`, async (c) => {
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   const u = new URL('https://account.do/op/audit-query');
-  for (const k of ['limit', 'before_id', 'status', 'host', 'source']) {
+  for (const k of ['limit', 'before_id', 'after_seq', 'status', 'host', 'source']) {
     const v = c.req.query(k);
     if (v) u.searchParams.set(k, v);
   }
   return stub.fetch(u.toString());
+});
+
+// Real-time audit stream (WebSocket). Access-gated by the /${ADMIN_SEG}/* mount
+// above, exactly like the REST audit API — the upgrade is a plain GET, so
+// requireAccess runs and fails closed BEFORE this handler (the DO's /ws-admin is
+// never reached on an auth failure). The verified JWT `exp` is forwarded so the
+// DO can bind the hibernating socket's lifetime to the admin's session.
+app.get(`/${ADMIN_SEG}/api/audit-stream`, async (c) => {
+  if (c.req.header('Upgrade') !== 'websocket') return c.text('expected websocket', 426);
+  const exp = c.get('accessExp');
+  if (typeof exp !== 'number') return c.text('forbidden', 403); // requireAccess must have set it
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  const wsUrl = `https://account.do/ws-admin?exp=${encodeURIComponent(String(exp))}`;
+  return stub.fetch(new Request(wsUrl, { headers: c.req.raw.headers }));
 });
 
 // Clear the cached DEKs written by ONE approval (by its audit token_id). Powers

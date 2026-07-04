@@ -57,11 +57,33 @@ export interface AuditRow {
    *  or 'agent' (SSH-agent Touch ID decision pushed by the Mac). The column is
    *  NOT NULL DEFAULT 'ceremony', so a read always has a value. */
   source: string;
+  /** Monotonic change counter, bumped on EVERY write to the row (create +
+   *  each in-place lifecycle update). Unlike `id` (assigned once at INSERT), a
+   *  later approve/reject/expire/verify-fail UPDATE advances `seq`, so the
+   *  real-time admin stream can reconcile missed UPDATEs after a reconnect via
+   *  `after_seq` (an `id`-cursor can never see an UPDATE to an older row). */
+  seq: number;
 }
 
 export interface AuditQueryResponse {
   rows: AuditRow[];
+  /** Highest `seq` present in the table at query time — the client uses it as
+   *  the reconnect high-water mark (fetch `after_seq=<snapshot_seq>` to catch
+   *  up on anything that changed while the WebSocket was down). */
+  snapshot_seq: number;
 }
+
+/** Push messages sent to the admin audit page over the '/kestrel/api/audit-stream'
+ *  WebSocket. A SEPARATE channel from the per-ceremony daemon socket (WsMessage).
+ *  'hello' signals (re)connection — the client then runs an `after_seq` catch-up.
+ *  'audit' carries one full row (same projection as AuditQueryResponse.rows) so
+ *  the client never has to re-fetch on an event. */
+export type AdminWsMessage =
+  | { kind: 'hello' }
+  | { kind: 'audit'; event: 'insert' | 'update'; row: AuditRow }
+  // The audit table was wiped (admin "清空审计") — connected tabs should reset
+  // their list and reload, rather than keep showing now-deleted rows.
+  | { kind: 'clear' };
 
 // DEK-cache events (hit / miss / clear) are NOT a separate table — they are
 // rows in `audit` with op_kind='cache' and status ∈ {approved=hit, miss,

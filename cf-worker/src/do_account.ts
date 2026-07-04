@@ -15,7 +15,7 @@
 // same DO — no extra locking is needed.
 
 import { DurableObject } from 'cloudflare:workers';
-import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AuditRow, AuditQueryResponse, CacheEntry, DekCacheResponse } from './types';
+import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, AuditRow, AuditQueryResponse, CacheEntry, DekCacheResponse } from './types';
 import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, sha256 } from './crypto';
 import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
@@ -33,6 +33,20 @@ const AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 // can mint an over-long window. 0 ("do not cache") is NOT a member — it is the
 // absence of a write. The PWA's radio options are [0, ...this] (see opPageData).
 const CACHE_TTL_WHITELIST = new Set([8 * 60, 20 * 60, 2 * 60 * 60]);
+
+// Cap concurrent admin audit-stream sockets (multiple browser tabs / stale
+// hibernated sockets). Bounds broadcast fan-out and DO memory; a new connect
+// past the cap is refused (the client retries with backoff). Admin is a single
+// operator, so this is generous.
+const MAX_ADMIN_SOCKETS = 8;
+
+// Column projection shared by opAuditQuery and the real-time broadcast, so a
+// pushed row is byte-for-byte the same shape the REST query returns (no field
+// can leak into the stream that the query itself does not already expose).
+const AUDIT_SELECT_COLS =
+  `id, token_id, created_ms, finalized_ms, status, op_kind, command, reason,
+   host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms,
+   verify_failures, cache_ttl_s, ppid, source, seq`;
 
 // DEK cache entry key. ctx binds the entry to (a) the requester's worker-derived
 // IP (CF-Connecting-IP — unspoofable by the client, the hard boundary) AND (b)
@@ -92,6 +106,9 @@ function auditKey(approveToken: string): string {
 
 export class AccountDO extends DurableObject<Env> {
   private readonly expectedOrigin: string;
+  // Monotonic audit change counter. Seeded from MAX(seq) in the constructor so
+  // it survives DO eviction (every write persists seq), then ++'d per write.
+  private seqCounter = 0;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -135,7 +152,8 @@ export class AccountDO extends DurableObject<Env> {
            verify_failures INTEGER NOT NULL DEFAULT 0,
            cache_ttl_s INTEGER,
            ppid INTEGER,
-           source TEXT NOT NULL DEFAULT 'ceremony'
+           source TEXT NOT NULL DEFAULT 'ceremony',
+           seq INTEGER
          )`,
       );
       // Additive migrations for older audit tables (token_id present but newer
@@ -164,6 +182,18 @@ export class AccountDO extends DurableObject<Env> {
         this.ctx.storage.sql.exec(
           `ALTER TABLE audit ADD COLUMN source TEXT NOT NULL DEFAULT 'ceremony'`);
       }
+      // seq: monotonic per-row change counter for the real-time admin stream's
+      // reconnect catch-up. Re-snapshot table_info first — the `source` ALTER
+      // above invalidated the `auditCols` snapshot (per the note there). Backfill
+      // existing rows with seq = id (a valid monotonic ordering) so no row has a
+      // NULL seq and `after_seq` catch-up covers historical rows uniformly.
+      const colsAfterSource = this.ctx.storage.sql
+        .exec<{ name: string }>(`PRAGMA table_info(audit)`)
+        .toArray();
+      if (colsAfterSource.length > 0 && !colsAfterSource.some(c => c.name === 'seq')) {
+        this.ctx.storage.sql.exec(`ALTER TABLE audit ADD COLUMN seq INTEGER`);
+        this.ctx.storage.sql.exec(`UPDATE audit SET seq = id WHERE seq IS NULL`);
+      }
       // Drop the short-lived standalone cache_audit table from an earlier build
       // of this branch — its events now live in the unified audit table.
       this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS cache_audit`);
@@ -172,6 +202,16 @@ export class AccountDO extends DurableObject<Env> {
       this.ctx.storage.sql.exec(
         `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit(created_ms)`,
       );
+      // idx_audit_seq serves the reconnect catch-up query (seq > ? ORDER BY seq).
+      this.ctx.storage.sql.exec(
+        `CREATE INDEX IF NOT EXISTS idx_audit_seq ON audit(seq)`,
+      );
+      // Seed the in-memory counter from the durable high-water mark so a restart
+      // never re-issues a seq (which would let a reconnecting client skip a row).
+      const seqRow = this.ctx.storage.sql
+        .exec<{ m: number }>(`SELECT COALESCE(MAX(seq), 0) AS m FROM audit`)
+        .toArray()[0];
+      this.seqCounter = seqRow?.m ?? 0;
     });
     // Schedule initial alarm if none set (alarm() re-arms itself thereafter).
     this.ctx.storage.getAlarm()
@@ -182,16 +222,56 @@ export class AccountDO extends DurableObject<Env> {
   // Audit writes are best-effort: a failure must never break the ceremony, so
   // we swallow and log. All three run inside the DO's single-threaded op.
 
-  // INSERT the full challenge params once, at creation (status=pending).
-  private auditCreate(ch: Challenge): void {
+  // Next monotonic change counter. DO ops (and the alarm) are serialized per
+  // instance, so a plain ++ is race-free — no atomics needed.
+  private nextSeq(): number { return ++this.seqCounter; }
+
+  // Send one message to every connected admin stream. Best-effort and isolated:
+  // a failure here (or a dead socket) must never affect the ceremony or block
+  // delivery to the OTHER sockets, so the whole thing is try/caught and each send
+  // is individually guarded (mirrors the pt: broadcast pattern).
+  private broadcastAdmin(msg: AdminWsMessage): void {
+    try {
+      const wss = this.ctx.getWebSockets('admin');
+      if (wss.length === 0) return;   // nobody listening
+      const text = JSON.stringify(msg);
+      for (const ws of wss) {
+        try { ws.send(text); } catch { /* dead socket; skip, don't block others */ }
+      }
+    } catch (e) {
+      logErr('audit.broadcast_failed', e);
+    }
+  }
+
+  // Push one audit row to every admin stream. The re-SELECT uses the shared
+  // projection, so the pushed row cannot expose any field the REST audit query
+  // does not. Skips the SELECT entirely when no admin sockets are connected.
+  private broadcastRow(tokenId: string, event: 'insert' | 'update'): void {
+    try {
+      if (this.ctx.getWebSockets('admin').length === 0) return;
+      const rows = this.ctx.storage.sql
+        .exec(`SELECT ${AUDIT_SELECT_COLS} FROM audit WHERE token_id = ?`, tokenId)
+        .toArray() as unknown as AuditRow[];
+      const row = rows[0];
+      if (!row) return;
+      this.broadcastAdmin({ kind: 'audit', event, row });
+    } catch (e) {
+      logErr('audit.broadcast_failed', e);
+    }
+  }
+
+  // INSERT the full challenge params once, at creation (status=pending). Returns
+  // true only if a row was actually written (false on an ON CONFLICT no-op), so
+  // the caller can skip a wasted broadcast on an idempotent re-create.
+  private auditCreate(ch: Challenge): boolean {
     const m = ch.meta ?? ({} as Challenge['meta']);
     try {
       // source='ceremony' set explicitly (not relying on the column default) so
       // a future schema change can never silently mis-categorize these rows.
-      this.ctx.storage.sql.exec(
+      const cursor = this.ctx.storage.sql.exec(
         `INSERT INTO audit
-           (token_id, created_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source)
-         VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ceremony')
+           (token_id, created_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source, seq)
+         VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ceremony', ?)
          ON CONFLICT(token_id) DO NOTHING`,
         auditKey(ch.approve_token),
         ch.created_ms ?? Date.now(),
@@ -207,9 +287,12 @@ export class AccountDO extends DurableObject<Env> {
         m.ip ?? null,
         Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0,
         typeof m.ppid === 'number' ? m.ppid : null,
+        this.nextSeq(),
       );
+      return cursor.rowsWritten > 0;
     } catch (e) {
       logErr('audit.create_failed', e);
+      return false;
     }
   }
 
@@ -217,10 +300,11 @@ export class AccountDO extends DurableObject<Env> {
   private auditFinalize(approveToken: string, status: string, latencyMs: number): void {
     try {
       this.ctx.storage.sql.exec(
-        `UPDATE audit SET status = ?, finalized_ms = ?, latency_ms = ? WHERE token_id = ?`,
+        `UPDATE audit SET status = ?, finalized_ms = ?, latency_ms = ?, seq = ? WHERE token_id = ?`,
         status,
         Date.now(),
         latencyMs,
+        this.nextSeq(),
         auditKey(approveToken),
       );
     } catch (e) {
@@ -232,9 +316,11 @@ export class AccountDO extends DurableObject<Env> {
   private auditVerifyFailure(approveToken: string): void {
     try {
       this.ctx.storage.sql.exec(
-        `UPDATE audit SET verify_failures = verify_failures + 1 WHERE token_id = ?`,
+        `UPDATE audit SET verify_failures = verify_failures + 1, seq = ? WHERE token_id = ?`,
+        this.nextSeq(),
         auditKey(approveToken),
       );
+      this.broadcastRow(auditKey(approveToken), 'update');
     } catch (e) {
       logErr('audit.verifyfail_failed', e);
     }
@@ -244,10 +330,14 @@ export class AccountDO extends DurableObject<Env> {
   private auditSetCacheTtl(approveToken: string, ttlS: number): void {
     try {
       this.ctx.storage.sql.exec(
-        `UPDATE audit SET cache_ttl_s = ? WHERE token_id = ?`,
+        `UPDATE audit SET cache_ttl_s = ?, seq = ? WHERE token_id = ?`,
         ttlS,
+        this.nextSeq(),
         auditKey(approveToken),
       );
+      // No broadcast here: this runs inside the approve flow, which emits a
+      // single 'update' after writeCache so the pushed row already carries the
+      // final cache_ttl_s (avoids a duplicate mid-approve broadcast).
     } catch (e) {
       logErr('audit.cachettl_failed', e);
     }
@@ -275,14 +365,16 @@ export class AccountDO extends DurableObject<Env> {
       const tokenId = 'c_' + b64uEnc(crypto.getRandomValues(new Uint8Array(9)));
       this.ctx.storage.sql.exec(
         `INSERT INTO audit
-           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source)
-         VALUES (?, ?, ?, ?, 'cache', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cache')
+           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source, seq)
+         VALUES (?, ?, ?, ?, 'cache', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cache', ?)
          ON CONFLICT(token_id) DO NOTHING`,
         tokenId, now, now, status,
         meta.command ?? null, meta.reason ?? null, meta.host ?? null, meta.user ?? null,
         meta.pwd ?? null, meta.tty ?? null, meta.ppid_cmd ?? null, meta.ssh_client ?? null,
         meta.ip ?? null, salts, typeof meta.ppid === 'number' ? meta.ppid : null,
+        this.nextSeq(),
       );
+      this.broadcastRow(tokenId, 'insert');
     } catch (e) {
       logErr('audit.cacheevent_failed', e);
     }
@@ -294,17 +386,20 @@ export class AccountDO extends DurableObject<Env> {
   private auditAgent(op: DoAuditIngestOp): void {
     const m = op.meta;
     try {
-      this.ctx.storage.sql.exec(
+      const cursor = this.ctx.storage.sql.exec(
         `INSERT INTO audit
-           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, ppid, source)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent')
+           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, ppid, source, seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?)
          ON CONFLICT(token_id) DO NOTHING`,
         op.token_id, op.ts_ms, op.ts_ms, op.outcome,
         m.op_kind ?? null, m.command ?? null, m.reason ?? null, m.host ?? null,
         m.user ?? null, m.pwd ?? null, m.tty ?? null, m.ppid_cmd ?? null,
         m.ssh_client ?? null, m.ip ?? null, op.salts, op.latency_ms,
         typeof m.ppid === 'number' ? m.ppid : null,
+        this.nextSeq(),
       );
+      // Skip the broadcast on an idempotent-retry no-op (agent's 1-retry).
+      if (cursor.rowsWritten > 0) this.broadcastRow(op.token_id, 'insert');
     } catch (e) {
       logErr('audit.agent_failed', e);
     }
@@ -313,8 +408,11 @@ export class AccountDO extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // WebSocket upgrade — client polls for DEK delivery
+    // WebSocket upgrade. Two distinct channels:
+    //   /ws        — per-ceremony daemon socket (tagged pt:{poll_token})
+    //   /ws-admin  — admin audit stream (tagged 'admin'); Access-gated at the edge
     if (request.headers.get('Upgrade') === 'websocket') {
+      if (url.pathname === '/ws-admin') return this.handleAdminWsUpgrade(url);
       return this.handleWsUpgrade(url);
     }
 
@@ -375,6 +473,39 @@ export class AccountDO extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  // Admin audit stream. Access-gated at the Worker edge (requireAccess), which
+  // passes the VERIFIED JWT `exp` (epoch seconds) through as ?exp=. We bind the
+  // socket's lifetime to that exp via serializeAttachment so a hibernating
+  // stream cannot outlive the admin's authenticated session — the alarm() sweep
+  // closes any socket past exp. (REST polling gets a fresh 403 the moment the
+  // session ends; a long-lived socket needs this explicit re-check.)
+  private async handleAdminWsUpgrade(url: URL): Promise<Response> {
+    const expRaw = url.searchParams.get('exp') ?? '';
+    if (!/^\d+$/.test(expRaw)) return new Response('missing exp', { status: 400 });
+    const exp = parseInt(expRaw, 10);
+    // Already-expired token → refuse before accepting (defence in depth; the edge
+    // JWT check already enforces exp, but never trust a stale query param).
+    if (Math.floor(Date.now() / 1000) >= exp) return new Response('expired', { status: 400 });
+
+    // Bound concurrent admin sockets so broadcast fan-out and DO memory stay
+    // bounded across many tabs / stale hibernated sockets. At the cap, evict the
+    // oldest (likely a dead/stale tab) to make room rather than lock out a fresh,
+    // authenticated client.
+    const open = this.ctx.getWebSockets('admin');
+    if (open.length >= MAX_ADMIN_SOCKETS) {
+      try { open[0]!.close(4002, 'evicted: admin socket cap'); } catch {}
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+    this.ctx.acceptWebSocket(server, ['admin']);
+    server.serializeAttachment({ exp });
+    // 'hello' → the client runs an after_seq catch-up to reconcile anything it
+    // missed between its REST snapshot and this socket opening.
+    server.send(JSON.stringify({ kind: 'hello' } satisfies AdminWsMessage));
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
   webSocketMessage(ws: WebSocket, _message: string | ArrayBuffer): void {
     // No client-to-server messages are expected on this socket.
     try { ws.close(1003, 'no input expected'); } catch {}
@@ -417,6 +548,7 @@ export class AccountDO extends DurableObject<Env> {
             age_ms: now - ch.created_ms,
           });
           this.auditFinalize(ch.approve_token, 'expired', now - ch.created_ms);
+          this.broadcastRow(auditKey(ch.approve_token), 'update');
           // Retain `ch:` for RETENTION_MS so an in-flight WS reconnect still
           // sees the terminal status; drop only the routing key now.
           toDelete.push(ptKey);
@@ -454,6 +586,21 @@ export class AccountDO extends DurableObject<Env> {
       logErr('audit.sweep_failed', e);
     }
 
+    // 4. Admin audit-stream sockets: close any whose Access-JWT `exp` has passed,
+    // so a hibernating stream cannot outlive the admin's authenticated session.
+    // Bounds staleness to at most one alarm period (TTL_MS) past exp. A socket
+    // with no/garbled attachment is treated as expired (fail closed).
+    try {
+      const nowSec = Math.floor(now / 1000);
+      for (const ws of this.ctx.getWebSockets('admin')) {
+        let exp = 0;
+        try { exp = (ws.deserializeAttachment() as { exp?: number } | null)?.exp ?? 0; } catch {}
+        if (nowSec >= exp) { try { ws.close(4001, 'access session expired'); } catch {} }
+      }
+    } catch (e) {
+      logErr('alarm.admin_ws_sweep_failed', e);
+    }
+
     } finally {
       // Always reschedule, even if a sweep threw, so periodic cleanup self-heals
       // instead of stopping forever once CF exhausts its automatic alarm retries.
@@ -476,7 +623,9 @@ export class AccountDO extends DurableObject<Env> {
       [`ch:${challenge.approve_token}`]: challenge,
       [`pt:${challenge.poll_token}`]: challenge.approve_token,
     });
-    this.auditCreate(challenge);
+    if (this.auditCreate(challenge)) {
+      this.broadcastRow(auditKey(challenge.approve_token), 'insert');
+    }
     return new Response('ok');
   }
 
@@ -584,6 +733,11 @@ export class AccountDO extends DurableObject<Env> {
       try { await this.writeCache(ch, ttlS, body.cache_sealed_deks_b64u); }
       catch (e) { logErr('cache.write_failed', e, { at: tokenPrefix(ch.approve_token) }); }
     }
+
+    // One admin broadcast for the whole approval — AFTER writeCache, so the
+    // pushed row already carries the final cache_ttl_s (writeCache's
+    // auditSetCacheTtl deliberately does not broadcast to avoid a duplicate).
+    this.broadcastRow(auditKey(ch.approve_token), 'update');
 
     // Wake waiting WS clients
     const wss = this.ctx.getWebSockets(`pt:${ch.poll_token}`);
@@ -814,6 +968,10 @@ export class AccountDO extends DurableObject<Env> {
       logErr('audit.clear_failed', e);
       return new Response('clear failed', { status: 500 });
     }
+    // Notify every connected admin tab (not just the one that clicked) so none
+    // keeps showing now-deleted rows. seqCounter is intentionally NOT reset —
+    // staying monotonic means a reconnecting client's cursor never regresses.
+    this.broadcastAdmin({ kind: 'clear' });
     log('audit.cleared', {});
     return Response.json({ ok: true });
   }
@@ -895,6 +1053,7 @@ export class AccountDO extends DurableObject<Env> {
       latency_ms: ch.finalized_ms - ch.created_ms,
     });
     this.auditFinalize(ch.approve_token, 'rejected', ch.finalized_ms - ch.created_ms);
+    this.broadcastRow(auditKey(ch.approve_token), 'update');
 
     return new Response('ok');
   }
@@ -958,6 +1117,13 @@ export class AccountDO extends DurableObject<Env> {
     const binds: (string | number)[] = [];
     const beforeId = q.get('before_id');
     if (beforeId && /^\d+$/.test(beforeId)) { conds.push('id < ?'); binds.push(parseInt(beforeId, 10)); }
+    // after_seq: reconnect catch-up. Selects rows whose seq advanced past the
+    // client's high-water mark — an id cursor cannot do this because a lifecycle
+    // UPDATE bumps seq but not id. When present, order ASC by seq (chronological
+    // replay) instead of the default id DESC (newest-first list).
+    const afterSeqRaw = q.get('after_seq');
+    const useAfterSeq = afterSeqRaw != null && /^\d+$/.test(afterSeqRaw);
+    if (useAfterSeq) { conds.push('seq > ?'); binds.push(parseInt(afterSeqRaw!, 10)); }
     const status = q.get('status');
     // 'cache' is a pseudo-filter selecting records that ARMED a DEK cache (the
     // approvals where a TTL was chosen → cache_ttl_s set). It deliberately
@@ -972,15 +1138,20 @@ export class AccountDO extends DurableObject<Env> {
     if (source) { conds.push('source = ?'); binds.push(source); }
 
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    const order = useAfterSeq ? 'ORDER BY seq ASC' : 'ORDER BY id DESC';
     const sql =
-      `SELECT id, token_id, created_ms, finalized_ms, status, op_kind, command, reason,
-              host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, verify_failures, cache_ttl_s, ppid, source
-       FROM audit ${where} ORDER BY id DESC LIMIT ?`;
+      `SELECT ${AUDIT_SELECT_COLS}
+       FROM audit ${where} ${order} LIMIT ?`;
     binds.push(limit);
 
     try {
       const rows = this.ctx.storage.sql.exec(sql, ...binds).toArray() as unknown as AuditRow[];
-      const resp: AuditQueryResponse = { rows };
+      // Current high-water mark, so the client can set its reconnect cursor even
+      // when this page returns no rows (e.g. an empty initial load).
+      const snapRow = this.ctx.storage.sql
+        .exec<{ m: number }>(`SELECT COALESCE(MAX(seq), 0) AS m FROM audit`)
+        .toArray()[0];
+      const resp: AuditQueryResponse = { rows, snapshot_seq: snapRow?.m ?? 0 };
       return Response.json(resp);
     } catch (e) {
       logErr('audit.query_failed', e);

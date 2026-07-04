@@ -28,6 +28,15 @@ import { log } from './log';
 interface Jwk { kid?: string; kty?: string; n?: string; e?: string; }
 interface Jwks { keys?: Jwk[] }
 
+/** Context variables requireAccess sets after a successful verification, so a
+ *  gated handler can bind work to the caller's authenticated session. `accessExp`
+ *  (JWT exp, epoch seconds) lets the audit-stream WebSocket self-close when the
+ *  Access session ends — a hibernating socket must not outlive its auth. */
+export interface AccessVars {
+  accessExp: number;
+  accessEmail: string;
+}
+
 interface JwtHeader { alg?: string; kid?: string; typ?: string }
 interface JwtPayload {
   aud?: string | string[];
@@ -95,7 +104,7 @@ function decodeSegment(seg: string): Uint8Array {
   return b64uDec(seg);
 }
 
-export const requireAccess: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
+export const requireAccess: MiddlewareHandler<{ Bindings: Env; Variables: AccessVars }> = async (c, next) => {
   const ip = c.req.header('CF-Connecting-IP') ?? '';
   const path = new URL(c.req.url).pathname;
   const deny = (reason: string): Response => {
@@ -163,6 +172,11 @@ export const requireAccess: MiddlewareHandler<{ Bindings: Env }> = async (c, nex
   if (typeof payload.iat === 'number' && payload.iat > nowSec + CLOCK_SKEW_SEC) return deny('iat');
 
   const email = typeof payload.email === 'string' ? payload.email : '';
+  // Expose the verified exp/email so a gated handler (e.g. the audit-stream WS)
+  // can bind a long-lived resource to this authenticated session. exp is a
+  // verified claim (checked above), safe to trust downstream.
+  c.set('accessExp', payload.exp);
+  c.set('accessEmail', email);
   log('admin.access', { email, path });
   await next();
 };

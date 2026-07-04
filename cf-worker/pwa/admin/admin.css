@@ -148,6 +148,12 @@ button.small { padding: 4px 10px; font-size: 12px; margin: 0; }
 #status.ok { color: var(--ok); }
 #status.error { color: var(--err); }
 
+/* Real-time stream indicator (pushed to the actions bar by audit.js). */
+#ws-status { margin-left: auto; font-size: 12px; font-variant-numeric: tabular-nums; }
+#ws-status.ws-live { color: var(--ok); }
+#ws-status.ws-sync { color: #b45309; }
+#ws-status.ws-down { color: var(--muted); }
+
 /* Audit table */
 #table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
