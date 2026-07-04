@@ -400,8 +400,8 @@ pub async fn get_deks(
     if !ch.push_warning.is_empty() {
         eprintln!("vt: push warning: {}", ch.push_warning);
     }
-    eprintln!("vt: waiting for Passkey approval…");
-    eprintln!("vt: approve at: {}", ch.approve_url);
+    eprintln!("vt: approve on your phone: {}", ch.approve_url);
+    eprintln!("vt: waiting for approval…");
 
     let ws_url = format!(
         "{}/api/dek?poll_token={}",

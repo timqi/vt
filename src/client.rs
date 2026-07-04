@@ -325,7 +325,11 @@ impl VTClient {
             Ok(some_or_none) => Ok(some_or_none),
             Err(e) => {
                 if should_fallback_to_cf(&e) {
-                    eprintln!("{} — falling back to phone passkey", e);
+                    // Keep the raw error out of default output (it reads as a
+                    // scary internal failure); the CF path prints a clean,
+                    // user-facing fallback line. `RUST_LOG=debug` still surfaces
+                    // the underlying cause for diagnosing bad fallbacks.
+                    debug!("agent call failed, falling back to phone passkey: {}", e);
                     Ok(None)
                 } else {
                     Err(e)
