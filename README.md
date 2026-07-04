@@ -17,11 +17,14 @@ A simple KMS solution based on macOS keychain. No plaintext secrets, explicit au
 
 Download prebuilt binaries from [GitHub Releases](https://github.com/timqi/vt/releases) (macOS arm64, Linux amd64).
 
-Or build from source:
+Or build from source (recipes live in the `justfile`, run `just` to list them):
 
 ```bash
 cargo build --release
 cp target/release/vt /usr/local/bin/
+
+# Or, with `just`: builds (musl-static on Linux) and installs to ~/.local/bin
+just install
 ```
 
 ## Quick Start
