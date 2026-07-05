@@ -195,8 +195,9 @@ pub enum Decision {
 /// unit-testable without touching the real environment. `cwd` is the working
 /// directory of the command (used to pick per-directory env-value overrides).
 ///
-/// Precedence for each named var: the process environment > `[env.dirs.
-/// "<cwd-prefix>"]` > `[env.default]` (env always wins; config is a fallback).
+/// Precedence for each named var: `[env.dirs."<cwd-prefix>"]` (longest prefix)
+/// > `[env.default]` > the process environment (agent config wins; a stray
+/// ambient env var can't override a carefully-configured per-project value).
 /// Block rules win over inject rules.
 pub fn decide(
     prog: &str,
@@ -231,19 +232,21 @@ pub fn decide(
             .unwrap_or_else(|| format!("vt hook: {prog}")),
     };
     for name in &rule.env_vars {
-        // Precedence: the process env WINS; the agent config is a fallback for
-        // vars the caller didn't set — matching vt's config.toml convention
-        // ("env vars are primary and always win; the file is fallback"). This
-        // also makes shim + PreToolUse compose without double-injecting: once
-        // one layer decrypts a var to plaintext in the env, the next layer sees
-        // plaintext (not vt://) and won't re-inject it.
-        let (val, from_config) = match get_env(name) {
-            Some(v) => (v, false),
-            None => match dir_vars
-                .and_then(|m| m.get(name))
-                .or_else(|| cfg.env.default.get(name))
-            {
-                Some(v) => (v.clone(), true),
+        // Precedence: the agent config WINS over the process env — dirs
+        // (longest cwd-prefix) > default > process env. A carefully-configured
+        // per-project value is authoritative; a stray ambient env var can't
+        // silently override it. Tradeoff (accepted): shim + PreToolUse no longer
+        // compose without double-injecting — once an outer layer decrypts a var
+        // to plaintext in the env, an inner layer still re-reads the config
+        // vt:// value and decrypts it a second time (a silent DEK-cache hit when
+        // caching is on, an extra approval otherwise).
+        let (val, from_config) = match dir_vars
+            .and_then(|m| m.get(name))
+            .or_else(|| cfg.env.default.get(name))
+        {
+            Some(v) => (v.clone(), true),
+            None => match get_env(name) {
+                Some(v) => (v, false),
                 None => continue,
             },
         };
@@ -1319,9 +1322,9 @@ mod tests {
     }
 
     #[test]
-    fn process_env_wins_over_config_and_is_not_prepended() {
-        // env-first: an exported vt:// value takes precedence over the config
-        // default, and (being env-sourced) is not prepended as an assignment.
+    fn config_wins_over_process_env_and_is_prepended() {
+        // config-first: the config default takes precedence over an exported
+        // vt:// value, and (being config-sourced) is prepended as an assignment.
         let env = EnvConfig {
             default: map(&[("GH_TOKEN", "vt://0cfg")]),
             dirs: BTreeMap::new(),
@@ -1330,25 +1333,32 @@ mod tests {
         let proc_env = |_: &str| Some("vt://0env".to_string());
         match evaluate("gh pr list", "/x", &c, proc_env, "vt") {
             Action::Rewrite(cmd) => {
+                assert!(cmd.starts_with("GH_TOKEN='vt://0cfg' "), "config should win: {cmd}");
                 assert!(cmd.contains("--only-env 'GH_TOKEN'"), "{cmd}");
-                assert!(!cmd.contains("vt://0cfg"), "config should not win: {cmd}");
-                assert!(!cmd.contains("GH_TOKEN='"), "env-sourced not prepended: {cmd}");
+                assert!(!cmd.contains("vt://0env"), "env value must not be used: {cmd}");
             }
             other => panic!("expected rewrite, got {other:?}"),
         }
     }
 
     #[test]
-    fn already_plaintext_env_is_not_reinjected() {
-        // The composition guard: once a var is plaintext in the env (e.g. a
-        // prior inject decrypted it), env-first means we don't re-inject.
+    fn config_reinjects_over_plaintext_env() {
+        // Accepted tradeoff of config-first: even when a var is already
+        // plaintext in the env (e.g. an outer inject decrypted it), a config
+        // vt:// value wins and is re-injected (double-decrypt in compose).
         let env = EnvConfig {
             default: map(&[("GH_TOKEN", "vt://0cfg")]),
             dirs: BTreeMap::new(),
         };
         let c = cfg_env(vec![rule("gh", &["GH_TOKEN"], false)], env);
         let proc_env = |_: &str| Some("ghp_plaintext".to_string());
-        assert_eq!(evaluate("gh pr list", "/x", &c, proc_env, "vt"), Action::Allow);
+        match evaluate("gh pr list", "/x", &c, proc_env, "vt") {
+            Action::Rewrite(cmd) => {
+                assert!(cmd.starts_with("GH_TOKEN='vt://0cfg' "), "config should win: {cmd}");
+                assert!(cmd.contains("--only-env 'GH_TOKEN'"), "{cmd}");
+            }
+            other => panic!("expected rewrite, got {other:?}"),
+        }
     }
 
     #[test]

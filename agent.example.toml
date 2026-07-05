@@ -43,9 +43,10 @@ reason  = "refusing `gh auth token`: it would reveal the injected GH_TOKEN"
 # Instead of exporting secrets, you can store their (vt://) values here so the
 # hook supplies them to matched commands. A rule must still NAME the var in its
 # `env_vars`; this section provides the value. Values should be vt:// ciphertext
-# (they get decrypted on use). Resolution precedence for each var (env WINS,
-# config is a fallback — matching config.toml's convention):
-#   process env  >  [env.dirs."<longest matching PWD prefix>"]  >  [env.default]
+# (they get decrypted on use). Resolution precedence for each var (agent config
+# WINS over the process env — a stray ambient value can't override a per-project
+# config value):
+#   [env.dirs."<longest matching PWD prefix>"]  >  [env.default]  >  process env
 #
 # Defaults — apply in every working directory:
 # [env.default]

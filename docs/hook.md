@@ -120,18 +120,20 @@ GH_TOKEN = "vt://0defaultCiphertext…"
 GH_TOKEN = "vt://0projACiphertext…"
 ```
 
-Resolution precedence for each named var (**env always wins; config is a
-fallback** — matching vt's config.toml convention):
+Resolution precedence for each named var (**agent config wins over the process
+env** — a stray ambient value can't override a per-project config value):
 
-1. the **process environment** (what the caller exported).
-2. `[env.dirs."<path>"]` — the **longest** path key that is a prefix of the
+1. `[env.dirs."<path>"]` — the **longest** path key that is a prefix of the
    command's CWD (the PreToolUse event's `cwd`, else the hook process's CWD).
-3. `[env.default]`.
+2. `[env.default]`.
+3. the **process environment** (what the caller exported) — used only when the
+   config supplies nothing for the var.
 
-Because env wins, `[env.dirs]`/`[env.default]` only apply to vars you have NOT
-exported (the intended usage — let the config supply them). Env-first also makes
-the shim and PreToolUse layers compose safely: once one layer decrypts a var to
-plaintext in the environment, the next sees plaintext and won't re-inject it.
+Accepted tradeoff of config-first: the shim and PreToolUse layers no longer
+compose without double-injecting — once an outer layer decrypts a var to
+plaintext in the environment, an inner layer still re-reads the config `vt://`
+value and decrypts it a second time (a silent DEK-cache hit when caching is on,
+otherwise an extra approval).
 
 Config-sourced values are prepended to the rewrite as `NAME='vt://…'`
 assignments (so they need not be exported); a value found only in the process

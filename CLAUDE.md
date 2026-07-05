@@ -270,12 +270,14 @@ secret is protected.
 - **Env-var values** can be supplied centrally in the same file via
   `[env.default]` (all PWDs) and per-directory `[env.dirs."<abs path>"]`
   (longest CWD-prefix wins), so the agent need not export secrets. Per-var
-  precedence: **process env > `dirs` > `default`** (env always wins; config is a
-  fallback, matching config.toml's convention). Config-sourced values are
-  prepended to the rewrite as `NAME='vt://…'`; env-sourced values are used
-  as-is. env-first also makes shim+PreToolUse compose without double-injecting
-  (a var already plaintext in the env is not re-injected). CWD comes from the
-  PreToolUse event's `cwd` (else the hook's CWD).
+  precedence: **`dirs` > `default` > process env** (agent config wins; a stray
+  ambient env var can't silently override a per-project value). Config-sourced
+  values are prepended to the rewrite as `NAME='vt://…'`; env-sourced values are
+  used as-is. Accepted tradeoff of config-first: shim+PreToolUse no longer
+  compose without double-injecting — once an outer layer decrypts a var to
+  plaintext, an inner layer still re-reads the config `vt://` value and decrypts
+  it again (silent DEK-cache hit when caching is on, else an extra approval).
+  CWD comes from the PreToolUse event's `cwd` (else the hook's CWD).
 - **Compound commands**: the string paths (`claude`/`check`) split the command
   at top-level `|`/`||`/`&&`/`;`/newline (`split_segments`, quote/escape/paren
   aware) and evaluate each segment, so a target after an operator still injects
