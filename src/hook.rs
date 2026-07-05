@@ -543,23 +543,49 @@ fn install_shims(cfg: &HookConfig, vt_bin: &str, dir: Option<&str>) -> Result<()
     Ok(())
 }
 
+/// Expand a leading `~` / `~/` in a config dir key to the user's home directory.
+/// Only a bare `~` prefix is handled (not `~user`); everything else is returned
+/// verbatim. Trailing slashes are left intact — callers trim them.
+fn expand_tilde(key: &str) -> std::borrow::Cow<'_, str> {
+    let rest = if key == "~" {
+        Some("")
+    } else {
+        key.strip_prefix("~/")
+    };
+    match (rest, dirs::home_dir()) {
+        (Some(rest), Some(home)) => {
+            let home = home.to_string_lossy();
+            let home = home.trim_end_matches('/');
+            std::borrow::Cow::Owned(if rest.is_empty() {
+                home.to_string()
+            } else {
+                format!("{home}/{rest}")
+            })
+        }
+        _ => std::borrow::Cow::Borrowed(key),
+    }
+}
+
 /// Pick the per-directory override map whose path key is the longest prefix of
-/// `cwd` (exact match or a parent directory). Trailing slashes are ignored.
+/// `cwd` (exact match or a parent directory). Trailing slashes are ignored, and a
+/// leading `~` in the config key is expanded to the user's home directory.
 fn dir_override<'a>(
     dirs: &'a std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     cwd: &str,
 ) -> Option<&'a std::collections::BTreeMap<String, String>> {
     let cwd_n = cwd.trim_end_matches('/');
     dirs.iter()
-        .filter(|(d, _)| {
-            let dn = d.trim_end_matches('/');
+        .filter_map(|(d, m)| {
+            let dn = expand_tilde(d);
+            let dn = dn.trim_end_matches('/');
             // exact dir, or cwd is `<dn>/<something>` (a real subdirectory).
-            cwd_n == dn
+            let hit = cwd_n == dn
                 || (cwd_n.len() > dn.len()
                     && cwd_n.starts_with(dn)
-                    && cwd_n.as_bytes()[dn.len()] == b'/')
+                    && cwd_n.as_bytes()[dn.len()] == b'/');
+            hit.then(|| (dn.len(), m))
         })
-        .max_by_key(|(d, _)| d.trim_end_matches('/').len())
+        .max_by_key(|(len, _)| *len)
         .map(|(_, m)| m)
 }
 
@@ -1281,6 +1307,27 @@ mod tests {
         assert!(dir_override(&dirs, "/tmp").is_none());
         // exact match with trailing slash normalizes
         assert!(dir_override(&dirs, "/home/me/work/").is_some());
+    }
+
+    #[test]
+    fn dir_override_expands_tilde() {
+        let Some(home) = dirs::home_dir() else { return };
+        let home = home.to_string_lossy().trim_end_matches('/').to_string();
+        let mut dirs = BTreeMap::new();
+        dirs.insert("~/work/projA".to_string(), map(&[("K", "tilde")]));
+        // a real cwd under $HOME/work/projA hits the tilde key
+        assert_eq!(
+            dir_override(&dirs, &format!("{home}/work/projA/sub")).unwrap().get("K"),
+            Some(&"tilde".to_string())
+        );
+        // exact match on the expanded home dir
+        assert!(dir_override(&dirs, &format!("{home}/work/projA")).is_some());
+        // bare "~" expands to $HOME itself
+        let mut only_home = BTreeMap::new();
+        only_home.insert("~".to_string(), map(&[("K", "h")]));
+        assert!(dir_override(&only_home, &home).is_some());
+        // a literal "~/..." cwd (no expansion on the cwd side) must NOT match
+        assert!(dir_override(&dirs, "/elsewhere").is_none());
     }
 
     #[test]

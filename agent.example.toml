@@ -53,8 +53,9 @@ reason  = "refusing `gh auth token`: it would reveal the injected GH_TOKEN"
 # GH_TOKEN = "vt://0defaultGhTokenCiphertext…"
 #
 # Per-directory overrides — keyed by absolute path (longest prefix of the
-# command's CWD wins), so different projects get different tokens:
-# [env.dirs."/home/me/work/projA"]
+# command's CWD wins), so different projects get different tokens. A leading
+# "~" / "~/" in the key is expanded to your home directory:
+# [env.dirs."~/work/projA"]
 # GH_TOKEN = "vt://0projAtokenCiphertext…"
 #
 # [env.dirs."/home/me/work/projB"]

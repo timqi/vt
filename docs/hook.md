@@ -124,7 +124,8 @@ Resolution precedence for each named var (**agent config wins over the process
 env** — a stray ambient value can't override a per-project config value):
 
 1. `[env.dirs."<path>"]` — the **longest** path key that is a prefix of the
-   command's CWD (the PreToolUse event's `cwd`, else the hook process's CWD).
+   command's CWD (the PreToolUse event's `cwd`, else the hook process's CWD). A
+   leading `~` / `~/` in the key is expanded to the user's home directory.
 2. `[env.default]`.
 3. the **process environment** (what the caller exported) — used only when the
    config supplies nothing for the var.
