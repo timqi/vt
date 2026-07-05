@@ -17,6 +17,10 @@ export interface Env {
   PUSHOVER_JSON: string;
   /** JSON: {"webhook_url":"https://hooks.slack.com/services/…"}. Empty/invalid → Slack disabled. */
   SLACK_JSON: string;
+  /** JSON: {"app_id","app_secret","receive_id","receive_id_type"?,"mention"?,"base"?}.
+   *  Feishu/Lark self-built-app bot channel: @-mentions approvers + edits the
+   *  card in place on the decision. Empty/invalid → Feishu disabled. See feishu.ts. */
+  FEISHU_JSON: string;
   WORKER_ORIGIN: string;
   RP_ID: string;
   /** Cloudflare Access team domain, e.g. "myteam.cloudflareaccess.com". Empty → admin surface fails closed. */
@@ -120,6 +124,10 @@ export interface Challenge {
   created_ms: number;
   /** ms epoch when status transitioned to a terminal state (approved/rejected/expired) */
   finalized_ms?: number;
+  /** Feishu card message_id (present once the approval card was sent), so the DO
+   *  can PATCH the card to its terminal state on approve/reject/expire. Absent
+   *  when the Feishu channel is off or the send failed. */
+  feishu_message_id?: string;
 }
 
 export interface ChallengeMeta {

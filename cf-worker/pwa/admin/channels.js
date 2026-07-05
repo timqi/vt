@@ -12,8 +12,10 @@
 
   var chkPushover = document.getElementById('chk-pushover');
   var chkSlack = document.getElementById('chk-slack');
+  var chkFeishu = document.getElementById('chk-feishu');
   var poBody = document.getElementById('pushover-body');
   var slBody = document.getElementById('slack-body');
+  var fsBody = document.getElementById('feishu-body');
   var out = document.getElementById('output-section');
 
   function bind(chk, body) {
@@ -21,6 +23,7 @@
   }
   bind(chkPushover, poBody);
   bind(chkSlack, slBody);
+  bind(chkFeishu, fsBody);
 
   // ── Output rendering (DOM only — values are never interpolated into HTML) ──
 
@@ -120,6 +123,36 @@
         }
       } else if (data.slack_set) {
         notes.push(disableHint('Slack', 'SLACK_JSON'));
+      }
+
+      // Feishu / Lark
+      if (chkFeishu.checked) {
+        var appId = val('fs-app-id');
+        var appSecret = val('fs-app-secret');
+        var receiveId = val('fs-receive-id');
+        var receiveIdType = val('fs-receive-id-type') || 'chat_id';
+        var base = val('fs-base') || 'feishu';
+        var mention = val('fs-mention').split(/[\s,]+/).filter(function (s) { return s; });
+        if (appId || appSecret || receiveId) {
+          if (!appId || !appSecret || !receiveId) {
+            throw new Error('飞书：app_id、app_secret、receive_id 需同时填写');
+          }
+          cards.push(resultCard('飞书 / Lark',
+            JSON.stringify({
+              app_id: appId,
+              app_secret: appSecret,
+              receive_id: receiveId,
+              receive_id_type: receiveIdType,
+              mention: mention,
+              base: base,
+            }, null, 2), 'FEISHU_JSON'));
+        } else if (data.feishu_set) {
+          notes.push(el('p', 'hint', '飞书：未填写新值，保持现有配置不变。'));
+        } else {
+          throw new Error('飞书 已启用：请填写 app_id、app_secret、receive_id');
+        }
+      } else if (data.feishu_set) {
+        notes.push(disableHint('飞书 / Lark', 'FEISHU_JSON'));
       }
 
       if (!cards.length && !notes.length) {

@@ -14,8 +14,9 @@ function truncate(s: string, max = 512): string {
 // The shared context lines (who / pwd / cmd / ssh / ip / reason) that every
 // notification body carries. Approval and cache-hit notices differ only in their
 // title and trailing line, so they build on this common block — keeping the two
-// from silently drifting if a field is added later.
-function metaLines(
+// from silently drifting if a field is added later. Exported so feishu.ts renders
+// the SAME context block (as plain_text) rather than keeping a third copy.
+export function metaLines(
   meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
 ): string[] {
   const who = [meta.user, meta.host].filter(Boolean).join('@');
@@ -51,13 +52,35 @@ export function buildApprovalMessage(
 // "FYI: auto-decrypt happened" notice, not an approval request — there is no
 // approve URL to tap and no action to take. The title is distinct so an operator
 // can tell at a glance it was served from cache.
+// Shared cache-hit content (title + context lines). Exported so feishu.ts's
+// card renders the SAME title and lines as the Pushover/Slack text — the whole
+// point of a shared builder is that the two can never drift. Compact — a cache
+// hit is a terminal FYI, not an actionable approval, so it drops the
+// ssh/ip/reason lines and leads with a one-line summary (who · N records · cache
+// note), then the two highest-signal fields pwd + cmd (what ran, and where). No
+// @-mention anywhere on this path. The durable audit row keeps the full context.
+export function buildCacheHitLines(
+  meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd'>,
+  salts: number,
+): { title: string; lines: string[] } {
+  const title = meta.op_kind ? `VT 缓存命中(免审批): ${meta.op_kind}` : 'VT 缓存命中(免审批解密)';
+  const who = [meta.user, meta.host].filter(Boolean).join('@');
+  const head: string[] = [];
+  if (who) head.push(who);
+  head.push(`${salts} 条`);
+  head.push('缓存命中，无手机审批');
+  const lines: string[] = [head.join(' · ')];
+  if (meta.pwd) lines.push(`pwd: ${meta.pwd}`);
+  // Same self-labelled-multi-line handling as metaLines above.
+  if (meta.command) lines.push(meta.command.includes('\n') ? meta.command : `cmd: ${meta.command}`);
+  return { title, lines };
+}
+
 export function buildCacheHitMessage(
-  meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
+  meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd'>,
   salts: number,
 ): { title: string; body: string } {
-  const title = meta.op_kind ? `VT 缓存命中(免审批): ${meta.op_kind}` : 'VT 缓存命中(免审批解密)';
-  const lines = metaLines(meta);
-  lines.push(`records: ${salts} (served from DEK cache, no phone approval)`);
+  const { title, lines } = buildCacheHitLines(meta, salts);
   return { title, body: lines.join('\n') };
 }
 

@@ -21,6 +21,7 @@ import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
 import { seal, openToCache, cachePublicKey } from './cache_crypto';
 import { notifyCacheHit } from './notify';
+import { parseFeishuConfig, sendApprovalCard, editCard, sendCacheHitNotice, FeishuConfig, FeishuState, Kv as FeishuKv } from './feishu';
 import { log, logErr, tokenPrefix } from './log';
 
 const TTL_MS = 5 * 60 * 1000;
@@ -529,29 +530,51 @@ export class AccountDO extends DurableObject<Env> {
     try {
       const list = await this.ctx.storage.list<Challenge>({ prefix: 'ch:' });
       const toDelete: string[] = [];
+      // Parse the Feishu config ONCE for the whole sweep (it can't change mid-
+      // sweep) — avoids re-parsing FEISHU_JSON and re-logging any config error
+      // per expiring challenge.
+      const feishuSweepCfg = this.feishuCfg();
       for (const [key, ch] of list) {
         const ptKey = `pt:${ch.poll_token}`;
         if (ch.status === 'pending' && now - ch.created_ms >= TTL_MS) {
-          ch.status = 'expired';
-          ch.finalized_ms = now;
-          await this.ctx.storage.put(key, ch);
-          const wss = this.ctx.getWebSockets(`pt:${ch.poll_token}`);
-          for (const ws of wss) {
-            try { ws.send(JSON.stringify({ status: 'expired' } satisfies WsMessage)); ws.close(1000, 'expired'); } catch {}
+          // `ch` is a stale snapshot from list() at sweep start. opApprove /
+          // opReject do a NON-atomic read-modify-write across their WebAuthn
+          // awaits (the DO input gate is open during crypto/verify), so a
+          // decision may have committed after our snapshot. Re-read inside an
+          // atomic get→put window and only expire if it is STILL pending —
+          // otherwise we'd clobber the terminal status, double-finalize the
+          // audit row, and emit a card edit (⌛) that conflicts with the
+          // decision's (✅/❌). This fresh read also carries feishu_message_id.
+          const fresh = await this.ctx.storage.get<Challenge>(key);
+          if (fresh && fresh.status === 'pending') {
+            fresh.status = 'expired';
+            fresh.finalized_ms = now;
+            await this.ctx.storage.put(key, fresh);
+            const wss = this.ctx.getWebSockets(`pt:${fresh.poll_token}`);
+            for (const ws of wss) {
+              try { ws.send(JSON.stringify({ status: 'expired' } satisfies WsMessage)); ws.close(1000, 'expired'); } catch {}
+            }
+            log('expired', {
+              at: tokenPrefix(fresh.approve_token),
+              op_kind: fresh.meta.op_kind,
+              host: fresh.meta.host,
+              user: fresh.meta.user,
+              tty: fresh.meta.tty,
+              age_ms: now - fresh.created_ms,
+            });
+            this.auditFinalize(fresh.approve_token, 'expired', now - fresh.created_ms);
+            this.broadcastRow(auditKey(fresh.approve_token), 'update');
+            // Edit the Feishu card to ⌛ 已过期. feishuEdit fires via waitUntil (not
+            // awaited), so a burst of simultaneous expiries doesn't stretch the
+            // sweep by 6s each; every edit is independently guarded. Pass the
+            // once-parsed config so we don't re-parse per challenge.
+            this.feishuEdit(fresh, 'expired', {}, feishuSweepCfg);
+            // Retain `ch:` for RETENTION_MS so an in-flight WS reconnect still
+            // sees the terminal status; drop only the routing key now.
+            toDelete.push(ptKey);
           }
-          log('expired', {
-            at: tokenPrefix(ch.approve_token),
-            op_kind: ch.meta.op_kind,
-            host: ch.meta.host,
-            user: ch.meta.user,
-            tty: ch.meta.tty,
-            age_ms: now - ch.created_ms,
-          });
-          this.auditFinalize(ch.approve_token, 'expired', now - ch.created_ms);
-          this.broadcastRow(auditKey(ch.approve_token), 'update');
-          // Retain `ch:` for RETENTION_MS so an in-flight WS reconnect still
-          // sees the terminal status; drop only the routing key now.
-          toDelete.push(ptKey);
+          // else: a decision beat us — its own handler finalized it, and a later
+          // RETENTION sweep drops the keys. Leave everything untouched.
         } else if (
           ch.status !== 'pending'
           && ch.finalized_ms != null
@@ -611,6 +634,69 @@ export class AccountDO extends DurableObject<Env> {
 
   // ── HTTP ops ──────────────────────────────────────────────────────────
 
+  // ── Feishu channel (stateful: token cache + editable card) ──────────────────
+  // Parsed lazily per use; a malformed FEISHU_JSON is logged once and treated as
+  // "channel off" (best-effort, never breaks the ceremony).
+  private feishuCfg(): FeishuConfig | null {
+    const { config, error } = parseFeishuConfig(this.env.FEISHU_JSON);
+    if (error) logErr('feishu.config_error', error);
+    return config;
+  }
+
+  // DO storage as the token cache backing store for feishu.ts.
+  private feishuKv(): FeishuKv {
+    return {
+      get: <T>(k: string) => this.ctx.storage.get<T>(k),
+      put: (k: string, v: unknown) => this.ctx.storage.put(k, v),
+    };
+  }
+
+  // Fire the pending approval card (off the ceremony path) and write the
+  // resulting message_id back onto the challenge so a later approve/reject/expire
+  // can edit it. If the decision raced ahead of the send (challenge already
+  // terminal), edit the card straight to its final state instead — the only
+  // failure mode of the race is a card that never leaves "⏳", which this closes.
+  private async feishuSendAndStore(cfg: FeishuConfig, ch: Challenge, approveUrl: string): Promise<void> {
+    try {
+      const id = await sendApprovalCard(cfg, this.feishuKv(), Date.now(), ch.meta.op_kind, ch.meta, approveUrl);
+      if (!id) { logErr('feishu.send_failed', 'no message_id'); return; }
+      const cur = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
+      if (!cur) return; // expired + swept before the send returned
+      cur.feishu_message_id = id;
+      await this.ctx.storage.put(`ch:${ch.approve_token}`, cur);
+      if (cur.status !== 'pending') {
+        // Decision landed first. Edit to the terminal state now that we have the
+        // id. Approver label is unavailable on this path (opApprove already ran
+        // without an id) — degrade to latency-only; this race is rare + cosmetic.
+        const latencyMs = cur.finalized_ms != null ? cur.finalized_ms - cur.created_ms : undefined;
+        const w = await editCard(cfg, this.feishuKv(), Date.now(), id, cur.status as FeishuState, cur.meta.op_kind, cur.meta, { latencyMs });
+        if (w) logErr('feishu.edit_failed', w);
+      }
+    } catch (e) { logErr('feishu.send_failed', e); }
+  }
+
+  // Edit an already-sent card to a terminal state (off the decision path).
+  // `cfgHint` lets a caller (the alarm sweep) pass a config parsed ONCE for the
+  // whole batch, instead of this method re-parsing FEISHU_JSON — and re-logging
+  // any config error — for every challenge in a loop. Omit it (undefined) for
+  // the one-shot approve/reject paths, which parse on demand.
+  private feishuEdit(
+    ch: Challenge,
+    state: FeishuState,
+    extra: { approverLabel?: string; latencyMs?: number },
+    cfgHint?: FeishuConfig | null,
+  ): void {
+    const cfg = cfgHint !== undefined ? cfgHint : this.feishuCfg();
+    if (!cfg || !ch.feishu_message_id) return;
+    const mid = ch.feishu_message_id;
+    const meta = ch.meta;
+    this.ctx.waitUntil(
+      editCard(cfg, this.feishuKv(), Date.now(), mid, state, meta.op_kind, meta, extra)
+        .then((w) => { if (w) logErr('feishu.edit_failed', w); })
+        .catch((e) => logErr('feishu.edit_failed', e)),
+    );
+  }
+
   private async opCreate(request: Request): Promise<Response> {
     let parsed: DoCreateOp;
     try { parsed = await request.json() as DoCreateOp; }
@@ -625,6 +711,15 @@ export class AccountDO extends DurableObject<Env> {
     });
     if (this.auditCreate(challenge)) {
       this.broadcastRow(auditKey(challenge.approve_token), 'insert');
+    }
+
+    // Feishu approval card — fire-and-forget (waitUntil), NOT awaited: this keeps
+    // a third-party API's latency out of the singleton DO's serialized op path.
+    // Pushover/Slack are sent separately from index.ts (stateless). See feishu.ts.
+    const cfg = this.feishuCfg();
+    if (cfg) {
+      const approveUrl = `${this.env.WORKER_ORIGIN}/a/${challenge.approve_token}`;
+      this.ctx.waitUntil(this.feishuSendAndStore(cfg, challenge, approveUrl));
     }
     return new Response('ok');
   }
@@ -714,6 +809,13 @@ export class AccountDO extends DurableObject<Env> {
     ch.pwa_pk_b64u = body.pwa_pk_b64u;
     ch.binding_tag_b64u = body.binding_tag_b64u;
     ch.finalized_ms = Date.now();
+    // `ch` was read before the (non-storage) crypto/verify awaits, during which
+    // the DO input gate is open — so the fire-and-forget feishuSendAndStore may
+    // have written feishu_message_id in the meantime. Merge it back from the
+    // latest stored copy so this put doesn't clobber it (which would leave the
+    // approved card unable to edit, stuck at ⏳). The get→put pair has no
+    // intervening await, so nothing can slip between them.
+    ch.feishu_message_id = (await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`))?.feishu_message_id;
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 
     log('approved', {
@@ -725,6 +827,9 @@ export class AccountDO extends DurableObject<Env> {
       latency_ms: ch.finalized_ms - ch.created_ms,
     });
     this.auditFinalize(ch.approve_token, 'approved', ch.finalized_ms - ch.created_ms);
+
+    // Edit the Feishu card to ✅ 已批准, naming the Passkey that approved.
+    this.feishuEdit(ch, 'approved', { approverLabel: entry.l, latencyMs: ch.finalized_ms - ch.created_ms });
 
     // Opt-in DEK cache write. Best-effort: a failure here must never break the
     // approval (the daemon already has its sealed DEKs via the WS path below).
@@ -916,6 +1021,15 @@ export class AccountDO extends DurableObject<Env> {
         .then((w) => { if (w) logErr('notify.cachehit_failed', w); })
         .catch((e) => logErr('notify.cachehit_failed', e)),
     );
+    // Feishu cache-hit notice — compact, no @, no edit lifecycle (terminal FYI).
+    const feishu = this.feishuCfg();
+    if (feishu) {
+      this.ctx.waitUntil(
+        sendCacheHitNotice(feishu, this.feishuKv(), Date.now(), meta, salts.length)
+          .then((w) => { if (w) logErr('feishu.cachehit_failed', w); })
+          .catch((e) => logErr('feishu.cachehit_failed', e)),
+      );
+    }
     return Response.json({ source: 'cache', sealed_deks_b64u: sealedB64u } satisfies DekCacheResponse);
   }
 
@@ -1037,6 +1151,9 @@ export class AccountDO extends DurableObject<Env> {
 
     ch.status = 'rejected';
     ch.finalized_ms = Date.now();
+    // See opApprove: merge feishu_message_id from the latest stored copy so a
+    // racing feishuSendAndStore write isn't clobbered by this put.
+    ch.feishu_message_id = (await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`))?.feishu_message_id;
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 
     const wss = this.ctx.getWebSockets(`pt:${ch.poll_token}`);
@@ -1054,6 +1171,9 @@ export class AccountDO extends DurableObject<Env> {
     });
     this.auditFinalize(ch.approve_token, 'rejected', ch.finalized_ms - ch.created_ms);
     this.broadcastRow(auditKey(ch.approve_token), 'update');
+
+    // Edit the Feishu card to ❌ 已拒绝.
+    this.feishuEdit(ch, 'rejected', {});
 
     return new Response('ok');
   }

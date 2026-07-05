@@ -66,5 +66,8 @@ ACCESS_AUD = "<YOUR_ACCESS_APPLICATION_AUD_TAG>"
 #                     Rotate to instantly invalidate all cached DEKs. NEVER inline.
 #   PUSHOVER_JSON     {"app_token":"…","user_key":"…"}  — optional Pushover channel
 #   SLACK_JSON        {"webhook_url":"https://hooks.slack.com/services/…"} — optional Slack channel
-# Both notification secrets are independent and opt-in; generate them on the
+#   FEISHU_JSON       {"app_id","app_secret","receive_id","receive_id_type"?,"mention"?,"base"?}
+#                     — optional 飞书/Lark channel (self-built app bot): @-mentions
+#                     approvers + edits the card in place on the decision. See docs/feishu.md.
+# All notification secrets are independent and opt-in; generate them on the
 # admin "推送渠道" tab. Empty/absent → that channel is simply disabled.

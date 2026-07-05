@@ -179,7 +179,8 @@ app.get(`/${ADMIN_SEG}/setup`, (c) => {
 app.get(`/${ADMIN_SEG}/channels`, (c) => {
   const pushoverSet = !!(c.env.PUSHOVER_JSON && c.env.PUSHOVER_JSON.trim());
   const slackSet = !!(c.env.SLACK_JSON && c.env.SLACK_JSON.trim());
-  const resp = c.html(buildChannelsPage(pushoverSet, slackSet));
+  const feishuSet = !!(c.env.FEISHU_JSON && c.env.FEISHU_JSON.trim());
+  const resp = c.html(buildChannelsPage(pushoverSet, slackSet, feishuSet));
   resp.headers.set('Content-Security-Policy', STRICT_CSP);
   return resp;
 });
@@ -754,10 +755,10 @@ function buildSetupPage(rpId: string, credentialsJson: string): string {
 // Notification-channel generator page. Pure client-side: the operator ticks the
 // channels they want, fills the fields, and the page emits the JSON secret(s) to
 // paste into `wrangler secret put`. Nothing is POSTed back to the Worker.
-function buildChannelsPage(pushoverSet: boolean, slackSet: boolean): string {
+function buildChannelsPage(pushoverSet: boolean, slackSet: boolean, feishuSet: boolean): string {
   const adminBase = `/${ADMIN_SEG}`;
   const pwaBase = `/pwa`;
-  const dataJson = escapeJsonForHtml({ pushover_set: pushoverSet, slack_set: slackSet });
+  const dataJson = escapeJsonForHtml({ pushover_set: pushoverSet, slack_set: slackSet, feishu_set: feishuSet });
   const badge = (set: boolean) =>
     set ? `<span class="badge badge-approved">已配置</span>` : `<span class="badge">未配置</span>`;
   return `<!doctype html>
@@ -810,6 +811,7 @@ function buildChannelsPage(pushoverSet: boolean, slackSet: boolean): string {
       </div>
       <div class="channel-body" id="slack-body"${slackSet ? '' : ' hidden'}>
         ${slackSet ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : ''}
+        <p class="hint warn">⚠️ Slack 走 Incoming Webhook，是<strong>单向通知</strong>：<strong>不支持</strong>审批通过/拒绝后回改原消息，也不 @ 人。审批结果只会在审批页与审计页更新。需要「@相关人 + 决策后回改卡片」请用下方的<strong>飞书 / Lark</strong> 通道。</p>
         <p class="hint">用 <strong>Incoming Webhook</strong> 方式——这是单向通知（真正的「同意」仍在审批页用 Passkey 完成），所以只需一个 Webhook URL，无需 bot、无需把机器人拉进频道：</p>
         <ol class="steps">
           <li>打开 <a href="https://api.slack.com/apps" target="_blank" rel="noopener">api.slack.com/apps</a> → <strong>Create New App</strong> → <strong>From scratch</strong>，填个名字（如 <code>vt-approval</code>）并选择目标 workspace。</li>
@@ -822,6 +824,53 @@ function buildChannelsPage(pushoverSet: boolean, slackSet: boolean): string {
           <label for="sl-webhook">Webhook URL（webhook_url）</label>
           <input id="sl-webhook" type="text" placeholder="https://hooks.slack.com/services/T…/B…/…" autocomplete="off" spellcheck="false">
         </div>
+      </div>
+    </section>
+
+    <section id="feishu-card" class="card channel">
+      <div class="card-head">
+        <h2>飞书 / Lark</h2>
+        <div class="channel-ctrl">
+          ${badge(feishuSet)}
+          <label class="switch" title="启用 飞书"><input type="checkbox" id="chk-feishu"${feishuSet ? ' checked' : ''}><span class="slider"></span></label>
+        </div>
+      </div>
+      <div class="channel-body" id="feishu-body"${feishuSet ? '' : ' hidden'}>
+        ${feishuSet ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : ''}
+        <p class="hint">用<strong>自建应用（机器人）</strong>方式——这是唯一能<strong>@相关人</strong>并在审批后<strong>回改原卡片填结果</strong>的通道（飞书自定义机器人 webhook 做不到）。完整步骤见 <code>docs/feishu.md</code>：创建自建应用 → 开启机器人 → 授予 <code>im:message</code> / <code>im:message:send_as_bot</code> → 发布 → 把机器人拉进目标群 → 取 <code>chat_id</code> 与要 @ 的人的 <code>open_id</code>。</p>
+        <div class="field">
+          <label for="fs-app-id">App ID（app_id）</label>
+          <input id="fs-app-id" type="text" placeholder="cli_xxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="fs-app-secret">App Secret（app_secret）</label>
+          <input id="fs-app-secret" type="text" placeholder="机器人凭证，勿泄露" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="fs-receive-id">目标 ID（receive_id）</label>
+          <input id="fs-receive-id" type="text" placeholder="oc_… (群 chat_id) 或 ou_… (私聊 open_id)" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="fs-receive-id-type">目标类型（receive_id_type）</label>
+          <select id="fs-receive-id-type">
+            <option value="chat_id" selected>chat_id（群）</option>
+            <option value="open_id">open_id</option>
+            <option value="user_id">user_id</option>
+            <option value="email">email</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="fs-mention">审批时 @ 的人（open_id，每行一个，可留空）</label>
+          <textarea id="fs-mention" rows="3" placeholder="ou_aaaaaaaa&#10;ou_bbbbbbbb" autocomplete="off" spellcheck="false"></textarea>
+        </div>
+        <div class="field">
+          <label for="fs-base">域名（base）</label>
+          <select id="fs-base">
+            <option value="feishu" selected>feishu（open.feishu.cn，中国版飞书）</option>
+            <option value="larksuite">larksuite（open.larksuite.com，国际版 Lark）</option>
+          </select>
+        </div>
+        <p class="hint">免审批（缓存命中）通知会精简为一两行、不 @ 任何人；审批请求才会 @ 上面列出的人，并带「去审批」按钮。</p>
       </div>
     </section>
 
