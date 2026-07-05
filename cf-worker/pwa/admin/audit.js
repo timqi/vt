@@ -244,8 +244,9 @@
       if (oldTr && oldTr.parentNode) oldTr.parentNode.replaceChild(newTr, oldTr);
       else document.getElementById('rows').appendChild(newTr);
       trById[r.id] = newTr;
-      // Keep an open detail card for this row in sync.
-      if (!backdrop.hidden && openDetailId === r.id) openDetail(r.id);
+      // Keep an open detail card for this row in sync (isRefresh=true so a
+      // mounted, in-flight ceremony below isn't torn down mid-approval).
+      if (!backdrop.hidden && openDetailId === r.id) openDetail(r.id, true);
     } else {
       // Not currently shown. Only surface it if it matches the filter; the
       // cursor still advanced via trackNewest so it won't be re-fetched.
@@ -301,19 +302,14 @@
     dl.appendChild(dt); dl.appendChild(dd);
   }
 
-  // Row with a clickable link (opens a new tab). href set via property (no
-  // inline handler), so it's CSP-safe and same-origin.
-  function addLinkRow(dl, label, url, text) {
-    var dt = document.createElement('dt'); dt.textContent = label;
-    var dd = document.createElement('dd');
-    var a = document.createElement('a');
-    a.href = url; a.target = '_blank'; a.rel = 'noopener';
-    a.textContent = text || url;
-    dd.appendChild(a);
-    dl.appendChild(dt); dl.appendChild(dd);
-  }
+  // Monotonic guard so a slow /api/page fetch from a stale openDetail() (row
+  // re-opened, or live-refreshed to a new status) can't mount into the card
+  // after a newer call already re-rendered it.
+  var detailApproveSeq = 0;
 
-  function openDetail(id) {
+  // isRefresh: true when re-rendering the already-open row from a live WS update
+  // (vs. a fresh click). On a refresh we leave any mounted ceremony untouched.
+  function openDetail(id, isRefresh) {
     var r = byId[id];
     if (!r) return;
     var dl = document.getElementById('detail-dl');
@@ -337,18 +333,49 @@
     addRow(dl, '终态时间', fmtTime(r.finalized_ms));
     addRow(dl, '延迟(ms)', r.latency_ms);
     addRow(dl, 'token', r.token_id);
-    // Approve URL: token_id IS the full approve_token (12-byte / 16-char) for
-    // ceremony rows, so /a/{token_id} is the approval page. Only actionable while
-    // pending; shown for non-cache rows. Cache events have a synthetic token_id.
-    if (r.op_kind !== 'cache' && r.token_id) {
-      var approveUrl = location.origin + '/a/' + r.token_id;
-      addLinkRow(dl, '审批链接', approveUrl, approveUrl);
-    }
     openDetailId = id;
     backdrop.hidden = false;
+    // Pending ceremony rows (token_id IS the approve_token) get the approval
+    // ceremony mounted inline — approve/reject happen right here, no new tab.
+    // Everything else just shows details.
+    mountApproval(r, isRefresh);
   }
 
-  function closeDetail() { backdrop.hidden = true; openDetailId = null; }
+  // Fetch this row's ApprovePageData and mount the shared ceremony into
+  // #detail-approve. Only for pending non-cache rows; a no-op (cleared box)
+  // otherwise. Guarded against races via detailApproveSeq.
+  function mountApproval(r, isRefresh) {
+    var box = document.getElementById('detail-approve');
+    // Live re-render of the already-open row: never disturb a mounted ceremony.
+    // The running ceremony owns the modal until it settles (success → close) or
+    // the admin closes it; a settle-elsewhere just surfaces as a 410 on submit.
+    if (isRefresh && box.firstChild) return;
+    box.innerHTML = '';
+    var seq = ++detailApproveSeq;
+    if (r.op_kind === 'cache' || r.status !== 'pending' || !r.token_id) return;
+    if (!window.vt || !vt.mountApprove) return;
+    fetch('/api/page/' + encodeURIComponent(r.token_id), { headers: { 'Accept': 'application/json' } })
+      .then(function (resp) { return resp.ok ? resp.json() : null; })
+      .then(function (data) {
+        // Bail if a newer openDetail()/close happened, or the row is no longer
+        // the pending one on screen (data null → already handled/expired).
+        if (!data || seq !== detailApproveSeq || openDetailId !== r.id) return;
+        vt.mountApprove({
+          data: data,
+          root: box,
+          showMeta: false,   // the detail dl above already shows request info
+          onSettled: function () { setTimeout(closeDetail, 800); },
+        });
+      })
+      .catch(function () { /* leave details-only on any error */ });
+  }
+
+  function closeDetail() {
+    backdrop.hidden = true; openDetailId = null;
+    detailApproveSeq++;    // invalidate any in-flight mount
+    var box = document.getElementById('detail-approve');
+    if (box) box.innerHTML = '';
+  }
   document.getElementById('detail-close').addEventListener('click', closeDetail);
   backdrop.addEventListener('click', function (e) { if (e.target === backdrop) closeDetail(); });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeDetail(); });

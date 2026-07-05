@@ -44,7 +44,7 @@ const ADMIN_SEG = 'kestrel';
 // stale far-future-cached copy. (Workers Assets serves static files with a
 // cacheable response; without a versioned URL a changed audit.js can refresh
 // while admin.css stays stale, which desyncs markup from styles.)
-const ASSET_VER = '20260704-1';
+const ASSET_VER = '20260705-1';
 
 // Escape a JSON string for safe embedding in a <script type="application/json"> block.
 function escapeJsonForHtml(obj: unknown): string {
@@ -508,26 +508,46 @@ app.post('/api/reject', async (c) => {
   });
 });
 
+// Fetch ApprovePageData for a token from the DO. Shared by the HTML page
+// (/a/:token) and the JSON sibling (/api/page/:token). Returns a discriminated
+// result; a non-pending / unknown token maps to 410 / 404. The token is
+// url-encoded defensively (it feeds a query param) even though real tokens are
+// b64url and carry no special chars.
+async function fetchApprovePageData(
+  c: Context<{ Bindings: Env; Variables: AccessVars }>,
+  approveToken: string,
+): Promise<{ ok: true; data: ApprovePageData } | { ok: false; status: 404 | 410 }> {
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  const dataResp = await stub.fetch(
+    `https://account.do/op/page?approve_token=${encodeURIComponent(approveToken)}`);
+  if (!dataResp.ok) return { ok: false, status: dataResp.status === 410 ? 410 : 404 };
+  return { ok: true, data: await dataResp.json() };
+}
+
 // GET /a/:approve_token — serve the approval PWA page
 app.get('/a/:approve_token', async (c) => {
-  const approveToken = c.req.param('approve_token');
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  // Fetch page data from DO
-  const dataResp = await stub.fetch(`https://account.do/op/page?approve_token=${approveToken}`);
-  if (!dataResp.ok) {
-    const status = dataResp.status === 410 ? 410 : 404;
-    return c.text(status === 410 ? 'Request already handled or expired' : 'Not found', status);
+  const res = await fetchApprovePageData(c, c.req.param('approve_token'));
+  if (!res.ok) {
+    return c.text(res.status === 410 ? 'Request already handled or expired' : 'Not found', res.status);
   }
-  const pageData: ApprovePageData = await dataResp.json();
-
   // Inject page data into HTML template
-  const html = buildApprovePage(pageData);
-  const resp = c.html(html);
+  const resp = c.html(buildApprovePage(res.data));
   // Tight CSP for the approval page. <script type="application/json"> is
   // non-executable and exempt from script-src; same-origin /pwa/* scripts and
   // styles match 'self'; fetch() to /api/* is same-origin.
   resp.headers.set('Content-Security-Policy', STRICT_CSP);
   return resp;
+});
+
+// GET /api/page/:approve_token — same ApprovePageData as /a/:token but as JSON,
+// so the (Access-gated) audit page can mount the approval ceremony inline in its
+// detail modal instead of opening the standalone page in a new tab. The
+// approve_token is an unguessable 96-bit capability and the payload holds only
+// public/PRF-wrapped material — this exposes nothing /a/:token doesn't already.
+app.get('/api/page/:approve_token', async (c) => {
+  const res = await fetchApprovePageData(c, c.req.param('approve_token'));
+  if (!res.ok) return c.json({ error: res.status === 410 ? 'gone' : 'not_found' }, res.status);
+  return c.json(res.data);
 });
 
 // ── HTML template ─────────────────────────────────────────────────────────
@@ -551,24 +571,14 @@ function buildApprovePage(data: ApprovePageData): string {
       <h1>VT 审批请求</h1>
       <p class="hint">请用 Passkey（iCloud / 1Password / YubiKey）确认下列操作。</p>
     </header>
-    <section id="meta-section">
-      <h2>请求信息</h2>
-      <dl id="meta"></dl>
-    </section>
-    <section id="cache-section" hidden>
-      <h2>缓存解密授权</h2>
-      <p class="hint cache-warn">选择后，在该时长内、<strong>同一来源 IP 且同一父进程</strong>对这些记录的解密将<strong>免手机审批</strong>。默认不缓存。</p>
-      <div id="cache-options" role="radiogroup" aria-label="缓存时长"></div>
-    </section>
-    <section id="actions">
-      <button id="approve" type="button">✓ 同意</button>
-      <button id="reject" type="button">拒绝</button>
-    </section>
-    <p id="status" role="status" aria-live="polite"></p>
+    <!-- The ceremony UI (meta / cache selector / approve+reject / status) is
+         built by approve.js's vt.mountApprove(), the single source shared with
+         the admin audit page's inline approval modal. -->
+    <div id="vt-approve-root"></div>
   </main>
   <script src="${base}/libsodium.js"></script>
-  <script src="${base}/common.js"></script>
-  <script src="${base}/approve.js"></script>
+  <script src="${base}/common.js?v=${ASSET_VER}"></script>
+  <script src="${base}/approve.js?v=${ASSET_VER}"></script>
 </body>
 </html>`;
 }
@@ -628,7 +638,15 @@ function buildAuditPage(): string {
   <div id="detail-backdrop" hidden><div id="detail-card" role="dialog" aria-modal="true">
     <button id="detail-close" type="button" aria-label="关闭">×</button>
     <dl id="detail-dl"></dl>
+    <!-- Inline approval ceremony for pending rows, built by the SAME
+         vt.mountApprove() the standalone /a/:token page uses. -->
+    <div id="detail-approve"></div>
   </div></div>
+  <!-- Passkey ceremony deps (root /pwa/*, public) — reused so approve/reject
+       happen in this modal instead of a new tab. -->
+  <script src="/pwa/libsodium.js"></script>
+  <script src="/pwa/common.js"></script>
+  <script src="/pwa/approve.js?v=${ASSET_VER}"></script>
   <script src="${base}/pwa/audit.js?v=${ASSET_VER}"></script>
 </body>
 </html>`;

@@ -65,7 +65,7 @@ dl > div + div {
 dl dt { color: #888; }
 dl dd { margin: 0; word-break: break-all; white-space: pre-wrap; }
 
-#actions {
+.vt-ap-actions {
   display: grid;
   grid-template-columns: 2fr 1fr;
   gap: .6rem;
@@ -83,28 +83,28 @@ button {
   transition: opacity .12s;
 }
 
-#approve { background: var(--approve-bg); color: var(--approve-fg); }
-#reject  { background: rgba(127, 127, 127, .14); color: inherit; }
+.vt-ap-approve { background: var(--approve-bg); color: var(--approve-fg); }
+.vt-ap-reject  { background: rgba(127, 127, 127, .14); color: inherit; }
 
 button:active  { opacity: .72; }
 button[disabled] { opacity: .38; cursor: not-allowed; }
 
-#status {
+.vt-ap-status {
   margin-top: .9rem;
   min-height: 1.3em;
   font-size: .82rem;
   line-height: 1.4;
 }
 
-#status.error { color: var(--err); }
-#status.ok    { color: var(--ok); }
+.vt-ap-status.error { color: var(--err); }
+.vt-ap-status.ok    { color: var(--ok); }
 
 /* ── DEK-cache duration selector ─────────────────────────────────────── */
-#cache-section { margin-top: .9rem; }
+.vt-ap-cache-section { margin-top: .9rem; }
 .cache-warn { margin: 0 0 .4rem; font-size: .74rem; }
 .cache-warn strong { color: var(--err); }
 
-#cache-options {
+.vt-ap-cache-opts {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
   gap: .35rem;

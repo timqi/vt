@@ -211,6 +211,33 @@ tbody tr.clickable { cursor: pointer; }
 #detail-dl dd { margin: 0; font-size: 13px; word-break: break-word; }
 #detail-dl dd.mono { font-family: var(--mono); white-space: pre-wrap; }
 
+/* Inline Passkey approval ceremony (built by vt.mountApprove, shared with the
+   standalone /a/:token page). Class-scoped under .vt-approve so it never
+   collides with the audit page's own #actions / #status. */
+#detail-approve:empty { display: none; }
+.vt-approve { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
+.vt-approve h2 {
+  font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--muted); margin: 0 0 6px;
+}
+.vt-ap-cache-section { margin: 0 0 14px; }
+.vt-ap-cache-section .cache-warn { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+.vt-ap-cache-section .cache-warn strong { color: var(--err); }
+.vt-ap-cache-opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: 6px; }
+.vt-ap-cache-opts .cache-opt {
+  display: flex; align-items: center; justify-content: center; gap: 4px;
+  padding: 6px 4px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-2); font-size: 13px; cursor: pointer; margin: 0;
+}
+.vt-ap-cache-opts .cache-opt:has(input:checked) { border-color: var(--accent); background: rgba(127,127,127,.14); }
+.vt-ap-cache-opts .cache-opt input { accent-color: var(--accent); margin: 0; }
+.vt-ap-actions { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; }
+.vt-ap-approve { background: var(--ok); color: #fff; margin: 0; }
+.vt-ap-reject { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); margin: 0; }
+.vt-ap-status { min-height: 20px; font-size: 13px; margin-top: 10px; }
+.vt-ap-status.ok { color: var(--ok); }
+.vt-ap-status.error { color: var(--err); }
+
 /* Setup: current Passkey list + CLI command block */
 .cred-list { list-style: none; margin: 0 0 16px; padding: 0; }
 .cred-list li {
