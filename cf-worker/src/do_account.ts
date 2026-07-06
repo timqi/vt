@@ -22,6 +22,13 @@ import { verifyAssertion } from './webauthn';
 import { seal, openToCache, cachePublicKey } from './cache_crypto';
 import { notifyCacheHit } from './notify';
 import { parseFeishuConfig, sendApprovalCard, editCard, sendCacheHitNotice, FeishuConfig, FeishuState, Kv as FeishuKv } from './feishu';
+import {
+  parseSlackAppConfig,
+  sendApprovalCard as sendSlackAppCard,
+  editCard as editSlackAppCard,
+  sendCacheHitNotice as sendSlackAppCacheHitNotice,
+  SlackAppConfig, SlackAppState, SlackAppMsgRef,
+} from './slack_app';
 import { log, logErr, tokenPrefix } from './log';
 
 const TTL_MS = 5 * 60 * 1000;
@@ -542,10 +549,11 @@ export class AccountDO extends DurableObject<Env> {
     try {
       const list = await this.ctx.storage.list<Challenge>({ prefix: 'ch:' });
       const toDelete: string[] = [];
-      // Parse the Feishu config ONCE for the whole sweep (it can't change mid-
-      // sweep) — avoids re-parsing FEISHU_JSON and re-logging any config error
-      // per expiring challenge.
+      // Parse the Feishu + Slack App configs ONCE for the whole sweep (they
+      // can't change mid-sweep) — avoids re-parsing the secrets and re-logging
+      // any config error per expiring challenge.
       const feishuSweepCfg = this.feishuCfg();
+      const slackAppSweepCfg = this.slackAppCfg();
       for (const [key, ch] of list) {
         const ptKey = `pt:${ch.poll_token}`;
         if (ch.status === 'pending' && now - ch.created_ms >= TTL_MS) {
@@ -553,9 +561,10 @@ export class AccountDO extends DurableObject<Env> {
           // have committed after it. expireChallenge re-reads atomically and is a
           // no-op if no longer pending, so it can't clobber a terminal status,
           // double-finalize the audit row, or emit a ⌛ card edit that conflicts
-          // with the decision's ✅/❌. It drops the pt: key itself; feishuEdit
-          // fires via waitUntil, so a burst of expiries doesn't stretch the sweep.
-          await this.expireChallenge(ch.approve_token, now, feishuSweepCfg);
+          // with the decision's ✅/❌. It drops the pt: key itself; feishuEdit /
+          // slackAppEdit fire via waitUntil, so a burst of expiries doesn't
+          // stretch the sweep.
+          await this.expireChallenge(ch.approve_token, now, feishuSweepCfg, slackAppSweepCfg);
         } else if (
           ch.status !== 'pending'
           && ch.finalized_ms != null
@@ -687,6 +696,60 @@ export class AccountDO extends DurableObject<Env> {
     );
   }
 
+  // ── Slack App channel (stateful: bot token + editable message) ───────────────
+  // Structurally identical to the Feishu channel above (send → store ref → edit
+  // on decision), minus the token cache: a Slack bot token is long-lived, so
+  // there is no KV. A malformed SLACK_APP_JSON is logged once and treated as
+  // "channel off" (best-effort, never breaks the ceremony).
+  private slackAppCfg(): SlackAppConfig | null {
+    const { config, error } = parseSlackAppConfig(this.env.SLACK_APP_JSON);
+    if (error) logErr('slackapp.config_error', error);
+    return config;
+  }
+
+  // Fire the pending approval message (off the ceremony path) and write the
+  // resulting {channel, ts} back onto the challenge so a later approve/reject/
+  // expire can edit it. Mirrors feishuSendAndStore, including the send-vs-decision
+  // race: if the decision landed first, edit straight to the terminal state.
+  private async slackAppSendAndStore(cfg: SlackAppConfig, ch: Challenge, approveUrl: string): Promise<void> {
+    try {
+      const ref = await sendSlackAppCard(cfg, ch.meta.op_kind, ch.meta, approveUrl);
+      if (!ref) { logErr('slackapp.send_failed', 'no ts'); return; }
+      const cur = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
+      if (!cur) return; // expired + swept before the send returned
+      cur.slackapp = ref;
+      await this.ctx.storage.put(`ch:${ch.approve_token}`, cur);
+      if (cur.status !== 'pending') {
+        // Decision landed first — edit to the terminal state now that we have the
+        // ref. Approver label is unavailable on this path (opApprove already ran
+        // without a ref) — degrade to latency-only; this race is rare + cosmetic.
+        const latencyMs = cur.finalized_ms != null ? cur.finalized_ms - cur.created_ms : undefined;
+        const w = await editSlackAppCard(cfg, ref, cur.status as SlackAppState, cur.meta.op_kind, cur.meta, { latencyMs });
+        if (w) logErr('slackapp.edit_failed', w);
+      }
+    } catch (e) { logErr('slackapp.send_failed', e); }
+  }
+
+  // Edit an already-sent message to a terminal state (off the decision path).
+  // `cfgHint` mirrors feishuEdit: the alarm sweep passes a config parsed ONCE for
+  // the whole batch; the one-shot approve/reject paths omit it (parse on demand).
+  private slackAppEdit(
+    ch: Challenge,
+    state: SlackAppState,
+    extra: { approverLabel?: string; latencyMs?: number },
+    cfgHint?: SlackAppConfig | null,
+  ): void {
+    const cfg = cfgHint !== undefined ? cfgHint : this.slackAppCfg();
+    if (!cfg || !ch.slackapp) return;
+    const ref: SlackAppMsgRef = ch.slackapp;
+    const meta = ch.meta;
+    this.ctx.waitUntil(
+      editSlackAppCard(cfg, ref, state, meta.op_kind, meta, extra)
+        .then((w) => { if (w) logErr('slackapp.edit_failed', w); })
+        .catch((e) => logErr('slackapp.edit_failed', e)),
+    );
+  }
+
   // Atomically expire ONE past-TTL pending challenge and fire all the terminal
   // side-effects: flip status→expired, notify the polling WS, finalize the audit
   // row, broadcast to admin streams, edit the Feishu card, and drop the pt:
@@ -697,12 +760,14 @@ export class AccountDO extends DurableObject<Env> {
   // (opPageData / opApprove / opReject), so a stale challenge is fully finalized
   // the moment anyone touches it — the audit row and Feishu card update even when
   // the alarm is not running, instead of waiting on (or depending on) the sweep.
-  // Pass cfgHint to reuse a once-parsed Feishu config (the batch sweep); omit it
-  // on the one-shot read paths so it parses on demand.
+  // Pass cfgHint / slackCfgHint to reuse a once-parsed Feishu / Slack App config
+  // (the batch sweep); omit them on the one-shot read paths so they parse on
+  // demand.
   private async expireChallenge(
     approveToken: string,
     now: number,
     cfgHint?: FeishuConfig | null,
+    slackCfgHint?: SlackAppConfig | null,
   ): Promise<void> {
     const key = `ch:${approveToken}`;
     const fresh = await this.ctx.storage.get<Challenge>(key);
@@ -732,6 +797,7 @@ export class AccountDO extends DurableObject<Env> {
     this.auditFinalize(fresh.approve_token, 'expired', now - fresh.created_ms);
     this.broadcastRow(auditKey(fresh.approve_token), 'update');
     this.feishuEdit(fresh, 'expired', {}, cfgHint);
+    this.slackAppEdit(fresh, 'expired', {}, slackCfgHint);
     // Retain `ch:` for RETENTION_MS so an in-flight WS reconnect still sees the
     // terminal status; drop only the routing key now (a later RETENTION sweep
     // drops `ch:`).
@@ -770,9 +836,21 @@ export class AccountDO extends DurableObject<Env> {
     // a third-party API's latency out of the singleton DO's serialized op path.
     // Pushover/Slack are sent separately from index.ts (stateless). See feishu.ts.
     const cfg = this.feishuCfg();
-    if (cfg) {
+    const slackCfg = this.slackAppCfg();
+    if (cfg || slackCfg) {
       const approveUrl = `${this.env.WORKER_ORIGIN}/a/${challenge.approve_token}`;
-      this.ctx.waitUntil(this.feishuSendAndStore(cfg, challenge, approveUrl));
+      // Both feishuSendAndStore and slackAppSendAndStore do a read-modify-write of
+      // the SAME `ch:` record, each writing only its own ref field
+      // (feishu_message_id / slackapp). As independent waitUntil tasks their
+      // `await get`s can both read the pre-write snapshot, so the later `put`
+      // clobbers the sibling's ref — a lost update that strands that channel's
+      // message at ⏳ with no error logged. Run them SEQUENTIALLY inside one
+      // waitUntil so the second reads the first's committed write. Client latency
+      // is unaffected: opCreate already returns before these settle.
+      this.ctx.waitUntil((async () => {
+        if (cfg) await this.feishuSendAndStore(cfg, challenge, approveUrl);
+        if (slackCfg) await this.slackAppSendAndStore(slackCfg, challenge, approveUrl);
+      })());
     }
     return new Response('ok');
   }
@@ -897,6 +975,7 @@ export class AccountDO extends DurableObject<Env> {
       return new Response('challenge not pending', { status: 410 });
     }
     ch.feishu_message_id = latest.feishu_message_id;
+    ch.slackapp = latest.slackapp;
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 
     log('approved', {
@@ -909,8 +988,9 @@ export class AccountDO extends DurableObject<Env> {
     });
     this.auditFinalize(ch.approve_token, 'approved', ch.finalized_ms - ch.created_ms);
 
-    // Edit the Feishu card to ✅ 已批准, naming the Passkey that approved.
+    // Edit the Feishu / Slack App message to ✅ 已批准, naming the Passkey that approved.
     this.feishuEdit(ch, 'approved', { approverLabel: entry.l, latencyMs: ch.finalized_ms - ch.created_ms });
+    this.slackAppEdit(ch, 'approved', { approverLabel: entry.l, latencyMs: ch.finalized_ms - ch.created_ms });
 
     // Opt-in DEK cache write. Best-effort: a failure here must never break the
     // approval (the daemon already has its sealed DEKs via the WS path below).
@@ -1102,13 +1182,22 @@ export class AccountDO extends DurableObject<Env> {
         .then((w) => { if (w) logErr('notify.cachehit_failed', w); })
         .catch((e) => logErr('notify.cachehit_failed', e)),
     );
-    // Feishu cache-hit notice — compact, no @, no edit lifecycle (terminal FYI).
+    // Feishu / Slack App cache-hit notice — compact, no @, no edit lifecycle
+    // (terminal FYI).
     const feishu = this.feishuCfg();
     if (feishu) {
       this.ctx.waitUntil(
         sendCacheHitNotice(feishu, this.feishuKv(), Date.now(), meta, salts.length)
           .then((w) => { if (w) logErr('feishu.cachehit_failed', w); })
           .catch((e) => logErr('feishu.cachehit_failed', e)),
+      );
+    }
+    const slackApp = this.slackAppCfg();
+    if (slackApp) {
+      this.ctx.waitUntil(
+        sendSlackAppCacheHitNotice(slackApp, meta, salts.length)
+          .then((w) => { if (w) logErr('slackapp.cachehit_failed', w); })
+          .catch((e) => logErr('slackapp.cachehit_failed', e)),
       );
     }
     return Response.json({ source: 'cache', sealed_deks_b64u: sealedB64u } satisfies DekCacheResponse);
@@ -1250,6 +1339,7 @@ export class AccountDO extends DurableObject<Env> {
       return new Response('challenge not pending', { status: 410 });
     }
     ch.feishu_message_id = latest.feishu_message_id;
+    ch.slackapp = latest.slackapp;
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 
     const wss = this.ctx.getWebSockets(`pt:${ch.poll_token}`);
@@ -1268,8 +1358,9 @@ export class AccountDO extends DurableObject<Env> {
     this.auditFinalize(ch.approve_token, 'rejected', ch.finalized_ms - ch.created_ms);
     this.broadcastRow(auditKey(ch.approve_token), 'update');
 
-    // Edit the Feishu card to ❌ 已拒绝.
+    // Edit the Feishu / Slack App message to ❌ 已拒绝.
     this.feishuEdit(ch, 'rejected', {});
+    this.slackAppEdit(ch, 'rejected', {});
 
     return new Response('ok');
   }

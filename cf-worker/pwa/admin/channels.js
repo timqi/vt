@@ -12,9 +12,11 @@
 
   var chkPushover = document.getElementById('chk-pushover');
   var chkSlack = document.getElementById('chk-slack');
+  var chkSlackApp = document.getElementById('chk-slackapp');
   var chkFeishu = document.getElementById('chk-feishu');
   var poBody = document.getElementById('pushover-body');
   var slBody = document.getElementById('slack-body');
+  var saBody = document.getElementById('slackapp-body');
   var fsBody = document.getElementById('feishu-body');
   var out = document.getElementById('output-section');
 
@@ -23,6 +25,7 @@
   }
   bind(chkPushover, poBody);
   bind(chkSlack, slBody);
+  bind(chkSlackApp, saBody);
   bind(chkFeishu, fsBody);
 
   // ── Output rendering (DOM only — values are never interpolated into HTML) ──
@@ -123,6 +126,33 @@
         }
       } else if (data.slack_set) {
         notes.push(disableHint('Slack', 'SLACK_JSON'));
+      }
+
+      // Slack App (Bot token)
+      if (chkSlackApp.checked) {
+        var botToken = val('sa-bot-token');
+        var channel = val('sa-channel');
+        var saMention = val('sa-mention').split(/[\s,]+/).filter(function (s) { return s; });
+        if (botToken || channel) {
+          if (!botToken || !channel) {
+            throw new Error('Slack App：bot_token 和 channel 需同时填写');
+          }
+          if (/\s/.test(botToken) || /\s/.test(channel)) {
+            throw new Error('Slack App：bot_token / channel 不能包含空白');
+          }
+          cards.push(resultCard('Slack App',
+            JSON.stringify({
+              bot_token: botToken,
+              channel: channel,
+              mention: saMention,
+            }, null, 2), 'SLACK_APP_JSON'));
+        } else if (data.slackapp_set) {
+          notes.push(el('p', 'hint', 'Slack App：未填写新值，保持现有配置不变。'));
+        } else {
+          throw new Error('Slack App 已启用：请填写 bot_token 和 channel');
+        }
+      } else if (data.slackapp_set) {
+        notes.push(disableHint('Slack App', 'SLACK_APP_JSON'));
       }
 
       // Feishu / Lark
