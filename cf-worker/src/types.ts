@@ -15,8 +15,13 @@ export interface Env {
   CACHE_SECKEY: string;
   /** JSON: {"app_token":"…","user_key":"…"}. Empty/invalid → Pushover disabled. */
   PUSHOVER_JSON: string;
-  /** JSON: {"webhook_url":"https://hooks.slack.com/services/…"}. Empty/invalid → Slack disabled. */
+  /** JSON: {"webhook_url":"https://hooks.slack.com/services/…"}. Empty/invalid → Slack (webhook) disabled. */
   SLACK_JSON: string;
+  /** JSON: {"bot_token","channel","mention"?}. Slack self-built-app (bot token)
+   *  channel: @-mentions approvers + edits the message in place on the decision
+   *  (like Feishu, unlike the one-way SLACK_JSON webhook). Empty/invalid → Slack
+   *  App disabled. See slack_app.ts. */
+  SLACK_APP_JSON: string;
   /** JSON: {"app_id","app_secret","receive_id","receive_id_type"?,"mention"?,"base"?}.
    *  Feishu/Lark self-built-app bot channel: @-mentions approvers + edits the
    *  card in place on the decision. Empty/invalid → Feishu disabled. See feishu.ts. */
@@ -128,6 +133,19 @@ export interface Challenge {
    *  can PATCH the card to its terminal state on approve/reject/expire. Absent
    *  when the Feishu channel is off or the send failed. */
   feishu_message_id?: string;
+  /** Slack App message reference, present once the approval message was sent, so
+   *  the DO can chat.update it to its terminal state on approve/reject/expire.
+   *  Absent when the Slack App channel is off or the send failed. */
+  slackapp?: SlackAppMsgRef;
+}
+
+/** Handle to edit a sent Slack App message in place: `channel` is the resolved
+ *  channel ID echoed by chat.postMessage (robust even when config `channel` was
+ *  a name), `ts` is the message timestamp. Shared by Challenge.slackapp and
+ *  slack_app.ts's send return type. */
+export interface SlackAppMsgRef {
+  channel: string;
+  ts: string;
 }
 
 export interface ChallengeMeta {

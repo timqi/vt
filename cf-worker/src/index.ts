@@ -44,7 +44,7 @@ const ADMIN_SEG = 'kestrel';
 // stale far-future-cached copy. (Workers Assets serves static files with a
 // cacheable response; without a versioned URL a changed audit.js can refresh
 // while admin.css stays stale, which desyncs markup from styles.)
-const ASSET_VER = '20260705-1';
+const ASSET_VER = '20260706-1';
 
 // Escape a JSON string for safe embedding in a <script type="application/json"> block.
 function escapeJsonForHtml(obj: unknown): string {
@@ -179,8 +179,9 @@ app.get(`/${ADMIN_SEG}/setup`, (c) => {
 app.get(`/${ADMIN_SEG}/channels`, (c) => {
   const pushoverSet = !!(c.env.PUSHOVER_JSON && c.env.PUSHOVER_JSON.trim());
   const slackSet = !!(c.env.SLACK_JSON && c.env.SLACK_JSON.trim());
+  const slackAppSet = !!(c.env.SLACK_APP_JSON && c.env.SLACK_APP_JSON.trim());
   const feishuSet = !!(c.env.FEISHU_JSON && c.env.FEISHU_JSON.trim());
-  const resp = c.html(buildChannelsPage(pushoverSet, slackSet, feishuSet));
+  const resp = c.html(buildChannelsPage(pushoverSet, slackSet, slackAppSet, feishuSet));
   resp.headers.set('Content-Security-Policy', STRICT_CSP);
   return resp;
 });
@@ -755,10 +756,10 @@ function buildSetupPage(rpId: string, credentialsJson: string): string {
 // Notification-channel generator page. Pure client-side: the operator ticks the
 // channels they want, fills the fields, and the page emits the JSON secret(s) to
 // paste into `wrangler secret put`. Nothing is POSTed back to the Worker.
-function buildChannelsPage(pushoverSet: boolean, slackSet: boolean, feishuSet: boolean): string {
+function buildChannelsPage(pushoverSet: boolean, slackSet: boolean, slackAppSet: boolean, feishuSet: boolean): string {
   const adminBase = `/${ADMIN_SEG}`;
   const pwaBase = `/pwa`;
-  const dataJson = escapeJsonForHtml({ pushover_set: pushoverSet, slack_set: slackSet, feishu_set: feishuSet });
+  const dataJson = escapeJsonForHtml({ pushover_set: pushoverSet, slack_set: slackSet, slackapp_set: slackAppSet, feishu_set: feishuSet });
   const badge = (set: boolean) =>
     set ? `<span class="badge badge-approved">已配置</span>` : `<span class="badge">未配置</span>`;
   return `<!doctype html>
@@ -811,7 +812,7 @@ function buildChannelsPage(pushoverSet: boolean, slackSet: boolean, feishuSet: b
       </div>
       <div class="channel-body" id="slack-body"${slackSet ? '' : ' hidden'}>
         ${slackSet ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : ''}
-        <p class="hint warn">⚠️ Slack 走 Incoming Webhook，是<strong>单向通知</strong>：<strong>不支持</strong>审批通过/拒绝后回改原消息，也不 @ 人。审批结果只会在审批页与审计页更新。需要「@相关人 + 决策后回改卡片」请用下方的<strong>飞书 / Lark</strong> 通道。</p>
+        <p class="hint warn">⚠️ Slack 走 Incoming Webhook，是<strong>单向通知</strong>：<strong>不支持</strong>审批通过/拒绝后回改原消息，也不 @ 人。审批结果只会在审批页与审计页更新。需要「@相关人 + 决策后回改消息」请用下方的 <strong>Slack App</strong>（Bot token）或<strong>飞书 / Lark</strong> 通道。</p>
         <p class="hint">用 <strong>Incoming Webhook</strong> 方式——这是单向通知（真正的「同意」仍在审批页用 Passkey 完成），所以只需一个 Webhook URL，无需 bot、无需把机器人拉进频道：</p>
         <ol class="steps">
           <li>打开 <a href="https://api.slack.com/apps" target="_blank" rel="noopener">api.slack.com/apps</a> → <strong>Create New App</strong> → <strong>From scratch</strong>，填个名字（如 <code>vt-approval</code>）并选择目标 workspace。</li>
@@ -824,6 +825,33 @@ function buildChannelsPage(pushoverSet: boolean, slackSet: boolean, feishuSet: b
           <label for="sl-webhook">Webhook URL（webhook_url）</label>
           <input id="sl-webhook" type="text" placeholder="https://hooks.slack.com/services/T…/B…/…" autocomplete="off" spellcheck="false">
         </div>
+      </div>
+    </section>
+
+    <section id="slackapp-card" class="card channel">
+      <div class="card-head">
+        <h2>Slack App</h2>
+        <div class="channel-ctrl">
+          ${badge(slackAppSet)}
+          <label class="switch" title="启用 Slack App"><input type="checkbox" id="chk-slackapp"${slackAppSet ? ' checked' : ''}><span class="slider"></span></label>
+        </div>
+      </div>
+      <div class="channel-body" id="slackapp-body"${slackAppSet ? '' : ' hidden'}>
+        ${slackAppSet ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : ''}
+        <p class="hint">用<strong>自建应用（Bot token）</strong>方式——这是 Slack 侧唯一能<strong>@相关人</strong>并在审批后<strong>回改原消息填结果</strong>的通道（上面的 Incoming Webhook 做不到）。完整步骤见 <code>docs/slack-app.md</code>：创建 App → 加 Bot Token Scopes（<code>chat:write</code>，如按频道名发送另加 <code>chat:write.public</code>）→ 安装到 workspace 取 <strong>Bot User OAuth Token</strong>（<code>xoxb-…</code>）→ 把 Bot 拉进目标频道 → 取频道 ID（<code>C…</code>）与要 @ 的人的成员 ID（<code>U…</code>）。</p>
+        <div class="field">
+          <label for="sa-bot-token">Bot Token（bot_token）</label>
+          <input id="sa-bot-token" type="text" placeholder="xoxb-…（Bot 凭证，勿泄露）" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="sa-channel">频道 ID（channel）</label>
+          <input id="sa-channel" type="text" placeholder="C0123456789（频道 ID，或私聊的 D…/用户 U…）" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="sa-mention">审批时 @ 的人（成员 ID，每行一个，可留空）</label>
+          <textarea id="sa-mention" rows="3" placeholder="U01ABCDEF&#10;U02GHIJKL" autocomplete="off" spellcheck="false"></textarea>
+        </div>
+        <p class="hint">免审批（缓存命中）通知会精简为一两行、不 @ 任何人；审批请求才会 @ 上面列出的人，并带「去审批」按钮。</p>
       </div>
     </section>
 

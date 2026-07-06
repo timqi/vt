@@ -65,7 +65,10 @@ ACCESS_AUD = "<YOUR_ACCESS_APPLICATION_AUD_TAG>"
 #                     Empty/absent → caching disabled (every decrypt needs phone).
 #                     Rotate to instantly invalidate all cached DEKs. NEVER inline.
 #   PUSHOVER_JSON     {"app_token":"…","user_key":"…"}  — optional Pushover channel
-#   SLACK_JSON        {"webhook_url":"https://hooks.slack.com/services/…"} — optional Slack channel
+#   SLACK_JSON        {"webhook_url":"https://hooks.slack.com/services/…"} — optional Slack (webhook, one-way) channel
+#   SLACK_APP_JSON    {"bot_token":"xoxb-…","channel":"C…","mention"?:["U…"]}
+#                     — optional Slack App channel (bot token): @-mentions approvers
+#                     + edits the message in place on the decision. See docs/slack-app.md.
 #   FEISHU_JSON       {"app_id","app_secret","receive_id","receive_id_type"?,"mention"?,"base"?}
 #                     — optional 飞书/Lark channel (self-built app bot): @-mentions
 #                     approvers + edits the card in place on the decision. See docs/feishu.md.

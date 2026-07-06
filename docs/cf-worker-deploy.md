@@ -103,7 +103,8 @@ openssl rand 32 | basenc --base64url | tr -d '=' | wrangler secret put CACHE_SEC
 
 # Optional notification channels (independent, opt-in):
 wrangler secret put PUSHOVER_JSON   # {"app_token":"…","user_key":"…"}
-wrangler secret put SLACK_JSON      # {"webhook_url":"https://hooks.slack.com/services/…"}
+wrangler secret put SLACK_JSON      # {"webhook_url":"https://hooks.slack.com/services/…"} (one-way webhook)
+wrangler secret put SLACK_APP_JSON  # {"bot_token":"xoxb-…","channel":"C…","mention"?:["U…"]}: @mention + editable msg — see docs/slack-app.md
 wrangler secret put FEISHU_JSON     # 飞书/Lark bot: @mention + editable card — see docs/feishu.md
 ```
 
