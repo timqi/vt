@@ -142,6 +142,19 @@ const HEADER: Record<SlackAppState, { emoji: string; label: string; color: strin
 
 const CACHE_HIT_COLOR = '#1d9bd1';
 
+// Slack mrkdwn escaping: neutralize the three chars that drive link/entity
+// parsing (`<url|label>` link syntax and HTML-ish entities) so caller-supplied
+// context (command / pwd / …) cannot inject a clickable link or fabricate
+// worker-authoritative-looking markup into the message a human reads to approve.
+// We render context as `mrkdwn` (not `plain_text`) only because Slack's
+// plain_text section objects COLLAPSE embedded `\n` into spaces — that
+// flattening (every field crammed onto one line) is the bug this file fixes.
+// `*` `_` `~` `` ` `` are left alone: at worst they yield cosmetic bold/italic,
+// never a link, so they are not a security concern.
+function escapeMrkdwn(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 export interface EditExtra {
   approverLabel?: string;  // Passkey label that approved (state=approved)
   latencyMs?: number;      // ceremony latency (state=approved/rejected)
@@ -149,12 +162,20 @@ export interface EditExtra {
 
 // Build the Block Kit blocks + the attachment color for a given state.
 //
-// SECURITY: the context block (who/pwd/cmd/ssh/ip/reason) is caller-supplied and
-// is rendered as a `plain_text` section, which Slack does NOT parse as mrkdwn —
-// so a hostile CLI cannot inject links or fabricate worker-authoritative-looking
-// markup into the message a human reads to approve. Only the @-mention line is
-// `mrkdwn` (it must be, for the `<@id>` tag), and its ids are charset-validated
-// in parseSlackAppConfig so they cannot break out of the tag. The context lines
+// The title lives ONLY in the message's top-level `text` (see sendApprovalCard /
+// editCard). We deliberately do NOT emit a `header` block here — it would repeat
+// the title a second time inside the colored attachment ("引用" quote line).
+// State is still conveyed twice, harmlessly: by the title's leading emoji
+// (✅/❌/⏳/⌛) and by the attachment's colored left bar.
+//
+// SECURITY: the context block (who/pwd/cmd/ssh/ip/reason) is caller-supplied.
+// It is rendered as `mrkdwn` — Slack's `plain_text` section objects collapse
+// embedded `\n` into spaces, which flattened every field onto one line — but
+// every context value is run through escapeMrkdwn() first, so a hostile CLI
+// still cannot inject a link or fabricate worker-authoritative markup (same
+// guarantee plain_text gave for free). The @-mention line is also `mrkdwn` (it
+// must be, for the `<@id>` tag) and its ids are charset-validated in
+// parseSlackAppConfig so they cannot break out of the tag. The context lines
 // reuse notify.ts's shared metaLines() so this message and the webhook text can
 // never drift.
 function buildMessage(
@@ -178,9 +199,7 @@ function buildMessage(
     context.push('审批超时未处理');
   }
 
-  const blocks: unknown[] = [
-    { type: 'header', text: { type: 'plain_text', text: title, emoji: true } },
-  ];
+  const blocks: unknown[] = [];
   // @-mentions only while pending (an approval REQUEST). mrkdwn is required for
   // the <@id> tag; ids are validated (parseSlackAppConfig) so they can't inject.
   if (state === 'pending' && opts.mention && opts.mention.length) {
@@ -189,7 +208,9 @@ function buildMessage(
       text: { type: 'mrkdwn', text: opts.mention.map((id) => `<@${id}>`).join(' ') },
     });
   }
-  blocks.push({ type: 'section', text: { type: 'plain_text', text: context.join('\n'), emoji: false } });
+  // One field per line: mrkdwn honors `\n` (plain_text does not); escapeMrkdwn
+  // keeps the caller-supplied context injection-safe.
+  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: escapeMrkdwn(context.join('\n')) } });
   // The approval button is a pure URL open-link — NOT an interactive action — so
   // no inbound Worker endpoint / request URL is required (same as Feishu's
   // open-link button). Clicking opens /a/<token>; the real approval is still
@@ -268,10 +289,11 @@ export async function sendCacheHitNotice(
     text: title,
     attachments: [{
       color: CACHE_HIT_COLOR,
+      // Title lives in top-level `text`; no repeated header block. Context is
+      // mrkdwn (plain_text collapses `\n`) with escapeMrkdwn keeping the
+      // caller-supplied command/pwd injection-safe.
       blocks: [
-        { type: 'header', text: { type: 'plain_text', text: title, emoji: true } },
-        // plain_text (NOT mrkdwn): command/pwd are caller-supplied.
-        { type: 'section', text: { type: 'plain_text', text: lines.join('\n'), emoji: false } },
+        { type: 'section', text: { type: 'mrkdwn', text: escapeMrkdwn(lines.join('\n')) } },
       ],
     }],
   }, cfg.botToken);

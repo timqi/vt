@@ -85,7 +85,8 @@ wrangler deploy    # 全部 secret 设好后统一 deploy 生效
 
 - **Bot Token = 机器人凭证**：作为 Worker secret 存储，**永不写日志、永不回显到 admin 页**（同 Pushover/Slack/飞书）。泄露后攻击者可冒充 Bot 在其可达频道收发/编辑消息，范围受 scope 与「只拉进目标频道」限制。
 - **审批 URL 不是承载凭证**：消息里的 `/a/<token>` 即使被频道里任何人点开，真正的「批准」仍需**已注册的 Passkey + PRF**。频道成员身份 =「谁能看到 / 发起」，不等于「谁能批准」。这与 Slack webhook / Pushover / 飞书的信任模型一致。
-- **上下文按 `plain_text` 渲染**：who/pwd/cmd/ssh/ip/reason 都是调用方（CLI）上报的，作为 `plain_text` block 渲染，Slack **不**当 mrkdwn 解析——因此恶意 CLI 无法在人要读的审批消息里注入链接或伪造「像 Worker 权威行」的内容。只有 @-mention 行是 mrkdwn（`<@id>` 必需），其 id 在 `parseSlackAppConfig` 里做了字符校验，无法逃逸出 mention 标签。
+- **标题只出现一次 + 每字段一行**：标题（含状态 emoji ✅/❌/⏳/⌛）只放在消息顶层 `text`，不再额外发 `header` block（否则会在带色附件里把标题「引用」重复一遍）；状态另由附件左侧色条表示。上下文（who/pwd/cmd/ssh/ip/reason）按 `\n` **每字段独占一行**渲染。
+- **上下文按 `mrkdwn`（转义后）渲染**：who/pwd/cmd/ssh/ip/reason 都是调用方（CLI）上报的。之所以用 `mrkdwn` 而非 `plain_text`，是因为 Slack 的 `plain_text` section 会把内嵌 `\n` **压成空格**，导致所有字段挤成一行（本次修复的问题）。每个上下文值先经 `escapeMrkdwn()` 转义 `& < >`，因此恶意 CLI 仍无法注入链接或伪造「像 Worker 权威行」的内容（与 `plain_text` 同等保证）。只有 @-mention 行是 mrkdwn（`<@id>` 必需），其 id 在 `parseSlackAppConfig` 里做了字符校验，无法逃逸出 mention 标签。
 - **SSRF 收口**：API 域名硬编码为 `slack.com`，绝不取用户填的任意 URL，因此坏配置无法把本通道变成 SSRF 原语（同 Slack webhook 绑定 `hooks.slack.com`、飞书绑定 `base` 枚举）。
 - **不阻塞审批仪式**：所有 Slack 调用都 best-effort、6s 超时、经 `waitUntil` 异步触发；任何失败只记日志，绝不影响 WebAuthn 仪式或 DEK 下发。
 
