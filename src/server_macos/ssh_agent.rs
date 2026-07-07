@@ -648,9 +648,29 @@ fn sign_data_with_privkey(
         KeypairData::Rsa(ref key) => {
             use rsa::pkcs1v15::SigningKey;
             use rsa::signature::{RandomizedSigner, SignatureEncoding};
+            use rsa::BigUint;
             use ssh_agent_lib::proto::signature;
 
-            let private_key: rsa::RsaPrivateKey = key.try_into().map_err(AgentError::other)?;
+            // Build the rsa key from its components directly rather than via
+            // ssh-key's `TryFrom<&RsaKeypair> for rsa::RsaPrivateKey`: that
+            // conversion (ssh-key 0.6.7) rejects otherwise-valid OpenSSH RSA
+            // keys with `Error::Crypto`, while `from_components` (which itself
+            // validates + precomputes) accepts the exact same n/e/d/p/q. An
+            // Mpint stores a signed big-endian integer; `as_positive_bytes`
+            // strips the leading sign byte so `from_bytes_be` sees the raw
+            // magnitude.
+            let mp = |m: &ssh_key::Mpint| {
+                m.as_positive_bytes()
+                    .map(BigUint::from_bytes_be)
+                    .ok_or_else(|| agent_err(anyhow::anyhow!("RSA component is not a positive integer")))
+            };
+            let private_key = rsa::RsaPrivateKey::from_components(
+                mp(&key.public.n)?,
+                mp(&key.public.e)?,
+                mp(&key.private.d)?,
+                vec![mp(&key.private.p)?, mp(&key.private.q)?],
+            )
+            .map_err(AgentError::other)?;
             let mut rng = rand::thread_rng();
 
             if flags & signature::RSA_SHA2_512 != 0 {
