@@ -1,21 +1,97 @@
 #!/bin/bash
 set -euo pipefail
 
-# Setup PAM for vt auth (remote sudo via Touch ID)
-# Run as root or with sudo on the remote Linux server.
+# Setup PAM for `vt auth` as a sudo authentication factor.
+#
+# Two approval paths, tried in the same order vt itself routes:
+#   1. SSH agent (macOS Touch ID) over a forwarded agent — needs VT_AUTH.
+#   2. Phone passkey (Cloudflare Worker) — needs VT_PASSKEY_URL + VT_PASSKEY_TOKEN.
+# A host may configure either or both. On a plain Linux server with no forwarded
+# macOS agent, only the worker path applies (leave VT_AUTH unset).
+#
+# Values are resolved with the SAME precedence vt uses: environment variable
+# wins, else the invoking user's ~/.config/vt/config.toml (override with
+# VT_CONFIG). So `sudo ./setup-pam.sh` normally needs no arguments.
+#
+# Run as root (via sudo) on the target Linux server.
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Error: must run as root (use sudo)" >&2
     exit 1
 fi
 
-if [ -z "${VT_AUTH:-}" ]; then
-    read -rp "Enter VT_AUTH token: " VT_AUTH
-    if [ -z "$VT_AUTH" ]; then
-        echo "Error: VT_AUTH cannot be empty" >&2
-        exit 1
+# --- Resolve the invoking user's vt config -------------------------------
+# sudo runs us as root, so ~ is /root. The config lives in the real user's
+# home; recover it from $SUDO_USER. VT_CONFIG (if exported) always wins.
+# getent can exit non-zero (SUDO_USER set but no passwd entry) — guard it so
+# `set -e` doesn't abort the script, and fall back to $HOME when empty.
+if [ -n "${VT_CONFIG:-}" ]; then
+    CFG="$VT_CONFIG"
+else
+    home=""
+    if [ -n "${SUDO_USER:-}" ]; then
+        home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
     fi
+    [ -z "$home" ] && home="${HOME:-/root}"
+    CFG="$home/.config/vt/config.toml"
 fi
+
+# read_cfg KEY -> value from the flat TOML, empty if absent. Uses awk (not sed)
+# to match vt's own parser closely: honours both "double" and 'single' quoted
+# TOML strings and strips trailing inline `# comments`, so a common hand-edit
+# (single-quoting or same-line-commenting a token) doesn't silently corrupt the
+# embedded secret. Anchored at line start so keys inside comments don't match,
+# and the `=`/whitespace boundary prevents prefix collisions (VT_AUTH vs VT_*).
+read_cfg() {
+    [ -r "$CFG" ] || return 0
+    awk -v key="$1" '
+        $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            q = substr($0, 1, 1)
+            if (q == "\"" || q == "\x27") {         # "double" or '\''single'\'' string
+                rest = substr($0, 2)
+                i = index(rest, q)
+                if (i > 0) print substr(rest, 1, i - 1)
+            } else {                                 # bare value: drop inline comment + trailing ws
+                sub(/[[:space:]]+#.*$/, "")
+                sub(/[[:space:]]+$/, "")
+                print
+            }
+            exit
+        }
+    ' "$CFG"
+}
+
+if [ -r "$CFG" ]; then
+    echo "Reading vt config from $CFG"
+    # Secrets live here — warn (don't fail) if group/other can read it.
+    perm=$(stat -c '%a' "$CFG" 2>/dev/null || echo "")
+    case "$perm" in
+        *[1-7][0-7] | *[0-7][1-7]) echo "  warning: $CFG is group/other-readable; chmod 600 recommended" >&2 ;;
+    esac
+fi
+
+# env wins, else fall back to the config file (mirrors vt's own precedence).
+VT_AUTH="${VT_AUTH:-$(read_cfg VT_AUTH)}"
+VT_PASSKEY_URL="${VT_PASSKEY_URL:-$(read_cfg VT_PASSKEY_URL)}"
+VT_PASSKEY_TOKEN="${VT_PASSKEY_TOKEN:-$(read_cfg VT_PASSKEY_TOKEN)}"
+
+if [ -z "$VT_AUTH" ] && [ -z "$VT_PASSKEY_URL" ]; then
+    echo "Error: no auth path configured." >&2
+    echo "  Set VT_AUTH (SSH agent path) and/or VT_PASSKEY_URL + VT_PASSKEY_TOKEN" >&2
+    echo "  (worker path) in the environment or in $CFG." >&2
+    exit 1
+fi
+if [ -n "$VT_PASSKEY_URL" ] && [ -z "$VT_PASSKEY_TOKEN" ]; then
+    echo "Error: VT_PASSKEY_URL set but VT_PASSKEY_TOKEN missing." >&2
+    exit 1
+fi
+
+# Report which path(s) will be wired in.
+paths=""
+[ -n "$VT_AUTH" ] && paths="SSH-agent (Touch ID)"
+[ -n "$VT_PASSKEY_URL" ] && paths="${paths:+$paths + }phone passkey (worker)"
+echo "Configuring paths: $paths"
 
 VT_BIN=$(command -v vt 2>/dev/null || true)
 if [ -z "$VT_BIN" ] || [ ! -x "$VT_BIN" ]; then
@@ -26,42 +102,60 @@ fi
 SCRIPT_PATH="/usr/local/bin/vt-sudo-auth.sh"
 PAM_FILE="/etc/pam.d/sudo"
 
-# 1. Create PAM helper script
-cat > "$SCRIPT_PATH" << 'SCRIPT_EOF'
-#!/bin/bash
-export VT_AUTH="VT_AUTH_PLACEHOLDER"
+# --- Generate the PAM helper script --------------------------------------
+# Secrets are embedded via single-quote-safe printf (no sed placeholder
+# substitution — robust against &, /, backslashes in the token). env vars
+# always win over any config file, so hard-coding them here is deterministic.
+shq() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
 
-# pam_exec doesn't inherit the user's shell environment.
-# Read SSH_AUTH_SOCK from the calling process tree via /proc.
-if [ -z "$SSH_AUTH_SOCK" ]; then
-    # Process tree: user's shell → sudo → pam_exec → this script
-    # Walk up to sudo's parent (user's shell) to find SSH_AUTH_SOCK
-    SUDO_PID=$PPID
-    USER_PID=$(awk '/^PPid:/{print $2}' /proc/$SUDO_PID/status 2>/dev/null)
+{
+    echo '#!/bin/bash'
+    echo '# Generated by setup-pam.sh — vt auth as a sudo factor. Keep root-only.'
+    printf "export VT_AUTH='%s'\n" "$(shq "$VT_AUTH")"
+    printf "export VT_PASSKEY_URL='%s'\n" "$(shq "$VT_PASSKEY_URL")"
+    printf "export VT_PASSKEY_TOKEN='%s'\n" "$(shq "$VT_PASSKEY_TOKEN")"
+    cat << 'BODY'
+
+# Agent path (macOS Touch ID over a forwarded SSH agent). Skipped when VT_AUTH
+# is empty. pam_exec doesn't inherit the user's env, so recover SSH_AUTH_SOCK
+# from the invoking shell via /proc: user shell -> sudo -> pam_exec -> here.
+if [ -z "${SSH_AUTH_SOCK:-}" ] && [ -n "$VT_AUTH" ]; then
+    USER_PID=$(awk '/^PPid:/{print $2}' /proc/$PPID/status 2>/dev/null)
     if [ -n "$USER_PID" ]; then
         SSH_AUTH_SOCK=$(tr '\0' '\n' < /proc/$USER_PID/environ 2>/dev/null | sed -n 's/^SSH_AUTH_SOCK=//p')
-        export SSH_AUTH_SOCK
+        [ -n "$SSH_AUTH_SOCK" ] && export SSH_AUTH_SOCK
     fi
 fi
 
-if [ -z "$SSH_AUTH_SOCK" ]; then exit 1; fi
-timeout 30 VT_BIN_PLACEHOLDER auth --reason "sudo ${PAM_SERVICE:-sudo} by ${PAM_USER:-unknown}" 2>/dev/null
-SCRIPT_EOF
-sed -i "s|VT_AUTH_PLACEHOLDER|$VT_AUTH|" "$SCRIPT_PATH"
-sed -i "s|VT_BIN_PLACEHOLDER|$VT_BIN|" "$SCRIPT_PATH"
+# Refuse cleanly if neither path is usable (don't hang on a blank prompt).
+if [ -z "$VT_AUTH" ] && [ -z "$VT_PASSKEY_URL" ]; then exit 1; fi
+
+# vt routes agent-first (if VT_AUTH set + socket reachable), then falls back to
+# the phone-passkey worker path. stderr is intentionally NOT silenced: pam_exec
+# leaves stderr attached to the terminal, so the "approve on your phone: <url>"
+# line reaches the user — the only feedback when no push channel is configured.
+# timeout is 60s: a phone approval needs human reaction time (vs instant Touch
+# ID). Tradeoff: sudo hangs up to 60s before falling back to the password stack.
+BODY
+    printf 'timeout 60 %s auth --reason "sudo ${PAM_SERVICE:-sudo} by ${PAM_USER:-unknown}"\n' "$VT_BIN"
+} > "$SCRIPT_PATH"
+
 chmod 700 "$SCRIPT_PATH"
 chown root:root "$SCRIPT_PATH"
-echo "Created $SCRIPT_PATH"
+echo "Created $SCRIPT_PATH (root:root, 700)"
 
-# 2. Add pam_exec line to /etc/pam.d/sudo (if not already present)
+# --- Wire into /etc/pam.d/sudo -------------------------------------------
 PAM_LINE="auth    sufficient    pam_exec.so seteuid quiet $SCRIPT_PATH"
 if grep -qF "vt-sudo-auth.sh" "$PAM_FILE" 2>/dev/null; then
     echo "PAM already configured in $PAM_FILE, skipping"
 else
-    # Insert before the first auth line
+    # Insert before the first auth / @include line.
     sed -i "0,/^@include\|^auth/{s||$PAM_LINE\n&|}" "$PAM_FILE"
     echo "Updated $PAM_FILE"
 fi
 
 echo ""
-echo "Done. Test with: ssh -A user@this-host, then run 'sudo whoami'"
+echo "Done."
+echo "  Agent path:  ssh -A user@this-host, then 'sudo whoami' -> Touch ID"
+echo "  Worker path: 'sudo whoami' -> approve on your phone (URL shown on the terminal)"
+echo "  Tip: enable a push channel (Pushover/Slack/Feishu) so approvals reach your phone directly."

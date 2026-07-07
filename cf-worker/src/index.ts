@@ -12,6 +12,10 @@ import { Hono, type Context } from 'hono';
 import { Env } from './types';
 import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, hkdfSha256, inReplayWindow } from './crypto';
 import { notifyApproval } from './notify';
+import { parsePushoverConfig } from './pushover';
+import { parseSlackConfig } from './slack';
+import { parseSlackAppConfig } from './slack_app';
+import { parseFeishuConfig } from './feishu';
 import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp } from './types';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess, type AccessVars } from './access';
@@ -176,11 +180,15 @@ app.get(`/${ADMIN_SEG}/setup`, (c) => {
 // the live PUSHOVER_JSON / SLACK_JSON secrets are plaintext credentials and are
 // NEVER injected — only booleans indicating whether each is currently set, so
 // the page can show a configured/not-configured badge without echoing tokens.
+// The badge runs the SAME parser the dispatch paths use (config !== null), so a
+// present-but-malformed secret reads as "not configured" here too — matching
+// what actually fires, instead of the old presence-only `&& trim()` check that
+// would show ✓ for a secret that silently never delivers.
 app.get(`/${ADMIN_SEG}/channels`, (c) => {
-  const pushoverSet = !!(c.env.PUSHOVER_JSON && c.env.PUSHOVER_JSON.trim());
-  const slackSet = !!(c.env.SLACK_JSON && c.env.SLACK_JSON.trim());
-  const slackAppSet = !!(c.env.SLACK_APP_JSON && c.env.SLACK_APP_JSON.trim());
-  const feishuSet = !!(c.env.FEISHU_JSON && c.env.FEISHU_JSON.trim());
+  const pushoverSet = parsePushoverConfig(c.env.PUSHOVER_JSON).config !== null;
+  const slackSet = parseSlackConfig(c.env.SLACK_JSON).config !== null;
+  const slackAppSet = parseSlackAppConfig(c.env.SLACK_APP_JSON).config !== null;
+  const feishuSet = parseFeishuConfig(c.env.FEISHU_JSON).config !== null;
   const resp = c.html(buildChannelsPage(pushoverSet, slackSet, slackAppSet, feishuSet));
   resp.headers.set('Content-Security-Policy', STRICT_CSP);
   return resp;
