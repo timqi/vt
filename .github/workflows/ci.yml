@@ -1,0 +1,75 @@
+name: CI
+
+# Default-triggers on every PR (all base branches) plus pushes to main.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# One in-flight run per ref: a new push to a PR cancels the stale run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Unit + integration tests on every platform vt ships to. macos-latest is the
+  # one that actually exercises the `cfg(target_os = "macos")` module
+  # (server_macos: SSH agent, keychain, the RSA sign/verify regression test) —
+  # that code and its `rsa`/`sha1` deps don't compile on Linux at all.
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      # Mirror `just check`: host + the x86_64-unknown-linux-gnu boundary that
+      # CLAUDE.md requires to stay green. Only meaningful on Linux.
+      - name: Type-check host + linux-gnu boundary
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          rustup target add x86_64-unknown-linux-gnu
+          cargo check --locked
+          cargo check --locked --target x86_64-unknown-linux-gnu
+
+  # The shipping artifact is a musl-static binary (see justfile `build-musl`).
+  # Build it in CI so musl-specific link regressions (the ring/CRT segfault the
+  # justfile warns about) surface on PRs, not at release time.
+  build-musl:
+    name: build (linux musl-static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # CC lets ring (via rustls) compile its C/asm for musl; do NOT set a musl
+      # LINKER — rustc's self-contained musl link already bundles the CRT.
+      - name: Build (musl-static)
+        run: CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --bin vt --target x86_64-unknown-linux-musl
