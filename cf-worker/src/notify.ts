@@ -85,15 +85,19 @@ export function buildCacheHitMessage(
 }
 
 // Fan out one composed message to every configured channel in parallel. Returns
-// '' when every enabled channel succeeded, or a single aggregated, channel-
-// prefixed warning string otherwise. `requireChannel` controls whether "no
-// channel configured" is itself surfaced as a warning (true for approvals, which
-// expect at least one channel; false for the best-effort cache-hit notice).
+// '' when every enabled channel succeeded (or none was enabled), or a single
+// aggregated, channel-prefixed warning string on a genuine config/delivery error.
+//
+// NOTE: this path only knows about the STATELESS channels (Pushover, Slack
+// webhook). The STATEFUL channels (Slack App `SLACK_APP_JSON`, Feishu
+// `FEISHU_JSON`) are dispatched independently from the DO's opCreate via
+// waitUntil (see do_account.ts) and are invisible here. So fanOut MUST NOT try
+// to decide whether "any channel is configured" — it can't see half of them,
+// and a stateful-only deployment would produce a false "no channel" warning.
 async function fanOut(
   env: Env,
   title: string,
   body: string,
-  requireChannel: boolean,
 ): Promise<string> {
   const warnings: string[] = [];
 
@@ -119,17 +123,16 @@ async function fanOut(
       .then((w) => { if (w) warnings.push(`slack: ${w}`); })
       .catch(() => { warnings.push('slack: notify error'); }));
   }
-  if (requireChannel && tasks.length === 0 && warnings.length === 0) {
-    warnings.push('no notification channel configured');
-  }
 
   await Promise.all(tasks);
   return warnings.length ? truncate(warnings.join('; ')) : '';
 }
 
-// Fan out an approval request to every configured channel in parallel. Returns
-// '' when every enabled channel succeeded (and at least one was enabled), or a
-// single aggregated, channel-prefixed warning string otherwise.
+// Fan out an approval request to every configured STATELESS channel in parallel.
+// Returns '' when every enabled channel succeeded (or none is enabled here), or a
+// single aggregated, channel-prefixed warning string on a genuine error. Whether
+// a stateful channel (Slack App / Feishu) covers this ceremony is decided in the
+// DO, not here — see fanOut's note.
 export async function notifyApproval(
   env: Env,
   opKind: string,
@@ -137,19 +140,19 @@ export async function notifyApproval(
   approveUrl: string,
 ): Promise<string> {
   const { title, body } = buildApprovalMessage(opKind, meta, approveUrl);
-  return fanOut(env, title, body, true);
+  return fanOut(env, title, body);
 }
 
 // Fan out a DEK-cache-hit notice to every configured channel. Best-effort and
 // non-fatal: a cache hit never has a phone in the loop, so this is the only
 // real-time signal an operator gets that a record was decrypted without an
-// approval. No channel configured is NOT a warning here (the audit row already
-// captures the hit). Returns the same aggregated warning string contract.
+// approval. A missing channel is never a warning (the audit row already captures
+// the hit). Returns the same aggregated warning string contract.
 export async function notifyCacheHit(
   env: Env,
   meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
   salts: number,
 ): Promise<string> {
   const { title, body } = buildCacheHitMessage(meta, salts);
-  return fanOut(env, title, body, false);
+  return fanOut(env, title, body);
 }
