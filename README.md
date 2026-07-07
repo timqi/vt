@@ -183,19 +183,33 @@ demand via the normal `vt://` decrypt path — SSH agent (`$SSH_AUTH_SOCK`, incl
 agent) first, CF passkey ceremony as fallback. The remote host needs `VT_AUTH` set to use a forwarded
 agent; otherwise it goes straight to the phone passkey. See `docs/ssh-vt-design.md` for the full design.
 
-### Remote sudo via Touch ID
+### sudo via Touch ID or phone passkey
 
-Use `vt auth` to trigger Touch ID on your macOS when running `sudo` on a remote Linux server. If macOS is unreachable or Touch ID is rejected, sudo falls back to password.
+Use `vt auth` as a `sudo` authentication factor. Two approval paths, tried in
+the order vt itself routes — agent first, then worker:
+
+1. **SSH agent (macOS Touch ID)** over a forwarded agent (`VT_AUTH`).
+2. **Phone passkey (Cloudflare Worker)** ceremony (`VT_PASSKEY_URL` +
+   `VT_PASSKEY_TOKEN`) — the only path on a plain Linux server with no forwarded
+   macOS agent.
+
+A host may configure either or both. If the chosen path is unreachable or the
+approval is rejected, `sudo` falls back to the password prompt.
 
 ```
 macOS (vt SSH agent)  ◄──SSH agent forwarding──  Linux: sudo
        │                                            │
-   Touch ID prompt                              PAM → vt auth
-       │                                            │
-   approve/reject   ──────────────────────────►  proceed/fallback to password
+   Touch ID prompt                              PAM → vt auth ──► agent path (VT_AUTH)
+       │                                            │                 │ (no agent / socket down)
+   approve/reject   ──────────────────────────►    │                 ▼
+                                                    │            worker path → /api/challenge
+                                                    │                 │
+   phone (Passkey)  ◄───────────────────────────────────────  approve on phone
+                                                    ▼
+                                       proceed / fall back to password
 ```
 
-**Setup on macOS:**
+**Setup on macOS (agent path only):**
 
 ```bash
 # Ensure vt agent is your SSH agent
@@ -206,32 +220,43 @@ vt ssh agent
 ssh -A user@your-server
 ```
 
-**Setup on the remote Linux server:**
+**Setup on the Linux server:**
 
-Install the `vt` binary, then run the setup script:
+Install the `vt` binary, then run the setup script. It reads `VT_AUTH` /
+`VT_PASSKEY_URL` / `VT_PASSKEY_TOKEN` with the same precedence vt uses —
+environment variable wins, else the invoking user's `~/.config/vt/config.toml`
+(resolved via `$SUDO_USER`; override with `VT_CONFIG`). So if your CLI config is
+already in place, no arguments are needed:
 
 ```bash
-sudo VT_AUTH="your-token" ./setup-pam.sh
+sudo ./setup-pam.sh                          # read everything from ~/.config/vt/config.toml
+sudo VT_PASSKEY_TOKEN=… ./setup-pam.sh       # or override a value from the env
+sudo VT_CONFIG=/path/config.toml ./setup-pam.sh
 ```
 
 Or configure manually:
 
-1. Create `/usr/local/bin/vt-sudo-auth.sh` (root:root, chmod 700):
+1. Create `/usr/local/bin/vt-sudo-auth.sh` (root:root, chmod 700). Embed the
+   values you use — leave `VT_AUTH` empty on a worker-only host:
    ```bash
    #!/bin/bash
-   export VT_AUTH="your-base64-token-here"
-   # pam_exec doesn't inherit user's env; read SSH_AUTH_SOCK from /proc
-   if [ -z "$SSH_AUTH_SOCK" ]; then
-       SUDO_PID=$PPID
-       USER_PID=$(awk '/^PPid:/{print $2}' /proc/$SUDO_PID/status 2>/dev/null)
+   export VT_AUTH=''                          # empty = agent path disabled
+   export VT_PASSKEY_URL='https://vt-passkey.example.com'
+   export VT_PASSKEY_TOKEN='your-worker-token'
+   # Agent path: pam_exec doesn't inherit the user's env; recover SSH_AUTH_SOCK
+   # from the invoking shell via /proc (skipped when VT_AUTH is empty).
+   if [ -z "${SSH_AUTH_SOCK:-}" ] && [ -n "$VT_AUTH" ]; then
+       USER_PID=$(awk '/^PPid:/{print $2}' /proc/$PPID/status 2>/dev/null)
        if [ -n "$USER_PID" ]; then
            SSH_AUTH_SOCK=$(tr '\0' '\n' < /proc/$USER_PID/environ 2>/dev/null | sed -n 's/^SSH_AUTH_SOCK=//p')
-           export SSH_AUTH_SOCK
+           [ -n "$SSH_AUTH_SOCK" ] && export SSH_AUTH_SOCK
        fi
    fi
-   if [ -z "$SSH_AUTH_SOCK" ]; then exit 1; fi
-   timeout 30 /usr/local/bin/vt auth \
-       --reason "sudo ${PAM_SERVICE:-sudo} by ${PAM_USER:-unknown}" 2>/dev/null
+   if [ -z "$VT_AUTH" ] && [ -z "$VT_PASSKEY_URL" ]; then exit 1; fi
+   # No 2>/dev/null: pam_exec keeps stderr on the terminal, so the
+   # "approve on your phone: <url>" line reaches the user.
+   timeout 60 /usr/local/bin/vt auth \
+       --reason "sudo ${PAM_SERVICE:-sudo} by ${PAM_USER:-unknown}"
    ```
 
 2. Edit `/etc/pam.d/sudo`, add **before** `@include common-auth`:
@@ -240,9 +265,10 @@ Or configure manually:
    ```
 
 **Security notes:**
-- `auth@vt` always prompts Touch ID (no caching) — over forwarded agents, all remote sessions share the same local process
-- `VT_AUTH` in the helper script is a full credential (also authorizes encrypt/decrypt) — keep the script root-only
-- `sufficient` means Touch ID success skips password; failure falls through to password prompt
+- `auth@vt` always prompts Touch ID (no caching) — over forwarded agents, all remote sessions share the same local process.
+- `sufficient` means an approved ceremony skips the password; failure/timeout falls through to the password prompt.
+- **Worker path spreads the worker master.** `VT_PASSKEY_TOKEN` equals the worker master `VT_AUTH_CF` — a static, network-reachable credential. Embedding it on every sudo host is a larger blast radius than the agent path (whose `VT_AUTH` is only useful while a live forwarded socket exists): theft lets an attacker POST `/api/challenge` from anywhere (still phone-gated — no decrypt without a tap, but they can spam approval prompts) and, if `CACHE_SECKEY` is set, probe `/api/dek-cache` within the TTL (bounded by its IP+pwd binding). Keep the helper script root-only (700); prefer enabling the worker path on a small set of bastion hosts. A per-host derived key (like the agent-audit design in `docs/agent-audit.md`) would need a worker-side change and is not yet available here.
+- **No terminal feedback under some setups.** `pam_exec` swallows stdout; the approval URL is on stderr. Enable a push channel (Pushover/Slack/Feishu) so approvals reach your phone directly. The 60s timeout means sudo can hang that long before falling back to the password stack.
 
 ## VT Protocol Format
 
