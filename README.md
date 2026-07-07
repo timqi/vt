@@ -20,10 +20,7 @@ Download prebuilt binaries from [GitHub Releases](https://github.com/timqi/vt/re
 Or build from source (recipes live in the `justfile`, run `just` to list them):
 
 ```bash
-cargo build --release
-cp target/release/vt /usr/local/bin/
-
-# Or, with `just`: builds (musl-static on Linux) and installs to ~/.local/bin
+# Builds (musl-static on Linux, native on macOS) and installs to ~/.local/bin
 just install
 ```
 

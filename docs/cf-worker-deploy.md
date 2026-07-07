@@ -111,7 +111,7 @@ wrangler secret put FEISHU_JSON     # 飞书/Lark bot: @mention + editable card 
 ## 5. Deploy
 
 ```bash
-wrangler deploy
+just deploy-worker   # runs `wrangler deploy` in cf-worker/ (works from any dir in the repo)
 ```
 
 Then point the custom domain at the Worker: in the Workers dashboard add a
@@ -171,7 +171,7 @@ npm run dev        # wrangler dev — local Worker + DO
 
 ## Updates & rotation
 
-- **Redeploy code/PWA:** `wrangler deploy`.
+- **Redeploy code/PWA:** `just deploy-worker`.
 - **Rotate the CLI token:** `wrangler secret put VT_AUTH_CF`, then update
   `VT_PASSKEY_TOKEN` on all hosts.
 - **Invalidate all cached DEKs:** rotate `CACHE_SECKEY` (or use the admin

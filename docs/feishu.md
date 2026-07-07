@@ -86,7 +86,7 @@ curl -s https://open.feishu.cn/open-apis/im/v1/chats \
 ```bash
 wrangler secret put FEISHU_JSON
 # 粘贴生成的 JSON
-wrangler deploy    # 全部 secret 设好后统一 deploy 生效
+just deploy-worker    # 全部 secret 设好后统一 deploy 生效
 ```
 
 生成的 JSON 形如：

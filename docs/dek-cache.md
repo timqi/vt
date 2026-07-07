@@ -263,9 +263,9 @@ DEK 之所以 worker 拿不到，是因为 PWA 用 `crypto_box_seal(deks, daemon
 ```bash
 # worker（含 PWA 资源 + 审计/缓存接口）
 cd cf-worker && wrangler secret put CACHE_SECKEY   # 32B: head -c32 /dev/urandom|base64|tr +/ -_|tr -d =
-wrangler deploy
-# 客户端
-cargo build --release && install -m755 target/release/vt ~/.local/bin/vt
+just deploy-worker
+# 客户端（musl-static on Linux, native on macOS → ~/.local/bin/vt）
+just install
 ```
 
 ### 验证缓存命中

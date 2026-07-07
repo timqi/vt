@@ -17,14 +17,13 @@ host; and (2) the client-reported **`pwd`** — an **advisory** same-host
 blast-radius reducer, so a cached grant for one project tree does not serve a
 decrypt from an unrelated directory. `pwd` is client-reported (a fully
 compromised local host can spoof it, so it never widens the real IP boundary),
-but unlike the removed PPID it is **stable** across orchestrated callers (Claude
-Code / CI / make / tmux spawn a fresh shell per command from the same project
-dir), so the cache still hits. (A previous build folded in the client-reported
-parent PID instead of pwd; it was **removed** — PPID is both spoofable AND
-*unstable* — `getppid()` changed every call so the cache never hit. The reported
-`ppid` is now forensic-only: stored on each entry + audit row, not part of the
-cache key.) On the cache hit, a real-time notice is also
-pushed to any configured Pushover/Slack channel (best-effort, fire-and-forget).
+but it is **stable** across orchestrated callers (Claude Code / CI / make / tmux
+spawn a fresh shell per command from the same project dir), so the cache still
+hits. (An earlier build keyed on the client-reported PPID instead; removed
+because `getppid()` is both spoofable AND *unstable* — it changed every call so
+the cache never hit. `ppid` is now forensic-only: stored on each entry + audit
+row, not in the cache key.) On the cache hit, a real-time notice is also pushed
+to any configured notification channel (best-effort, fire-and-forget).
 Default is 0 (no cache, historical behaviour); caching is fully disabled unless
 the `CACHE_SECKEY` worker secret is set. Every cache read (hit/miss) is audited.
 See `docs/dek-cache.md` for the full design, threat model, and `wrangler secret
@@ -32,9 +31,12 @@ put CACHE_SECKEY` setup.
 
 ## Build
 
+Recipes live in the `justfile` (`just` lists them):
+
 ```bash
-cargo build --release                                # native build
-cargo check --target x86_64-unknown-linux-gnu        # Linux surface check (must stay green)
+just build                                           # release build (native)
+just install                                         # build (musl-static on Linux) + install to ~/.local/bin
+just check                                            # cargo check host + x86_64-unknown-linux-gnu (must stay green)
 cargo test                                           # unit tests
 ```
 
@@ -136,9 +138,9 @@ any unset `VT_*` variable is loaded from a flat TOML file at
 `~/.config/vt/config.toml` (override the path with `$VT_CONFIG`). Only keys
 matching `^VT_[A-Z0-9_]+$` are honoured; a set env var is never overridden.
 Loading happens once in `main()` (`src/config.rs::hydrate_env_from_file`) before
-`Cli::parse()` and before the tokio runtime is built, by populating `std::env`,
-so every existing read (including clap's `env = "VT_AUTH"`) transparently picks
-up file values. Malformed/absent file → silent no-op (env path still works); a
+`Cli::parse()`, by populating `std::env`, so every existing read (including
+clap's `env = "VT_AUTH"`) transparently picks up file values. Malformed/absent
+file → silent no-op (env path still works); a
 group/other-readable file logs a `chmod 600` warning since it holds secrets. See
 `config.example.toml` for the template. (The previous JSON file
 `~/.config/vt/cf_config.json` was removed; this TOML fallback replaces it.)
@@ -169,9 +171,7 @@ forge any host's audit rows and make authenticated worker requests: `/api/challe
 is still phone-gated, but `/api/dek-cache` returns cached DEKs with no phone in the
 loop within the TTL window for the same egress IP (same IP binding as the CLI). It
 still cannot decrypt secrets that aren't cached — the vault master stays on the
-phone. See `docs/agent-audit.md`.
-
-See `docs/agent-audit.md` for the full design and threat model.
+phone. Full design and threat model: `docs/agent-audit.md`.
 
 ## run@vt — remote-triggered local command launcher
 
@@ -273,7 +273,8 @@ secret is protected.
   (`gh auth token`) overrides a broad inject (`gh`).
 - **Env-var values** can be supplied centrally in the same file via
   `[env.default]` (all PWDs) and per-directory `[env.dirs."<abs path>"]`
-  (longest CWD-prefix wins), so the agent need not export secrets. Per-var
+  (longest CWD-prefix wins; a leading `~`/`~/` in the key is expanded to
+  `$HOME`), so the agent need not export secrets. Per-var
   precedence: **`dirs` > `default` > process env** (agent config wins; a stray
   ambient env var can't silently override a per-project value). Config-sourced
   values are prepended to the rewrite as `NAME='vt://…'`; env-sourced values are
@@ -317,10 +318,9 @@ secret is protected.
 ## Worker deployment
 
 ```bash
-cd cf-worker
-npm install
+cd cf-worker && npm install
 # pwa/libsodium.js is vendored/committed (see pwa/libsodium.README to refresh it)
-wrangler deploy
+just deploy-worker                        # runs `wrangler deploy` in cf-worker/ (works from any dir in the repo)
 # Set secrets (once):
 wrangler secret put VT_AUTH_CF
 wrangler secret put CREDENTIALS_JSON      # generated by the admin setup page — see below
@@ -345,11 +345,10 @@ the decision (✅/❌/⌛). Slack App uses a long-lived `xoxb-` bot token via
 (`slackAppSendAndStore`/`slackAppEdit`, `challenge.slackapp` = {channel, ts}). See
 docs/slack-app.md.
 
-**Feishu/Lark (`FEISHU_JSON`, `src/feishu.ts`)** likewise uses the self-built-app
-(bot) API to (1) **@-mention** approvers on a request and (2) **edit the card in
-place** on the decision (✅ approved / ❌ rejected / ⌛ expired), naming the
-Passkey that approved. Because editing needs the sent `message_id`, Feishu is
-owned by the **DO** (`do_account.ts`): `opCreate` fires the card via
+**Feishu/Lark (`FEISHU_JSON`, `src/feishu.ts`)** uses the self-built-app (bot)
+API; its decision edit (✅ approved / ❌ rejected / ⌛ expired) names the Passkey
+that approved. Because editing needs the sent `message_id`, Feishu is owned by
+the **DO** (`do_account.ts`): `opCreate` fires the card via
 `waitUntil` (NOT on the ceremony path) and writes back `feishu_message_id`;
 `opApprove`/`opReject`/the `alarm` expire-sweep PATCH the card. A cached
 `tenant_access_token` lives in DO storage (`feishu:tat:<app_id>`, refreshed on
@@ -435,6 +434,5 @@ This prevents salt-swap and approve/reject replay; the daemon-side binding HMAC
 
 ## Test gates
 
-1. `cargo check` -- must compile
-2. `cargo check --target x86_64-unknown-linux-gnu` -- Linux boundary check
-3. `cargo test` -- unit tests
+`just check` (host + `x86_64-unknown-linux-gnu` boundary) and `cargo test` must
+stay green.
