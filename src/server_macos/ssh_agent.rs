@@ -648,9 +648,29 @@ fn sign_data_with_privkey(
         KeypairData::Rsa(ref key) => {
             use rsa::pkcs1v15::SigningKey;
             use rsa::signature::{RandomizedSigner, SignatureEncoding};
+            use rsa::BigUint;
             use ssh_agent_lib::proto::signature;
 
-            let private_key: rsa::RsaPrivateKey = key.try_into().map_err(AgentError::other)?;
+            // Build the rsa key from its components directly rather than via
+            // ssh-key's `TryFrom<&RsaKeypair> for rsa::RsaPrivateKey`: that
+            // conversion (ssh-key 0.6.7) rejects otherwise-valid OpenSSH RSA
+            // keys with `Error::Crypto`, while `from_components` (which itself
+            // validates + precomputes) accepts the exact same n/e/d/p/q. An
+            // Mpint stores a signed big-endian integer; `as_positive_bytes`
+            // strips the leading sign byte so `from_bytes_be` sees the raw
+            // magnitude.
+            let mp = |m: &ssh_key::Mpint| {
+                m.as_positive_bytes()
+                    .map(BigUint::from_bytes_be)
+                    .ok_or_else(|| agent_err(anyhow::anyhow!("RSA component is not a positive integer")))
+            };
+            let private_key = rsa::RsaPrivateKey::from_components(
+                mp(&key.public.n)?,
+                mp(&key.public.e)?,
+                mp(&key.private.d)?,
+                vec![mp(&key.private.p)?, mp(&key.private.q)?],
+            )
+            .map_err(AgentError::other)?;
             let mut rng = rand::thread_rng();
 
             if flags & signature::RSA_SHA2_512 != 0 {
@@ -2349,6 +2369,98 @@ mod tests {
         let sig_arr: [u8; 64] = sig.as_bytes().try_into().expect("64-byte ed25519 sig");
         vk.verify(data, &DalekSig::from_bytes(&sig_arr))
             .expect("signature must verify under the key's own public key");
+    }
+
+    // Regression test for the ssh-key 0.6.7 `TryFrom<&RsaKeypair> for
+    // rsa::RsaPrivateKey` bug (passes `p` twice, omits `q` → `Πprimes = p² ≠ n`
+    // → `validate()` fails with `InvalidModulus` → `Error::Crypto`). Before the
+    // `from_components`-with-correct-p/q fix, this `.expect("sign")` panicked and
+    // every RSA identity was unusable ("agent refused operation"). We build the
+    // key from a fixed 2048-bit OpenSSH RSA key (no slow keygen), sign under
+    // each SHA2 variant OpenSSH requests, and verify each signature under the
+    // key's own public modulus so a correct-but-wrong-key regression can't slip
+    // through either.
+    #[test]
+    fn sign_data_with_privkey_rsa_signs_and_verifies() {
+        use rsa::signature::Verifier;
+        use rsa::{BigUint, RsaPublicKey};
+        use ssh_agent_lib::proto::signature;
+        use ssh_key::private::PrivateKey;
+
+        // Throwaway key generated solely for this test (never used elsewhere).
+        const RSA_TEST_KEY: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
+NhAAAAAwEAAQAAAQEAv1DuBUp4HN3VKYb7f/4iMGxx3pC0r3AEql67eYoT+J5dm21EuOQE
+pSz7+B2YnylnQ0ypMEsp0bOn99IlBeG++66Rp18Ypp6RUS8v27gNd4ZoI22gXDpQ3t/EIf
+v5FYMNhqHYS9OWCSxwY0pVASVdQkKSV7LX+cD/Q0TwFFe+0pvweXd085T1L/IgD/fvroIb
+3ckJ22ENGkdAH6wlcYqsTvxk2avZCRLifUZ+O3htBdfRa7MIuKBqD+QZyouXmkEPwiKkFo
+NINzUCJmC19GoiaLwfW0OL2Md60ogmA+HO44k3pGcP2kWPJSO21wfmkLMMv6kLqHSDKUDP
+1L+qFkxYXQAAA9DW6UJQ1ulCUAAAAAdzc2gtcnNhAAABAQC/UO4FSngc3dUphvt//iIwbH
+HekLSvcASqXrt5ihP4nl2bbUS45ASlLPv4HZifKWdDTKkwSynRs6f30iUF4b77rpGnXxim
+npFRLy/buA13hmgjbaBcOlDe38Qh+/kVgw2GodhL05YJLHBjSlUBJV1CQpJXstf5wP9DRP
+AUV77Sm/B5d3TzlPUv8iAP9++ughvdyQnbYQ0aR0AfrCVxiqxO/GTZq9kJEuJ9Rn47eG0F
+19Frswi4oGoP5BnKi5eaQQ/CIqQWg0g3NQImYLX0aiJovB9bQ4vYx3rSiCYD4c7jiTekZw
+/aRY8lI7bXB+aQswy/qQuodIMpQM/Uv6oWTFhdAAAAAwEAAQAAAQAPdTtKH6Z9VJou0Qp8
+oLzD81su+7uxqigiWOWmcBblgWw4TPeexcOvUedo+IE2qPqAOE86SPRvzmeNsUPPChqrjM
+MVhixAeDLvH5QrGV+zLt+2rxqkIQ0cOPHIuip5x709ydFnbQjkJFxPVXfxUALNQgI/hkKH
+mkW1unn4ds+DBjT4JDlNQUsP/u9JLEnQtcsJT4tNrNT3TjqIc6L/MEf84POPI8WDwh/oJr
+3txJCSSbDcvZe8e+Dks7Te81efsFqCfVOJdSO2HlYjIT2C60E/jh8+AC5CnXrG8uxw0LVe
+Efm47qAy9Jey7CtqtqdWZ/lHYz09xo2jREbAba1Tt4RJAAAAgCSkmvIoXNd4atHlem/xkk
++RdaGh7kLmzuRSnFGSUZbHOxniXTetE80sr4PLpRfmATUw7ARLMYBpMGfVT09hF1FVHhLP
+2bZwWNvyQeID3Mf9DdjxDojMrosTBFSDzTcy4vO+tzj2tSQvl64gfIAamhyhkMwziubbX5
+xZukhlVfp3AAAAgQD6567L89SEqjrduzyISvkDSdIfhQ/CLCt5e95YJ9kc4jrnHLYx83SJ
+dwxb2C9I3QDoOskhDxhxMW3kL1xiIm9WcgBJzkimRImX8DpniNsEc03UEK5ovQxaOXHtV4
+7GtxAz6Lk6t1maFY5vskFBL6ZiqAcrYtFI18Xs+fKnOS97NQAAAIEAwzN6JnfM5bJ4uRkO
+8ej2jLwDvtol/iOhG5X09snhK/iSuF1HztKhJ+eCM3o2t6fj30uy+UrdnArTZCrIl7EiMm
+zlOx88YIANh/5p3Kf6SlADCbea0TJ9bpUQf3BhkzN6cE8RF04Uc3VtvUG1CKcyBr2Tj0TW
+d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
+-----END OPENSSH PRIVATE KEY-----
+";
+
+        let privkey = PrivateKey::from_openssh(RSA_TEST_KEY).expect("parse RSA test key");
+        let data = b"sign@vt rsa regression payload";
+
+        // Public modulus for verification, rebuilt from the ssh public key's
+        // Mpint components the same way the signing core rebuilds the private key.
+        let mp = |m: &ssh_key::Mpint| {
+            BigUint::from_bytes_be(m.as_positive_bytes().expect("positive component"))
+        };
+        let pubkey = match privkey.public_key().key_data() {
+            KeyData::Rsa(k) => RsaPublicKey::new(mp(&k.n), mp(&k.e)).expect("rsa pubkey"),
+            _ => unreachable!("embedded key is RSA"),
+        };
+
+        // rsa-sha2-256
+        let sig =
+            sign_data_with_privkey(&privkey, data, signature::RSA_SHA2_256).expect("sign 256");
+        assert_eq!(sig.algorithm().to_string(), "rsa-sha2-256");
+        rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(pubkey.clone())
+            .verify(
+                data,
+                &rsa::pkcs1v15::Signature::try_from(sig.as_bytes()).expect("sig256"),
+            )
+            .expect("rsa-sha2-256 signature must verify");
+
+        // rsa-sha2-512
+        let sig =
+            sign_data_with_privkey(&privkey, data, signature::RSA_SHA2_512).expect("sign 512");
+        assert_eq!(sig.algorithm().to_string(), "rsa-sha2-512");
+        rsa::pkcs1v15::VerifyingKey::<sha2::Sha512>::new(pubkey)
+            .verify(
+                data,
+                &rsa::pkcs1v15::Signature::try_from(sig.as_bytes()).expect("sig512"),
+            )
+            .expect("rsa-sha2-512 signature must verify");
+
+        // NOTE: the legacy ssh-rsa (SHA-1, `flags == 0`) branch is intentionally
+        // NOT asserted here. ssh-key 0.6.7 `Signature::new` only accepts RSA
+        // signatures with `Algorithm::Rsa { hash: Some(_) }`; a plain `ssh-rsa`
+        // (hash: None) hits the catch-all arm and returns `Encoding(Length)`, so
+        // that branch of `sign_data_with_privkey` can never succeed on this
+        // ssh-key version. That is a pre-existing limitation orthogonal to the
+        // from_components fix (which the SHA-2 paths above fully exercise), and
+        // SHA-1 ssh-rsa is deprecated (OpenSSH disables it by default ≥ 8.8).
     }
 
     #[test]
