@@ -145,6 +145,36 @@ group/other-readable file logs a `chmod 600` warning since it holds secrets. See
 `config.example.toml` for the template. (The previous JSON file
 `~/.config/vt/cf_config.json` was removed; this TOML fallback replaces it.)
 
+### Agent auth cache (opt-in)
+
+`vt ssh agent` can cache a successful Touch ID / FIDO2 / password decision so
+repeat `sign` / `decrypt@vt` requests within a TTL skip the prompt. Both caches
+default to `none` (every request prompts):
+
+| flag | default TTL | scope |
+|---|---|---|
+| `--ssh-auth-cache-mode` + `--ssh-auth-cache-duration` | 120s | SSH `sign`, per key fingerprint |
+| `--decrypt-auth-cache-mode` + `--decrypt-auth-cache-duration` | 30s | `decrypt@vt`, per record (`SHA-256(type‖salt‖host)`); any legacy item in a batch disables caching for that batch |
+
+Modes: `per-session` keys on the terminal session leader (`getsid` + start
+time); `per-app` keys on the nearest `.app/Contents/` ancestor (all tabs of one
+terminal app share a context). Peers without a controlling TTY never cache.
+`auth@vt` / `run@vt` NEVER cache.
+
+Expiry is tracked on **both** the monotonic and the wall clock (macOS `Instant`
+freezes during sleep — either clock passing the TTL kills the entry), grants are
+strict-TTL (no sliding refresh), and both caches are flushed on: agent `lock`,
+screen lock, wake-from-sleep (detected via clock divergence), and idle key
+clearing. All prompts are serialized through a global one-permit semaphore so a
+hostile peer cannot stack dialogs.
+
+**Forwarded-agent hazard (deliberate tradeoff, off by default):** the cache
+context is derived from the *local* peer process. Requests arriving over a
+forwarded socket (`ssh -A`, incl. ControlMaster-multiplexed sessions) all
+resolve to the local `ssh` process's terminal session, so within the TTL a
+process on the remote host can sign / fetch cached-record DEKs silently. Keep
+`none` when forwarding to hosts you don't fully trust.
+
 ### Agent audit push (opt-in)
 
 `vt ssh agent` can push one audit record per Touch ID decision (encrypt@vt /

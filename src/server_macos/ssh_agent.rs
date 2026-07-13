@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -18,7 +18,7 @@ use ssh_key::{Algorithm, HashAlg, Signature};
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::core::crypto::{derive_dek, AesGcmCrypto};
-use crate::core::session::AuthOutcome;
+use crate::core::session::{AuthOutcome, UnavailableReason};
 use crate::core::wire::{
     outcome_to_err_strict, wrap_ok_envelope, ErrKind, WIRE_VERSION,
 };
@@ -28,9 +28,7 @@ use crate::core::{
 };
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
-use super::security::{
-    authenticate, derive_passcode_ciphers, load_mac_cipher, local_authentication,
-};
+use super::security::{authenticate, derive_passcode_ciphers, load_mac_cipher};
 use super::store::KeychainStore;
 use super::audit::{self, AgentAuditEntry, AuditPushConfig};
 
@@ -129,9 +127,31 @@ impl std::fmt::Display for AuthCacheMode {
 /// cached grant.
 pub type CacheContext = (u64, u64);
 
+/// A cache entry's expiry, tracked on two clocks.
+///
+/// `std::time::Instant` on macOS reads `CLOCK_UPTIME_RAW`, which does NOT
+/// advance while the system is asleep — an expiry tracked only on `Instant`
+/// pauses its countdown when the lid closes, so a grant issued just before
+/// sleep would still be live on wake hours (or days) later. The wall clock
+/// keeps counting through sleep but can be stepped backwards (NTP), which
+/// would stretch a wall-only expiry. An entry is therefore valid only while
+/// BOTH clocks agree: `mono` caps total awake time at the TTL, `wall` caps
+/// total real time at the TTL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheExpiry {
+    mono: Instant,
+    wall: SystemTime,
+}
+
+impl CacheExpiry {
+    fn is_valid_at(&self, now_mono: Instant, now_wall: SystemTime) -> bool {
+        now_mono < self.mono && now_wall < self.wall
+    }
+}
+
 pub struct AuthCache {
     /// Each entry stores when it expires (computed at grant time).
-    entries: HashMap<(CacheContext, String), Instant>,
+    entries: HashMap<(CacheContext, String), CacheExpiry>,
     /// Lifetime of a fresh grant.
     ttl: Duration,
 }
@@ -145,36 +165,120 @@ impl AuthCache {
     }
 
     pub fn is_authorized(&self, context: CacheContext, fingerprint: &str) -> bool {
-        if let Some(expires_at) = self.entries.get(&(context, fingerprint.to_string())) {
-            Instant::now() < *expires_at
-        } else {
-            false
-        }
+        self.is_authorized_at(context, fingerprint, Instant::now(), SystemTime::now())
+    }
+
+    /// Clock-injectable core of [`is_authorized`], unit-testable for the
+    /// sleep scenario (mono frozen, wall advanced) without real sleeping.
+    fn is_authorized_at(
+        &self,
+        context: CacheContext,
+        fingerprint: &str,
+        now_mono: Instant,
+        now_wall: SystemTime,
+    ) -> bool {
+        self.entries
+            .get(&(context, fingerprint.to_string()))
+            .is_some_and(|e| e.is_valid_at(now_mono, now_wall))
     }
 
     /// Strict-TTL grant: a still-valid entry's expiry is left untouched.
     /// Concurrent grants for the same key cannot extend the original TTL.
     /// Expired entries (or absent ones) are replaced with a fresh expiry.
     pub fn grant(&mut self, context: CacheContext, fingerprint: &str) {
-        let now = Instant::now();
-        let new_expires = now + self.ttl;
-        self.entries
-            .entry((context, fingerprint.to_string()))
-            .and_modify(|expires_at| {
-                if *expires_at <= now {
-                    *expires_at = new_expires;
-                }
-            })
-            .or_insert(new_expires);
+        self.grant_at(context, fingerprint, Instant::now(), SystemTime::now());
     }
 
-    pub fn clear(&mut self) {
+    fn grant_at(
+        &mut self,
+        context: CacheContext,
+        fingerprint: &str,
+        now_mono: Instant,
+        now_wall: SystemTime,
+    ) {
+        let fresh = CacheExpiry {
+            mono: now_mono + self.ttl,
+            wall: now_wall + self.ttl,
+        };
+        self.entries
+            .entry((context, fingerprint.to_string()))
+            .and_modify(|e| {
+                if !e.is_valid_at(now_mono, now_wall) {
+                    *e = fresh;
+                }
+            })
+            .or_insert(fresh);
+    }
+
+    /// Drop every entry; returns how many were dropped (for flush logging).
+    pub fn clear(&mut self) -> usize {
+        let n = self.entries.len();
         self.entries.clear();
+        n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     pub fn sweep_expired(&mut self) {
-        let now = Instant::now();
-        self.entries.retain(|_, expires_at| now < *expires_at);
+        let now_mono = Instant::now();
+        let now_wall = SystemTime::now();
+        self.entries.retain(|_, e| e.is_valid_at(now_mono, now_wall));
+    }
+}
+
+/// True when `timeout` has elapsed since the last activity on EITHER clock —
+/// the same dual-clock rule as [`CacheExpiry`] (which documents why), applied
+/// to the idle timeout: without the wall clock a laptop that naps often could
+/// stay "active" for days and never drop its keys.
+fn idle_exceeded(
+    last_mono: Instant,
+    last_wall: SystemTime,
+    now_mono: Instant,
+    now_wall: SystemTime,
+    timeout: Duration,
+) -> bool {
+    let deadline = CacheExpiry {
+        mono: last_mono + timeout,
+        wall: last_wall + timeout,
+    };
+    !deadline.is_valid_at(now_mono, now_wall)
+}
+
+// --- Cache watcher (screen lock + sleep/wake invalidation) ---
+
+/// How often the cache watcher samples screen-lock state and clock skew.
+const WATCHER_TICK: Duration = Duration::from_secs(5);
+/// Wall clock advancing this much further than the monotonic clock between
+/// two watcher ticks means the system slept (mono pauses during sleep).
+/// Large enough to also absorb small NTP steps without spurious clears.
+const WATCHER_SLEEP_DIVERGENCE: Duration = Duration::from_secs(30);
+
+/// Decide whether the auth caches must be flushed for this watcher tick.
+///
+/// Two triggers, both "the human walked away" signals that must revoke
+/// standing grants (sudo-timestamp semantics):
+///   1. Screen transitioned interactive → not interactive (locked, fast-user
+///      -switched, or logged out). Only the *transition* clears, so a grant
+///      issued after unlock isn't immediately eaten by the steady locked
+///      state of some other display.
+///   2. Sleep detected: wall time advanced ≥ [`WATCHER_SLEEP_DIVERGENCE`]
+///      more than monotonic time since the previous tick. `wall_delta` is
+///      `None` when the wall clock stepped backwards — not a sleep signal;
+///      the dual-clock TTL ([`CacheExpiry`]) still bounds those entries.
+fn watcher_should_clear(
+    was_interactive: bool,
+    is_interactive: bool,
+    mono_delta: Duration,
+    wall_delta: Option<Duration>,
+) -> bool {
+    if was_interactive && !is_interactive {
+        return true;
+    }
+    match wall_delta {
+        Some(wall) => wall.saturating_sub(mono_delta) >= WATCHER_SLEEP_DIVERGENCE,
+        None => false,
     }
 }
 
@@ -758,7 +862,9 @@ fn get_peer_pid(stream: &tokio::net::UnixStream) -> Option<i32> {
 
 pub struct VtSshAgentFactory {
     keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
-    last_activity: Arc<RwLock<Instant>>,
+    /// Last request time on both clocks — see [`idle_exceeded`] for why the
+    /// monotonic clock alone can't drive the idle timeout.
+    last_activity: Arc<RwLock<(Instant, SystemTime)>>,
     locked: Arc<RwLock<bool>>,
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
     idle_cleared: Arc<RwLock<bool>>,
@@ -773,12 +879,9 @@ pub struct VtSshAgentFactory {
     disable_legacy_decrypt: bool,
     /// run@vt allowlist. Empty = feature disabled.
     run_allow: Arc<RunAllowlist>,
-    /// Global serializer for run@vt Touch ID prompts. One permit means a
-    /// remote attacker holding VT_AUTH and opening N parallel SSH agent
-    /// connections cannot queue N concurrent prompts at the user — they
-    /// must approve or reject each in sequence. Critically, run@vt has
-    /// no auth cache (same rule as auth@vt — see check_or_prompt_run).
-    run_prompt_sem: Arc<Semaphore>,
+    /// Global serializer for ALL human auth prompts; see
+    /// [`VtSshSession::authenticate_serialized`] for the rationale.
+    prompt_sem: Arc<Semaphore>,
     /// Fire-and-forget audit push config. Cloned per session like `run_allow`.
     /// Disabled config = audit push is a no-op.
     audit_push: Arc<AuditPushConfig>,
@@ -795,7 +898,7 @@ impl VtSshAgentFactory {
     ) -> Self {
         Self {
             keys: Arc::new(RwLock::new(keys)),
-            last_activity: Arc::new(RwLock::new(Instant::now())),
+            last_activity: Arc::new(RwLock::new((Instant::now(), SystemTime::now()))),
             locked: Arc::new(RwLock::new(false)),
             lock_passphrase: Arc::new(RwLock::new(None)),
             idle_cleared: Arc::new(RwLock::new(false)),
@@ -805,7 +908,7 @@ impl VtSshAgentFactory {
             decrypt_cache_mode: decrypt_cache.mode,
             disable_legacy_decrypt,
             run_allow: Arc::new(run_allow),
-            run_prompt_sem: Arc::new(Semaphore::new(1)),
+            prompt_sem: Arc::new(Semaphore::new(1)),
             audit_push,
         }
     }
@@ -872,7 +975,7 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             sign_auth_cache: Arc::clone(&self.sign_auth_cache),
             decrypt_auth_cache: Arc::clone(&self.decrypt_auth_cache),
             run_allow: Arc::clone(&self.run_allow),
-            run_prompt_sem: Arc::clone(&self.run_prompt_sem),
+            prompt_sem: Arc::clone(&self.prompt_sem),
             audit_push: Arc::clone(&self.audit_push),
             peer_pid,
             sign_cache_context,
@@ -886,7 +989,7 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
 
 struct VtSshSession {
     keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
-    last_activity: Arc<RwLock<Instant>>,
+    last_activity: Arc<RwLock<(Instant, SystemTime)>>,
     locked: Arc<RwLock<bool>>,
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
     idle_cleared: Arc<RwLock<bool>>,
@@ -895,8 +998,8 @@ struct VtSshSession {
     /// Cloned per session for cheap reads; the underlying allowlist is
     /// constant for the lifetime of the agent process.
     run_allow: Arc<RunAllowlist>,
-    /// Shared across all sessions so run@vt prompts serialize globally.
-    run_prompt_sem: Arc<Semaphore>,
+    /// Shared across all sessions; see [`VtSshSession::authenticate_serialized`].
+    prompt_sem: Arc<Semaphore>,
     /// Shared fire-and-forget audit push config (disabled = no-op).
     audit_push: Arc<AuditPushConfig>,
     peer_pid: Option<i32>,
@@ -1033,7 +1136,35 @@ impl VtSshSession {
 
     async fn touch_activity(&self) {
         let mut last = self.last_activity.write().await;
-        *last = Instant::now();
+        *last = (Instant::now(), SystemTime::now());
+    }
+
+    /// Run the blocking auth chain (`authenticate`) for `reason`, serialized
+    /// through the global one-permit prompt semaphore and moved off the async
+    /// workers via `spawn_blocking`.
+    ///
+    /// Serialization: every accepted socket runs in its own tokio task, so
+    /// without the permit a peer holding VT_AUTH (or any process reaching a
+    /// forwarded socket) could stack N concurrent dialogs at the user —
+    /// prompt-fatigue that trains reflexive approval. `spawn_blocking`:
+    /// `authenticate` blocks on a human for up to ~30s; run inline it would
+    /// pin one runtime worker per concurrent prompt and, at worker-count
+    /// prompts, stall the whole agent including unrelated sessions.
+    async fn authenticate_serialized(&self, reason: &str) -> AuthOutcome {
+        // The semaphore is never closed, so acquire only fails if that ever
+        // changes; fail closed as "cannot prompt" rather than a user reject.
+        let Ok(_permit) = self.prompt_sem.acquire().await else {
+            return AuthOutcome::Unavailable(UnavailableReason::NotInteractive);
+        };
+        let msg = reason.to_string();
+        match tokio::task::spawn_blocking(move || authenticate(&msg)).await {
+            Ok(outcome) => outcome,
+            // Join error means the auth chain panicked — fail closed.
+            Err(e) => {
+                tracing::error!("auth prompt task failed: {}", e);
+                AuthOutcome::Unavailable(UnavailableReason::NotInteractive)
+            }
+        }
     }
 
     /// Check auth cache or prompt the user. Returns an [`AuthDecision`]
@@ -1049,14 +1180,12 @@ impl VtSshSession {
     /// authorization purposes — a deliberate policy choice.
     async fn check_or_prompt_auth(&self, fingerprint: &str, auth_message: &str) -> AuthDecision {
         // If we couldn't resolve a cache context at session creation (no
-        // peer PID, no TTY, missing proc info), always prompt. `local_authentication`
-        // returns only a bool, so we cannot distinguish reject vs unavailable
-        // on this path — a false maps to Rejected.
+        // peer PID, no TTY, missing proc info), always prompt.
         let Some(context) = self.sign_cache_context else {
-            return if local_authentication(auth_message) {
-                AuthDecision::Approved
-            } else {
-                AuthDecision::Rejected
+            return match self.authenticate_serialized(auth_message).await {
+                AuthOutcome::Success(_) => AuthDecision::Approved,
+                AuthOutcome::Rejected => AuthDecision::Rejected,
+                AuthOutcome::Unavailable(_) => AuthDecision::Unavailable,
             };
         };
 
@@ -1074,7 +1203,7 @@ impl VtSshSession {
         }
 
         // Prompt (no locks held)
-        let method = match authenticate(auth_message) {
+        let method = match self.authenticate_serialized(auth_message).await {
             AuthOutcome::Success(m) => m,
             AuthOutcome::Rejected => return AuthDecision::Rejected,
             AuthOutcome::Unavailable(reason) => {
@@ -1106,8 +1235,8 @@ impl VtSshSession {
     /// Any legacy item in the batch disables caching for the whole batch —
     /// legacy items release plaintext, and the invariant "legacy-containing
     /// batch always prompts" is load-bearing for that decision. Otherwise:
-    /// full hit skips Touch ID; partial hit prompts once and grants only the
-    /// previously-missing items so existing strict TTLs are not refreshed.
+    /// full hit skips Touch ID; partial hit prompts once and then grants the
+    /// whole batch (strict-TTL — see the grant loop below).
     ///
     /// Returns a [`DecryptDecision`]: `CacheHit`/`Approved` allow the decrypt,
     /// `Rejected`/`Err(kind)` block it (the caller maps those to the structured
@@ -1130,7 +1259,11 @@ impl VtSshSession {
             // (SessionLocked/NoGuiSession) is not flattened (NEW-1). Fail
             // closed: a `None` for a non-Success outcome (future enum variant)
             // becomes an Err rather than a silent allow.
-            _ => return decrypt_decision_from_authenticate(authenticate(auth_message)),
+            _ => {
+                return decrypt_decision_from_authenticate(
+                    self.authenticate_serialized(auth_message).await,
+                )
+            }
         };
 
         let keys: Vec<String> = v2_items
@@ -1138,15 +1271,16 @@ impl VtSshSession {
             .map(|(t, salt)| decrypt_cache_key(*t, salt, host))
             .collect();
 
-        let missing: Vec<String> = {
+        let miss_count = {
+            let now_mono = Instant::now();
+            let now_wall = SystemTime::now();
             let cache = self.decrypt_auth_cache.read().await;
             keys.iter()
-                .filter(|k| !cache.is_authorized(context, k))
-                .cloned()
-                .collect()
+                .filter(|k| !cache.is_authorized_at(context, k, now_mono, now_wall))
+                .count()
         };
 
-        if missing.is_empty() {
+        if miss_count == 0 {
             tracing::debug!(
                 "Decrypt auth cache hit for context={:?} ({} v2 items)",
                 context,
@@ -1155,7 +1289,7 @@ impl VtSshSession {
             return DecryptDecision::CacheHit;
         }
 
-        let method = match authenticate(auth_message) {
+        let method = match self.authenticate_serialized(auth_message).await {
             AuthOutcome::Success(m) => m,
             AuthOutcome::Rejected => return DecryptDecision::Rejected,
             AuthOutcome::Unavailable(reason) => {
@@ -1168,15 +1302,23 @@ impl VtSshSession {
         };
 
         if method.is_cacheable() {
+            // The user just approved the ENTIRE batch, so grant every key in
+            // it, not just the previously-missing ones — an entry that was
+            // valid at the check above but expired while the prompt sat on
+            // screen would otherwise stay expired despite the fresh approval.
+            // `grant_at` is strict-TTL: keys still valid at this instant keep
+            // their original expiry (no sliding refresh).
+            let now_mono = Instant::now();
+            let now_wall = SystemTime::now();
             let mut cache = self.decrypt_auth_cache.write().await;
-            for k in &missing {
-                cache.grant(context, k);
+            for k in &keys {
+                cache.grant_at(context, k, now_mono, now_wall);
             }
             tracing::debug!(
-                "Decrypt auth cache grant for context={:?} method={:?} new_entries={}",
+                "Decrypt auth cache grant for context={:?} method={:?} cache_misses={}",
                 context,
                 method,
-                missing.len()
+                miss_count
             );
         }
 
@@ -1261,6 +1403,13 @@ impl VtSshSession {
         }
         if req.items.len() > MAX_CRYPTO_BATCH {
             return Err((ErrKind::BadRequest, Some(DETAIL_BATCH_TOO_LARGE)));
+        }
+        // An empty batch has nothing to authorize; without this guard it
+        // would fall through to the uncached always-prompt path and put a
+        // "decrypt 0 secrets" dialog in front of the user — free prompt spam
+        // for any peer holding VT_AUTH.
+        if req.items.is_empty() {
+            return Err((ErrKind::BadRequest, Some(DETAIL_BATCH_EMPTY)));
         }
 
         // Reject `SecretType::UNKNOWN` v2 items: serde would otherwise
@@ -1412,7 +1561,7 @@ impl VtSshSession {
         // forwarded agents, all remote sessions share the same local
         // process, so caching would approve all sudo from any session.
         let t0 = Instant::now();
-        let outcome = authenticate(&auth_message);
+        let outcome = self.authenticate_serialized(&auth_message).await;
         let latency_ms = t0.elapsed().as_millis() as u64;
         let outcome_str = match &outcome {
             AuthOutcome::Success(_) => "approved",
@@ -1512,27 +1661,18 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
-        // Serialize Touch ID prompts globally for run@vt. Without this,
-        // each accepted SSH-agent socket runs in its own tokio task and
-        // a remote attacker holding VT_AUTH could queue N concurrent
-        // prompts at the user. The permit is held across the (synchronous)
-        // `authenticate` call so prompts are presented one at a time.
-        // SAFETY: the semaphore is never `close`d, so `acquire` cannot
-        // fail; mapping the error to Generic is a defensive default.
-        let _permit = self.run_prompt_sem.acquire().await.map_err(|_| {
-            (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
-        })?;
-
         // NEVER cache. run@vt is treated like auth@vt — every call prompts
         // because a forwarded agent socket is shared across all remote
         // sessions, and any cache here would let one session's approval
         // be reused by another to run arbitrary allowlisted programs.
+        // Prompt serialization (one dialog at a time) is inside
+        // `authenticate_serialized`, shared with every other prompting path.
         // run@vt: exe + argv joined as the audit `command` (reuses the prompt
         // builders above). All emit points carry it.
         let run_command = format!("exe: {}\nargv: {}", exe_display, argv_for_prompt);
         let run_reason = req.reason.as_deref().unwrap_or("");
         let t0 = Instant::now();
-        let outcome = authenticate(&auth_message);
+        let outcome = self.authenticate_serialized(&auth_message).await;
         let latency_ms = t0.elapsed().as_millis() as u64;
         match outcome {
             AuthOutcome::Success(_) => {}
@@ -1647,7 +1787,7 @@ impl VtSshSession {
         // v1: ALWAYS PROMPT (no cache). Distinguish reject vs unavailable so the
         // client gets the right ErrKind (AuthRejected => no fallback, G3).
         let t0 = Instant::now();
-        let outcome = authenticate(&auth_message);
+        let outcome = self.authenticate_serialized(&auth_message).await;
         let latency_ms = t0.elapsed().as_millis() as u64;
         // Audit the decision (op_kind="ssh-sign", same as the CF ceremony sign
         // path) — without this, agent-side `vt ssh connect` signing left no
@@ -1776,6 +1916,7 @@ const DETAIL_RUN_ARGV_EMPTY: &str = "run@vt argv is empty";
 const DETAIL_RUN_ARGV_TOO_LARGE: &str = "run@vt argv exceeds size cap";
 const DETAIL_DISPLAY_FIELD_TOO_LARGE: &str = "display field exceeds size cap";
 const DETAIL_BATCH_TOO_LARGE: &str = "batch exceeds the per-request item cap";
+const DETAIL_BATCH_EMPTY: &str = "batch contains no items";
 const DETAIL_RUN_NOT_ALLOWLISTED: &str = "run@vt program is not in the agent's allowlist";
 const DETAIL_RUN_SPAWN_FAILED: &str = "run@vt failed to spawn the program";
 // sign@vt-specific failure reasons. All strings are static program info
@@ -2240,17 +2381,37 @@ pub async fn run_ssh_agent(
         tracing::info!("run@vt enabled (allowlist configured)");
     }
 
-    // Spawn idle sweeper that clears keys from memory after inactivity
+    // Spawn idle sweeper that clears keys from memory after inactivity.
+    // Judged on both clocks (see `idle_exceeded`) so time asleep counts.
+    // Clearing keys also clears both auth caches: "idle long enough to drop
+    // keys" implies the human is gone, so standing grants must not survive
+    // the silent keychain reload that serves the next request.
     let sweeper_keys = Arc::clone(&factory.keys);
     let sweeper_last = Arc::clone(&factory.last_activity);
     let sweeper_idle_cleared = Arc::clone(&factory.idle_cleared);
+    let sweeper_sign_cache = Arc::clone(&factory.sign_auth_cache);
+    let sweeper_decrypt_cache = Arc::clone(&factory.decrypt_auth_cache);
     let sweeper_timeout = idle_timeout;
     tokio::spawn(async move {
         let check_interval = Duration::from_secs(60).min(sweeper_timeout);
         loop {
             tokio::time::sleep(check_interval).await;
-            let last = *sweeper_last.read().await;
-            if last.elapsed() >= sweeper_timeout {
+            let (last_mono, last_wall) = *sweeper_last.read().await;
+            if idle_exceeded(
+                last_mono,
+                last_wall,
+                Instant::now(),
+                SystemTime::now(),
+                sweeper_timeout,
+            ) {
+                // Grants must not outlive the idle window even when no SSH
+                // keys are loaded (decrypt-only agents), so the cache flush
+                // is unconditional — not tied to the keys branch below.
+                let dropped = sweeper_sign_cache.write().await.clear()
+                    + sweeper_decrypt_cache.write().await.clear();
+                if dropped > 0 {
+                    tracing::info!("Idle timeout, dropped {} auth cache grants", dropped);
+                }
                 let mut keys = sweeper_keys.write().await;
                 if !keys.is_empty() {
                     let count = keys.len();
@@ -2267,16 +2428,55 @@ pub async fn run_ssh_agent(
         }
     });
 
-    // Spawn auth cache sweeper (sweeps both sign and decrypt caches).
+    // Spawn the cache watcher: flushes both auth caches when the screen
+    // locks or the system wakes from sleep (sudo-timestamp semantics), and
+    // sweeps expired entries periodically. See `watcher_should_clear`.
     if sign_cache.mode != AuthCacheMode::None || decrypt_cache.mode != AuthCacheMode::None {
-        let sweeper_sign = Arc::clone(&factory.sign_auth_cache);
-        let sweeper_decrypt = Arc::clone(&factory.decrypt_auth_cache);
+        let watcher_sign = Arc::clone(&factory.sign_auth_cache);
+        let watcher_decrypt = Arc::clone(&factory.decrypt_auth_cache);
         tokio::spawn(async move {
-            let check_interval = Duration::from_secs(60);
+            // `None` while there's nothing cached: the WindowServer poll is
+            // skipped, so no lock-state history exists. On the first tick
+            // with entries the unknown history defaults to "was interactive"
+            // — grants can only be created under an interactive screen
+            // (`authenticate` pre-checks session state), so finding the
+            // screen locked with live entries means it locked after the
+            // grant and the transition must fire.
+            let mut was_interactive: Option<bool> = None;
+            let mut prev_mono = Instant::now();
+            let mut prev_wall = SystemTime::now();
             loop {
-                tokio::time::sleep(check_interval).await;
-                sweeper_sign.write().await.sweep_expired();
-                sweeper_decrypt.write().await.sweep_expired();
+                tokio::time::sleep(WATCHER_TICK).await;
+                let now_mono = Instant::now();
+                let now_wall = SystemTime::now();
+                let empty = watcher_sign.read().await.is_empty()
+                    && watcher_decrypt.read().await.is_empty();
+                if empty {
+                    // Nothing to flush — with 30-120s TTLs this is the common
+                    // case, so skip the CGSession poll entirely.
+                    was_interactive = None;
+                } else {
+                    let is_interactive = super::security::session_interactive_now();
+                    if watcher_should_clear(
+                        was_interactive.unwrap_or(true),
+                        is_interactive,
+                        now_mono.saturating_duration_since(prev_mono),
+                        now_wall.duration_since(prev_wall).ok(),
+                    ) {
+                        let dropped = watcher_sign.write().await.clear()
+                            + watcher_decrypt.write().await.clear();
+                        tracing::info!(
+                            "Auth caches cleared on screen lock / wake ({} grants dropped)",
+                            dropped
+                        );
+                    } else {
+                        watcher_sign.write().await.sweep_expired();
+                        watcher_decrypt.write().await.sweep_expired();
+                    }
+                    was_interactive = Some(is_interactive);
+                }
+                prev_mono = now_mono;
+                prev_wall = now_wall;
             }
         });
         tracing::info!(
@@ -2601,44 +2801,9 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         assert!(cache.is_authorized(ctx, "fp1"));
     }
 
-    #[test]
-    fn test_auth_cache_grant_is_strict_ttl_idempotent() {
-        // A repeated grant on a still-valid entry must NOT extend its TTL —
-        // otherwise concurrent grants from racing sessions would silently
-        // refresh the entry and violate the strict-TTL invariant.
-        let mut cache = AuthCache::new(300);
-        let ctx = (1u64, 100u64);
-        cache.grant(ctx, "fp1");
-        let first_expiry = *cache.entries.get(&(ctx, "fp1".to_string())).unwrap();
-
-        // Sleep long enough that a second grant would compute a strictly
-        // later expiry if it were allowed to overwrite.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        cache.grant(ctx, "fp1");
-        let second_expiry = *cache.entries.get(&(ctx, "fp1".to_string())).unwrap();
-        assert_eq!(
-            first_expiry, second_expiry,
-            "valid entry's TTL must not be refreshed by a repeat grant"
-        );
-    }
-
-    #[test]
-    fn test_auth_cache_grant_replaces_expired_entry() {
-        // An expired entry (still in the map because the sweeper hasn't run
-        // yet) must be replaced by a fresh grant — otherwise a successful
-        // re-auth after expiry would silently fail to populate the cache.
-        let mut cache = AuthCache::new(0);
-        let ctx = (1u64, 100u64);
-        cache.grant(ctx, "fp1");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(!cache.is_authorized(ctx, "fp1"), "entry should be expired");
-
-        // Switch to a non-zero TTL and re-grant; the entry is replaced with
-        // a fresh expiry.
-        cache.ttl = std::time::Duration::from_secs(300);
-        cache.grant(ctx, "fp1");
-        assert!(cache.is_authorized(ctx, "fp1"));
-    }
+    // (Strict-TTL idempotence and expired-entry replacement are covered
+    // deterministically by the clock-injected `_at` tests below — no
+    // sleep-based duplicates.)
 
     #[test]
     fn test_auth_cache_different_context_misses() {
@@ -2666,17 +2831,6 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     }
 
     #[test]
-    fn test_auth_cache_expiry() {
-        let mut cache = AuthCache::new(0); // 0 second duration = immediately expired
-        let ctx = (1u64, 100u64);
-        cache.grant(ctx, "fp1");
-
-        // With 0 duration, entries expire immediately
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(!cache.is_authorized(ctx, "fp1"));
-    }
-
-    #[test]
     fn test_auth_cache_clear() {
         let mut cache = AuthCache::new(300);
         let ctx1 = (1u64, 100u64);
@@ -2699,6 +2853,197 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         std::thread::sleep(std::time::Duration::from_millis(10));
         cache.sweep_expired();
         assert!(cache.entries.is_empty());
+    }
+
+    // --- Dual-clock expiry tests (sleep / clock-step scenarios) ---
+    //
+    // Clock-injected regression tests for the grant-survives-sleep bug;
+    // see [`CacheExpiry`] for the CLOCK_UPTIME_RAW rationale.
+
+    #[test]
+    fn test_auth_cache_wall_clock_expires_grant_across_sleep() {
+        let mut cache = AuthCache::new(120);
+        let ctx = (1u64, 100u64);
+        let m0 = Instant::now();
+        let w0 = SystemTime::now();
+        cache.grant_at(ctx, "fp1", m0, w0);
+
+        // 1s of awake time, but 10 minutes of wall time passed (slept).
+        let asleep_mono = m0 + Duration::from_secs(1);
+        let asleep_wall = w0 + Duration::from_secs(600);
+        assert!(
+            !cache.is_authorized_at(ctx, "fp1", asleep_mono, asleep_wall),
+            "grant must not survive a sleep longer than the TTL"
+        );
+    }
+
+    #[test]
+    fn test_auth_cache_mono_clock_bounds_stalled_wall_clock() {
+        // Wall clock stalled or stepped backwards (NTP): the monotonic bound
+        // still caps total awake time at the TTL.
+        let mut cache = AuthCache::new(120);
+        let ctx = (1u64, 100u64);
+        let m0 = Instant::now();
+        let w0 = SystemTime::now();
+        cache.grant_at(ctx, "fp1", m0, w0);
+
+        let late_mono = m0 + Duration::from_secs(121);
+        let early_wall = w0 + Duration::from_secs(1);
+        assert!(
+            !cache.is_authorized_at(ctx, "fp1", late_mono, early_wall),
+            "a backwards/stalled wall clock must not extend the grant"
+        );
+    }
+
+    #[test]
+    fn test_auth_cache_valid_while_both_clocks_within_ttl() {
+        let mut cache = AuthCache::new(120);
+        let ctx = (1u64, 100u64);
+        let m0 = Instant::now();
+        let w0 = SystemTime::now();
+        cache.grant_at(ctx, "fp1", m0, w0);
+
+        assert!(cache.is_authorized_at(
+            ctx,
+            "fp1",
+            m0 + Duration::from_secs(60),
+            w0 + Duration::from_secs(60),
+        ));
+    }
+
+    #[test]
+    fn test_auth_cache_strict_ttl_not_extended_by_midway_regrant() {
+        // A re-grant at TTL/2 (e.g. racing prompt resolved late) must not
+        // move the original expiry.
+        let mut cache = AuthCache::new(120);
+        let ctx = (1u64, 100u64);
+        let m0 = Instant::now();
+        let w0 = SystemTime::now();
+        cache.grant_at(ctx, "fp1", m0, w0);
+        cache.grant_at(
+            ctx,
+            "fp1",
+            m0 + Duration::from_secs(60),
+            w0 + Duration::from_secs(60),
+        );
+
+        assert!(
+            !cache.is_authorized_at(
+                ctx,
+                "fp1",
+                m0 + Duration::from_secs(121),
+                w0 + Duration::from_secs(121),
+            ),
+            "midway re-grant must not extend the original expiry"
+        );
+    }
+
+    #[test]
+    fn test_auth_cache_regrant_after_wall_expiry_refreshes() {
+        // Fresh approval after a sleep-induced expiry must produce a live
+        // entry (models the decrypt batch grant-all-keys path where an entry
+        // expired while the prompt sat on screen).
+        let mut cache = AuthCache::new(120);
+        let ctx = (1u64, 100u64);
+        let m0 = Instant::now();
+        let w0 = SystemTime::now();
+        cache.grant_at(ctx, "fp1", m0, w0);
+
+        // Slept past the TTL, then the user re-approved.
+        let m1 = m0 + Duration::from_secs(1);
+        let w1 = w0 + Duration::from_secs(600);
+        assert!(!cache.is_authorized_at(ctx, "fp1", m1, w1));
+        cache.grant_at(ctx, "fp1", m1, w1);
+        assert!(cache.is_authorized_at(
+            ctx,
+            "fp1",
+            m1 + Duration::from_secs(1),
+            w1 + Duration::from_secs(1),
+        ));
+    }
+
+    // --- idle_exceeded tests ---
+
+    #[test]
+    fn test_idle_exceeded_counts_sleep_via_wall_clock() {
+        // 1s of awake time but 31 minutes of wall time → idle (the mono-only
+        // check would have kept keys in memory forever on a nap-happy laptop).
+        let m0 = Instant::now();
+        let w0 = SystemTime::now();
+        let timeout = Duration::from_secs(30 * 60);
+        assert!(idle_exceeded(
+            m0,
+            w0,
+            m0 + Duration::from_secs(1),
+            w0 + Duration::from_secs(31 * 60),
+            timeout,
+        ));
+    }
+
+    #[test]
+    fn test_idle_not_exceeded_when_recently_active() {
+        let m0 = Instant::now();
+        let w0 = SystemTime::now();
+        let timeout = Duration::from_secs(30 * 60);
+        assert!(!idle_exceeded(
+            m0,
+            w0,
+            m0 + Duration::from_secs(60),
+            w0 + Duration::from_secs(60),
+            timeout,
+        ));
+    }
+
+    #[test]
+    fn test_idle_exceeded_via_mono_despite_backwards_wall() {
+        // Wall clock stepped backwards (duration_since errors → treated as
+        // zero); the monotonic clock alone must still drive the timeout.
+        let m0 = Instant::now();
+        let w0 = SystemTime::now() + Duration::from_secs(3600);
+        let timeout = Duration::from_secs(30 * 60);
+        assert!(idle_exceeded(
+            m0,
+            w0,
+            m0 + Duration::from_secs(31 * 60),
+            SystemTime::now(),
+            timeout,
+        ));
+    }
+
+    // --- watcher_should_clear tests ---
+
+    #[test]
+    fn test_watcher_clears_on_lock_transition() {
+        let tick = Duration::from_secs(5);
+        assert!(watcher_should_clear(true, false, tick, Some(tick)));
+    }
+
+    #[test]
+    fn test_watcher_does_not_clear_on_steady_states_or_unlock() {
+        let tick = Duration::from_secs(5);
+        // Steady locked: the transition already cleared; don't churn.
+        assert!(!watcher_should_clear(false, false, tick, Some(tick)));
+        // Steady interactive: nothing happened.
+        assert!(!watcher_should_clear(true, true, tick, Some(tick)));
+        // Unlock: fresh grants after unlock must not be eaten.
+        assert!(!watcher_should_clear(false, true, tick, Some(tick)));
+    }
+
+    #[test]
+    fn test_watcher_clears_on_sleep_divergence() {
+        // Wall advanced 5s (tick) + 35s more than mono → system slept.
+        let mono = Duration::from_secs(5);
+        let wall = Some(Duration::from_secs(40));
+        assert!(watcher_should_clear(true, true, mono, wall));
+    }
+
+    #[test]
+    fn test_watcher_ignores_small_divergence_and_backwards_wall() {
+        let mono = Duration::from_secs(5);
+        // Small NTP adjustment below the threshold: no clear.
+        assert!(!watcher_should_clear(true, true, mono, Some(Duration::from_secs(20))));
+        // Wall stepped backwards (None): not a sleep signal.
+        assert!(!watcher_should_clear(true, true, mono, None));
     }
 
     // --- decrypt_cache_key tests ---

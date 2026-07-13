@@ -314,7 +314,7 @@ pub enum SshCommands {
         #[arg(
             long = "ssh-auth-cache-mode",
             default_value = "none",
-            help = "Sign auth cache mode: none, per-session, or per-app"
+            help = "Sign auth cache mode: none, per-session, or per-app. WARNING: the cache context is the LOCAL terminal session/app — requests arriving over a forwarded agent socket (ssh -A) from a remote host share it, so within the TTL a hostile remote process can sign silently. Keep 'none' if you forward this agent to hosts you don't fully trust."
         )]
         auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
         #[arg(
@@ -326,7 +326,7 @@ pub enum SshCommands {
         #[arg(
             long = "decrypt-auth-cache-mode",
             default_value = "none",
-            help = "Decrypt auth cache mode: none, per-session, or per-app. Only v2 envelope URLs are cache-eligible; legacy items always prompt."
+            help = "Decrypt auth cache mode: none, per-session, or per-app. Only v2 envelope URLs are cache-eligible; legacy items always prompt. Same forwarded-agent caveat as --ssh-auth-cache-mode."
         )]
         decrypt_auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
         #[arg(
