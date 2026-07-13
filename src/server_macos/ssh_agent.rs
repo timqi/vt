@@ -1030,12 +1030,14 @@ struct VtSshSession {
 
 /// Outcome of a `sign` authorization, carrying enough to audit it. Replaces
 /// the old `bool` so the emit point in `Session::sign` can distinguish a
-/// silent cache hit from a fresh approval and from a denial.
+/// silent cache hit from a fresh approval and from a denial. `Unavailable`
+/// keeps the [`UnavailableReason`] so `sign@vt` can surface the structured
+/// ErrKind (SessionLocked/NoGuiSession) instead of flattening to Generic.
 enum AuthDecision {
     CacheHit,
     Approved,
     Rejected,
-    Unavailable,
+    Unavailable(UnavailableReason),
 }
 
 impl AuthDecision {
@@ -1048,7 +1050,7 @@ impl AuthDecision {
             AuthDecision::CacheHit => "cache_hit",
             AuthDecision::Approved => "approved",
             AuthDecision::Rejected => "rejected",
-            AuthDecision::Unavailable => "unavailable",
+            AuthDecision::Unavailable(_) => "unavailable",
         }
     }
 }
@@ -1200,9 +1202,10 @@ impl VtSshSession {
     /// distinguishing a silent cache hit from a fresh approval / denial so the
     /// `Session::sign` call site can audit the outcome.
     ///
-    /// Used for `sign` (SSH authentication). `auth@vt` always prompts because
-    /// forwarded agents share one local process. `decrypt@vt` has its own
-    /// cache (see `check_or_prompt_decrypt_batch`).
+    /// Used for `sign` (SSH authentication) and `sign@vt` (`vt ssh connect`),
+    /// which share one cache — both authorize "sign with this key". `auth@vt`
+    /// always prompts because forwarded agents share one local process.
+    /// `decrypt@vt` has its own cache (see `check_or_prompt_decrypt_batch`).
     ///
     /// All three success methods (Biometric, FIDO2, Password) are cached:
     /// FIDO2 (YubiKey touch) is treated as equivalent to Touch ID for
@@ -1214,7 +1217,7 @@ impl VtSshSession {
             return match self.authenticate_serialized(auth_message).await {
                 AuthOutcome::Success(_) => AuthDecision::Approved,
                 AuthOutcome::Rejected => AuthDecision::Rejected,
-                AuthOutcome::Unavailable(_) => AuthDecision::Unavailable,
+                AuthOutcome::Unavailable(r) => AuthDecision::Unavailable(r),
             };
         };
 
@@ -1228,7 +1231,7 @@ impl VtSshSession {
         // while the permit is still held) during the wait, so an N-request
         // burst costs one dialog instead of N.
         let Ok(_permit) = self.prompt_sem.acquire().await else {
-            return AuthDecision::Unavailable;
+            return AuthDecision::Unavailable(UnavailableReason::NotInteractive);
         };
         if self.sign_cache_hit(context, fingerprint, " after prompt-queue wait").await {
             return AuthDecision::CacheHit;
@@ -1244,7 +1247,7 @@ impl VtSshSession {
                     fingerprint,
                     reason
                 );
-                return AuthDecision::Unavailable;
+                return AuthDecision::Unavailable(reason);
             }
         };
 
@@ -1808,7 +1811,13 @@ impl VtSshSession {
     /// execution context (host/command/meta) in the Touch ID prompt. Unlike the
     /// standard `SIGN_REQUEST` path, the request is authenticated by the
     /// auth-cipher envelope and carries human context. The private key never
-    /// leaves the agent. v1 ALWAYS prompts (no cache — see docs/sign-vt-design.md).
+    /// leaves the agent.
+    ///
+    /// Shares the sign auth cache with the standard `SIGN_REQUEST` path (same
+    /// (context, fingerprint) key — both authorize "sign with this key"), so a
+    /// multi-host `vt ssh connect` fan-out costs one Touch ID within the TTL
+    /// instead of one per host. v1 always prompted; superseded by the cache
+    /// opt-in — mode `none` (default) restores per-request prompts.
     async fn handle_sign_vt(
         &self,
         decrypted: &[u8],
@@ -1857,22 +1866,22 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
-        // v1: ALWAYS PROMPT (no cache). Distinguish reject vs unavailable so the
-        // client gets the right ErrKind (AuthRejected => no fallback, G3).
+        // Cache-aware authorization (same cache + double-check semantics as
+        // `Session::sign`). Distinguish reject vs unavailable so the client
+        // gets the right ErrKind (AuthRejected => no fallback, G3).
         let t0 = Instant::now();
-        let outcome = self.authenticate_serialized(&auth_message).await;
-        let latency_ms = t0.elapsed().as_millis() as u64;
+        let decision = self.check_or_prompt_auth(&fp_str, &auth_message).await;
+        let latency_ms = if matches!(decision, AuthDecision::CacheHit) {
+            0
+        } else {
+            t0.elapsed().as_millis() as u64
+        };
         // Audit the decision (op_kind="ssh-sign", same as the CF ceremony sign
         // path) — without this, agent-side `vt ssh connect` signing left no
         // audit row, a visibility gap vs every other handler.
-        let outcome_str = match outcome {
-            AuthOutcome::Success(_) => "approved",
-            AuthOutcome::Rejected => "rejected",
-            AuthOutcome::Unavailable(_) => "unavailable",
-        };
         self.emit_audit(
             "ssh-sign",
-            outcome_str,
+            decision.outcome(),
             &req.host,
             &req.meta,
             &req.command,
@@ -1880,8 +1889,16 @@ impl VtSshSession {
             0,
             latency_ms,
         );
-        if let Some(kind) = outcome_to_err_strict(outcome) {
-            return Err((kind, auth_outcome_detail(kind)));
+        match decision {
+            AuthDecision::CacheHit | AuthDecision::Approved => {}
+            AuthDecision::Rejected => {
+                return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
+            }
+            AuthDecision::Unavailable(reason) => {
+                let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
+                    .unwrap_or(ErrKind::Generic);
+                return Err((kind, auth_outcome_detail(kind)));
+            }
         }
 
         let sig = sign_data_with_privkey(&privkey, &req.data, req.flags)

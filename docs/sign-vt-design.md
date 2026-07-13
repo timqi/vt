@@ -50,7 +50,9 @@ Keychain copy" idea does not apply here.
   agent's existing multi-algorithm signing core (Ed25519 / RSA-SHA2 / ECDSA
   P-256/P-384), so it is not pinned to Ed25519 even though the git identity from
   `vt ssh keygen` is Ed25519.
-- No `sign@vt` Touch ID cache in v1 — it **always prompts** (see §6).
+- `sign@vt` shares the sign auth cache with the standard `SIGN_REQUEST` path
+  (opt-in via `--ssh-auth-cache-mode`; default `none` = always prompts). v1
+  shipped cache-free; see §6 for the revised decision.
 
 ## 3. Wire additions (`src/core.rs`, cross-platform)
 
@@ -181,11 +183,11 @@ async fn handle_sign_vt(
     if !body.is_empty() { auth_message.push('\n'); auth_message.push_str(&body); }
     append_meta_lines(&mut auth_message, &req.meta);
 
-    // v1: ALWAYS PROMPT (no cache, see §6). Distinguish reject vs unavailable
-    // so the client gets the right ErrKind (AuthRejected => no fallback).
-    if let Some(kind) = outcome_to_err_strict(authenticate(&auth_message)) {
-        return Err((kind, auth_outcome_detail(kind)));
-    }
+    // Cache-aware (shared sign auth cache, see §6). Distinguish reject vs
+    // unavailable so the client gets the right ErrKind (AuthRejected => no
+    // fallback). (v1 always prompted here.)
+    let decision = self.check_or_prompt_auth(&fp_str, &auth_message).await;
+    /* … audit + map CacheHit/Approved → proceed, Rejected/Unavailable → ErrKind … */
 
     let sig = sign_data_with_privkey(&privkey, &req.data, req.flags)
         .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_FAILED)))?;
@@ -204,16 +206,26 @@ verification BEFORE dispatch, so `sign@vt` is VT_AUTH-gated for free, and the
 `handle_sign_vt` errors flow back through the same `ExtResponse` envelope as the
 other extensions.
 
-## 6. AuthCache decision — v1 is NO cache
+## 6. AuthCache decision — shared with the standard sign cache (v1 was NO cache)
 
-`sign@vt` always prompts. git pushes are infrequent and a per-sign Touch ID is
-cheap. Reusing the existing `sign_auth_cache` (keyed `(context, fingerprint)`)
-would let a prior **standard**-sign grant silently authorize a richer-context
-`sign@vt` for the same key (and vice versa) — a cache-context escalation. If a
-cache is added later it MUST be a dedicated namespace keyed
-`(context, fingerprint, host, op)`, never shared with the standard sign or
-decrypt caches. Keeping v1 cache-free removes the only subtle correctness
-question from the agent side.
+v1 always prompted, on the theory that git pushes are infrequent and a
+per-sign Touch ID is cheap. In practice `vt ssh connect` is also the transport
+for multi-host fan-outs (`tssh h1 h2 …`), where a single command produced one
+Touch ID **per host** — exactly the prompt storm the sign cache exists to
+prevent.
+
+`sign@vt` therefore now goes through `check_or_prompt_auth`, sharing the
+standard sign cache (keyed `(context, fingerprint)`; opt-in via
+`--ssh-auth-cache-mode`, default `none` = v1 behaviour). The
+originally-feared "cache-context escalation" (a standard-sign grant silently
+authorizing `sign@vt` for the same key, and vice versa) is now accepted
+deliberately: both operations are "sign an arbitrary challenge with this key",
+so a cached grant on either path already concedes the same capability for the
+TTL — a dedicated `(context, fingerprint, host, op)` namespace would re-add
+one prompt per host on a fan-out (defeating the point) without denying a
+cache holder any real power. The shared cache carries all the standard
+protections: strict TTL, dual-clock expiry, lock/wake/idle flush, and the
+prompt-queue re-check that collapses concurrent bursts to one dialog.
 
 ## 7. Client: `VTClient::sign_vt` (`src/client.rs`, `#[cfg(unix)]`)
 
@@ -333,8 +345,9 @@ async fn sign(&mut self, request: SignRequest) -> Result<ssh_key::Signature, Age
   by the agent itself). It never signs with caller-supplied key material. This
   is strictly weaker capability than the standard `sign` path already grants
   for the same key.
-- **G2 — cache.** v1 none (always prompt). If added: dedicated namespace
-  `(context, fingerprint, host, op)`, never shared.
+- **G2 — cache.** Shares the standard sign auth cache (opt-in, default `none`
+  = always prompt) — see §6 for why the dedicated-namespace requirement was
+  dropped.
 - **G3 — fallback only on pre-prompt failure.** Enforced by reusing
   `should_fallback_to_cf`. All `handle_sign_vt` rejections that occur before the
   prompt are `BadRequest`/`Generic`; `Generic` ("key not here") falls back,

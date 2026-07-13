@@ -153,7 +153,7 @@ default to `none` (every request prompts):
 
 | flag | default TTL | scope |
 |---|---|---|
-| `--ssh-auth-cache-mode` + `--ssh-auth-cache-duration` | 120s | SSH `sign`, per key fingerprint |
+| `--ssh-auth-cache-mode` + `--ssh-auth-cache-duration` | 120s | SSH `sign` + `sign@vt` (`vt ssh connect`), per key fingerprint — the two share one cache |
 | `--decrypt-auth-cache-mode` + `--decrypt-auth-cache-duration` | 30s | `decrypt@vt`, per record (`SHA-256(type‖salt‖host)`); any legacy item in a batch disables caching for that batch |
 
 Modes: `per-session` keys on the terminal session leader (`getsid` + start
