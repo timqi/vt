@@ -158,15 +158,29 @@ default to `none` (every request prompts):
 
 Modes: `per-session` keys on the terminal session leader (`getsid` + start
 time); `per-app` keys on the nearest `.app/Contents/` ancestor (all tabs of one
-terminal app share a context). Peers without a controlling TTY never cache.
-`auth@vt` / `run@vt` NEVER cache.
+terminal app share a context). Both require the caller to have a controlling
+TTY — **orchestrated callers (AI agents / CI / make) spawn TTY-less commands
+with a fresh session per call, so they can never hit these modes.** `global` is
+the escape hatch for that case: ONE shared context for the whole agent, no TTY
+requirement — the coarsest blast radius (within the TTL any socket reacher,
+including every forwarded session, rides one grant; only the TTL and the
+lock/wake/idle flushes bound it). `auth@vt` / `run@vt` NEVER cache.
 
 Expiry is tracked on **both** the monotonic and the wall clock (macOS `Instant`
 freezes during sleep — either clock passing the TTL kills the entry), grants are
 strict-TTL (no sliding refresh), and both caches are flushed on: agent `lock`,
 screen lock, wake-from-sleep (detected via clock divergence), and idle key
 clearing. All prompts are serialized through a global one-permit semaphore so a
-hostile peer cannot stack dialogs.
+hostile peer cannot stack dialogs; cached paths **re-check the cache after the
+queue wait** (grants land while the permit is still held), so an N-request
+burst for the same key/records costs one Touch ID, and the waiters resolve as
+silent cache hits.
+
+When audit push is configured (`--audit-url`/`--audit-key`), every agent-side
+cache hit also triggers a **免审批 notice** on the same notification channels
+as the Worker DEK-cache hit (Pushover / Slack / Slack App / Feishu), with the
+note 「缓存命中，免 Touch ID」. Throttled Worker-side to one notice per
+(op_kind, host) per 60s — the audit table still records every hit.
 
 **Forwarded-agent hazard (deliberate tradeoff, off by default):** the cache
 context is derived from the *local* peer process. Requests arriving over a

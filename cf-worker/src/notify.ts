@@ -59,16 +59,21 @@ export function buildApprovalMessage(
 // ssh/ip/reason lines and leads with a one-line summary (who · N records · cache
 // note), then the two highest-signal fields pwd + cmd (what ran, and where). No
 // @-mention anywhere on this path. The durable audit row keeps the full context.
+// `note` names the skipped factor: the default fits the Worker DEK cache
+// (no phone approval); the agent's Touch-ID-cache ingest path passes its own
+// (免 Touch ID). `salts` of 0 (e.g. an agent `sign` hit has no records) drops
+// the count segment rather than printing "0 条".
 export function buildCacheHitLines(
   meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd'>,
   salts: number,
+  note = '缓存命中，无手机审批',
 ): { title: string; lines: string[] } {
   const title = meta.op_kind ? `VT 缓存命中(免审批): ${meta.op_kind}` : 'VT 缓存命中(免审批解密)';
   const who = [meta.user, meta.host].filter(Boolean).join('@');
   const head: string[] = [];
   if (who) head.push(who);
-  head.push(`${salts} 条`);
-  head.push('缓存命中，无手机审批');
+  if (salts > 0) head.push(`${salts} 条`);
+  head.push(note);
   const lines: string[] = [head.join(' · ')];
   if (meta.pwd) lines.push(`pwd: ${meta.pwd}`);
   // Same self-labelled-multi-line handling as metaLines above.
@@ -79,8 +84,9 @@ export function buildCacheHitLines(
 export function buildCacheHitMessage(
   meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd'>,
   salts: number,
+  note?: string,
 ): { title: string; body: string } {
-  const { title, lines } = buildCacheHitLines(meta, salts);
+  const { title, lines } = buildCacheHitLines(meta, salts, note);
   return { title, body: lines.join('\n') };
 }
 
@@ -152,7 +158,8 @@ export async function notifyCacheHit(
   env: Env,
   meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
   salts: number,
+  note?: string,
 ): Promise<string> {
-  const { title, body } = buildCacheHitMessage(meta, salts);
+  const { title, body } = buildCacheHitMessage(meta, salts, note);
   return fanOut(env, title, body);
 }

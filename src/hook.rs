@@ -388,7 +388,7 @@ fn run_exec(cfg: &HookConfig, vt_bin: &str, argv: &[String]) -> Result<()> {
     let cwd = current_dir();
     match decide(&prog, &args, &cwd, cfg, &env_lookup) {
         Decision::Allow => {
-            let real = resolve_real(arg0);
+            let real = resolve_real(arg0)?;
             exec_real(&real, rest)
         }
         Decision::Deny(reason) => {
@@ -402,7 +402,7 @@ fn run_exec(cfg: &HookConfig, vt_bin: &str, argv: &[String]) -> Result<()> {
             for (k, v) in &plan.set_vars {
                 std::env::set_var(k, v);
             }
-            let real = resolve_real(arg0);
+            let real = resolve_real(arg0)?;
             if !plan.needs_inject() {
                 // Only plaintext values to supply — exec the command directly.
                 return exec_real(&real, rest);
@@ -433,25 +433,46 @@ fn exec_real(prog: &str, args: &[String]) -> Result<()> {
 /// back at `vt`). This is how re-execing never re-enters a shim — and it is
 /// robust to symlinked PATH entries (`/home/me` → `/essd/me`) because it
 /// compares the *resolved target*, not the directory string. A name already
-/// containing `/` is returned unchanged; unresolvable → returned as-is (let
-/// `exec` fail with ENOENT).
-fn resolve_real(arg0: &str) -> String {
+/// containing `/` is returned unchanged.
+///
+/// When every PATH candidate IS a vt shim, this is a hard error: exec'ing the
+/// bare name would go through execvp's own PATH search, land on the shim
+/// again, and loop to the depth limit — the confusing failure mode this
+/// replaces. A name with no candidates at all is returned as-is (let `exec`
+/// fail with ENOENT).
+fn resolve_real(arg0: &str) -> Result<String> {
     if arg0.contains('/') {
-        return arg0.to_string();
+        return Ok(arg0.to_string());
     }
-    let self_exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| std::fs::canonicalize(p).ok());
+    let self_exe = canonical_self_exe();
     let paths: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    resolve_in_paths(arg0, &paths, self_exe.as_deref()).unwrap_or_else(|| arg0.to_string())
+    match resolve_in_paths(arg0, &paths, self_exe.as_deref()) {
+        Resolved::Real(p) => Ok(p),
+        Resolved::OnlyShims => anyhow::bail!(
+            "vt hook exec: no real `{arg0}` on PATH — every candidate is a vt shim. \
+             Install `{arg0}` (or put its real location on PATH), or remove the shim."
+        ),
+        Resolved::NotFound => Ok(arg0.to_string()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Resolved {
+    /// First executable PATH candidate that is not a vt shim.
+    Real(String),
+    /// Executable candidates exist, but every one canonicalizes to vt itself.
+    OnlyShims,
+    /// No executable candidate at all.
+    NotFound,
 }
 
 /// First `dir/arg0` on `paths` that is executable and is NOT `self_exe` (our own
 /// binary, i.e. a vt shim symlink). Canonicalizing the candidate resolves the
 /// symlink to the real vt binary, so shims are detected regardless of path form.
-fn resolve_in_paths(arg0: &str, paths: &[PathBuf], self_exe: Option<&Path>) -> Option<String> {
+fn resolve_in_paths(arg0: &str, paths: &[PathBuf], self_exe: Option<&Path>) -> Resolved {
+    let mut skipped_shim = false;
     for dir in paths {
         let cand = dir.join(arg0);
         if !is_executable(&cand) {
@@ -462,11 +483,16 @@ fn resolve_in_paths(arg0: &str, paths: &[PathBuf], self_exe: Option<&Path>) -> O
             None => false,
         };
         if is_self {
+            skipped_shim = true;
             continue; // this candidate is a vt shim → skip past it
         }
-        return Some(cand.to_string_lossy().into_owned());
+        return Resolved::Real(cand.to_string_lossy().into_owned());
     }
-    None
+    if skipped_shim {
+        Resolved::OnlyShims
+    } else {
+        Resolved::NotFound
+    }
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -615,16 +641,35 @@ fn args_prefix_matches(rule_args: &[String], inv_args: &[String]) -> bool {
             .all(|(want, got)| want == got)
 }
 
+/// This process's executable, canonicalized.
+///
+/// Canonicalization is load-bearing: when running as a shim (a symlink to vt
+/// named after the shimmed tool), macOS's `current_exe()` returns the symlink
+/// path as invoked (`_NSGetExecutablePath` does not resolve links, unlike
+/// Linux's `/proc/self/exe`). Un-canonicalized, `basename(vt_bin)` would
+/// equal the tool name itself, so run_exec's "bare vt runs as-is" recursion
+/// guard would match EVERY shimmed command and exec the bare name — which
+/// execvp resolves right back to the shim, looping to the depth limit; inject
+/// rewrites would similarly re-enter the shim instead of `vt inject`. The
+/// same resolved identity is what `resolve_in_paths` compares candidates
+/// against to skip shims.
+fn canonical_self_exe() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+}
+
 /// The vt binary to invoke in rewrites. Prefer `$VT_HOOK_BIN`, then this
-/// process's own absolute path (guarantees the same binary), else bare `vt`.
+/// process's own canonicalized path (guarantees the same binary — see
+/// `canonical_self_exe` for why the raw `current_exe` path is NOT usable
+/// here), else bare `vt`.
 fn vt_binary() -> String {
     if let Ok(p) = std::env::var("VT_HOOK_BIN") {
         if !p.trim().is_empty() {
             return p;
         }
     }
-    std::env::current_exe()
-        .ok()
+    canonical_self_exe()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "vt".to_string())
 }
@@ -1046,17 +1091,35 @@ mod tests {
         let paths = vec![link.join("shim"), real.clone()];
 
         // With self set → the shim (symlink to vt) is skipped, real gh wins.
-        let got = resolve_in_paths("gh", &paths, Some(&vt_canon)).unwrap();
-        assert_eq!(got, real_gh.to_string_lossy(), "vt shim symlink must be skipped");
+        let got = resolve_in_paths("gh", &paths, Some(&vt_canon));
+        assert_eq!(
+            got,
+            Resolved::Real(real_gh.to_string_lossy().into_owned()),
+            "vt shim symlink must be skipped"
+        );
         // Without self → first candidate wins (the shim), proving self is the guard.
-        let got2 = resolve_in_paths("gh", &paths, None).unwrap();
-        assert_eq!(got2, link.join("shim").join("gh").to_string_lossy());
-        // Missing command → None.
-        assert!(resolve_in_paths("nope", &paths, Some(&vt_canon)).is_none());
+        let got2 = resolve_in_paths("gh", &paths, None);
+        assert_eq!(
+            got2,
+            Resolved::Real(link.join("shim").join("gh").to_string_lossy().into_owned())
+        );
+        // Missing command → NotFound.
+        assert_eq!(resolve_in_paths("nope", &paths, Some(&vt_canon)), Resolved::NotFound);
+        // Shim is the ONLY candidate → OnlyShims (a hard error upstream): exec'ing
+        // the bare name would execvp straight back into the shim and loop.
+        let shim_only = vec![link.join("shim")];
+        assert_eq!(
+            resolve_in_paths("gh", &shim_only, Some(&vt_canon)),
+            Resolved::OnlyShims
+        );
 
         std::fs::remove_file(&link).ok();
         std::fs::remove_dir_all(&base).ok();
     }
+
+    // (The macOS current_exe-returns-the-symlink regression is guarded by
+    // canonical_self_exe's doc + the OnlyShims coverage above; a unit test
+    // here could only re-assert stdlib canonicalize semantics.)
 
     #[test]
     fn decide_returns_structured_inject_plan() {

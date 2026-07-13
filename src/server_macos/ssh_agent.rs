@@ -91,6 +91,13 @@ pub enum AuthCacheMode {
     None,
     PerSession,
     PerApp,
+    /// One shared context for the whole agent process — no TTY or session
+    /// requirement. The only mode that serves orchestrated callers (AI
+    /// agents, CI, make) whose spawned commands have no controlling terminal
+    /// and a fresh session per call, so per-session/per-app can never hit.
+    /// Coarsest blast radius: within the TTL, ANY caller that can reach the
+    /// socket (including every session of a forwarded agent) rides one grant.
+    Global,
 }
 
 impl FromStr for AuthCacheMode {
@@ -101,8 +108,9 @@ impl FromStr for AuthCacheMode {
             "none" => Ok(AuthCacheMode::None),
             "per-session" | "per_session" | "session" => Ok(AuthCacheMode::PerSession),
             "per-app" | "per_app" | "app" => Ok(AuthCacheMode::PerApp),
+            "global" => Ok(AuthCacheMode::Global),
             _ => Err(format!(
-                "invalid auth cache mode '{}': expected none, per-session, or per-app",
+                "invalid auth cache mode '{}': expected none, per-session, per-app, or global",
                 s
             )),
         }
@@ -115,6 +123,7 @@ impl std::fmt::Display for AuthCacheMode {
             AuthCacheMode::None => write!(f, "none"),
             AuthCacheMode::PerSession => write!(f, "per-session"),
             AuthCacheMode::PerApp => write!(f, "per-app"),
+            AuthCacheMode::Global => write!(f, "global"),
         }
     }
 }
@@ -929,15 +938,21 @@ impl VtSshAgentFactory {
 /// (the shell at the head of the pty — see `proc_info::get_sid`) lives for the
 /// full terminal session, giving the cache a stable anchor. `tdev != 0` is
 /// still required so daemons without a controlling terminal stay uncacheable.
+///
+/// `Global` is the escape hatch for orchestrated callers (AI agents / CI /
+/// make) whose spawned commands have **no controlling terminal and a fresh
+/// session per call** — under per-session/per-app they resolve to `None` and
+/// can never hit. It maps every peer to one fixed context; the only remaining
+/// boundary is the TTL (plus the lock/wake/idle flushes).
 fn resolve_cache_context(
     peer_pid: Option<i32>,
     mode: AuthCacheMode,
 ) -> Option<CacheContext> {
     let pid = peer_pid?;
-    // Both cache modes require the peer to have a controlling terminal.
+    // Per-session / per-app require the peer to have a controlling terminal.
     // launchd-managed daemons and other non-interactive peers always prompt
-    // and never enter the cache — caching only makes sense for explicit
-    // human-driven terminal sessions.
+    // and never enter the cache — for these modes caching only makes sense
+    // for explicit human-driven terminal sessions.
     if matches!(mode, AuthCacheMode::PerSession | AuthCacheMode::PerApp)
         && proc_info::get_tty_dev(pid).is_none()
     {
@@ -955,6 +970,9 @@ fn resolve_cache_context(
             let start = proc_info::get_start_tvsec(app_pid)?;
             Some((app_pid as u64, start))
         }
+        // (0, 0) can never collide with a real context: sid/app_pid are
+        // always > 0.
+        AuthCacheMode::Global => Some((0, 0)),
     }
 }
 
@@ -1057,6 +1075,20 @@ impl DecryptDecision {
     }
 }
 
+/// Run the blocking auth chain on the blocking pool. No serialization —
+/// callers must already hold the prompt permit (or deliberately not need
+/// one). Join error means the auth chain panicked; fail closed.
+async fn authenticate_on_blocking_pool(reason: &str) -> AuthOutcome {
+    let msg = reason.to_string();
+    match tokio::task::spawn_blocking(move || authenticate(&msg)).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::error!("auth prompt task failed: {}", e);
+            AuthOutcome::Unavailable(UnavailableReason::NotInteractive)
+        }
+    }
+}
+
 /// Map a single `authenticate()` outcome (the always-prompt, no-cache path)
 /// onto a `DecryptDecision`, preserving the structured `ErrKind` for the
 /// failure arms. `Rejected` is its own variant; a `None` from
@@ -1150,21 +1182,18 @@ impl VtSshSession {
     /// `authenticate` blocks on a human for up to ~30s; run inline it would
     /// pin one runtime worker per concurrent prompt and, at worker-count
     /// prompts, stall the whole agent including unrelated sessions.
+    ///
+    /// The cached paths (`check_or_prompt_auth`,
+    /// `check_or_prompt_decrypt_batch`) don't use this wrapper: they acquire
+    /// the permit themselves so they can re-check the cache after the queue
+    /// wait. Use this only where no cache is involved.
     async fn authenticate_serialized(&self, reason: &str) -> AuthOutcome {
         // The semaphore is never closed, so acquire only fails if that ever
         // changes; fail closed as "cannot prompt" rather than a user reject.
         let Ok(_permit) = self.prompt_sem.acquire().await else {
             return AuthOutcome::Unavailable(UnavailableReason::NotInteractive);
         };
-        let msg = reason.to_string();
-        match tokio::task::spawn_blocking(move || authenticate(&msg)).await {
-            Ok(outcome) => outcome,
-            // Join error means the auth chain panicked — fail closed.
-            Err(e) => {
-                tracing::error!("auth prompt task failed: {}", e);
-                AuthOutcome::Unavailable(UnavailableReason::NotInteractive)
-            }
-        }
+        authenticate_on_blocking_pool(reason).await
     }
 
     /// Check auth cache or prompt the user. Returns an [`AuthDecision`]
@@ -1189,21 +1218,24 @@ impl VtSshSession {
             };
         };
 
-        // Check cache (read lock, released before auth prompt)
-        {
-            let cache = self.sign_auth_cache.read().await;
-            if cache.is_authorized(context, fingerprint) {
-                tracing::debug!(
-                    "Sign auth cache hit for context={:?} fingerprint={}",
-                    context,
-                    fingerprint
-                );
-                return AuthDecision::CacheHit;
-            }
+        // Fast path: cache hit without touching the prompt queue.
+        if self.sign_cache_hit(context, fingerprint, "").await {
+            return AuthDecision::CacheHit;
         }
 
-        // Prompt (no locks held)
-        let method = match self.authenticate_serialized(auth_message).await {
+        // Queue for the prompt, then RE-CHECK the cache: a racing request for
+        // the same key may have been approved (and granted — grants happen
+        // while the permit is still held) during the wait, so an N-request
+        // burst costs one dialog instead of N.
+        let Ok(_permit) = self.prompt_sem.acquire().await else {
+            return AuthDecision::Unavailable;
+        };
+        if self.sign_cache_hit(context, fingerprint, " after prompt-queue wait").await {
+            return AuthDecision::CacheHit;
+        }
+
+        // Prompt (permit held, no cache locks held)
+        let method = match authenticate_on_blocking_pool(auth_message).await {
             AuthOutcome::Success(m) => m,
             AuthOutcome::Rejected => return AuthDecision::Rejected,
             AuthOutcome::Unavailable(reason) => {
@@ -1217,6 +1249,8 @@ impl VtSshSession {
         };
 
         if method.is_cacheable() {
+            // Granted while the permit is still held, so queued waiters are
+            // guaranteed to observe this entry on their re-check.
             let mut cache = self.sign_auth_cache.write().await;
             cache.grant(context, fingerprint);
             tracing::debug!(
@@ -1271,16 +1305,8 @@ impl VtSshSession {
             .map(|(t, salt)| decrypt_cache_key(*t, salt, host))
             .collect();
 
-        let miss_count = {
-            let now_mono = Instant::now();
-            let now_wall = SystemTime::now();
-            let cache = self.decrypt_auth_cache.read().await;
-            keys.iter()
-                .filter(|k| !cache.is_authorized_at(context, k, now_mono, now_wall))
-                .count()
-        };
-
-        if miss_count == 0 {
+        // Fast path: full hit without touching the prompt queue.
+        if self.decrypt_miss_count(context, &keys).await == 0 {
             tracing::debug!(
                 "Decrypt auth cache hit for context={:?} ({} v2 items)",
                 context,
@@ -1289,7 +1315,26 @@ impl VtSshSession {
             return DecryptDecision::CacheHit;
         }
 
-        let method = match self.authenticate_serialized(auth_message).await {
+        // Queue for the prompt, then RE-CHECK: a racing request covering the
+        // same records may have been approved (and granted — grants happen
+        // while the permit is still held) during the wait, so an N-request
+        // burst costs one dialog instead of N.
+        let Ok(_permit) = self.prompt_sem.acquire().await else {
+            return decrypt_decision_from_authenticate(AuthOutcome::Unavailable(
+                UnavailableReason::NotInteractive,
+            ));
+        };
+        let miss_count = self.decrypt_miss_count(context, &keys).await;
+        if miss_count == 0 {
+            tracing::debug!(
+                "Decrypt auth cache hit after prompt-queue wait for context={:?} ({} v2 items)",
+                context,
+                v2_items.len()
+            );
+            return DecryptDecision::CacheHit;
+        }
+
+        let method = match authenticate_on_blocking_pool(auth_message).await {
             AuthOutcome::Success(m) => m,
             AuthOutcome::Rejected => return DecryptDecision::Rejected,
             AuthOutcome::Unavailable(reason) => {
@@ -1307,7 +1352,9 @@ impl VtSshSession {
             // valid at the check above but expired while the prompt sat on
             // screen would otherwise stay expired despite the fresh approval.
             // `grant_at` is strict-TTL: keys still valid at this instant keep
-            // their original expiry (no sliding refresh).
+            // their original expiry (no sliding refresh). Granted while the
+            // permit is still held, so queued waiters observe the entries on
+            // their re-check.
             let now_mono = Instant::now();
             let now_wall = SystemTime::now();
             let mut cache = self.decrypt_auth_cache.write().await;
@@ -1323,6 +1370,32 @@ impl VtSshSession {
         }
 
         DecryptDecision::Approved
+    }
+
+    /// Sign-cache lookup with a hit-path debug log; `phase` distinguishes the
+    /// fast-path check from the post-queue re-check in the log line.
+    async fn sign_cache_hit(&self, context: CacheContext, fingerprint: &str, phase: &str) -> bool {
+        let hit = self.sign_auth_cache.read().await.is_authorized(context, fingerprint);
+        if hit {
+            tracing::debug!(
+                "Sign auth cache hit{} for context={:?} fingerprint={}",
+                phase,
+                context,
+                fingerprint
+            );
+        }
+        hit
+    }
+
+    /// Count how many of `keys` are NOT currently authorized for `context` —
+    /// 0 means a full cache hit. One clock capture per call.
+    async fn decrypt_miss_count(&self, context: CacheContext, keys: &[String]) -> usize {
+        let now_mono = Instant::now();
+        let now_wall = SystemTime::now();
+        let cache = self.decrypt_auth_cache.read().await;
+        keys.iter()
+            .filter(|k| !cache.is_authorized_at(context, k, now_mono, now_wall))
+            .count()
     }
 
     // ---- Structured-envelope dispatch helpers --------------------------------
@@ -2730,6 +2803,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             AuthCacheMode::None
         );
         assert_eq!(
+            AuthCacheMode::from_str("global").unwrap(),
+            AuthCacheMode::Global
+        );
+        assert_eq!(
             AuthCacheMode::from_str("per-session").unwrap(),
             AuthCacheMode::PerSession
         );
@@ -2799,6 +2876,23 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
 
         cache.grant(ctx, "fp1");
         assert!(cache.is_authorized(ctx, "fp1"));
+    }
+
+    #[test]
+    fn test_resolve_cache_context_global_needs_no_tty() {
+        // Global must resolve for ANY identified peer — including TTY-less
+        // orchestrated callers (AI agents / CI) whose fresh-session spawns
+        // make per-session/per-app permanently miss. Our own test process
+        // works regardless of whether the runner has a controlling terminal.
+        let me = std::process::id() as i32;
+        assert_eq!(
+            resolve_cache_context(Some(me), AuthCacheMode::Global),
+            Some((0, 0))
+        );
+        // No peer PID → still uncacheable even in global mode.
+        assert_eq!(resolve_cache_context(None, AuthCacheMode::Global), None);
+        // None mode never caches.
+        assert_eq!(resolve_cache_context(Some(me), AuthCacheMode::None), None);
     }
 
     // (Strict-TTL idempotence and expired-entry replacement are covered
