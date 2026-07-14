@@ -679,7 +679,7 @@ impl VTClient {
         }
 
         // Fast path: try the opt-in DEK cache first (no phone if all salts are
-        // cached for this IP+ppid within the approved TTL). The full meta is sent
+        // cached for this IP+pwd within the approved TTL). The full meta is sent
         // so a cache HIT is audited with the same context as a ceremony decrypt.
         // On any miss / cache disabled / transport hiccup, fall through to the
         // full phone ceremony.

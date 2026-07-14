@@ -123,7 +123,8 @@ pub struct ChallengeMeta {
     pub ppid_cmd: String,
     /// Numeric parent PID. Recorded on the approval + every cache event purely
     /// for FORENSICS (audit display) — it is NOT part of the DEK-cache binding
-    /// context, which is keyed on the worker-derived IP alone. See docs/dek-cache.md.
+    /// context, which is keyed on worker-derived IP + client-reported pwd. See
+    /// docs/dek-cache.md.
     pub ppid: u32,
     pub ssh_client: String,
     pub reason: String,
@@ -131,8 +132,9 @@ pub struct ChallengeMeta {
 
 /// Numeric parent PID of the current process (libc::getppid). 0 where
 /// unavailable. Reported to the worker for audit/forensics only — the DEK cache
-/// is bound to the worker-derived IP alone, not to the PID (ppid was both
-/// spoofable and unstable across orchestrated shells, so it was dropped).
+/// is bound to worker-derived IP + client-reported pwd, not to the PID (ppid
+/// was both spoofable and unstable across orchestrated shells, so it was
+/// dropped from the binding).
 #[cfg(unix)]
 pub fn current_ppid() -> u32 {
     let p = unsafe { libc::getppid() };
@@ -266,7 +268,7 @@ struct DekCacheReq<'a> {
     timestamp_ms: u64,
     /// Full display meta (host/user/command/ppid/…), same shape as the challenge
     /// request — so a cache HIT is audited with the same context as a ceremony
-    /// decrypt. The cache binding ctx is keyed on the worker-derived IP alone;
+    /// decrypt. The cache binding ctx is keyed on worker-derived IP + pwd;
     /// `meta.ppid` here is forensic-only and not part of the key.
     meta: &'a ChallengeMeta,
 }
@@ -469,7 +471,7 @@ pub async fn get_deks(
 
 /// Fast path: try the opt-in server-side DEK cache before running a full phone
 /// approval. Returns `Some(deks)` on a full cache hit (all `salts` present,
-/// unexpired, and the request's IP+ppid match what was recorded at approval),
+/// unexpired, and the request's IP+pwd match what was recorded at approval),
 /// or `None` on any miss / disabled cache / recoverable transport error (the
 /// caller then falls back to `get_deks`).
 ///

@@ -3,7 +3,7 @@
 //! The Ed25519 private key is stored as an ordinary `SecretType::RAW` v2 record
 //! whose plaintext is `BASE64_URL_SAFE_NO_PAD(seed[32])` — reusing the existing
 //! encrypt/decrypt ceremony with zero core/worker changes. `keygen` creates the
-//! identity here; `connect` (the git SSH driver) lands in a follow-up.
+//! identity here and `connect` is the git SSH driver implemented below.
 //!
 //! See `docs/ssh-vt-design.md` for the full design and security boundary.
 

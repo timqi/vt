@@ -1,10 +1,13 @@
-# Feishu / Lark notification channel — design spec (for review)
+# Feishu / Lark notification channel — design record
 
-Status: **draft, pre-implementation**. Adds a third notification channel
-(飞书/Lark) alongside Pushover + Slack, with two capabilities the existing
-one-way webhooks lack: (1) **@-mention** approvers on an approval request, and
-(2) **edit the original card in place** when the request reaches a terminal
-state (approved / rejected / expired).
+Status: **implemented**. The operator-facing setup is
+[`feishu.md`](feishu.md); the implementation lives in
+`cf-worker/src/feishu.ts` and `cf-worker/src/do_account.ts`.
+
+This file preserves the design rationale and security decisions. The review
+revisions and open questions near the end are historical records, not pending
+work or implementation instructions. When behavior changes, update `feishu.md`
+and the code first.
 
 ## Why this can't reuse the Slack/Pushover pattern
 
@@ -139,7 +142,7 @@ JSON for `wrangler secret put`.
 - Token cache in DO storage (`feishu:tat:<app_id>`) holds a short-lived
   `tenant_access_token`; never logged.
 
-## Review revisions (LOCKED — codex-expert approve-with-changes + API verification)
+## Historical review revisions (locked decisions)
 
 Folded in before coding:
 
@@ -159,8 +162,8 @@ Folded in before coding:
    visible to ALL recipients of a shared/group card (без it, the edit only
    reaches some). Required for the group-chat use case.
 6. **`opCreate` does NOT await the send.** Fire-and-forget via
-   `ctx.waitUntil(...)` (same pattern as `opDekCache`'s `notifyCacheHit`,
-   do_account.ts:914). The send callback then re-gets the challenge and: if
+   `ctx.waitUntil(...)` (same pattern as `opDekCache`'s `notifyCacheHit` in
+   `AccountDO`). The send callback then re-gets the challenge and: if
    still `pending` → store `feishu_message_id`; if already terminal (approve
    raced ahead) → edit the card straight to the final state (we now have the
    id). Keeps 3rd-party latency out of the singleton DO's serialized op path;
@@ -172,12 +175,12 @@ Folded in before coding:
 8. **Requirement 2 (cache-hit trim)** lands as a **separate commit** from the
    Feishu addition (independent revert).
 9. `approveUrl` is reconstructed in the DO as `${env.WORKER_ORIGIN}/a/${token}`
-   via a shared helper (index.ts:311 computes the same; avoid drift).
+   via the shared `approveUrlFor` helper (avoid drift).
 10. Known gap to document in `docs/feishu.md`: **a failed card edit is never
     retried** (best-effort) — the card may stay at ⏳ while the ceremony itself
     completed correctly. Consistent with how other known gaps are documented.
 
-## Open questions for review (resolved above)
+## Historical open questions (resolved above)
 
 1. Send-site split (Feishu in DO, Pushover/Slack in `index.ts`) vs. moving ALL
    approval notifications into the DO for symmetry — is the split acceptable?

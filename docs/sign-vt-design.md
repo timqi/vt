@@ -1,9 +1,27 @@
 # `sign@vt` design — context-carrying agent signing for `vt ssh connect`
 
-Status: DRAFT rev2 (chosen design). Supersedes rev1 (the "agent decrypts a
-`vt://` record and signs internally" variant, C′). Builds on
-`docs/ssh-vt-design.md`. See §12 for why rev2 (Keychain-backed C) was chosen
-over rev1 (C′).
+Status: **implemented design reference**. The current implementation is in
+`src/core.rs`, `src/client.rs`, `src/ssh_sign.rs`, and
+`src/server_macos/ssh_agent.rs`. The revision history and PR breakdown below
+are historical context only; they are not a task list.
+
+## Current implementation summary
+
+`sign@vt` is the VT-authenticated signing extension used by `vt ssh connect`:
+
+- On macOS, the agent signs with a matching Keychain-backed key without
+  exposing the private key to the caller.
+- If the matching agent key is unavailable before authentication, the client
+  may fall back to decrypt-then-sign using the portable `vt://` record. A
+  rejection or post-prompt failure is not silently converted into another
+  approval path.
+- The route shares the standard sign auth cache (`none` by default) and keeps
+  the advertised public key as the binding between lookup and signature.
+- The wire types are cross-platform; only the Keychain-backed agent handler is
+  macOS-specific.
+
+The `PR-A`/`PR-B` labels and implementation snippets below are retained as
+design history. They are not instructions to split or redo the implementation.
 
 ## 1. Goal
 
@@ -24,7 +42,8 @@ Key-residency model is **per-host** (each host has its own Ed25519 identity and
 its own public key enrolled on the provider):
 
 - **Host with a vt agent (macOS workstation):** the private key lives **only in
-  the Keychain** (added via `vt ssh add`). `vt ssh connect` signs via `sign@vt`.
+  VT's encrypted macOS Keychain-backed store** (added via `vt ssh add`). `vt ssh
+  connect` signs via `sign@vt`.
   The private key never leaves the agent. There is no `vt://` record for this
   key.
 - **Agent-less host (Linux / CI):** the private key lives **only as a portable
@@ -125,25 +144,24 @@ fn sign_data_with_privkey(
 `sign_data_with_privkey(...)`. Behaviour is byte-identical (guarded by a test
 that signs the same data via the old inline path vs the helper).
 
-## 5. Agent: `sign@vt` handler + dispatcher wiring
+## 5. Agent: `sign@vt` handler + dispatcher wiring (current)
 
-Add the extension name and dispatch:
+The extension name and both dispatcher sites are implemented as follows:
 
 ```rust
 pub const EXT_SIGN: &str = "sign@vt";
 ```
-- Add `EXT_SIGN` to the allow-list `matches!(…, EXT_ENCRYPT | EXT_DECRYPT | EXT_AUTH | EXT_RUN | EXT_SIGN)`. (An older agent without this arm returns `Ok(None)` from the dispatcher — exactly the fallback signal the client wants.)
-- Add the match arm: `EXT_SIGN => self.handle_sign_vt(&decrypted).await,`.
+- `EXT_SIGN` is in the allow-list `matches!(…, EXT_ENCRYPT | EXT_DECRYPT | EXT_AUTH | EXT_RUN | EXT_SIGN)`. An older agent without this arm returns `Ok(None)` from the dispatcher, which is the fallback signal the client expects.
+- The dispatch match contains `EXT_SIGN => self.handle_sign_vt(&decrypted).await,`.
   (`handle_sign_vt` does its own Keychain lookup via the in-memory `keys` map,
   so it does not need the `store`/`passphrase_cipher` that encrypt/decrypt take;
   pass them only if a future cache needs them.)
 
-> ⚠️ **Atomic dual edit.** The dispatcher has TWO places that must both learn
+> ⚠️ **Atomic dual edit.** The dispatcher has TWO places that must both contain
 > `EXT_SIGN`: the `matches!(…)` allow-list guard (~1572) and the dispatch match
 > with `_ => unreachable!()` (~1622). Updating only one compiles but fires
-> `unreachable!()` at runtime for every `sign@vt` call. There is no compile-time
-> guard, so PR-B MUST edit both, and add a test that drives a real `sign@vt`
-> request end-to-end (not just unit-testing the handler) to catch a half-edit.
+> `unreachable!()` at runtime for every `sign@vt` call. Keep an end-to-end test
+> in place so a half-edit cannot regress silently.
 
 ```rust
 async fn handle_sign_vt(
@@ -268,22 +286,27 @@ fallback-eligible.
 
 ## 8. connect: routing (`src/ssh_sign.rs`, `#[cfg(unix)]`)
 
-`connect_unix` changes:
-- The public key is **required** (advertised to system ssh, and identifies the
-  Keychain key). Loaded from the `.pub` file (or `VT_GIT_SSH_PUB`).
-- The `vt://` record file becomes **optional**. A macOS Keychain-backed host has
-  no `vt://` file; an agent-less host has one. `SignerInner.vt_url: Option<String>`.
-**Startup load contract (PR-C).** Today `connect_unix` calls
-`load_private_record().await?` (env `VT_GIT_SSH_PRIVATE_KEY` if non-empty, else
-read `~/.config/vt/git-ssh`) and `bail!`s on any error, then requires
-`starts_with("vt://")`. PR-C changes this to:
-- **pubkey is required.** `load_pubkey_line()` (env `VT_GIT_SSH_PUB`, else
-  `~/.config/vt/git-ssh.pub`) must succeed; on failure, hard-fail at startup with
-  an actionable message ("write the public key to ~/.config/vt/git-ssh.pub or set
-  VT_GIT_SSH_PUB"). connect needs it to advertise the identity and to tell the
-  agent which key.
-- **`vt://` record is optional** — introduce `load_private_record_opt() ->
-  Result<Option<String>>`:
+Current `connect_unix` behavior:
+
+1. An explicit public key (`VT_GIT_SSH_PUB`, otherwise
+   `~/.config/vt/git-ssh.pub`) takes precedence. It is advertised to system
+   `ssh` and may be paired with an optional `vt://` record from
+   `VT_GIT_SSH_PRIVATE_KEY` or `~/.config/vt/git-ssh`.
+2. If no explicit public key exists and `VT_AUTH` is set, `connect` discovers
+   all identities from the upstream VT agent and advertises them. These use
+   `sign@vt` and do not need a local `vt://` record.
+3. If neither source provides an identity, `connect` fails before starting
+   system `ssh` with an actionable error. A missing `vt://` record is therefore
+   normal for an agent-backed identity, not a sign-time error.
+
+`load_private_record_opt()` returns `Result<Option<String>>`: an absent default
+file is `Ok(None)`, other IO errors are fatal, and a present value must start
+with `vt://`. The macOS Keychain-backed flow intentionally uses `None`.
+
+### Explicit-record loading details
+
+- **`vt://` record is optional** — `load_private_record_opt()` returns
+  `Result<Option<String>>`:
   - if `VT_GIT_SSH_PRIVATE_KEY` is set and non-empty → `Some(value)`;
   - else read the default file `~/.config/vt/git-ssh`: map
     **`ErrorKind::NotFound` (ENOENT) → `Ok(None)`**, propagate any OTHER IO error
@@ -292,9 +315,8 @@ read `~/.config/vt/git-ssh`) and `bail!`s on any error, then requires
   The macOS provisioning flow (§14) deliberately leaves no `vt://` file and does
   not set `VT_GIT_SSH_PRIVATE_KEY`, so `None` is the normal Keychain-backed
   case — not an error.
-- This means a host with neither an agent key nor a `vt://` record fails only at
-  **sign time** (truth-table last row), with the actionable message, after
-  successfully advertising the identity.
+
+### Wire encoding detail
 
 - `pubkey_bytes: Vec<u8>` = SSH wire encoding of the advertised `KeyData`,
   computed once. **`encode_vec()` does not exist** in ssh-encoding 0.2; use the
@@ -411,7 +433,7 @@ coexistence in §10. (Note: Ed25519 keys are regular Keychain items, not Secure
 Enclave — SE is P-256 only — so they are protected and non-exportable but loaded
 into agent RAM at sign time.)
 
-## 13. PR breakdown
+## 13. Historical PR breakdown
 
 1. **PR-A (wire):** `SignReq`/`SignRes` in `core.rs` + round-trip test. Linux-green.
 2. **PR-B (agent):** extract `sign_data_with_privkey`; add `EXT_SIGN`, dispatcher
@@ -426,7 +448,7 @@ into agent RAM at sign time.)
 ## 14. Provisioning (closes the keygen↔Keychain gap)
 
 `vt ssh keygen` writes a `vt://` record; it does **not** put a key in the agent.
-`vt ssh add <file>` imports an OpenSSH private key into **vt's own encrypted
+`vt ssh add -f <file>` imports an OpenSSH private key into **vt's own encrypted
 KeychainStore** (`rusty.vault.store`, encrypted under the master key — NOT the
 macOS login keychain, so `ssh-add --apple-use-keychain` is irrelevant here).
 The two key-residency models are provisioned differently:
@@ -434,9 +456,9 @@ The two key-residency models are provisioned differently:
 **macOS workstation (Keychain-backed, no `vt://` file):**
 ```bash
 ssh-keygen -t ed25519 -f /tmp/vt-git -C "git@$(hostname -s)" -N ""   # plaintext key + .pub
-vt ssh add /tmp/vt-git                                               # import into vt store (Touch-ID gated)
+vt ssh add -f /tmp/vt-git                                            # import into vt store (Touch-ID gated)
 install -m 0644 /tmp/vt-git.pub ~/.config/vt/git-ssh.pub            # connect advertises + identifies via this
-shred -u /tmp/vt-git                                                # remove plaintext private key
+rm -P /tmp/vt-git                                                   # macOS best-effort overwrite + remove
 # enroll ~/.config/vt/git-ssh.pub with the provider (GitHub/GitLab)
 git config --global core.sshCommand "vt ssh connect"
 ```

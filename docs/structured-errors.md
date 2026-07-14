@@ -3,7 +3,11 @@
 Status: shipped — `ExtResponse`/`ErrKind` in `src/core/wire.rs`, `VtClientError`
 downcast + exit-code mapping in `src/client.rs` (with tests).
 
-## Motivation
+This is the current protocol reference. The rollout plan, resolved review
+questions, and original questions near the end are historical notes; they are
+not pending implementation work.
+
+## Background (historical)
 
 Today the only failure signal a client sees from `vt ssh agent` is `SSH_AGENT_FAILURE` (the bare 0x05 byte from `ssh-agent-lib`). Inside the agent we already distinguish:
 
@@ -17,7 +21,9 @@ Today the only failure signal a client sees from `vt ssh agent` is `SSH_AGENT_FA
 
 …but all of it collapses to `AgentError::Failure` on the way out. The user sees `Command failed: SSH agent extension failed: SSH agent failure` and a process exit code of `1`. Scripts, PAM modules, and humans all read the same opaque message.
 
-Goal: structured, append-only error payloads inside the (auth-cipher encrypted) extension response, mapped to stable exit codes on the client.
+The shipped design is a structured, append-only error payload inside the
+auth-cipher-encrypted extension response, mapped to stable exit codes on the
+client.
 
 ## Non-goals
 
@@ -54,14 +60,17 @@ pub enum ExtBody<T> {
 }
 ```
 
-- `v` starts at `1`. The client checks `v == EXPECTED_WIRE_VERSION` (constant in `core`) and refuses anything else.
+- `v` starts at `1`. The client checks `v == WIRE_VERSION` (the constant in
+  `src/core/wire.rs`) and refuses anything else.
 - `detail` is **optional, server-controlled, never contains PII or user-supplied strings**. The agent populates it only with static `&'static str`s describing the failure in a way that's safe to log on remote machines. Specifically: never reflect `req.host`, `req.reason`, `req.command`, key fingerprints, or filesystem paths. The client may surface `detail` verbatim.
 - The enum is `#[non_exhaustive]` on the client side via serde default-case (see "Forwards compatibility" below).
 
 ### Versioning policy
 
 - `ErrKind` is **append-only**. Renaming or removing a variant requires bumping `v`.
-- Older clients seeing an unknown `kind` MUST treat it as `ErrKind::Generic` (exit code `1`) and log the raw string. Implemented with a `#[serde(other)] Unknown` variant.
+- Older clients seeing an unknown `kind` MUST treat it as `ErrKind::Generic`
+  (exit code `1`). This is implemented with a `#[serde(other)] Unknown`
+  variant; the raw value is not surfaced as user-facing detail.
 - A wrong `v` is itself a hard error: `ErrKind::ProtocolVersion` with the client's exit `22` (see exit-code table below).
 
 ## Error taxonomy
@@ -87,6 +96,10 @@ pub enum ExtBody<T> {
 Per-item errors **inside batch responses** (`Vec<EncryptResItem>` / `Vec<DecryptResItem>`) keep their existing `err_message` field. The new envelope errors only fire for batch-level failures (auth denied, lock, malformed request). This preserves the partial-success semantics of batch decrypt.
 
 ## Server-side mapping
+
+The following is simplified pseudocode. The real implementation keeps the
+successful DEK payload on a raw-JSON path so it can preserve zeroization
+properties; see `wrap_ok_envelope` in `src/core/wire.rs`.
 
 In `src/server_macos/ssh_agent.rs`:
 
@@ -120,7 +133,7 @@ The agent only returns `AgentError` for cases the SSH agent transport itself can
 
 1. **`auth_cipher` decryption failure on the incoming payload.** Without `VT_AUTH` we have no key to encrypt a structured response with, and an unencrypted envelope would be a presence oracle ("is this socket a vt agent?"). The marginal "wrong VT_AUTH vs agent crashed" distinguishability for the legitimate caller is not worth the leak.
 
-2. **`AgentLocked` (`ssh-add -x` lock).** The lock check today fires *before* `KeychainStore::load()` and `derive_passcode_ciphers()` — see `ssh_agent.rs` line 854. Returning a structured error here would force us to run keychain I/O for every locked request just to derive the cipher to encrypt the envelope. The cost is small but the behavioral change is real. We keep `AgentLocked` as `AgentError::Failure`; client maps SSH-wire failure with no parseable envelope to `ErrKind::Generic` (exit 1) and prints a hint to try `ssh-add -X`.
+2. **`AgentLocked` (`ssh-add -x` lock).** The lock check fires *before* `KeychainStore::load()` and `derive_passcode_ciphers()` in the SSH-agent extension dispatcher. Returning a structured error here would force us to run keychain I/O for every locked request just to derive the cipher to encrypt the envelope. The cost is small but the behavioral change is real. We keep `AgentLocked` as `AgentError::Failure`; client maps SSH-wire failure with no parseable envelope to `ErrKind::Generic` (exit 1) and prints a hint to try `ssh-add -X`.
 
 All other vt-level failures travel inside the envelope.
 
@@ -201,9 +214,12 @@ Failure responses must not leave caches partially populated:
 - **`detail` accidentally containing user data**: easy to regress. Mitigation: `detail` field type is `&'static str` at the construction site; we use an `enum WireFail { kind, detail: Option<&'static str> }` internally and the JSON serializer turns the static into an owned `String` only at the JSON layer. Anything dynamic forces a compile error.
 - **Forwarded-socket leak**: see § "auth@vt and forwarded sockets". No regression vs today's logs.
 - **Cache poisoning via error path**: ruled out by review of `check_or_prompt_*` — both helpers `return false` before any `cache.grant` on the failure path.
-- **Test surface bloat**: every kind needs a test. Plan: one table-driven `core::wire` test that round-trips each variant through serde; a second test that maps `AuthOutcome` → `ErrKind`; a third that maps `ErrKind` → exit code. All pure functions, no agent required.
+- **Test surface bloat**: every kind needs a pure unit test. The current suite
+  covers wire round-trips, `AuthOutcome` mapping, exit-code mapping, unknown
+  future kinds, version mismatches, and malformed envelopes without requiring a
+  running agent.
 
-## Test plan
+## Tests covering the contract
 
 Pure unit tests (no keychain, no agent):
 
@@ -221,23 +237,26 @@ Integration (gated on `--ignored`, needs agent):
 9. **`agent_returns_auth_rejected_on_reject`** — programmatically deny Touch ID, observe `ErrKind::AuthRejected` in client.
 10. **`agent_locked_returns_generic_via_wire_failure`** — `ssh-add -x` then `vt read`. Today the lock check pre-empts envelope generation, so this surfaces as the unstructured SSH-wire failure → exit 1 with the hint message.
 11. **`agent_legacy_disabled_returns_legacy_disabled`** — start agent with `--no-legacy-decrypt`, send a legacy URL, observe `ErrKind::LegacyDisabled` and exit code `21`.
-12. **`agent_unknown_secret_type_returns_bad_request`** — send `DecryptInput::V2` with `UNKNOWN` type, observe `ErrKind::BadRequest` (replacing today's `AgentError::Failure` at `ssh_agent.rs:934`).
+12. **`agent_unknown_secret_type_returns_bad_request`** — send a v2 decrypt
+    input with an unknown type, observe `ErrKind::BadRequest` rather than a
+    generic agent failure.
 
-## Rollout
+## Historical rollout record
 
 Single PR, since this is one binary:
 
 1. Add `core::wire` module with `ExtResponse`, `ErrKind`, `WIRE_VERSION = 1`, exit-code table, serde unknown-kind handling. Pure tests.
 2. Convert all three extension arms in `ssh_agent.rs` to return `ExtResponse`. Remove `AgentError::Failure` returns except for transport-level cases (lock state read failure, auth-cipher decrypt failure of the incoming payload).
 3. Convert `client.rs::try_agent_extension` to parse `ExtResponse`. Add `VtClientError`. Wire exit codes through `main.rs`.
-4. Update `core::session` adapter `outcome_to_err`. (Could live in `wire` instead — TBD with reviewer.)
+4. The final implementation places `outcome_to_err` in `src/core/wire.rs` so
+   the mapping remains cross-platform.
 5. Add ignored integration tests. Update CHANGELOG.
 
-## CHANGELOG notes
+## Compatibility notes
 
 - **Breaking**: client and agent binaries must match versions. An older client running against a newer agent will see `failed to parse response` (its `serde_json::from_slice::<Vec<_>>` chokes on the new envelope) and exit 1. Document the upgrade order: stop the agent, install the new binary, restart the agent, then upgrade clients on the same machine. There is no graceful fallback path.
 
-## Decisions on open questions
+## Historical decisions
 
 (Resolved during codex-expert review — keeping here for the PR record.)
 
@@ -246,7 +265,7 @@ Single PR, since this is one binary:
 3. **`Transient` variant**: defer. No current caller surfaces flock contention as an error; add when `KeychainStore::try_modify` becomes a request path.
 4. **Per-item batch errors**: defer. Inner `err_message` stays free-form text — only our own client reads it, scripts branch on the envelope-level exit code.
 
-## Original open questions for review
+## Historical open questions
 
 1. **`SessionLocked` vs `NoGuiSession` distinction**: worth two separate exit codes (11/12) or fold into one? Argument for two: PAM modules can retry-later on `Locked` (screen will unlock eventually) but should hard-fail on `NoGuiSession` (LaunchDaemon won't ever get a GUI). Recommend keep separate.
 2. **Should `detail` exist at all on `auth@vt`?** Conservative read says yes — see § "auth@vt and forwarded sockets" for why I believe it's safe. Reviewer's call.

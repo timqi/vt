@@ -1,7 +1,26 @@
 # SSH-over-`vt://` design
 
-Status: DRAFT rev4 (addresses codex review rounds 1+2+3 — see §10 changelog)
-Branch: `ssh-sign`
+Status: **implemented design reference**. The current implementation is in
+`src/ssh_sign.rs`, `src/client.rs`, and `src/main.rs`; user-facing setup starts
+in `README.md`. Sections describing review rounds, branches, and PR planning
+are historical context only.
+
+## Current implementation summary
+
+- `vt ssh keygen` writes an encrypted `vt://` record to
+  `~/.config/vt/git-ssh` (or `--key-file`) and writes the matching public key
+  beside it. The record is ciphertext and may be copied between hosts.
+- `vt ssh connect` is a `GIT_SSH_COMMAND` driver. It uses the public key to
+  advertise an identity, runs the system `ssh` for transport and host-key
+  checks, and obtains signatures through the VT approval path.
+- On a host with an appropriate VT agent, signing can use the agent's
+  Keychain-backed key. Otherwise the driver decrypts the portable record on
+  demand through the agent/Passkey routing described in `README.md`.
+- `--forward-real-agent` is opt-in and forwards only the filtered VT extension
+  set documented in §11; `run@vt` and unknown extensions are refused.
+
+The older `PR1`/`PR2`, review-round, and changelog labels below describe how
+the feature was built. They are not pending work items.
 
 ## 1. Goal
 
@@ -30,7 +49,8 @@ plaintext is `BASE64_URL_SAFE_NO_PAD(seed)`** — a 43-char ASCII string. No new
 byte.
 
 **Alphabet is pinned (NEW-B1):** `base64::prelude::BASE64_URL_SAFE_NO_PAD`, the same
-encoder used everywhere else in the codebase (`core.rs:8`, `cf.rs`, `client.rs`).
+encoder used by the shared crypto/client code (`src/core.rs`, `src/cf.rs`,
+`src/client.rs`).
 32 bytes → **43 chars** (NOT 44; standard padded base64 would be 44 and is forbidden
 here). keygen and connect MUST use this exact encoder; a round-trip unit test
 (§9.3) guards against an alphabet/padding mismatch silently yielding a wrong key.
@@ -43,9 +63,10 @@ nonce = salt[..12]
 ct    = AES-256-GCM(DEK, nonce, base64url(seed), AAD="vt:v2:0")
 ```
 
-Why this is correct (verified round 2): `client_encrypt_v2` takes arbitrary bytes
-(`core.rs:351`); `vt://0…` parses (`core.rs:304-310`); the RAW decrypt arm does
-`String::from_utf8` (`core.rs:382-384`) which always succeeds on ASCII base64.
+Why this is correct: `client_encrypt_v2` accepts arbitrary plaintext bytes;
+the v2 parser preserves the `RAW` type; and the RAW decrypt arm converts the
+plaintext to a string, which always succeeds for ASCII base64. See
+`src/core.rs::{client_encrypt_v2,parse_v2_url,client_decrypt_v2}`.
 
 `vt ssh connect` decodes the recovered string with `BASE64_URL_SAFE_NO_PAD` into
 `Zeroizing<[u8;32]>`, asserts `len()==32`, and rejects otherwise. This is the only
@@ -53,11 +74,11 @@ Why this is correct (verified round 2): `client_encrypt_v2` takes arbitrary byte
 
 ### 3.1 Why this is cheap
 
-- `encrypt` already falls back to CF with fresh salts (`client.rs:296`, `cf.rs:43/250`).
+- `VTClient::encrypt` already falls back to CF with fresh salts.
 - `decrypt` already reads `$SSH_AUTH_SOCK` first, then `~/.ssh/vt.sock`, then CF
-  (`client.rs:216`, `should_fallback_to_cf` `client.rs:117`).
+  (`VTClient::connect_agent_socket`, `should_fallback_to_cf`).
 - Worker records `op_kind`/`command` as doubly-sanitized, capped passthrough
-  (`cf.rs:132-144` → `index.ts:219` → `approve.js` `textContent`). `op_kind="ssh-sign"`
+  (`cf::collect_meta` → `index.ts::capChallengeMeta` → `approve.js` `textContent`). `op_kind="ssh-sign"`
   flows through with **no worker change** (confirmed round 1 focus 6).
 
 ### 3.2 Free two-tier routing (no router agent) — with prerequisite
@@ -67,21 +88,25 @@ Why this is correct (verified round 2): `client_encrypt_v2` takes arbitrary byte
 - No laptop / CI → fallback CF (phone passkey).
 
 **Prerequisite (N2):** `try_agent_extension` short-circuits to CF when `VT_AUTH` is
-empty (`client.rs:211-214`). The laptop tier engages **only if the remote host also
+empty (`VTClient::try_agent_extension`). The laptop tier engages **only if the remote host also
 has `VT_AUTH` set**; otherwise `connect` goes straight to CF even with a forwarded
 socket. Documented requirement, not a bug.
 
-## 4. Where the `vt://` lives — a FILE, never an env value (REVISED, NEW-B2)
+## 4. Where the `vt://` lives — file by default, env override supported
 
-**The `vt://` record is stored in a file, never exported in an environment variable.**
+The default and recommended location is a file. `connect` also supports the
+explicit `VT_GIT_SSH_PRIVATE_KEY` environment override for CI or wrappers; that
+variable contains the encrypted `vt://` record, not the plaintext seed.
 
-Reason (NEW-B2): `vt inject` scans the process environment for any value containing a
+Reason (NEW-B2): `client::inject` scans the process environment for any value containing a
 `vt://` URL, decrypts it, and injects the plaintext into the child's environment
-(`client.rs:1086-1099`). If `VT_GIT_SSH_KEY` held the `vt://` directly, any
+(`env_vt_vars` in `src/client.rs`). If `VT_GIT_SSH_PRIVATE_KEY` held the `vt://` directly, any
 `vt inject -- cmd` on that host would decrypt the seed (base64) into the child's
 `/proc/<pid>/environ` / `ps e` — a new exposure of a *signing* key. Keeping the
-`vt://` in a file (which `vt inject` does NOT auto-scan; it only reads an explicit
-`-r FILE`) eliminates this without modifying the security-sensitive inject code.
+record in the default file avoids that scan. If the environment override is
+used, do not run an unrestricted `vt inject -- ...` with that variable inherited;
+use the default file or `--only-env` to keep the signing record out of the
+decryption set.
 
 Layout (default, overridable):
 
@@ -94,48 +119,28 @@ Overrides: `keygen` writes to `--key-file <path>` or the default. `connect` read
 the **raw `vt://` record** from `VT_GIT_SSH_PRIVATE_KEY` (env value, not a path),
 falling back to the default key file. The public key may likewise be supplied as
 the raw OpenSSH line via `VT_GIT_SSH_PUB` (cleartext is harmless).
-Note: `VT_GIT_SSH_PRIVATE_KEY` holds the **`vt://` ciphertext** record — env
-exposure is equivalent to the 0600 ciphertext file, since decryption still
-requires the ceremony (Touch ID / phone passkey). Only the plaintext seed must
-never touch disk or env.
+`VT_GIT_SSH_PRIVATE_KEY` is still ciphertext at rest/in the environment, but its
+presence makes it eligible for the generic `vt inject` environment scan described
+above. Only the plaintext seed must never be written to disk or placed in an
+environment variable.
 
 **Deployment note (round-3 N4):** every host where `git push` runs must reach the
 key material — either the ciphertext file at the default path (copy it; safe to
 distribute) or `VT_GIT_SSH_PRIVATE_KEY=<vt:// record>` (+ `VT_GIT_SSH_PUB` when the
 `.pub` is not copied). `keygen` docs/help must state this.
 
-## 5. clap / platform structure (B5 — implementation prerequisite)
+## 5. Platform structure (current)
 
-The entire `Commands::Ssh(SshCommands)` subtree is currently `#[cfg(target_os=
-"macos")]` (`main.rs:139-141, 181-183, 280`). Implementation MUST:
-
-- ungate the `SshCommands` enum and the `Commands::Ssh` dispatch arm;
-- keep `#[cfg(target_os="macos")]` on each mac-only variant (Agent/Add/List/Remove/
-  RemoveAll/Comment/Show) **and** its dispatch arm (Rust strips cfg'd variants before
-  clap's derive macro runs, so the derived `Subcommand` stays exhaustive per target —
-  confirmed valid round 2);
-- add ungated `Keygen` / `Connect` variants;
-- place keygen/connect impl in a **cross-platform module** `src/ssh_sign.rs` (NOT under
-  the macOS-gated `server_macos`).
-
-**Cargo.toml — BLOCKING prerequisite for PR2 (round-3 B2, promoted from NIT-2):**
-`ssh-agent-lib` currently enables `features=["agent","codec"]` only on the macOS-gated
-dependency (`Cargo.toml:45`); the base unix entry has `default-features=false` with no
-features (`Cargo.toml:28`). Note `ssh_agent_lib::blocking::Client` + `proto::{Extension,
-Unparsed}` used today in `client.rs` are unconditional (not behind `agent`), so the
-current Linux build is fine. BUT the ephemeral signer in `ssh_sign.rs` needs
-`ssh_agent_lib::agent::{listen, Agent, Session}`, which ARE behind `#[cfg(feature=
-"agent")]`. Therefore **PR2 cannot compile on Linux until `["agent","codec"]` is moved
-to the cross-platform dependency entry.** This is a hard gate on PR2, verified by §9.2.
-`ed25519_dalek` and `base64` are already cross-platform.
-
-This restructure is a prerequisite for the §9.2 Linux check to be meaningful (NIT-3):
-the changelog's "B5 resolved" refers to the *plan*; the source change happens in
-implementation.
+`SshCommands` and its `Keygen`/`Connect` variants are cross-platform. The local
+agent and key-management variants (`Agent`, `Add`, `List`, `Remove`,
+`RemoveAll`, `Comment`, `Show`) remain macOS-only through `#[cfg]`. The
+cross-platform implementation is in `src/ssh_sign.rs`; it uses the
+cross-platform `ssh-agent-lib` agent/codec features needed by the ephemeral
+signer. Keep this split intact when changing the CLI or Cargo features.
 
 ## 6. Components
 
-### A. `vt ssh keygen` (PR1)
+### A. `vt ssh keygen`
 
 ```
 vt ssh keygen [--label <name>] [--comment <text>] [--key-file <path>]
@@ -147,15 +152,15 @@ vt ssh keygen [--label <name>] [--comment <text>] [--key-file <path>]
 3. Write `~/.config/vt/git-ssh` (vt://, mode 0600) + `~/.config/vt/git-ssh.pub`
    (OpenSSH pubkey, mode 0644) using `OpenOptions::create_new(true)` +
    `custom_flags(O_NOFOLLOW)` + `.mode(...)` — mirror the existing safe-write pattern
-   in `inject()` (`client.rs:1166-1175`) to defeat symlink redirection (round-3 N3).
+   in `client::inject` to defeat symlink redirection (round-3 N3).
    Also echo both to stdout with guidance.
 4. Zeroize seed, base64 buffer, `SigningKey`. (Only ciphertext `vt://` + cleartext
    pubkey are written to disk; the plaintext seed never is.)
 
-Routing: Mac+agent → no Touch ID; headless → one CF approval (`op_kind="encrypt"`).
-**Safe standalone increment** — RAW records work on all existing binaries (B4 resolved).
+Routing: key generation uses the normal encrypt path (which does not require a
+Touch ID prompt); later signing requires the agent or phone approval path.
 
-### B. `vt ssh connect` (PR2 — git SSH driver)
+### B. `vt ssh connect` (git SSH driver)
 
 ```
 git config core.sshCommand "vt ssh connect"
@@ -182,7 +187,7 @@ git invokes: `vt ssh connect [ssh-opts] [user@]host 'git-receive-pack …'`.
 4. **Pass `SSH_AUTH_SOCK=<temp sock>` to the child via `Command::env()` ONLY. The parent
    process MUST NOT call `std::env::set_var("SSH_AUTH_SOCK", …)` (round-3 B1).**
    `VTClient::decrypt` reads `SSH_AUTH_SOCK` from the process env at call time
-   (`client.rs:216`); if the parent mutated its own env, the signer's SIGN handler would
+   (via `VTClient::connect_agent_socket`); if the parent mutated its own env, the signer's SIGN handler would
    resolve `SSH_AUTH_SOCK` to the ephemeral socket and connect to itself
    (recursion / self-connect). Keeping the override child-scoped means the parent retains
    the original (possibly forwarded) agent for decrypt. Then spawn system `ssh` with the
@@ -239,8 +244,9 @@ agent and bypass the context-injecting shim.
 
 - Plaintext seed in RAM only at (a) keygen and (b) sign-time decrypt. On a remote host
   (b) briefly places the seed in that host's RAM — inherent to decrypt-then-sign-locally.
-- **`vt inject` exposure (NEW-B2) eliminated** by never holding the `vt://` in an env
-  value (§4); the record lives in a file inject does not auto-scan.
+- **`vt inject` exposure (NEW-B2) avoided by default** by keeping the `vt://` in a
+  file that inject does not auto-scan. The supported environment override has the
+  explicit inheritance caveat described in §4.
 - **Zeroization residual (B3, documented):** the decrypt pipeline returns a plain
   `String` (`base64(seed)`) — identical to every existing vt secret. We decode into
   `Zeroizing<[u8;32]>` immediately and best-effort clear the String. No raw-bytes
@@ -256,15 +262,15 @@ agent and bypass the context-injecting shim.
 |---|---|---|
 | D1 | storage / type byte | `SecretType::RAW` (`vt://0`), plaintext = `BASE64_URL_SAFE_NO_PAD(seed)`. No core.rs change. |
 | D2 | key representation | 32-byte seed (base64url at rest; `Zeroizing<[u8;32]>` in use). |
-| D3 | `vt://` location | default **file** (`~/.config/vt/git-ssh`, 0600), or raw `vt://` via `VT_GIT_SSH_PRIVATE_KEY` env (ciphertext — same exposure as the file). pubkey in sibling `.pub` / `VT_GIT_SSH_PUB`. |
+| D3 | `vt://` location | default **file** (`~/.config/vt/git-ssh`, 0600), or raw ciphertext via `VT_GIT_SSH_PRIVATE_KEY`. The environment override is scanned by unrestricted `vt inject`; see §4. Pubkey in sibling `.pub` / `VT_GIT_SSH_PUB`. |
 | D4 | overrides / multi-key | `keygen --key-file`; `connect` via `VT_GIT_SSH_PRIVATE_KEY` (raw record). single key v1; host→key map deferred. |
 | D5 | keygen import | generate-only v1. |
 | D6 | signer impl | ephemeral agent + exec system `ssh`. |
 | D7 | op_kind | keygen → `"encrypt"`; sign → `"ssh-sign"`. |
-| D8 | PR split | PR1 = keygen (safe standalone). PR2 = connect. Neither needs core.rs changes. |
+| D8 | Historical PR split | PR1 = keygen; PR2 = connect. Neither needed core.rs changes. |
 | D9 | macOS strategy | Opt 1 coexist. |
 | D10 | algorithm | Ed25519 only. |
-| D11 | clap/platform | ungate `SshCommands`; per-variant `#[cfg]`; keygen/connect in `src/ssh_sign.rs`; move `ssh-agent-lib` agent/codec features cross-platform. |
+| D11 | Current clap/platform | `SshCommands` is cross-platform; macOS-only variants retain per-variant `#[cfg]`; keygen/connect live in `src/ssh_sign.rs`; `ssh-agent-lib` agent/codec features are cross-platform. |
 | D12 | base64 alphabet | `BASE64_URL_SAFE_NO_PAD` (43 chars), pinned + round-trip test. |
 | D13 | signer cache | `tokio::sync::OnceCell::get_or_try_init` (fallible; rejected auth retriable, error not cached). |
 | D14 | child env override | `Command::env("SSH_AUTH_SOCK", temp)` ONLY; parent never `env::set_var` (prevents signer self-connect). |
@@ -280,21 +286,22 @@ agent and bypass the context-injecting shim.
    - malformed/short record rejected (len != 32);
    - argv → (host, push/fetch) parsing.
 
-## 10. Changelog
+## 10. Historical changelog
 
 Round 1: B1/B4 (no new type byte; base64 in RAW); B2 (base64 UTF-8-safe); B3 (downgraded
 to documented residual); B5 (clap restructure plan); N2 (VT_AUTH prereq); N3 (stale
 socket harmless); N4 (explicit chmod); N5 (Zeroizing seed, no disk).
 
 Round 2: NEW-B1 → §3 pins `BASE64_URL_SAFE_NO_PAD` (43 chars) + round-trip test (D12);
-NEW-B2 → §4 stores `vt://` in a file, never an env value; NIT-1 → 43 not 44 chars;
-NIT-2 → §5 move `ssh-agent-lib` agent/codec features cross-platform; NIT-3 → §5 B5 is an
-implementation prerequisite (plan only in doc); NIT-4 → §6.B `OnceCell` serializes the
-signer's decrypt (D13).
+NEW-B2 → §4 prefers a file and documents the environment override caveat; NIT-1 → 43 not 44 chars;
+NIT-2 → §5 moved `ssh-agent-lib` agent/codec features cross-platform; NIT-3 → §5
+recorded the platform split; NIT-4 → §6.B `OnceCell` serializes the signer's
+decrypt (D13).
 
 Round 3 (both round-2 blockers confirmed resolved): B1 → §6.B step 4 (D14) forbids
 `env::set_var`, child gets `SSH_AUTH_SOCK` via `Command::env()` only, preventing signer
-self-connect/recursion (decrypt reads the sock from env at call time, `client.rs:216`);
+self-connect/recursion (decrypt reads the sock from env at call time via
+`VTClient::connect_agent_socket`);
 B2 → §5 promotes the `ssh-agent-lib` `agent` feature move to a hard PR2 compile gate;
 N1 → `get_or_try_init` (D13); N2 → §6.B async-safe key-file read (`tokio::fs`/`spawn_blocking`);
 N3 → §6.A `O_NOFOLLOW`+`create_new` safe write; N4 → §4 per-host key-file deployment note.

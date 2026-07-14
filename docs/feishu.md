@@ -1,6 +1,6 @@
 # 飞书 / Lark 通知通道
 
-第三个可选、独立的通知通道（与 Pushover、Slack 并列），但能力不同：
+一个可选、独立的通知通道（与 Pushover、Slack Webhook、Slack App 并列），但能力不同：
 
 - **@相关人**：审批请求会 `@` 你配置的人。
 - **回改卡片**：审批通过 / 拒绝 / 超时后，**编辑最初那张卡片**把结果填上（✅ 已批准 / ❌ 已拒绝 / ⌛ 已过期），而不是再发一条新消息。
@@ -10,14 +10,14 @@
 
 ## 通道能力对比
 
-| 能力 | Pushover | Slack | 飞书 / Lark |
-|---|---|---|---|
-| 审批实时通知 | ✅ | ✅ | ✅ |
-| @ 相关人 | ❌ | ❌ | ✅ |
-| **决策后回改原消息**（✅/❌/⌛）| ❌ | ❌ | ✅ |
-| 传输方式 | 单向 API | 单向 Incoming Webhook | 自建应用 Bot API |
+| 能力 | Pushover | Slack Webhook | Slack App | 飞书 / Lark |
+|---|---|---|---|---|
+| 审批实时通知 | ✅ | ✅ | ✅ | ✅ |
+| @ 相关人 | ❌ | ❌ | ✅ | ✅ |
+| **决策后回改原消息**（✅/❌/⌛）| ❌ | ❌ | ✅ | ✅ |
+| 传输方式 | 单向 API | 单向 Incoming Webhook | Bot Web API | 自建应用 Bot API |
 
-> **Slack 是单向通知**：用的是 Incoming Webhook，Slack 只回 `ok`、不返回消息 `ts`，因此**无法在审批通过/拒绝后编辑原消息**（Slack 本身支持 `chat.update`，但需改用 Bot token + Web API，本项目未采用）。审批结果只在审批页与审计页更新。要「@人 + 决策后回改」，用飞书 / Lark 通道。
+> **Slack Webhook 是单向通知**：Slack 只回 `ok`、不返回消息 `ts`，因此无法在审批通过/拒绝后编辑原消息。要「@人 + 决策后回改」，可用 Slack App 或飞书 / Lark 通道。
 
 配置产物是一个 Worker secret `FEISHU_JSON`，在 Access 网关保护的 admin「推送渠道」页（`/<ADMIN_SEG>/channels`）里生成，再 `wrangler secret put FEISHU_JSON` 部署。缺省 / 非法 → 通道停用。
 
@@ -129,4 +129,4 @@ just deploy-worker    # 全部 secret 设好后统一 deploy 生效
 - **卡片编辑失败不重试**：回改是 best-effort。若 `PATCH` 失败，卡片可能停留在 `⏳ 待审批`，但审批本身已正确完成（以审计表为准）。
 - **发送响应丢失 → 卡片卡 ⏳**：审批卡异步发送（不阻塞仪式），6s 超时。若卡片已发出但响应超时/丢失，Worker 拿不到 `message_id`，之后就无法回改，卡片停在 `⏳`。审批本身不受影响（以审计表为准）。
 - **发送与决策竞态（罕见、仅影响观感）**：若审批人在卡片 `message_id` 落库前就完成了决策，`opApprove`/`opReject` 会从最新存储合并回 `message_id`（不再因覆盖而永久卡 ⏳）；但补发路径拿不到「批准所用 Passkey」标签，仅显示用时，且极端情况下可能对已决策的请求多 @ 一次。
-- **免审批精简是全通道的**：Pushover/Slack/飞书的缓存命中文案都精简（首行摘要 + `pwd` + `cmd`），不 @ 人。
+- **免审批精简是全通道的**：Pushover/Slack Webhook/Slack App/飞书的缓存命中文案都精简（首行摘要 + `pwd` + `cmd`），不 @ 人。

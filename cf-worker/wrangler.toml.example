@@ -19,8 +19,8 @@ preview_urls = false
 
 # Workers Logs: persist structured audit events (challenge.created /
 # approved / rejected / expired / error) for dashboard viewing. Retention
-# is platform-managed (~3 days on Free, ~7 days on Paid). Log volume is
-# kept minimal — see src/log.ts and audit call sites.
+# is platform-managed (currently 3 days on Free, 7 days on Paid). Log volume
+# is kept minimal — see src/log.ts and audit call sites.
 [observability]
 enabled = true
 head_sampling_rate = 1.0
@@ -61,7 +61,7 @@ ACCESS_AUD = "<YOUR_ACCESS_APPLICATION_AUD_TAG>"
 #   CREDENTIALS_JSON  JSON blob with passkey credentials (schema in src/credentials.ts)
 #   CACHE_SECKEY      32-byte base64url X25519 secret key enabling the opt-in DEK
 #                     cache (approve-time TTL → 免审批解密 within IP+pwd scope).
-#                     Generate: `openssl rand 32 | basenc --base64url | tr -d '='`.
+#                     Generate: `openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'`.
 #                     Empty/absent → caching disabled (every decrypt needs phone).
 #                     Rotate to instantly invalidate all cached DEKs. NEVER inline.
 #   PUSHOVER_JSON     {"app_token":"…","user_key":"…"}  — optional Pushover channel

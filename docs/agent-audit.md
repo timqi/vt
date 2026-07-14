@@ -1,5 +1,10 @@
 # Agent audit push (fire-and-forget)
 
+Status: **implemented**. This page documents the wire contract, security
+tradeoffs, and provisioning. The implementation is in `src/audit.rs`,
+`src/server_macos/audit.rs`, and `cf-worker/src/crypto.ts`; deferred items at
+the end are intentionally not part of the current feature.
+
 The macOS SSH agent (`src/server_macos/ssh_agent.rs`) historically wrote **no
 durable audit** — every Touch ID approve/reject and every silent auth-cache hit
 went only to `tracing` on stderr and was lost. The Cloudflare passkey ceremony,
@@ -22,7 +27,7 @@ admin page at `/<ADMIN_SEG>/audit`.
 
 ## What is audited
 
-All five agent decision points, each with `outcome ∈ {approved, rejected,
+All six agent decision points, each with `outcome ∈ {approved, rejected,
 unavailable, cache_hit, spawn_failed}`:
 
 | op_kind   | source                              | notes |
@@ -32,6 +37,7 @@ unavailable, cache_hit, spawn_failed}`:
 | `auth`    | `handle_auth` (auth@vt)             | always prompts |
 | `run`     | `handle_run` (run@vt)               | `approved` at the human tap, **plus** a second `spawn_failed` row if the launch fails (two events, two rows) |
 | `sign`    | `Session::sign` (standard SSH auth) | distinct from `auth@vt`; carries no vt ClientMeta, so the prompt label is the audit `command` |
+| `ssh-sign`| `handle_sign_vt` (`sign@vt`)         | context-carrying git signing; carries `ClientMeta` and shares the sign auth cache |
 
 `latency_ms` measures prompt-shown → decision; cache hits are `0`. `ppid` is the
 **socket peer PID** (`get_peer_pid`), `0`/absent for forwarded sessions — NOT the

@@ -3,7 +3,7 @@
 // Storage keys:
 //   ch:{approve_token}        →  Challenge JSON
 //   pt:{poll_token}           →  approve_token (WS tag routing)
-//   dek:{ctx}:{salt_b64u}     →  CacheEntry (opt-in DEK cache; ctx binds IP+PPID)
+//   dek:{ctx}:{salt_b64u}     →  CacheEntry (opt-in DEK cache; ctx binds IP+pwd)
 //
 // WebSocket hibernation: WS clients connect via Worker GET /api/dek, which
 // forwards to the DO. The DO hibernates the WS tagged with the poll_token so
@@ -1031,7 +1031,7 @@ export class AccountDO extends DurableObject<Env> {
     });
   }
 
-  // Write one cache entry per salt, keyed by ctx(IP,PPID)+salt. Caller has
+  // Write one cache entry per salt, keyed by ctx(IP,pwd)+salt. Caller has
   // already verified the WebAuthn assertion, so this is authorized. INVARIANT
   // (M1): we only reach here because the PHONE sent cache material (the PWA
   // produces it solely when the human picks TTL > 0) — the Worker cannot
@@ -1115,7 +1115,7 @@ export class AccountDO extends DurableObject<Env> {
     }
     const meta = body.meta;
     // ip (worker-derived from CF-Connecting-IP, already forced by capChallengeMeta)
-    // is the sole cache binding ctx. ppid is forensic-only (logged/audited).
+    // IP + pwd are the cache binding ctx. ppid is forensic-only (logged/audited).
     const ip = meta.ip ?? '';
     const ppid = (typeof meta.ppid === 'number' ? meta.ppid : 0) >>> 0;
     const pwd = meta.pwd ?? '';

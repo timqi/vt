@@ -260,7 +260,7 @@ export interface ApprovePageData {
   cache_pubkey_b64u: string;
 }
 
-// ── DEK cache (opt-in, IP+PPID-scoped) ─────────────────────────────────────
+// ── DEK cache (opt-in, IP+pwd-scoped) ──────────────────────────────────────
 
 /** Inbound from daemon via POST /api/dek-cache — the fast path tried before a
  *  ceremony. HMAC(VT_AUTH_CF)-gated like /api/challenge. */

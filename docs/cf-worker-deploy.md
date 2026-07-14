@@ -13,14 +13,16 @@ phone (PWA) ── approve: WebAuthn + PRF ─▶ derives DEKs, seals to CLI pub
 ```
 
 - Ceremony endpoints live at the root (`/api/challenge`, `/api/dek`, `/api/approve`, `/api/reject`, `/a/:token`), secured by `HMAC(VT_AUTH_CF)` + unguessable tokens + WebAuthn.
-- The admin surface (`/<ADMIN_SEG>/…`, `ADMIN_SEG = "kestrel"` in `src/index.ts`) is gated by **Cloudflare Access** at the edge plus `access.ts` JWT verification.
+- The admin surface (`/<ADMIN_SEG>/…`, currently `ADMIN_SEG = "kestrel"` in `cf-worker/src/index.ts`) is gated by **Cloudflare Access** at the edge plus `cf-worker/src/access.ts` JWT verification.
 
 ---
 
 ## Prerequisites
 
-- A Cloudflare account (Workers **Paid** plan recommended — Durable Objects with
-  SQLite storage and longer log retention).
+- A Cloudflare account. SQLite-backed Durable Objects are available on the
+  Workers Free plan; the Paid plan is useful for higher quotas and longer
+  Workers Logs retention. See [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
+  and [Workers Logs pricing](https://developers.cloudflare.com/workers/observability/logs/workers-logs/).
 - A domain on Cloudflare you can point at the Worker (e.g. `vt.example.com`).
 - Node.js 18+ and the repo checked out. Wrangler is pinned in `cf-worker/package.json`.
 - A phone with a Passkey authenticator that supports the **PRF** extension
@@ -32,8 +34,8 @@ phone (PWA) ── approve: WebAuthn + PRF ─▶ derives DEKs, seals to CLI pub
 
 ```bash
 cd cf-worker
-npm ci          # or: npm install
-npm run typecheck   # optional: tsc --noEmit
+npm ci
+npm run typecheck
 ```
 
 `pwa/libsodium.js` is vendored/committed (ISC) — no build step fetches it. If it
@@ -90,7 +92,7 @@ Secrets are never inlined in `wrangler.toml`. Set them per environment:
 ```bash
 # Required — 32-byte base64url token; CLI↔Worker HMAC on /api/challenge.
 # This value = the CLI's VT_PASSKEY_TOKEN.
-openssl rand 32 | basenc --base64url | tr -d '=' | wrangler secret put VT_AUTH_CF
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | wrangler secret put VT_AUTH_CF
 
 # Required — passkey credentials blob. Produced by the admin setup page in
 # step 6; on first deploy you may seed an empty set: {"v":1,"epoch":0,"c":[]}
@@ -99,7 +101,7 @@ wrangler secret put CREDENTIALS_JSON
 # Optional — enables the opt-in DEK cache (approve-time TTL → approval-free
 # decrypt within same IP+pwd). Empty/absent → caching disabled. Rotate to
 # instantly invalidate all cached DEKs. See docs/dek-cache.md.
-openssl rand 32 | basenc --base64url | tr -d '=' | wrangler secret put CACHE_SECKEY
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | wrangler secret put CACHE_SECKEY
 
 # Optional notification channels (independent, opt-in):
 wrangler secret put PUSHOVER_JSON   # {"app_token":"…","user_key":"…"}
@@ -135,8 +137,9 @@ Access-gated setup page `https://vt.example.com/kestrel/setup`:
 
 `add` / `revoke` of further Passkeys need no macOS interaction — the Worker
 injects the current `CREDENTIALS_JSON` into the page; still copy the result out
-and re-run `wrangler secret put CREDENTIALS_JSON`. See CLAUDE.md → *Passkey
-enrollment* for the full flow.
+and re-run `wrangler secret put CREDENTIALS_JSON`. The bootstrap and update
+flow is intentionally kept in this deployment guide so it is usable without
+reading repository-specific agent instructions.
 
 ## 7. Wire up the CLI
 
@@ -150,7 +153,8 @@ export VT_PASSKEY_TOKEN="<the VT_AUTH_CF value from step 4>"
 `VT_PASSKEY_TOKEN` **must** equal the `VT_AUTH_CF` secret. Test:
 
 ```bash
-vt read vt://0…    # approve on your phone
+# Paste a record previously printed by `vt create`.
+vt read 'vt://0<your-record>'    # approve on your phone
 ```
 
 ---
@@ -179,5 +183,6 @@ npm run dev        # wrangler dev — local Worker + DO
 - **Revoke a Passkey:** use the setup page (bumps `epoch`), then
   `wrangler secret put CREDENTIALS_JSON`.
 
-See also: `docs/dek-cache.md` (DEK cache design + threat model),
-`docs/agent-audit.md` (audit push), CLAUDE.md (architecture, key derivation).
+See also: [the documentation map](README.md),
+[`docs/dek-cache.md`](dek-cache.md) (DEK cache design + threat model), and
+[`docs/agent-audit.md`](agent-audit.md) (audit push).
