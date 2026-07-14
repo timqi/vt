@@ -321,7 +321,7 @@ pub enum SshCommands {
         #[arg(
             long = "ssh-auth-cache-mode",
             default_value = "none",
-            help = "Sign auth cache mode: none, per-session, per-app, or global. per-session/per-app require the caller to have a controlling terminal (TTY-less orchestrators like AI agents / CI never hit); global shares ONE context across all callers — the only mode that serves orchestrated callers, and the coarsest. WARNING: cache contexts are LOCAL — requests arriving over a forwarded agent socket (ssh -A) from a remote host share them, so within the TTL a hostile remote process can sign silently. Keep 'none' if you forward this agent to hosts you don't fully trust."
+            help = "Sign auth cache mode: none, per-session, per-app, or global. per-session/per-app require the caller to have a controlling terminal (TTY-less orchestrators like AI agents / CI never hit); global shares ONE context across all callers — the only mode that serves orchestrated callers, and the coarsest (cache keys still partition by the client-reported working directory). Forwarded agent sockets (ssh -A) get a per-connection context: a remote host reuses only its own approvals within the TTL, never grants from local tabs or other hosts. Still keep 'none' when forwarding to hosts you don't trust at all — within the TTL any process on that host reuses that connection's grants."
         )]
         auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
         #[arg(
