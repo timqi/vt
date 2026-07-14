@@ -22,11 +22,12 @@
 # VT_PASSKEY_TOKEN = "your-passkey-token"
 
 # --- SSH-agent path (macOS workstations running `vt ssh agent`) -------------
-# When set, the CLI tries the local SSH agent (Touch ID) first and falls back
-# to the passkey ceremony. Put this ONLY in the config of hosts that can reach
-# a vt agent — locally, or via a forwarded socket (`ssh -A`). On a passkey-only
-# server it makes every call probe whatever $SSH_AUTH_SOCK points at before
-# falling back. SENSITIVE.
+# When set (here or in the env — both are equivalent), the CLI verifies the
+# agent path first (local socket, or one forwarded with `ssh -A`) and falls
+# back to the passkey ceremony when it's unreachable or not a vt agent. Safe
+# to keep in a config synced across hosts; on agent-less hosts each call just
+# pays one failed local socket probe (pin VT_BACKEND=passkey to skip it).
+# SENSITIVE.
 # VT_AUTH = "your-ssh-agent-token"
 
 # --- Routing pin (optional) --------------------------------------------------

@@ -143,14 +143,16 @@ Pins (`src/config.rs::Backend`, validated in `VTClient::new`):
   set. Requires `VT_PASSKEY_URL`. `vt run` (agent-only) errors out under it.
 - Invalid values fail loudly at startup, not silently as `auto`.
 
-Because config-file hydration makes `VT_AUTH` presence ambient (see below),
-"`VT_AUTH` set" only expresses per-host intent if the file is per-host. Two
-rules of thumb: put `VT_AUTH` ONLY in the config.toml of hosts that can
-actually reach a vt agent (locally or via forwarding) — on a passkey-only
-server it just makes every call poke whatever `$SSH_AUTH_SOCK` points at
-before falling back; and to force the phone path for a single invocation, run
-`VT_AUTH= vt …` (set-but-empty env var beats the file and an empty token skips
-the agent) or set `VT_BACKEND=passkey`.
+Config-file hydration makes a config.toml `VT_AUTH` fully equivalent to the
+env var: under `auto` it still means "probe the agent path first" — the CLI
+verifies the path per call (socket connect; a non-vt agent answers the
+extension with a failure) and falls back to the passkey ceremony cleanly, so
+keeping `VT_AUTH` in a config shared across hosts is fine. The cost on a
+host with no reachable vt agent is one failed local socket round-trip per
+call; pin `VT_BACKEND=passkey` there if you want to skip even that. To force
+the phone path for a single invocation: `VT_AUTH= vt …` (set-but-empty env
+var beats the file and an empty token skips the agent) or
+`VT_BACKEND=passkey vt …`.
 
 **Config-file fallback.** Env vars are primary and always win. As a fallback,
 any unset `VT_*` variable is loaded from a flat TOML file at
