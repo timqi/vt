@@ -173,8 +173,10 @@ impl AuthCache {
         }
     }
 
-    pub fn is_authorized(&self, context: CacheContext, fingerprint: &str) -> bool {
-        self.is_authorized_at(context, fingerprint, Instant::now(), SystemTime::now())
+    /// `key` is a composed lookup digest ([`sign_cache_key`] /
+    /// [`decrypt_cache_key`]), not a raw fingerprint.
+    pub fn is_authorized(&self, context: CacheContext, key: &str) -> bool {
+        self.is_authorized_at(context, key, Instant::now(), SystemTime::now())
     }
 
     /// Clock-injectable core of [`is_authorized`], unit-testable for the
@@ -182,26 +184,26 @@ impl AuthCache {
     fn is_authorized_at(
         &self,
         context: CacheContext,
-        fingerprint: &str,
+        key: &str,
         now_mono: Instant,
         now_wall: SystemTime,
     ) -> bool {
         self.entries
-            .get(&(context, fingerprint.to_string()))
+            .get(&(context, key.to_string()))
             .is_some_and(|e| e.is_valid_at(now_mono, now_wall))
     }
 
     /// Strict-TTL grant: a still-valid entry's expiry is left untouched.
     /// Concurrent grants for the same key cannot extend the original TTL.
     /// Expired entries (or absent ones) are replaced with a fresh expiry.
-    pub fn grant(&mut self, context: CacheContext, fingerprint: &str) {
-        self.grant_at(context, fingerprint, Instant::now(), SystemTime::now());
+    pub fn grant(&mut self, context: CacheContext, key: &str) {
+        self.grant_at(context, key, Instant::now(), SystemTime::now());
     }
 
     fn grant_at(
         &mut self,
         context: CacheContext,
-        fingerprint: &str,
+        key: &str,
         now_mono: Instant,
         now_wall: SystemTime,
     ) {
@@ -210,7 +212,7 @@ impl AuthCache {
             wall: now_wall + self.ttl,
         };
         self.entries
-            .entry((context, fingerprint.to_string()))
+            .entry((context, key.to_string()))
             .and_modify(|e| {
                 if !e.is_valid_at(now_mono, now_wall) {
                     *e = fresh;
@@ -410,10 +412,12 @@ mod proc_info {
     }
 
     /// Walk the process tree upward to find a `.app/Contents/` ancestor.
-    /// Returns the PID of the app process, or `peer_pid` itself if no app
-    /// ancestor is found — never falls back to the parent, which would
-    /// conflate sibling CLI tools sharing a shell.
-    pub fn find_app_pid(peer_pid: i32) -> i32 {
+    /// Returns `None` when there is no app ancestor (tmux panes — the tmux
+    /// server re-parents to launchd — ssh logins, bare console sessions).
+    /// The caller must treat that as uncacheable: the previous fallback of
+    /// keying on the short-lived `peer_pid` itself produced a context that
+    /// could never hit again but still inserted a dead entry per call.
+    pub fn find_app_pid(peer_pid: i32) -> Option<i32> {
         let mut current_pid = peer_pid;
         // Limit traversal to prevent infinite loops
         for _ in 0..64 {
@@ -422,7 +426,7 @@ mod proc_info {
             }
             if let Some(path) = get_proc_path(current_pid) {
                 if path.contains(".app/Contents/") {
-                    return current_pid;
+                    return Some(current_pid);
                 }
             }
             match get_proc_bsdinfo(current_pid) {
@@ -432,7 +436,7 @@ mod proc_info {
                 _ => break,
             }
         }
-        peer_pid
+        None
     }
 }
 
@@ -689,25 +693,55 @@ pub struct AuthCacheConfig {
 /// Derive the decrypt-cache lookup string for a single v2 item.
 ///
 /// Domain-tagged so a digest from this hash can never collide with a digest
-/// from any other use of SHA-256 in the codebase. `host` is length-prefixed
-/// so the boundary between fields is unambiguous.
+/// from any other use of SHA-256 in the codebase. `host` and `pwd` are
+/// length-prefixed so the boundaries between fields are unambiguous.
 ///
-/// `host` is taken from the client-supplied `DecryptReq.host` and is NOT
-/// trusted for security — it only partitions the cache so two different
-/// hostnames don't share entries. A compromised peer can lie about `host` to
-/// force a cache miss (DoS, not privilege elevation).
-fn decrypt_cache_key(t: crate::core::SecretType, salt: &[u8; SALT_LEN], host: &str) -> String {
+/// `host` and `pwd` come from the client-supplied request and are NOT
+/// trusted for security — they only partition the cache, so different
+/// hostnames / working directories don't share entries. This mirrors the
+/// advisory `pwd` component of the Worker-side DEK cache: a compromised peer
+/// can lie to force a miss (DoS) or to reuse another directory's still-cached
+/// grant on the same host, but it never widens the hard context boundary
+/// (the peer process tree). The pwd component is what scopes `global`-mode
+/// grants to one project tree for orchestrated callers.
+fn decrypt_cache_key(
+    t: crate::core::SecretType,
+    salt: &[u8; SALT_LEN],
+    host: &str,
+    pwd: &str,
+) -> String {
     use sha2::{Digest, Sha256};
-    use std::fmt::Write;
     let mut h = Sha256::new();
-    h.update(b"vt-decrypt-cache-v1");
+    h.update(b"vt-decrypt-cache-v2");
     h.update([t.as_byte()]);
     h.update(salt);
     h.update((host.len() as u32).to_le_bytes());
     h.update(host.as_bytes());
-    let digest = h.finalize();
-    let mut s = String::with_capacity(64);
-    for b in digest.iter() {
+    h.update((pwd.len() as u32).to_le_bytes());
+    h.update(pwd.as_bytes());
+    hex_string(&h.finalize())
+}
+
+/// Derive the sign-cache lookup string: key fingerprint + client-reported
+/// working directory. Same advisory-`pwd` rationale as [`decrypt_cache_key`].
+/// Plain SSH `sign` requests (agent protocol, no `ClientMeta`) pass an empty
+/// pwd and so share one slot per fingerprint, unchanged from before; `sign@vt`
+/// requests carry `meta.pwd` and are partitioned by it.
+fn sign_cache_key(fingerprint: &str, pwd: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"vt-sign-cache-v1");
+    h.update((fingerprint.len() as u32).to_le_bytes());
+    h.update(fingerprint.as_bytes());
+    h.update((pwd.len() as u32).to_le_bytes());
+    h.update(pwd.as_bytes());
+    hex_string(&h.finalize())
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         let _ = write!(s, "{:02x}", b);
     }
     s
@@ -944,19 +978,51 @@ impl VtSshAgentFactory {
 /// session per call** — under per-session/per-app they resolve to `None` and
 /// can never hit. It maps every peer to one fixed context; the only remaining
 /// boundary is the TTL (plus the lock/wake/idle flushes).
+///
+/// **Forwarded-agent narrowing:** when the peer is the local OpenSSH client
+/// (`ssh -A`, incl. a ControlMaster master carrying forwarded agent channels),
+/// every mode — including `Global` — anchors the context on that ssh process
+/// itself (`(pid, start)`), not on its terminal session or app ancestor.
+/// Grants made over one ssh connection stay confined to that connection: the
+/// remote host can reuse its own approvals within the TTL (the point of
+/// caching while forwarded), but it can never ride grants issued by other
+/// local tabs or other remote hosts, and the context dies with the ssh
+/// process. An ssh process can coincide with a session leader only for its
+/// own session, so the `(pid, start)` tuple can't collide with an unrelated
+/// per-session context.
+///
+/// Accepted consequence: the narrowing keys on the peer *process*, so it also
+/// applies to plain outbound `ssh host` signs (the agent cannot distinguish
+/// ssh authenticating itself from ssh relaying a forwarded request — both
+/// arrive from the same process). Repeated one-shot ssh invocations therefore
+/// no longer share a grant within the TTL; connections multiplexed through a
+/// ControlMaster master do (one long-lived process).
 fn resolve_cache_context(
     peer_pid: Option<i32>,
     mode: AuthCacheMode,
 ) -> Option<CacheContext> {
+    if mode == AuthCacheMode::None {
+        return None;
+    }
     let pid = peer_pid?;
     // Per-session / per-app require the peer to have a controlling terminal.
     // launchd-managed daemons and other non-interactive peers always prompt
     // and never enter the cache — for these modes caching only makes sense
-    // for explicit human-driven terminal sessions.
+    // for explicit human-driven terminal sessions. Deliberately ahead of the
+    // ssh narrowing below, so a TTY-less process running a binary named `ssh`
+    // (cron/launchd, or a renamed tool) can't use that branch to bypass the
+    // gate under these modes.
     if matches!(mode, AuthCacheMode::PerSession | AuthCacheMode::PerApp)
         && proc_info::get_tty_dev(pid).is_none()
     {
         return None;
+    }
+    if proc_info::get_proc_path(pid)
+        .as_deref()
+        .is_some_and(is_ssh_client_path)
+    {
+        let start = proc_info::get_start_tvsec(pid)?;
+        return Some((pid as u64, start));
     }
     match mode {
         AuthCacheMode::None => None,
@@ -966,7 +1032,7 @@ fn resolve_cache_context(
             Some((sid as u64, start))
         }
         AuthCacheMode::PerApp => {
-            let app_pid = proc_info::find_app_pid(pid);
+            let app_pid = proc_info::find_app_pid(pid)?;
             let start = proc_info::get_start_tvsec(app_pid)?;
             Some((app_pid as u64, start))
         }
@@ -974,6 +1040,16 @@ fn resolve_cache_context(
         // always > 0.
         AuthCacheMode::Global => Some((0, 0)),
     }
+}
+
+/// True when `path` (the peer's canonical executable path from
+/// `proc_pidpath`) is an OpenSSH client binary, matched by basename so any
+/// install location (system, homebrew, nix) qualifies. A renamed copy evades
+/// the match — acceptable: the goal is correct grant scoping for honest
+/// forwarding setups, not containing local malware, which already reaches
+/// the socket directly.
+fn is_ssh_client_path(path: &str) -> bool {
+    path.rsplit('/').next() == Some("ssh")
 }
 
 impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
@@ -1210,7 +1286,12 @@ impl VtSshSession {
     /// All three success methods (Biometric, FIDO2, Password) are cached:
     /// FIDO2 (YubiKey touch) is treated as equivalent to Touch ID for
     /// authorization purposes — a deliberate policy choice.
-    async fn check_or_prompt_auth(&self, fingerprint: &str, auth_message: &str) -> AuthDecision {
+    async fn check_or_prompt_auth(
+        &self,
+        fingerprint: &str,
+        pwd: &str,
+        auth_message: &str,
+    ) -> AuthDecision {
         // If we couldn't resolve a cache context at session creation (no
         // peer PID, no TTY, missing proc info), always prompt.
         let Some(context) = self.sign_cache_context else {
@@ -1220,9 +1301,10 @@ impl VtSshSession {
                 AuthOutcome::Unavailable(r) => AuthDecision::Unavailable(r),
             };
         };
+        let key = sign_cache_key(fingerprint, pwd);
 
         // Fast path: cache hit without touching the prompt queue.
-        if self.sign_cache_hit(context, fingerprint, "").await {
+        if self.sign_cache_hit(context, &key, fingerprint, "").await {
             return AuthDecision::CacheHit;
         }
 
@@ -1233,7 +1315,7 @@ impl VtSshSession {
         let Ok(_permit) = self.prompt_sem.acquire().await else {
             return AuthDecision::Unavailable(UnavailableReason::NotInteractive);
         };
-        if self.sign_cache_hit(context, fingerprint, " after prompt-queue wait").await {
+        if self.sign_cache_hit(context, &key, fingerprint, " after prompt-queue wait").await {
             return AuthDecision::CacheHit;
         }
 
@@ -1255,7 +1337,7 @@ impl VtSshSession {
             // Granted while the permit is still held, so queued waiters are
             // guaranteed to observe this entry on their re-check.
             let mut cache = self.sign_auth_cache.write().await;
-            cache.grant(context, fingerprint);
+            cache.grant(context, &key);
             tracing::debug!(
                 "Sign auth cache grant for context={:?} fingerprint={} method={:?}",
                 context,
@@ -1285,6 +1367,7 @@ impl VtSshSession {
         v2_items: &[(crate::core::SecretType, [u8; SALT_LEN])],
         has_legacy: bool,
         host: &str,
+        pwd: &str,
         auth_message: &str,
     ) -> DecryptDecision {
         // Cacheable iff there's a resolved context AND the batch is non-empty
@@ -1305,7 +1388,7 @@ impl VtSshSession {
 
         let keys: Vec<String> = v2_items
             .iter()
-            .map(|(t, salt)| decrypt_cache_key(*t, salt, host))
+            .map(|(t, salt)| decrypt_cache_key(*t, salt, host, pwd))
             .collect();
 
         // Fast path: full hit without touching the prompt queue.
@@ -1376,9 +1459,17 @@ impl VtSshSession {
     }
 
     /// Sign-cache lookup with a hit-path debug log; `phase` distinguishes the
-    /// fast-path check from the post-queue re-check in the log line.
-    async fn sign_cache_hit(&self, context: CacheContext, fingerprint: &str, phase: &str) -> bool {
-        let hit = self.sign_auth_cache.read().await.is_authorized(context, fingerprint);
+    /// fast-path check from the post-queue re-check in the log line. `key` is
+    /// the [`sign_cache_key`] digest; `fingerprint` is passed alongside only
+    /// so the log line stays human-readable.
+    async fn sign_cache_hit(
+        &self,
+        context: CacheContext,
+        key: &str,
+        fingerprint: &str,
+        phase: &str,
+    ) -> bool {
+        let hit = self.sign_auth_cache.read().await.is_authorized(context, key);
         if hit {
             tracing::debug!(
                 "Sign auth cache hit{} for context={:?} fingerprint={}",
@@ -1543,6 +1634,7 @@ impl VtSshSession {
                 &v2_inputs,
                 legacy_count > 0,
                 &req.host,
+                &req.meta.pwd,
                 &local_auth_message,
             )
             .await;
@@ -1870,7 +1962,9 @@ impl VtSshSession {
         // `Session::sign`). Distinguish reject vs unavailable so the client
         // gets the right ErrKind (AuthRejected => no fallback, G3).
         let t0 = Instant::now();
-        let decision = self.check_or_prompt_auth(&fp_str, &auth_message).await;
+        let decision = self
+            .check_or_prompt_auth(&fp_str, &req.meta.pwd, &auth_message)
+            .await;
         let latency_ms = if matches!(decision, AuthDecision::CacheHit) {
             0
         } else {
@@ -2120,9 +2214,10 @@ impl Session for VtSshSession {
             format!("sign: {} ({})", key_label, proc_name)
         };
 
-        // Check auth cache or prompt Touch ID
+        // Check auth cache or prompt Touch ID. Plain agent-protocol signs
+        // carry no ClientMeta, so the pwd key component is empty.
         let t0 = Instant::now();
-        let decision = self.check_or_prompt_auth(&fp_str, &auth_message).await;
+        let decision = self.check_or_prompt_auth(&fp_str, "", &auth_message).await;
         let latency_ms = if matches!(decision, AuthDecision::CacheHit) {
             0
         } else {
@@ -3162,8 +3257,8 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     #[test]
     fn test_decrypt_cache_key_deterministic() {
         let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1");
+        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
+        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
         assert_eq!(k1, k2);
         assert_eq!(k1.len(), 64); // SHA-256 hex
     }
@@ -3171,8 +3266,8 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     #[test]
     fn test_decrypt_cache_key_changes_with_type() {
         let salt = [0x42u8; SALT_LEN];
-        let k_raw = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1");
-        let k_totp = decrypt_cache_key(crate::core::SecretType::TOTP, &salt, "host1");
+        let k_raw = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
+        let k_totp = decrypt_cache_key(crate::core::SecretType::TOTP, &salt, "host1", "/p");
         assert_ne!(k_raw, k_totp);
     }
 
@@ -3180,16 +3275,26 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     fn test_decrypt_cache_key_changes_with_salt() {
         let s1 = [0x42u8; SALT_LEN];
         let s2 = [0x43u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &s1, "host1");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &s2, "host1");
+        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &s1, "host1", "/p");
+        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &s2, "host1", "/p");
         assert_ne!(k1, k2);
     }
 
     #[test]
     fn test_decrypt_cache_key_changes_with_host() {
         let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host2");
+        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
+        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host2", "/p");
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_decrypt_cache_key_changes_with_pwd() {
+        // The pwd component is what scopes global-mode grants to one project
+        // tree; same record + host from a different directory must miss.
+        let salt = [0x42u8; SALT_LEN];
+        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/proj/a");
+        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/proj/b");
         assert_ne!(k1, k2);
     }
 
@@ -3199,9 +3304,44 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         // even though concatenation matches — there's no way for the host
         // string to absorb adjacent context bytes.
         let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "ab");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "abc");
+        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "ab", "");
+        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "abc", "");
         assert_ne!(k1, k2);
+        // Field-shift between host and pwd must also be unambiguous.
+        let k3 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "ab", "c");
+        let k4 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "a", "bc");
+        assert_ne!(k3, k4);
+    }
+
+    // --- sign_cache_key tests ---
+
+    #[test]
+    fn test_sign_cache_key_partitions_by_pwd_and_fingerprint() {
+        let k = sign_cache_key("SHA256:abc", "/proj/a");
+        assert_eq!(k, sign_cache_key("SHA256:abc", "/proj/a"));
+        assert_eq!(k.len(), 64);
+        assert_ne!(k, sign_cache_key("SHA256:abc", "/proj/b"));
+        assert_ne!(k, sign_cache_key("SHA256:xyz", "/proj/a"));
+        // Plain agent-protocol signs key on an empty pwd — distinct from any
+        // real directory, stable across calls.
+        assert_eq!(sign_cache_key("SHA256:abc", ""), sign_cache_key("SHA256:abc", ""));
+        assert_ne!(sign_cache_key("SHA256:abc", ""), k);
+        // Field-shift between fingerprint and pwd must be unambiguous.
+        assert_ne!(sign_cache_key("ab", "c"), sign_cache_key("a", "bc"));
+    }
+
+    // --- is_ssh_client_path tests ---
+
+    #[test]
+    fn test_is_ssh_client_path_matches_basename_only() {
+        assert!(is_ssh_client_path("/usr/bin/ssh"));
+        assert!(is_ssh_client_path("/opt/homebrew/bin/ssh"));
+        assert!(is_ssh_client_path("ssh"));
+        assert!(!is_ssh_client_path("/usr/sbin/sshd"));
+        assert!(!is_ssh_client_path("/usr/bin/ssh-agent"));
+        assert!(!is_ssh_client_path("/usr/bin/ssh-add"));
+        assert!(!is_ssh_client_path("/Users/x/notssh"));
+        assert!(!is_ssh_client_path(""));
     }
 
     // --- AuthMethod::is_cacheable tests ---

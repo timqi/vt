@@ -153,17 +153,27 @@ default to `none` (every request prompts):
 
 | flag | default TTL | scope |
 |---|---|---|
-| `--ssh-auth-cache-mode` + `--ssh-auth-cache-duration` | 120s | SSH `sign` + `sign@vt` (`vt ssh connect`), per key fingerprint — the two share one cache |
-| `--decrypt-auth-cache-mode` + `--decrypt-auth-cache-duration` | 30s | `decrypt@vt`, per record (`SHA-256(type‖salt‖host)`); any legacy item in a batch disables caching for that batch |
+| `--ssh-auth-cache-mode` + `--ssh-auth-cache-duration` | 120s | SSH `sign` + `sign@vt` (`vt ssh connect`), per `SHA-256(fingerprint‖pwd)` — the two share one cache |
+| `--decrypt-auth-cache-mode` + `--decrypt-auth-cache-duration` | 30s | `decrypt@vt`, per record (`SHA-256(type‖salt‖host‖pwd)`); any legacy item in a batch disables caching for that batch |
+
+Both cache keys fold in the client-reported **`pwd`** (from `ClientMeta`) as an
+**advisory** narrower, mirroring the Worker DEK cache: it scopes a grant to one
+project tree (load-bearing for `global` mode, where the context itself is
+shared) but never widens the hard context boundary — a compromised caller can
+spoof `pwd`, so it is a blast-radius reducer, not an authentication factor.
+Plain agent-protocol `sign` requests carry no `ClientMeta` and key on an empty
+`pwd` (one shared slot per fingerprint, as before).
 
 Modes: `per-session` keys on the terminal session leader (`getsid` + start
 time); `per-app` keys on the nearest `.app/Contents/` ancestor (all tabs of one
-terminal app share a context). Both require the caller to have a controlling
-TTY — **orchestrated callers (AI agents / CI / make) spawn TTY-less commands
-with a fresh session per call, so they can never hit these modes.** `global` is
-the escape hatch for that case: ONE shared context for the whole agent, no TTY
-requirement — the coarsest blast radius (within the TTL any socket reacher,
-including every forwarded session, rides one grant; only the TTL and the
+terminal app share a context; **no ancestor found → uncacheable**, so under
+tmux / ssh logins per-app always prompts rather than silently keying on the
+short-lived peer). Both require the caller to have a controlling TTY —
+**orchestrated callers (AI agents / CI / make) spawn TTY-less commands with a
+fresh session per call, so they can never hit these modes.** `global` is the
+escape hatch for that case: ONE shared context for the whole agent, no TTY
+requirement — the coarsest blast radius (within the TTL any socket reacher
+rides one grant per `pwd`; only the pwd key component, the TTL and the
 lock/wake/idle flushes bound it). `auth@vt` / `run@vt` NEVER cache.
 
 Expiry is tracked on **both** the monotonic and the wall clock (macOS `Instant`
@@ -182,12 +192,23 @@ as the Worker DEK-cache hit (Pushover / Slack / Slack App / Feishu), with the
 note 「缓存命中，免 Touch ID」. Throttled Worker-side to one notice per
 (op_kind, host) per 60s — the audit table still records every hit.
 
-**Forwarded-agent hazard (deliberate tradeoff, off by default):** the cache
-context is derived from the *local* peer process. Requests arriving over a
-forwarded socket (`ssh -A`, incl. ControlMaster-multiplexed sessions) all
-resolve to the local `ssh` process's terminal session, so within the TTL a
-process on the remote host can sign / fetch cached-record DEKs silently. Keep
-`none` when forwarding to hosts you don't fully trust.
+**Forwarded-agent narrowing (per-connection contexts):** when the local peer
+is the OpenSSH client (basename `ssh`), every mode — including `global` —
+anchors the context on that ssh process itself (`(pid, start_time)`) instead
+of its terminal session / app ancestor. A remote host can therefore reuse its
+*own* approvals within the TTL (caching still works over forwarding), but it
+can never ride grants issued by other local tabs or by other remote hosts, and
+the context dies with the ssh connection. Residual (deliberate) tradeoffs:
+within the TTL, any process on that one remote host can silently reuse that
+connection's grants — keep `none` when forwarding to hosts you don't trust at
+all. And because the agent cannot distinguish ssh authenticating itself from
+ssh relaying a forwarded request (same peer process), plain outbound `ssh
+host` signs are narrowed too: repeated one-shot ssh invocations no longer
+share a grant within the TTL (ControlMaster-multiplexed connections still do —
+one long-lived master process). Detection is by binary basename, so a renamed
+ssh evades it (it then falls through to the normal mode rules, incl. the
+per-session/per-app TTY gate); the goal is grant scoping for honest forwarding
+setups, not containing local malware.
 
 ### Agent audit push (opt-in)
 
