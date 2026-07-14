@@ -229,7 +229,16 @@ share a grant within the TTL (ControlMaster-multiplexed connections still do —
 one long-lived master process). Detection is by binary basename, so a renamed
 ssh evades it (it then falls through to the normal mode rules, incl. the
 per-session/per-app TTY gate); the goal is grant scoping for honest forwarding
-setups, not containing local malware.
+setups, not containing local malware. **The `vt ssh connect
+--forward-real-agent` relay (peer basename `vt`) gets the SAME per-connection
+narrowing** — `resolve_cache_context` recognises it by kernel-derived argv
+(`KERN_PROCARGS2` → pure `parse_procargs2` → `is_vt_relay_invocation`: basename
+`vt` + `ssh connect` + `--forward-real-agent`) and anchors on the relay
+`(pid, start_time)` in every mode (incl. `global`, no TTY gate), so a relayed
+`decrypt@vt` grant dies with that `vt ssh connect` process and is never ridden
+by local tabs or other hosts. Argv is process-controlled but a spoofed match
+only narrows a caller to its own context (never widens), so trusting it here is
+safe — same asymmetry as the ssh basename check.
 
 ### Agent audit push (opt-in)
 
@@ -285,6 +294,8 @@ Properties:
   PERL5LIB etc. are all dropped — a granted Touch ID cannot be used to
   exfil credentials or re-enter the agent via the forwarded socket.
 - **No CF passkey fallback.** `run@vt` is SSH-agent-only by design.
+- **Never relayed.** The `vt ssh connect --forward-real-agent` relay refuses
+  `run@vt` (see below) — a forwarded remote can never trigger local spawns.
 - TCC grants are inherited (intentional — Zed needs disk access).
 
 Enable on the agent:
@@ -294,6 +305,32 @@ vt ssh agent --run-allow zed,code,subl
 # or with absolute paths:
 vt ssh agent --run-allow /Applications/Zed.app/Contents/MacOS/cli
 ```
+
+## vt ssh connect --forward-real-agent — filtered relay over agent forwarding
+
+Default OFF. Plain `vt ssh connect` runs an ephemeral in-process agent that
+only answers `REQUEST_IDENTITIES` + `SIGN_REQUEST` (with vt context injected
+into the Touch ID prompt); a remote `vt read`/`vt inject` behind
+`vt ssh connect -A host` therefore couldn't reach the local vt agent and fell
+back to the phone ceremony. With `--forward-real-agent`, the ephemeral agent
+also implements the agent `extension` op as a **transparent, filtering relay**
+to the UPSTREAM real vt agent (socket captured at startup: parent
+`$SSH_AUTH_SOCK`, else `~/.ssh/vt.sock` — never the child's overridden env),
+and the child ssh is pinned with `-o ForwardAgent=<ephemeral sock>` (OpenSSH ≥
+8.2 path form; beats a config `ForwardAgent /real.sock` that would forward the
+real agent unfiltered). Filter (`route_extension` in `src/ssh_sign.rs`, pure +
+unit-tested, matched on the cleartext extension name — the payload stays an
+opaque AES-GCM(VT_AUTH) blob; the relay holds no VT_AUTH):
+`decrypt@vt`/`encrypt@vt`/`auth@vt` → relayed verbatim (fresh upstream
+connection per request); `run@vt`, `sign@vt`, and everything else → refused
+with `SSH_AGENT_FAILURE` (remote falls back to the passkey ceremony). This is
+the deliberate narrowing vs raw `ssh -A` of the real agent; residual risk is
+the same as any agent forwarding — while the connection is up, any process on
+the remote can trigger relayed (Touch-ID-gated) requests. The upstream agent's
+per-connection cache narrowing IS preserved for the relay (see "Forwarded-agent
+narrowing" above): a relayed `decrypt@vt` grant is scoped to that
+`vt ssh connect` process. `sign`/`request_identities` behavior is unchanged.
+Full design + threat model: `docs/ssh-vt-design.md` §11.
 
 ## vt inject — transient in-place decryption
 

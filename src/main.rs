@@ -302,6 +302,12 @@ pub enum SshCommands {
     /// Signs with the vt:// identity via an ephemeral in-process agent + system ssh.
     Connect {
         #[arg(
+            long = "forward-real-agent",
+            default_value_t = false,
+            help = "Forward the ephemeral agent to the remote (agent forwarding) and relay decrypt@vt / encrypt@vt / auth@vt to the UPSTREAM real vt agent; run@vt and every other extension are refused. Lets `vt read` / `vt inject` on the remote use this host's Touch ID instead of paging the phone. Must precede the ssh arguments."
+        )]
+        forward_real_agent: bool,
+        #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
             help = "Arguments passed through to the system ssh (host + remote command)"
@@ -438,10 +444,13 @@ async fn run(cli: Cli) -> Result<()> {
                 let vt_client = VTClient::new(auth)?;
                 ssh_sign::keygen(vt_client, label.clone(), comment.clone(), key_file.clone()).await
             }
-            SshCommands::Connect { args } => {
+            SshCommands::Connect {
+                forward_real_agent,
+                args,
+            } => {
                 let auth = require_auth(&cli.auth)?;
                 let vt_client = VTClient::new(auth)?;
-                ssh_sign::connect(vt_client, args.clone()).await
+                ssh_sign::connect(vt_client, args.clone(), *forward_real_agent).await
             }
             #[cfg(target_os = "macos")]
             SshCommands::Agent {
@@ -555,6 +564,43 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Commands::Hook(cmd) => hook::run(cmd),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_connect(argv: &[&str]) -> (bool, Vec<String>) {
+        let cli = Cli::try_parse_from(argv).expect("argv must parse");
+        match cli.command {
+            Commands::Ssh(SshCommands::Connect {
+                forward_real_agent,
+                args,
+            }) => (forward_real_agent, args),
+            _ => panic!("expected ssh connect"),
+        }
+    }
+
+    // `--forward-real-agent` must parse as OUR flag when it precedes the
+    // trailing ssh args (the `git config core.sshCommand "vt ssh connect
+    // --forward-real-agent"` shape), and the hyphenated ssh options after it
+    // must still pass through verbatim.
+    #[test]
+    fn connect_forward_flag_parses_before_trailing_args() {
+        let (fwd, args) = parse_connect(&[
+            "vt", "ssh", "connect", "--forward-real-agent", "-p", "2222", "host", "cmd",
+        ]);
+        assert!(fwd);
+        assert_eq!(args, vec!["-p", "2222", "host", "cmd"]);
+    }
+
+    // Default is OFF and plain usage is unchanged.
+    #[test]
+    fn connect_forward_flag_defaults_off() {
+        let (fwd, args) = parse_connect(&["vt", "ssh", "connect", "host", "git-upload-pack"]);
+        assert!(!fwd);
+        assert_eq!(args, vec!["host", "git-upload-pack"]);
     }
 }
 

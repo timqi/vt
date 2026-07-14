@@ -298,3 +298,103 @@ self-connect/recursion (decrypt reads the sock from env at call time, `client.rs
 B2 → §5 promotes the `ssh-agent-lib` `agent` feature move to a hard PR2 compile gate;
 N1 → `get_or_try_init` (D13); N2 → §6.B async-safe key-file read (`tokio::fs`/`spawn_blocking`);
 N3 → §6.A `O_NOFOLLOW`+`create_new` safe write; N4 → §4 per-host key-file deployment note.
+
+## 11. Forwarded relay: `vt ssh connect --forward-real-agent`
+
+Default **OFF**. Solves: `vt ssh connect -A host` for an interactive login used
+to forward only the ephemeral *signer*, which speaks nothing but
+`REQUEST_IDENTITIES` + `SIGN_REQUEST` — so `vt read` / `vt inject` on the
+remote could not reach the Mac agent through the forwarded socket and silently
+fell back to the phone/worker passkey ceremony on every decrypt.
+
+With the flag, the ephemeral agent additionally implements the agent-protocol
+`extension` op as a **transparent, filtering relay** to the UPSTREAM real vt
+agent, and the child `ssh` forwards the ephemeral socket to the remote:
+
+```
+remote vt CLI ──(forwarded $SSH_AUTH_SOCK)──> sshd unix sock ──ssh channel──>
+  ephemeral agent (op filter) ──fresh conn per request──> real vt agent
+                                                            ($SSH_AUTH_SOCK
+                                                             captured at start,
+                                                             else ~/.ssh/vt.sock)
+```
+
+### Op filter (`route_extension`, pure + unit-tested)
+
+Decided on the CLEARTEXT extension `name` only. The `details` payload is an
+opaque AES-GCM(`VT_AUTH`) blob: the relay holds **no `VT_AUTH`**, never
+decrypts, and passes `name` + `details` byte-for-byte (`Extension` re-encodes
+as `string name || raw details`; the upstream's response `Extension` is
+returned unchanged). Remote CLI and Mac agent share `VT_AUTH`, so end-to-end
+authentication/encryption is between *them* — the relay cannot read or forge
+requests.
+
+| extension | route | why |
+|---|---|---|
+| `decrypt@vt`, `auth@vt` | relay | Touch-ID-gated on the upstream agent per request |
+| `encrypt@vt` | relay | unauthenticated by design (same as running it locally) |
+| `run@vt` | **refuse** | spawns processes on the local machine — never over a forwarded socket |
+| `sign@vt`, `session-bind@openssh.com`, anything else | refuse | `sign@vt` would expose ALL local keys; unknown ops stay unsupported (pre-flag behavior) |
+
+Refusals and an unreachable upstream socket both answer `SSH_AGENT_FAILURE`;
+the remote CLI treats that as recoverable and falls back to the passkey
+ceremony (`should_fallback_to_cf`), so the failure mode is "phone tap", never
+a hang. `request_identities` / `sign` behavior is unchanged (login context
+injection preserved).
+
+### Why standard agent forwarding (not `RemoteForward`)
+
+- **Universal**: sshd creates a unique per-connection socket and exports
+  `$SSH_AUTH_SOCK` automatically; no remote sshd config
+  (`StreamLocalBindUnlink`), no fixed path to collide/squat, cleanup on
+  disconnect for free.
+- The child is pinned with `-o ForwardAgent=<ephemeral sock>` (OpenSSH ≥ 8.2
+  path form) rather than bare `-A`: it pins BOTH "forwarding on" and *which*
+  socket, and a command-line `-o` beats `~/.ssh/config` (first-obtained wins).
+  A config line `ForwardAgent /path/to/real.sock` could otherwise forward the
+  real agent **unfiltered** — the same hijack class the existing
+  `-o IdentityAgent=` pin defends against.
+- The upstream socket path is captured ONCE at startup from the parent env
+  (`$SSH_AUTH_SOCK`, else `~/.ssh/vt.sock`) — the child-only env override
+  (D14) plus path capture make relay self-connection impossible.
+
+### Cache-context narrowing IS preserved for the relay
+
+The macOS `vt ssh agent`'s "forwarded-agent narrowing" anchors the auth cache
+to a per-connection `(peer_pid, peer_start_time)` context when the connecting
+peer is a forwarding agent. That check keys on the peer's executable basename
+being `ssh` — but under `--forward-real-agent` the peer reaching the real agent
+is the **`vt` relay process** (basename `vt`), which would otherwise fall into
+the ordinary local-caller context (per-session / per-app / global) and lose the
+per-connection scoping. `resolve_cache_context` therefore ALSO recognises the
+relay peer — by its kernel-derived argv (`KERN_PROCARGS2`, parsed by the pure
+`parse_procargs2`; predicate `is_vt_relay_invocation`: basename `vt` +
+`ssh connect` + `--forward-real-agent`) — and gives it the **identical**
+`(pid, start)` per-connection context `ssh` gets, in every cache mode (incl.
+`global`) and with no TTY requirement (the relay may be scripted). So a relayed
+`decrypt@vt` grant is scoped to that one `vt ssh connect` process and dies with
+it — matching a plain `ssh -A` of the real agent, not widening it. Argv is
+process-controlled, but a spoofed match only *narrows* a caller to its own
+`(pid, start)` — it can never widen scope or ride another context's grants
+(the same asymmetry the `ssh` basename check relies on). `is_vt_relay_invocation`
++ `parse_procargs2` are pure and unit-tested on the Linux/host target; only the
+sysctl fetch and the wiring are macOS-only.
+
+### Threat model (what the remote gains)
+
+- `decrypt@vt` / `auth@vt`: the remote can *request* them, but each is
+  Touch-ID-gated on the Mac. Subject to the agent's own opt-in decrypt cache
+  policy — and that cache is narrowed to this connection (see above), so a
+  remote host rides only its own connection's grants within the TTL, never
+  those of local tabs or other remote hosts.
+- `encrypt@vt`: unauthenticated by design — a remote can mint new `vt://`
+  records; it could already do that via the worker path.
+- `run@vt`: blocked at the relay. This is the deliberate narrowing vs raw
+  `ssh -A` of the real agent (with which a remote could reach `run@vt`
+  directly).
+- Residual risk (same as any `ssh -A`): while the connection is up, ANY
+  process on the remote that can open the forwarded socket can trigger
+  relayed requests — i.e. cause Touch ID prompts / ride the decrypt cache
+  window. Keep the flag off for hosts you don't trust; it is off by default.
+- Concurrency: one fresh upstream connection per relayed request; prompt
+  stacking is bounded by the upstream agent's global one-permit semaphore.

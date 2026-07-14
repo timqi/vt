@@ -217,20 +217,25 @@ fn write_new_file(path: &std::path::Path, contents: &[u8], mode: u32) -> Result<
 /// in-process SSH-agent that answers `REQUEST_IDENTITIES` from the public key
 /// (no tap) and signs `SIGN_REQUEST` by decrypting the seed on demand via the
 /// existing ceremony, then execs the system `ssh` pointed at that agent.
-pub async fn connect(vt_client: VTClient, args: Vec<String>) -> Result<()> {
+///
+/// With `forward_real_agent` the ephemeral agent additionally acts as a
+/// filtering extension relay to the UPSTREAM real vt agent and is forwarded to
+/// the remote via standard agent forwarding — see `route_extension` and
+/// `docs/ssh-vt-design.md` §11.
+pub async fn connect(vt_client: VTClient, args: Vec<String>, forward_real_agent: bool) -> Result<()> {
     #[cfg(unix)]
     {
-        connect_unix(vt_client, args).await
+        connect_unix(vt_client, args, forward_real_agent).await
     }
     #[cfg(not(unix))]
     {
-        let _ = (vt_client, args);
+        let _ = (vt_client, args, forward_real_agent);
         bail!("vt ssh connect requires Unix")
     }
 }
 
 #[cfg(unix)]
-async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
+async fn connect_unix(vt_client: VTClient, args: Vec<String>, forward_real_agent: bool) -> Result<()> {
     // 1. Resolve which identity/identities to advertise. An explicit pubkey
     //    (VT_GIT_SSH_PUB / ~/.config/vt/git-ssh.pub) takes precedence and may
     //    carry a vt:// record for the decrypt-then-sign fallback; otherwise, with
@@ -256,6 +261,24 @@ async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
     };
 
     // 3. Ephemeral signer socket in a private 0700 dir.
+    //    `--forward-real-agent`: capture the UPSTREAM real-agent socket path
+    //    NOW, from the parent env (never mutated — the child override is
+    //    Command::env-scoped, D14), so the relay can never resolve to the
+    //    ephemeral socket itself (self-connect).
+    let relay_upstream = if forward_real_agent {
+        let sock = upstream_agent_sock()?;
+        if !sock.exists() {
+            tracing::warn!(
+                "--forward-real-agent: upstream agent socket {} does not exist; \
+                 relayed vt extension calls will fail (the remote then falls back \
+                 to the passkey ceremony)",
+                sock.display()
+            );
+        }
+        Some(sock)
+    } else {
+        None
+    };
     let dir = make_temp_dir_0700()?;
     let sock_path = dir.join("agent.sock");
     let inner = std::sync::Arc::new(SignerInner {
@@ -263,6 +286,7 @@ async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
         identities,
         host,
         command,
+        relay_upstream,
     });
     let listener = tokio::net::UnixListener::bind(&sock_path)
         .with_context(|| format!("bind {}", sock_path.display()))?;
@@ -288,9 +312,21 @@ async fn connect_unix(vt_client: VTClient, args: Vec<String>) -> Result<()> {
     // Run the agent + child ssh concurrently; capture the outcome so the
     // socket/dir are cleaned up exactly once regardless of which arm wins.
     let outcome: Result<std::process::ExitStatus> = async {
-        let mut child = tokio::process::Command::new("ssh")
-            .arg("-o")
-            .arg(format!("IdentityAgent={}", sock_path.display()))
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.arg("-o")
+            .arg(format!("IdentityAgent={}", sock_path.display()));
+        if forward_real_agent {
+            // Forward OUR ephemeral (filtering-relay) agent to the remote.
+            // `-o ForwardAgent=<sock>` (OpenSSH >= 8.2) rather than bare `-A`:
+            // it pins BOTH "forwarding on" and WHICH socket is forwarded, and
+            // command-line `-o` beats ~/.ssh/config (first-obtained wins) — a
+            // config `ForwardAgent /path/to/real.sock` could otherwise forward
+            // the real agent UNFILTERED, exactly the hijack class the
+            // IdentityAgent pin above defends against.
+            cmd.arg("-o")
+                .arg(format!("ForwardAgent={}", sock_path.display()));
+        }
+        let mut child = cmd
             .args(&args)
             .env("SSH_AUTH_SOCK", &sock_path)
             .spawn()
@@ -420,6 +456,23 @@ fn make_signer_identity(
     })
 }
 
+/// Resolve the UPSTREAM real-agent socket path for the `--forward-real-agent`
+/// relay: `$SSH_AUTH_SOCK` if set and non-empty, else `~/.ssh/vt.sock`. Same
+/// resolution as `VTClient::connect_agent_socket`, but captured ONCE at
+/// startup as a *path* (the parent env is read before the child spawns and is
+/// never mutated — D14), so per-request relaying cannot be redirected by any
+/// later env change.
+#[cfg(unix)]
+fn upstream_agent_sock() -> Result<std::path::PathBuf> {
+    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+        if !sock.is_empty() {
+            return Ok(std::path::PathBuf::from(sock));
+        }
+    }
+    let home = dirs::home_dir().context("cannot resolve home directory")?;
+    Ok(home.join(".ssh").join("vt.sock"))
+}
+
 #[cfg(unix)]
 fn make_temp_dir_0700() -> Result<std::path::PathBuf> {
     use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
@@ -502,6 +555,10 @@ struct SignerInner {
     identities: Vec<SignerIdentity>,
     host: String,
     command: String,
+    /// `--forward-real-agent`: UPSTREAM real-agent socket the extension relay
+    /// targets (captured at startup, see `upstream_agent_sock`). `None` =
+    /// relaying disabled (the default) — every extension is refused.
+    relay_upstream: Option<std::path::PathBuf>,
 }
 
 #[cfg(unix)]
@@ -560,6 +617,35 @@ fn decide_sign_route(outcome: Result<Option<(String, Vec<u8>)>>, has_vt_url: boo
                 .to_string(),
         ),
         Err(e) => SignRoute::Fail(e.to_string()),
+    }
+}
+
+/// Pure op-filter for the `--forward-real-agent` relay: which agent-protocol
+/// extensions may cross from the forwarded (remote) side to the UPSTREAM real
+/// vt agent. Decided on the CLEARTEXT `name` only — `details` is an opaque
+/// AES-GCM(VT_AUTH) blob the relay never decrypts (it holds no VT_AUTH).
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum ExtensionRoute {
+    /// Forward the `Extension` verbatim to the upstream real agent and return
+    /// its response verbatim.
+    Relay,
+    /// Refuse with `SSH_AGENT_FAILURE` (the remote falls back to the passkey
+    /// ceremony where one exists).
+    Refuse,
+}
+
+/// decrypt@vt / auth@vt are Touch-ID-gated upstream; encrypt@vt is
+/// unauthenticated by design (same as running it locally). run@vt is REFUSED —
+/// it spawns processes on the local machine and must never be reachable over a
+/// forwarded socket; this is the deliberate narrowing vs a raw `ssh -A` of the
+/// real agent. sign@vt (would expose ALL local keys) and anything unknown
+/// (incl. session-bind@openssh.com) are refused too.
+#[cfg(unix)]
+fn route_extension(name: &str) -> ExtensionRoute {
+    match name {
+        "decrypt@vt" | "encrypt@vt" | "auth@vt" => ExtensionRoute::Relay,
+        _ => ExtensionRoute::Refuse,
     }
 }
 
@@ -667,6 +753,324 @@ impl ssh_agent_lib::agent::Session for SignerSession {
         let sig = signing.sign(&request.data);
         Signature::new(Algorithm::Ed25519, sig.to_bytes().to_vec()).map_err(AgentError::other)
     }
+
+    /// `--forward-real-agent` relay: forward whitelisted vt extensions
+    /// VERBATIM to the upstream real agent (`route_extension` filters on the
+    /// cleartext name; `details` stays an opaque encrypted blob — the relay
+    /// holds no VT_AUTH and cannot read or forge payloads). Everything else —
+    /// notably run@vt — is refused with `SSH_AGENT_FAILURE`, which is also the
+    /// pre-existing behavior for all extensions when the flag is off.
+    async fn extension(
+        &mut self,
+        request: ssh_agent_lib::proto::Extension,
+    ) -> Result<Option<ssh_agent_lib::proto::Extension>, ssh_agent_lib::error::AgentError> {
+        use ssh_agent_lib::error::AgentError;
+
+        // Relaying is armed only by --forward-real-agent.
+        let Some(upstream) = self.inner.relay_upstream.clone() else {
+            return Err(AgentError::Failure);
+        };
+        if route_extension(&request.name) != ExtensionRoute::Relay {
+            tracing::warn!(
+                "refusing agent extension {:?} over the forwarded relay",
+                request.name
+            );
+            return Err(AgentError::Failure);
+        }
+
+        // Fresh upstream connection per request: concurrent relayed requests
+        // never share a stream (the upstream serializes its own Touch ID
+        // prompts via its global semaphore). The blocking client must not run
+        // on a tokio worker → spawn_blocking.
+        tokio::task::spawn_blocking(move || {
+            let stream = std::os::unix::net::UnixStream::connect(&upstream).map_err(|e| {
+                tracing::warn!(
+                    "relay: upstream agent socket {} unreachable: {e}",
+                    upstream.display()
+                );
+                AgentError::Failure
+            })?;
+            // Byte-for-byte passthrough: `Extension` re-encodes as
+            // name + raw `details` bytes, and the upstream's response
+            // `Extension` is returned unchanged (None = SSH_AGENT_SUCCESS;
+            // an upstream SSH_AGENT_FAILURE surfaces as Err → failure).
+            ssh_agent_lib::blocking::Client::new(stream).extension(request)
+        })
+        .await
+        .map_err(|_| AgentError::Failure)?
+    }
+}
+
+// ── vt-relay peer detection (cross-platform pure logic) ──────────────────────
+//
+// The macOS `vt ssh agent` narrows the auth cache to a per-connection
+// `(pid, start_time)` context when the connecting peer is a forwarding agent.
+// A plain forwarded `ssh` is recognised by executable basename
+// (`is_ssh_client_path`). With `vt ssh connect --forward-real-agent`, the peer
+// reaching the real agent is instead the `vt` relay process, so the agent must
+// recognise IT too and give it the identical per-connection scoping — otherwise
+// relayed `decrypt@vt` would fall into the coarse ordinary local-caller context
+// and the "context dies with the ssh connection" guarantee would be lost.
+//
+// Detection is by the peer's argv (kernel-derived on macOS via KERN_PROCARGS2 —
+// same trust level as the `proc_pidpath` basename check). These functions are
+// PURE and intentionally UNGATED so they compile and are unit-tested on the
+// Linux/host target too (the macOS agent module that consumes them is
+// `#[cfg(target_os = "macos")]`-gated out of the Linux build). Only the sysctl
+// fetch + the wiring into `resolve_cache_context` are macOS-only.
+
+/// Basename of an argv[0] token (`/usr/local/bin/vt` → `vt`, `vt` → `vt`).
+pub(crate) fn program_basename(arg0: &str) -> &str {
+    arg0.rsplit('/').next().unwrap_or(arg0)
+}
+
+/// True when `argv` is a `vt ssh connect --forward-real-agent …` invocation:
+/// the program basename is `vt`, an adjacent `ssh connect` subcommand pair is
+/// present, and the `--forward-real-agent` flag appears after it.
+///
+/// Safety: argv is process-controlled (unlike the executable path), but a
+/// spoofed match here only NARROWS the caller to its own `(pid, start_time)`
+/// per-connection context — it can never widen scope or let a caller ride
+/// another context's grants. This is the same asymmetry the `ssh` basename
+/// check relies on, so trusting argv for narrowing is safe.
+pub(crate) fn is_vt_relay_invocation(argv: &[String]) -> bool {
+    let Some(arg0) = argv.first() else {
+        return false;
+    };
+    if program_basename(arg0) != "vt" {
+        return false;
+    }
+    // Adjacent `ssh` `connect` (clap groups the subcommand as two tokens; any
+    // global options before `ssh` are skipped naturally by the window scan).
+    let Some(i) = argv
+        .windows(2)
+        .position(|w| w[0] == "ssh" && w[1] == "connect")
+    else {
+        return false;
+    };
+    // The flag must appear after `connect` (exact token match rejects
+    // near-misses like `--forward-real-agents` / `--forward-agent`).
+    argv[i + 2..].iter().any(|t| t == "--forward-real-agent")
+}
+
+/// Parse a macOS `KERN_PROCARGS2` buffer into the peer's argv.
+///
+/// Layout: `int32 argc` · NUL-terminated exec path · alignment NULs ·
+/// `argc` NUL-separated argv strings · env. Robust + bounded: any malformed /
+/// truncated buffer yields `None` (never panics), so a parse failure is treated
+/// as "not a relay". Kept pure + ungated for host unit-testing with synthetic
+/// buffers (the real sysctl fetch can only run on macOS).
+pub(crate) fn parse_procargs2(buf: &[u8]) -> Option<Vec<String>> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if argc <= 0 {
+        return None;
+    }
+    let argc = argc as usize;
+    // Sanity bound: no real process has this many args; guards a corrupt count.
+    if argc > 1_000_000 {
+        return None;
+    }
+    let mut pos = 4usize;
+    // Skip the exec-path string (up to its NUL) …
+    while pos < buf.len() && buf[pos] != 0 {
+        pos += 1;
+    }
+    // … then any alignment NUL padding before argv[0].
+    while pos < buf.len() && buf[pos] == 0 {
+        pos += 1;
+    }
+    let mut argv = Vec::with_capacity(argc.min(64));
+    for _ in 0..argc {
+        if pos >= buf.len() {
+            break;
+        }
+        let start = pos;
+        while pos < buf.len() && buf[pos] != 0 {
+            pos += 1;
+        }
+        argv.push(String::from_utf8_lossy(&buf[start..pos]).into_owned());
+        if pos < buf.len() {
+            pos += 1; // skip the NUL terminator
+        }
+    }
+    if argv.is_empty() {
+        None
+    } else {
+        Some(argv)
+    }
+}
+
+#[cfg(test)]
+mod relay_detection_tests {
+    use super::{is_vt_relay_invocation, parse_procargs2, program_basename};
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn matches_canonical_relay_invocation() {
+        assert!(is_vt_relay_invocation(&v(&[
+            "vt",
+            "ssh",
+            "connect",
+            "--forward-real-agent",
+            "host"
+        ])));
+    }
+
+    #[test]
+    fn matches_with_absolute_arg0_and_interspersed_flags() {
+        assert!(is_vt_relay_invocation(&v(&[
+            "/usr/local/bin/vt",
+            "ssh",
+            "connect",
+            "-p",
+            "2222",
+            "--forward-real-agent",
+            "host",
+        ])));
+        assert!(is_vt_relay_invocation(&v(&[
+            "./target/debug/vt",
+            "ssh",
+            "connect",
+            "--forward-real-agent",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "host",
+        ])));
+    }
+
+    #[test]
+    fn matches_with_global_option_before_subcommand() {
+        assert!(is_vt_relay_invocation(&v(&[
+            "vt",
+            "--auth",
+            "tok",
+            "ssh",
+            "connect",
+            "--forward-real-agent",
+            "host",
+        ])));
+    }
+
+    #[test]
+    fn rejects_connect_without_flag() {
+        assert!(!is_vt_relay_invocation(&v(&["vt", "ssh", "connect", "host"])));
+    }
+
+    #[test]
+    fn rejects_non_connect_subcommands() {
+        assert!(!is_vt_relay_invocation(&v(&["vt", "read", "vt://0abc"])));
+        assert!(!is_vt_relay_invocation(&v(&[
+            "vt", "ssh", "agent", "--forward-real-agent"
+        ])));
+        assert!(!is_vt_relay_invocation(&v(&["vt", "ssh", "keygen"])));
+    }
+
+    #[test]
+    fn rejects_near_miss_flag_names() {
+        assert!(!is_vt_relay_invocation(&v(&[
+            "vt",
+            "ssh",
+            "connect",
+            "--forward-real-agents",
+            "host"
+        ])));
+        assert!(!is_vt_relay_invocation(&v(&[
+            "vt",
+            "ssh",
+            "connect",
+            "--forward-agent",
+            "host"
+        ])));
+    }
+
+    #[test]
+    fn rejects_non_vt_basename() {
+        assert!(!is_vt_relay_invocation(&v(&[
+            "ssh",
+            "connect",
+            "--forward-real-agent"
+        ])));
+        assert!(!is_vt_relay_invocation(&v(&[
+            "notvt",
+            "ssh",
+            "connect",
+            "--forward-real-agent",
+            "host"
+        ])));
+    }
+
+    #[test]
+    fn rejects_empty_argv() {
+        assert!(!is_vt_relay_invocation(&[]));
+    }
+
+    #[test]
+    fn basename_strips_dirs() {
+        assert_eq!(program_basename("/usr/local/bin/vt"), "vt");
+        assert_eq!(program_basename("vt"), "vt");
+        assert_eq!(program_basename("./vt"), "vt");
+    }
+
+    /// Build a synthetic KERN_PROCARGS2 buffer: argc(int, native endian),
+    /// exec_path, alignment NUL(s), argv strings NUL-separated, then a trailing
+    /// env string (which must be ignored).
+    fn procargs2(exec_path: &str, argv: &[&str], pad: usize, env: &[&str]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(argv.len() as i32).to_ne_bytes());
+        b.extend_from_slice(exec_path.as_bytes());
+        b.push(0);
+        for _ in 0..pad {
+            b.push(0);
+        }
+        for a in argv {
+            b.extend_from_slice(a.as_bytes());
+            b.push(0);
+        }
+        for e in env {
+            b.extend_from_slice(e.as_bytes());
+            b.push(0);
+        }
+        b
+    }
+
+    #[test]
+    fn parse_procargs2_roundtrips_argv() {
+        let buf = procargs2(
+            "/usr/local/bin/vt",
+            &["vt", "ssh", "connect", "--forward-real-agent", "host"],
+            3,
+            &["PATH=/usr/bin", "HOME=/Users/x"],
+        );
+        let argv = parse_procargs2(&buf).expect("parse");
+        assert_eq!(argv, vec!["vt", "ssh", "connect", "--forward-real-agent", "host"]);
+        assert!(is_vt_relay_invocation(&argv));
+    }
+
+    #[test]
+    fn parse_procargs2_no_padding() {
+        let buf = procargs2("/bin/vt", &["vt", "read"], 0, &[]);
+        assert_eq!(parse_procargs2(&buf).unwrap(), vec!["vt", "read"]);
+    }
+
+    #[test]
+    fn parse_procargs2_rejects_malformed() {
+        assert_eq!(parse_procargs2(&[]), None);
+        assert_eq!(parse_procargs2(&[1, 2, 3]), None);
+        assert_eq!(parse_procargs2(&0i32.to_ne_bytes()), None);
+        assert_eq!(parse_procargs2(&(-5i32).to_ne_bytes()), None);
+        // argc says 3 but the buffer is truncated after the exec path → the
+        // loop stops early without panicking.
+        let mut b = 3i32.to_ne_bytes().to_vec();
+        b.extend_from_slice(b"/bin/vt\0");
+        let parsed = parse_procargs2(&b);
+        assert!(parsed.is_none() || parsed.unwrap().len() <= 3);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -749,6 +1153,49 @@ mod tests {
         match super::decide_sign_route(err, true) {
             super::SignRoute::Fail(m) => assert!(m.contains("authentication rejected")),
             other => panic!("expected Fail (no fallback), got {other:?}"),
+        }
+    }
+
+    // ── --forward-real-agent relay op-filter ─────────────────────────────────
+
+    // Only the three phone-ceremony-equivalent vt ops may cross the relay.
+    #[test]
+    fn relay_filter_allows_decrypt_encrypt_auth() {
+        for name in ["decrypt@vt", "encrypt@vt", "auth@vt"] {
+            assert_eq!(
+                super::route_extension(name),
+                super::ExtensionRoute::Relay,
+                "{name} must relay"
+            );
+        }
+    }
+
+    // run@vt spawns processes on the local machine — NEVER over the relay.
+    #[test]
+    fn relay_filter_refuses_run_vt() {
+        assert_eq!(super::route_extension("run@vt"), super::ExtensionRoute::Refuse);
+    }
+
+    // Unknown / out-of-scope extensions are refused: sign@vt (all local keys),
+    // OpenSSH's own session-bind, and arbitrary names. Also guards against
+    // prefix/suffix confusion — the match must be exact.
+    #[test]
+    fn relay_filter_refuses_unknown_and_near_misses() {
+        for name in [
+            "sign@vt",
+            "session-bind@openssh.com",
+            "query",
+            "",
+            "decrypt@vt2",
+            "xdecrypt@vt",
+            "DECRYPT@VT",
+            "decrypt@vt ",
+        ] {
+            assert_eq!(
+                super::route_extension(name),
+                super::ExtensionRoute::Refuse,
+                "{name:?} must be refused"
+            );
         }
     }
 

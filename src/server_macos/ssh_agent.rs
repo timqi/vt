@@ -391,6 +391,50 @@ mod proc_info {
         get_proc_bsdinfo(pid).map(|(_, _, s)| s)
     }
 
+    /// Fetch a process's argv via `sysctl(KERN_PROCARGS2)`, kernel-derived (same
+    /// trust level as `proc_pidpath`). `None` on any sysctl failure or malformed
+    /// buffer — callers treat that as "not the vt relay". The byte-buffer parse
+    /// itself is the pure, host-tested `ssh_sign::parse_procargs2`.
+    pub fn get_proc_argv(pid: i32) -> Option<Vec<String>> {
+        // 1. Upper bound on the args buffer size (`kern.argmax`).
+        let mut argmax: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        let ret = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                &mut argmax as *mut _ as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret != 0 || argmax <= 0 {
+            return None;
+        }
+
+        // 2. Fetch KERN_PROCARGS2 for `pid` into a buffer of that size.
+        let mut buf = vec![0u8; argmax as usize];
+        let mut size = buf.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+        let ret = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret != 0 || size == 0 || size > buf.len() {
+            return None;
+        }
+        buf.truncate(size);
+        crate::ssh_sign::parse_procargs2(&buf)
+    }
+
     /// Get the session leader PID (POSIX sid) for `pid`.
     ///
     /// Under macOS terminal stacks `forkpty()` calls `setsid()` in the child
@@ -1005,6 +1049,22 @@ fn resolve_cache_context(
         return None;
     }
     let pid = peer_pid?;
+    // vt-relay narrowing (`vt ssh connect --forward-real-agent`): when the peer
+    // is the vt relay forwarding vt extensions from a remote host, give it the
+    // SAME per-connection `(pid, start)` context a forwarded `ssh` gets — in
+    // EVERY mode (incl. Global) and with NO TTY requirement (the relay may be
+    // scripted/TTY-less; the remote side always is). Deliberately AHEAD of the
+    // TTY gate so a relay without a controlling terminal still narrows to its
+    // own connection rather than falling through to a coarse shared context.
+    // Detection is by kernel-derived argv (`is_vt_relay_invocation`); a spoofed
+    // argv only narrows the caller to its own context, never widens it.
+    if proc_info::get_proc_argv(pid)
+        .map(|argv| crate::ssh_sign::is_vt_relay_invocation(&argv))
+        .unwrap_or(false)
+    {
+        let start = proc_info::get_start_tvsec(pid)?;
+        return Some((pid as u64, start));
+    }
     // Per-session / per-app require the peer to have a controlling terminal.
     // launchd-managed daemons and other non-interactive peers always prompt
     // and never enter the cache — for these modes caching only makes sense
