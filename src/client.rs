@@ -160,6 +160,7 @@ fn parse_envelope(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
 #[derive(Clone)]
 pub struct VTClient {
     auth_token: String,
+    backend: crate::config::Backend,
 }
 
 impl VTClient {
@@ -169,23 +170,38 @@ impl VTClient {
     /// - SSH agent path: `VT_AUTH` (passed in as `auth_token`)
     /// - CF passkey path: `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN`
     ///
-    /// If neither is set we fail here rather than deep inside the routing
-    /// code, so the user sees a single actionable error.
+    /// `VT_BACKEND` (auto | agent | passkey) pins the routing; its
+    /// requirements are validated here too, so the user sees a single
+    /// actionable error rather than a failure deep inside the routing code.
     pub fn new(auth_token: String) -> Result<Self> {
+        let backend = crate::config::Backend::from_env()?;
+        match backend {
+            crate::config::Backend::Agent if auth_token.is_empty() => {
+                anyhow::bail!("VT_BACKEND=agent requires VT_AUTH for the SSH agent path");
+            }
+            crate::config::Backend::Passkey if std::env::var("VT_PASSKEY_URL").is_err() => {
+                anyhow::bail!(
+                    "VT_BACKEND=passkey requires VT_PASSKEY_URL + VT_PASSKEY_TOKEN \
+                     for the phone passkey ceremony"
+                );
+            }
+            _ => {}
+        }
         if auth_token.is_empty() && std::env::var("VT_PASSKEY_URL").is_err() {
             anyhow::bail!(
                 "no decryption path configured — set VT_AUTH for the SSH agent path, \
                  or VT_PASSKEY_URL + VT_PASSKEY_TOKEN for the phone passkey ceremony"
             );
         }
-        Ok(VTClient { auth_token })
+        Ok(VTClient { auth_token, backend })
     }
 
-    /// True when the SSH-agent path is configured (`VT_AUTH` was set). Gates
-    /// agent-identity discovery in `vt ssh connect`: `sign@vt` needs this key,
-    /// so discovery only makes sense when it's present.
+    /// True when the SSH-agent path is usable: `VT_AUTH` set and not pinned
+    /// away by `VT_BACKEND=passkey`. Gates agent-identity discovery in
+    /// `vt ssh connect`: `sign@vt` needs this key, so discovery only makes
+    /// sense when the agent path is in play.
     pub(crate) fn has_auth_token(&self) -> bool {
-        !self.auth_token.is_empty()
+        !self.auth_token.is_empty() && self.backend != crate::config::Backend::Passkey
     }
 
     /// Try to send an extension request via the SSH agent socket.
@@ -307,24 +323,41 @@ impl VTClient {
             .map_err(|e| transport(anyhow::anyhow!("{}", e)))
     }
 
-    /// Wrap `try_agent_extension` with the `auto`-mode fallback policy:
-    /// translate `Ok(None)` (socket missing/refused) and recoverable
-    /// `Err(_)` (per [`should_fallback_to_cf`]) into a single `Ok(None)` so
-    /// callers can route to the CF path. Non-recoverable errors propagate.
+    /// Wrap `try_agent_extension` with the routing policy:
+    ///
+    /// - `VT_BACKEND=passkey` → `Ok(None)` immediately, without probing the
+    ///   agent socket (a shared config.toml may set `VT_AUTH` on hosts where
+    ///   `$SSH_AUTH_SOCK` points at an unrelated ssh-agent).
+    /// - `VT_BACKEND=agent` → never fall back: socket-missing becomes an
+    ///   actionable error, agent errors propagate unfiltered.
+    /// - `auto` (default) → translate `Ok(None)` (socket missing/refused) and
+    ///   recoverable `Err(_)` (per [`should_fallback_to_cf`]) into a single
+    ///   `Ok(None)` so callers route to the CF path; non-recoverable errors
+    ///   propagate.
     #[cfg(unix)]
     async fn agent_call_or_fallback(
         auth_token: String,
+        backend: crate::config::Backend,
         name: &'static str,
         payload: Vec<u8>,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        use crate::config::Backend;
+        if backend == Backend::Passkey {
+            return Ok(None);
+        }
         let result = tokio::task::spawn_blocking(move || {
             Self::try_agent_extension(&auth_token, name, &payload)
         })
         .await?;
         match result {
-            Ok(some_or_none) => Ok(some_or_none),
+            Ok(Some(bytes)) => Ok(Some(bytes)),
+            Ok(None) if backend == Backend::Agent => Err(anyhow::anyhow!(
+                "SSH agent socket unavailable and VT_BACKEND=agent forbids the \
+                 passkey fallback — is the vt agent running / forwarded?"
+            )),
+            Ok(None) => Ok(None),
             Err(e) => {
-                if should_fallback_to_cf(&e) {
+                if backend != Backend::Agent && should_fallback_to_cf(&e) {
                     // Keep the raw error out of default output (it reads as a
                     // scary internal failure); the CF path prints a clean,
                     // user-facing fallback line. `RUST_LOG=debug` still surfaces
@@ -352,7 +385,7 @@ impl VTClient {
             let payload = serde_json::to_vec(&req)?;
             let auth_token = self.auth_token.clone();
             let result =
-                Self::agent_call_or_fallback(auth_token, "encrypt@vt", payload).await?;
+                Self::agent_call_or_fallback(auth_token, self.backend, "encrypt@vt", payload).await?;
             let bytes = match result {
                 Some(b) => b,
                 None => return Self::cf_encrypt(items, &get_hostname()).await,
@@ -469,7 +502,7 @@ impl VTClient {
             let payload = serde_json::to_vec(&wire)?;
             let auth_token = self.auth_token.clone();
             let result =
-                Self::agent_call_or_fallback(auth_token, "decrypt@vt", payload).await?;
+                Self::agent_call_or_fallback(auth_token, self.backend, "decrypt@vt", payload).await?;
             let bytes = match result {
                 Some(b) => b,
                 None => return Self::cf_decrypt(host, command, urls).await,
@@ -571,6 +604,15 @@ impl VTClient {
             flags,
             meta: cf::collect_client_meta(),
         };
+        // VT_BACKEND=passkey pins routing away from the agent: skip the socket
+        // probe and return the "fall back" signal — the caller's
+        // decrypt-then-sign fallback routes its decrypt through this client
+        // again, which then takes the passkey ceremony. `agent` mode is NOT
+        // special-cased here for the same reason: the fallback's decrypt still
+        // honors the agent-only pin.
+        if self.backend == crate::config::Backend::Passkey {
+            return Ok(None);
+        }
         let payload = serde_json::to_vec(&req)?;
         let auth_token = self.auth_token.clone();
         // Same blocking + classification as `agent_call_or_fallback`, but
@@ -694,6 +736,11 @@ impl VTClient {
                      is no phone-passkey fallback for run@vt)"
                 );
             }
+            if self.backend == crate::config::Backend::Passkey {
+                anyhow::bail!(
+                    "vt run is agent-only, but VT_BACKEND=passkey disables the agent path"
+                );
+            }
             if argv.is_empty() {
                 anyhow::bail!("vt run: argv is empty");
             }
@@ -706,7 +753,7 @@ impl VTClient {
             let payload = serde_json::to_vec(&req)?;
             let auth_token = self.auth_token.clone();
             let result =
-                Self::agent_call_or_fallback(auth_token, "run@vt", payload).await?;
+                Self::agent_call_or_fallback(auth_token, self.backend, "run@vt", payload).await?;
             match result {
                 Some(bytes) => {
                     let res: RunRes = serde_json::from_slice(&bytes)
@@ -737,7 +784,7 @@ impl VTClient {
             let payload = serde_json::to_vec(&req)?;
             let auth_token = self.auth_token.clone();
             let result =
-                Self::agent_call_or_fallback(auth_token, "auth@vt", payload).await?;
+                Self::agent_call_or_fallback(auth_token, self.backend, "auth@vt", payload).await?;
 
             match result {
                 Some(bytes) => {

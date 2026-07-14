@@ -23,8 +23,20 @@
 
 # --- SSH-agent path (macOS workstations running `vt ssh agent`) -------------
 # When set, the CLI tries the local SSH agent (Touch ID) first and falls back
-# to the passkey ceremony. Leave unset on Linux servers. SENSITIVE.
+# to the passkey ceremony. Put this ONLY in the config of hosts that can reach
+# a vt agent — locally, or via a forwarded socket (`ssh -A`). On a passkey-only
+# server it makes every call probe whatever $SSH_AUTH_SOCK points at before
+# falling back. SENSITIVE.
 # VT_AUTH = "your-ssh-agent-token"
+
+# --- Routing pin (optional) --------------------------------------------------
+# auto (default): agent first when VT_AUTH is set, passkey fallback on
+#                 recoverable errors.
+# agent:          agent only — never fall back to the phone ceremony.
+# passkey:        never probe the agent socket, even when VT_AUTH is set.
+# One-shot override without editing this file: `VT_BACKEND=passkey vt …`,
+# or `VT_AUTH= vt …` (empty env var beats the file and skips the agent).
+# VT_BACKEND = "auto"
 
 # --- git SSH signing identity (optional) ------------------------------------
 # Encrypted private key record and its matching public key.
