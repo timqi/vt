@@ -866,7 +866,18 @@ pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Resu
         "Error decrypting item: {}",
         res[0].err_message
     );
-    print!("{}", res[0].result);
+    // Interactive terminal: end the line so the shell prompt doesn't overwrite
+    // or obscure a plaintext with no trailing newline (redrawing prompts like
+    // starship/p10k clobber partial lines). Piped/redirected: byte-exact
+    // output — `$(vt read …)` strips trailing newlines anyway, and
+    // `vt read … > file` must not gain a byte.
+    use std::io::{IsTerminal, Write};
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(res[0].result.as_bytes())?;
+    if stdout.is_terminal() && !res[0].result.ends_with('\n') {
+        stdout.write_all(b"\n")?;
+    }
+    stdout.flush()?;
     Ok(())
 }
 

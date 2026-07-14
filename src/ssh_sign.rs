@@ -771,10 +771,20 @@ impl ssh_agent_lib::agent::Session for SignerSession {
             return Err(AgentError::Failure);
         };
         if route_extension(&request.name) != ExtensionRoute::Relay {
-            tracing::warn!(
-                "refusing agent extension {:?} over the forwarded relay",
-                request.name
-            );
+            // session-bind@openssh.com is probed by every modern OpenSSH client
+            // (agent restriction, >= 8.9); refusal is the spec'd graceful
+            // degradation — expected noise, not worth a warn.
+            if request.name == "session-bind@openssh.com" {
+                tracing::debug!(
+                    "refusing agent extension {:?} over the forwarded relay",
+                    request.name
+                );
+            } else {
+                tracing::warn!(
+                    "refusing agent extension {:?} over the forwarded relay",
+                    request.name
+                );
+            }
             return Err(AgentError::Failure);
         }
 
