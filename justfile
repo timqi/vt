@@ -45,6 +45,22 @@ check:
     cargo check
     cargo check --target x86_64-unknown-linux-gnu
 
+# Run the Rust unit + integration tests
+test:
+    cargo test --all-targets
+
+# Type-check + unit-test the Cloudflare worker. Installs deps on first run.
+[working-directory: 'cf-worker']
+check-worker:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -d node_modules ] || npm ci
+    npx tsc --noEmit
+    npm test
+
+# Everything the CI gates run, in one shot (Rust + worker)
+ci: check test check-worker
+
 # Deploy the Cloudflare worker (requires wrangler on PATH)
 [working-directory: 'cf-worker']
 deploy-worker:

@@ -1,6 +1,7 @@
 # Structured Errors over the vt Extension Protocol
 
-Status: proposal (pending codex-expert review)
+Status: shipped — `ExtResponse`/`ErrKind` in `src/core/wire.rs`, `VtClientError`
+downcast + exit-code mapping in `src/client.rs` (with tests).
 
 ## Motivation
 

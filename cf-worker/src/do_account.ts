@@ -35,6 +35,10 @@ const TTL_MS = 5 * 60 * 1000;
 const RETENTION_MS = 10 * 60 * 1000;
 // Audit rows (ceremony + cache events) are kept 90 days, then swept by the alarm.
 const AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+// Agent Touch-ID-cache hits inside a TTL window can arrive many times a minute
+// (orchestrated callers); notify at most once per key per this interval. The
+// audit table still records every hit — the notice is a heads-up, not a ledger.
+const AGENT_CACHE_NOTIFY_MIN_INTERVAL_MS = 60 * 1000;
 
 // Allowed positive DEK-cache TTLs (seconds). A write with any value outside
 // this set is rejected, so neither a tampered approve body nor a future UI typo
@@ -129,6 +133,9 @@ export class AccountDO extends DurableObject<Env> {
   // Monotonic audit change counter. Seeded from MAX(seq) in the constructor so
   // it survives DO eviction (every write persists seq), then ++'d per write.
   private seqCounter = 0;
+  // Last agent-cache-hit notice per `${op_kind}|${host}` (epoch ms). In-memory
+  // only: resets on DO eviction/hibernation — worst case one extra notice.
+  private agentCacheNotifyMs = new Map<string, number>();
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -1174,33 +1181,46 @@ export class AccountDO extends DurableObject<Env> {
     log('cache.hit', { n: salts.length, ip, ppid });
 
     // Real-time notice: a cache hit serves a decrypt with NO phone in the loop,
-    // so push the same opt-in channels used for approvals. Fire-and-forget via
-    // waitUntil — delivery is best-effort and must never delay or fail the DEK
-    // response (the audit row above is the durable record).
+    // so push the same opt-in channels used for approvals. Fire-and-forget —
+    // delivery is best-effort and must never delay or fail the DEK response
+    // (the audit row above is the durable record).
+    this.pushCacheHitNotices(meta, salts.length, undefined, 'cachehit_failed');
+    return Response.json({ source: 'cache', sealed_deks_b64u: sealedB64u } satisfies DekCacheResponse);
+  }
+
+  // Fan a cache-hit notice out to every configured channel (stateless
+  // Pushover/Slack-webhook fanOut + Feishu + Slack App), each via waitUntil —
+  // compact, no @, no edit lifecycle (terminal FYI). Shared by the Worker
+  // DEK-cache hit (opDekCache) and the agent Touch-ID-cache hit
+  // (notifyAgentCacheHit); `note` names the skipped factor when it isn't the
+  // default phone approval, `errTag` distinguishes the two sources in logs.
+  private pushCacheHitNotices(
+    meta: ChallengeMeta,
+    salts: number,
+    note: string | undefined,
+    errTag: string,
+  ): void {
     this.ctx.waitUntil(
-      notifyCacheHit(this.env, meta, salts.length)
-        .then((w) => { if (w) logErr('notify.cachehit_failed', w); })
-        .catch((e) => logErr('notify.cachehit_failed', e)),
+      notifyCacheHit(this.env, meta, salts, note)
+        .then((w) => { if (w) logErr(`notify.${errTag}`, w); })
+        .catch((e) => logErr(`notify.${errTag}`, e)),
     );
-    // Feishu / Slack App cache-hit notice — compact, no @, no edit lifecycle
-    // (terminal FYI).
     const feishu = this.feishuCfg();
     if (feishu) {
       this.ctx.waitUntil(
-        sendCacheHitNotice(feishu, this.feishuKv(), Date.now(), meta, salts.length)
-          .then((w) => { if (w) logErr('feishu.cachehit_failed', w); })
-          .catch((e) => logErr('feishu.cachehit_failed', e)),
+        sendCacheHitNotice(feishu, this.feishuKv(), Date.now(), meta, salts, note)
+          .then((w) => { if (w) logErr(`feishu.${errTag}`, w); })
+          .catch((e) => logErr(`feishu.${errTag}`, e)),
       );
     }
     const slackApp = this.slackAppCfg();
     if (slackApp) {
       this.ctx.waitUntil(
-        sendSlackAppCacheHitNotice(slackApp, meta, salts.length)
-          .then((w) => { if (w) logErr('slackapp.cachehit_failed', w); })
-          .catch((e) => logErr('slackapp.cachehit_failed', e)),
+        sendSlackAppCacheHitNotice(slackApp, meta, salts, note)
+          .then((w) => { if (w) logErr(`slackapp.${errTag}`, w); })
+          .catch((e) => logErr(`slackapp.${errTag}`, e)),
       );
     }
-    return Response.json({ source: 'cache', sealed_deks_b64u: sealedB64u } satisfies DekCacheResponse);
   }
 
   // Ingest one SSH-agent audit record. The Worker has already verified the
@@ -1216,7 +1236,26 @@ export class AccountDO extends DurableObject<Env> {
       return badRequest('invalid audit op');
     }
     this.auditAgent(op);
+    // An agent cache hit (sign / decrypt@vt served from the Touch ID auth
+    // cache) had no human in the loop, so surface it on the same channels as
+    // the Worker DEK-cache 免审批 notice. Throttled; fire-and-forget.
+    if (op.outcome === 'cache_hit') this.notifyAgentCacheHit(op);
     return Response.json({ ok: true });
+  }
+
+  // Throttled 免审批 notice for an agent-side cache hit; the actual dispatch
+  // is the shared pushCacheHitNotices. The note names the skipped factor —
+  // Touch ID here, not a phone approval.
+  private notifyAgentCacheHit(op: DoAuditIngestOp): void {
+    const key = `${op.meta.op_kind}|${op.meta.host}`;
+    const now = Date.now();
+    if (now - (this.agentCacheNotifyMs.get(key) ?? 0) < AGENT_CACHE_NOTIFY_MIN_INTERVAL_MS) return;
+    // Bound the map: keys are (op_kind, host) pairs, so growth needs a hostile
+    // agent minting hostnames — cheap to cap anyway.
+    if (this.agentCacheNotifyMs.size > 256) this.agentCacheNotifyMs.clear();
+    this.agentCacheNotifyMs.set(key, now);
+
+    this.pushCacheHitNotices(op.meta, op.salts, '缓存命中，免 Touch ID', 'agent_cachehit_failed');
   }
 
   // Admin: clear the cached DEKs written by ONE approval, identified by its

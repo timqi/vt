@@ -127,6 +127,13 @@ enum Commands {
         only_env: Option<Vec<String>>,
 
         #[arg(
+            long,
+            conflicts_with_all = ["replace_file", "reason", "only_env", "args"],
+            help = "Restore ciphertext for any file left decrypted by a crashed or rebooted restore supervisor (sweeps the injection state dir). Run at login/boot. Needs no auth — it only moves the ciphertext backup back over the target."
+        )]
+        recover: bool,
+
+        #[arg(
             trailing_var_arg = true,
             help = "Additional arguments to pass to the spawned process"
         )]
@@ -314,7 +321,7 @@ pub enum SshCommands {
         #[arg(
             long = "ssh-auth-cache-mode",
             default_value = "none",
-            help = "Sign auth cache mode: none, per-session, or per-app"
+            help = "Sign auth cache mode: none, per-session, per-app, or global. per-session/per-app require the caller to have a controlling terminal (TTY-less orchestrators like AI agents / CI never hit); global shares ONE context across all callers — the only mode that serves orchestrated callers, and the coarsest. WARNING: cache contexts are LOCAL — requests arriving over a forwarded agent socket (ssh -A) from a remote host share them, so within the TTL a hostile remote process can sign silently. Keep 'none' if you forward this agent to hosts you don't fully trust."
         )]
         auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
         #[arg(
@@ -326,7 +333,7 @@ pub enum SshCommands {
         #[arg(
             long = "decrypt-auth-cache-mode",
             default_value = "none",
-            help = "Decrypt auth cache mode: none, per-session, or per-app. Only v2 envelope URLs are cache-eligible; legacy items always prompt."
+            help = "Decrypt auth cache mode: none, per-session, per-app, or global. Only v2 envelope URLs are cache-eligible; legacy items always prompt. Same mode semantics and forwarded-agent caveat as --ssh-auth-cache-mode."
         )]
         decrypt_auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
         #[arg(
@@ -527,8 +534,14 @@ async fn run(cli: Cli) -> Result<()> {
             timeout,
             reason,
             only_env,
+            recover,
             args,
         } => {
+            // Recovery only moves the ciphertext backup back over the target —
+            // no decryption, so no VT_AUTH required.
+            if *recover {
+                return client::inject_recover();
+            }
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(auth)?;
             client::inject(

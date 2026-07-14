@@ -17,7 +17,7 @@ use crate::core::{
     SecretType, SignReq, SignRes, VtUrl, SALT_LEN,
 };
 use anyhow::{ensure, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use ssh_agent_lib::proto::{Extension, Unparsed};
 use tracing::debug;
@@ -1299,7 +1299,8 @@ pub async fn inject(
     // durable backstop: even if a parent crash makes immediate_restore
     // unreachable, the supervisor's `unlink(tmp) + rename(backup, target)`
     // after timeout still brings everything home (modulo SIGKILL / reboot).
-    let armed: Option<(String, std::path::PathBuf)> = if let Some(replace_file_path) = &replace_file
+    let armed: Option<(String, std::path::PathBuf, std::path::PathBuf)> =
+        if let Some(replace_file_path) = &replace_file
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
@@ -1323,6 +1324,16 @@ pub async fn inject(
         let suffix: String = rnd.iter().map(|b| format!("{:02x}", b)).collect();
         let backup_path = dir.join(format!(".{}.vt-backup-{}", file_name, suffix));
         let tmp_path = dir.join(format!(".{}.vt-tmp-{}", file_name, suffix));
+        // Crash-recovery sidecar path in the state dir. Computed up front so
+        // the supervisor gets it at spawn and can delete it after a normal
+        // restore. If the home dir can't be resolved we fall back to a path
+        // beside the target: the supervisor can still delete it on the normal
+        // path, but `vt inject --recover` (which only scans the state dir) will
+        // not find it — crash-recovery is effectively unavailable without a
+        // home dir. This mirrors `inject_recover`, which also bails on `None`.
+        let sidecar_path = inject_state_dir()
+            .map(|d| d.join(format!("{suffix}.json")))
+            .unwrap_or_else(|| dir.join(format!(".{}.vt-recover-{}.json", file_name, suffix)));
 
         // Step 2: write backup from the in-memory ORIGINAL bytes (captured at
         // the single O_NOFOLLOW open above) — NOT a fresh re-read of the target,
@@ -1348,12 +1359,33 @@ pub async fn inject(
         debug!("Created backup at: {}", backup_path.display());
 
         // Step 3: arm supervisor before any plaintext touches disk.
-        match spawn_restore_supervisor(timeout, &tmp_path, &backup_path, replace_file_path) {
+        match spawn_restore_supervisor(
+            timeout,
+            &tmp_path,
+            &backup_path,
+            replace_file_path,
+            &sidecar_path,
+        ) {
             Ok(()) => debug!("Restore supervisor armed (timeout={}s)", timeout),
             Err(e) => {
                 let _ = std::fs::remove_file(&backup_path);
                 return Err(e);
             }
+        }
+
+        // Step 3b: write the crash-recovery sidecar (before any plaintext hits
+        // disk). Best-effort — losing it only forfeits reboot recovery for this
+        // one injection, so a failure warns rather than aborts.
+        let sidecar = InjectSidecar {
+            target: absolutize(std::path::Path::new(replace_file_path))
+                .to_string_lossy()
+                .into_owned(),
+            backup: absolutize(&backup_path).to_string_lossy().into_owned(),
+            tmp: absolutize(&tmp_path).to_string_lossy().into_owned(),
+            deadline_ms: now_ms().saturating_add((timeout as u64).saturating_mul(1000)),
+        };
+        if let Err(e) = write_inject_sidecar(&sidecar_path, &sidecar) {
+            debug!("inject sidecar not written ({e:#}); crash-recovery disabled for this run");
         }
 
         // Step 4: write tmp (plaintext).
@@ -1362,6 +1394,7 @@ pub async fn inject(
             // sidecar state for the timeout window. Supervisor will later
             // observe ENOENT on backup and exit silently.
             let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(&sidecar_path);
             immediate_restore(replace_file_path, &backup_path);
             return Err(e);
         }
@@ -1369,6 +1402,7 @@ pub async fn inject(
         // Step 5: atomically expose plaintext at target.
         if let Err(e) = std::fs::rename(&tmp_path, replace_file_path) {
             let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(&sidecar_path);
             immediate_restore(replace_file_path, &backup_path);
             return Err(e).with_context(|| {
                 format!("Failed to atomically replace file: {}", replace_file_path)
@@ -1376,7 +1410,7 @@ pub async fn inject(
         }
         debug!("Content written to replace file: {}", replace_file_path);
 
-        Some((replace_file_path.clone(), backup_path))
+        Some((replace_file_path.clone(), backup_path, sidecar_path))
     } else {
         None
     };
@@ -1398,8 +1432,9 @@ pub async fn inject(
     // Restore immediately on exec failure so the user doesn't wait out the
     // supervisor's timeout. The supervisor will later observe ENOENT on the
     // backup and exit silently.
-    if let Some((target, backup)) = &armed {
+    if let Some((target, backup, sidecar)) = &armed {
         immediate_restore(target, backup);
+        let _ = std::fs::remove_file(sidecar);
     }
     Err(anyhow::anyhow!("Failed to execute command: {}", err))
 }
@@ -1435,6 +1470,172 @@ fn write_plaintext_tmp(tmp: &std::path::Path, mode: u32, content: &str) -> Resul
     Ok(())
 }
 
+// ── Crash-recovery sidecar ──────────────────────────────────────────────────
+//
+// The restore supervisor holds its state (tmp/backup/target/deadline) only in
+// its own argv. A reboot or SIGKILL kills the sleeper and leaves the plaintext
+// exposed at `target` with an orphaned ciphertext backup beside it — with no
+// record of what to restore. The sidecar closes that gap: a tiny JSON file
+// written (before any plaintext hits disk) at a stable, discoverable location,
+// so `vt inject --recover` can find and undo orphaned exposures after a crash.
+// It carries no secret — only paths + a deadline.
+
+/// One armed injection's recovery record. Absolute paths so `--recover` works
+/// from any cwd.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct InjectSidecar {
+    /// The file being exposed as plaintext (ciphertext must be restored here).
+    target: String,
+    /// The ciphertext backup to rename back over `target`.
+    backup: String,
+    /// The plaintext tmp file, removed on recovery if it was orphaned.
+    tmp: String,
+    /// Epoch ms after which the supervisor should already have restored; past
+    /// this (plus a grace) a surviving backup means the supervisor died.
+    deadline_ms: u64,
+}
+
+/// Wait past the deadline by this much before `--recover` acts, so a
+/// legitimately-still-sleeping supervisor is never raced.
+const RECOVER_GRACE_MS: u64 = 5_000;
+
+/// What `--recover` should do with one sidecar entry.
+#[derive(Debug, PartialEq, Eq)]
+enum RecoverAction {
+    /// Backup present and the window has elapsed → supervisor is dead; restore.
+    Restore,
+    /// Backup already consumed (normal completion) → sidecar is stale; delete.
+    CleanStale,
+}
+
+/// Pure recovery decision. `None` = leave it alone (an injection whose window
+/// has not yet elapsed — its supervisor is presumed still running).
+fn plan_recovery(deadline_ms: u64, backup_exists: bool, now_ms: u64) -> Option<RecoverAction> {
+    if !backup_exists {
+        // The supervisor (or immediate_restore) already renamed the backup
+        // over the target: the injection completed. Only the sidecar lingers.
+        return Some(RecoverAction::CleanStale);
+    }
+    if now_ms >= deadline_ms.saturating_add(RECOVER_GRACE_MS) {
+        Some(RecoverAction::Restore)
+    } else {
+        None
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `~/.local/state/vt/inject` — the sidecar directory (same on macOS and Linux
+/// for a single recovery path). `None` if the home dir can't be resolved.
+fn inject_state_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".local").join("state").join("vt").join("inject"))
+}
+
+/// Make `p` absolute (without requiring it to exist — the target is about to
+/// be renamed over) so the recorded path resolves from any later cwd.
+fn absolutize(p: &std::path::Path) -> std::path::PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|d| d.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    }
+}
+
+/// Write the sidecar at `path` (mode 0600), creating its parent dir. Best
+/// effort at the call site: a failure here loses only crash-recovery for this
+/// one injection (the in-memory supervisor still restores on the normal path),
+/// so callers warn and continue rather than aborting the user's command.
+fn write_inject_sidecar(path: &std::path::Path, sc: &InjectSidecar) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if let Some(dir) = path.parent() {
+        // Create every missing component as 0700 in one step (no create-then-
+        // chmod window) — the dir lists which files are mid-exposure.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("creating inject state dir {}", dir.display()))?;
+    }
+    let json = serde_json::to_vec(sc).context("serialize inject sidecar")?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating inject sidecar {}", path.display()))?;
+    f.write_all(&json)
+        .with_context(|| format!("writing inject sidecar {}", path.display()))?;
+    f.sync_all().ok();
+    Ok(())
+}
+
+/// Sweep the sidecar dir and restore any orphaned plaintext exposure. Invoked
+/// by `vt inject --recover` (run at login/boot). Never errors on an individual
+/// bad entry — it logs and moves on so one corrupt sidecar can't wedge the sweep.
+pub fn inject_recover() -> Result<()> {
+    let Some(dir) = inject_state_dir() else {
+        eprintln!("vt inject --recover: cannot resolve home dir");
+        return Ok(());
+    };
+    if !dir.exists() {
+        println!("vt inject --recover: nothing to recover");
+        return Ok(());
+    }
+    let now = now_ms();
+    let (mut restored, mut cleaned, mut active) = (0u32, 0u32, 0u32);
+    let entries = std::fs::read_dir(&dir)
+        .with_context(|| format!("reading inject state dir {}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let sc: InjectSidecar = match std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+        {
+            Some(sc) => sc,
+            None => {
+                eprintln!("vt inject --recover: skipping unreadable sidecar {}", path.display());
+                continue;
+            }
+        };
+        let backup_exists = std::path::Path::new(&sc.backup).exists();
+        match plan_recovery(sc.deadline_ms, backup_exists, now) {
+            Some(RecoverAction::Restore) => {
+                let _ = std::fs::remove_file(&sc.tmp);
+                if let Err(e) = std::fs::rename(&sc.backup, &sc.target) {
+                    eprintln!(
+                        "vt inject --recover: failed to restore {} from {}: {}",
+                        sc.target, sc.backup, e
+                    );
+                    continue; // leave the sidecar so a later sweep retries
+                }
+                let _ = std::fs::remove_file(&path);
+                println!("vt inject --recover: restored {}", sc.target);
+                restored += 1;
+            }
+            Some(RecoverAction::CleanStale) => {
+                let _ = std::fs::remove_file(&sc.tmp);
+                let _ = std::fs::remove_file(&path);
+                cleaned += 1;
+            }
+            None => active += 1,
+        }
+    }
+    println!(
+        "vt inject --recover: {restored} restored, {cleaned} stale cleaned, {active} still active"
+    );
+    Ok(())
+}
+
 /// Spawn the restore supervisor as a self-exec'd child. The intermediate
 /// process exits immediately after double-forking inside the supervisor
 /// subcommand body; we reap that exit here, leaving the grandchild reparented
@@ -1444,6 +1645,7 @@ fn spawn_restore_supervisor(
     tmp_path: &std::path::Path,
     backup_path: &std::path::Path,
     target_path: &str,
+    sidecar_path: &std::path::Path,
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1456,6 +1658,7 @@ fn spawn_restore_supervisor(
         .arg(tmp_path)
         .arg(backup_path)
         .arg(target_path)
+        .arg(sidecar_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1497,12 +1700,13 @@ fn spawn_restore_supervisor(
 /// parses clap definitions, or loads tracing — its RSS is just vt's text
 /// segment (shared with the parent via page cache) + a few KB of heap.
 ///
-/// Args (after the SUPERVISOR_SUBCOMMAND marker): `<secs> <tmp> <backup> <target>`.
+/// Args (after the SUPERVISOR_SUBCOMMAND marker):
+/// `<secs> <tmp> <backup> <target> <sidecar>`.
 pub fn supervisor_main(args: &[std::ffi::OsString]) -> i32 {
     // Stdio is /dev/null — any failure here is invisible to the user. Parent
     // distinguishes the intermediate's success (exit 0 after double-fork)
     // from any failure (non-zero) via Child::wait().
-    if args.len() != 4 {
+    if args.len() != 5 {
         return 2;
     }
     let secs: u64 = match args[0].to_str().and_then(|s| s.parse().ok()) {
@@ -1512,6 +1716,7 @@ pub fn supervisor_main(args: &[std::ffi::OsString]) -> i32 {
     let tmp = std::path::PathBuf::from(&args[1]);
     let backup = std::path::PathBuf::from(&args[2]);
     let target = std::path::PathBuf::from(&args[3]);
+    let sidecar = std::path::PathBuf::from(&args[4]);
 
     // Install SIG_IGN for the signals that would otherwise sweep us up when
     // the user closes the terminal, hits Ctrl+C, or runs `pkill vt`. These
@@ -1566,6 +1771,9 @@ pub fn supervisor_main(args: &[std::ffi::OsString]) -> i32 {
     // Restore ciphertext over the target. Either succeeds (normal case) or
     // returns ENOENT (parent already restored on exec failure / rename failure).
     let _ = std::fs::rename(&backup, &target);
+    // The exposure is over; drop the crash-recovery sidecar so `--recover`
+    // doesn't later see a stale entry.
+    let _ = std::fs::remove_file(&sidecar);
     0
 }
 
@@ -1754,5 +1962,59 @@ mod tests {
 
         let e2 = VtClientError::Agent(ErrKind::SessionLocked, None);
         assert_eq!(e2.to_string(), "vt: screen is locked");
+    }
+
+    // ── inject crash-recovery ───────────────────────────────────────────────
+
+    #[test]
+    fn plan_recovery_cleans_stale_when_backup_gone() {
+        // Backup already consumed (supervisor/immediate_restore renamed it) →
+        // the injection completed; only the sidecar lingers. Deadline is
+        // irrelevant on this arm.
+        assert_eq!(
+            plan_recovery(1_000, false, 500),
+            Some(RecoverAction::CleanStale)
+        );
+        assert_eq!(
+            plan_recovery(1_000, false, 999_999),
+            Some(RecoverAction::CleanStale)
+        );
+    }
+
+    #[test]
+    fn plan_recovery_restores_only_past_deadline_plus_grace() {
+        let deadline = 1_000_000;
+        // Before the deadline: an active injection — leave it for its supervisor.
+        assert_eq!(plan_recovery(deadline, true, deadline - 1), None);
+        // At the deadline but within the grace window: still hands-off, so a
+        // supervisor firing at exactly the deadline isn't raced.
+        assert_eq!(plan_recovery(deadline, true, deadline), None);
+        assert_eq!(plan_recovery(deadline, true, deadline + RECOVER_GRACE_MS - 1), None);
+        // Past deadline + grace with a surviving backup → supervisor is dead.
+        assert_eq!(
+            plan_recovery(deadline, true, deadline + RECOVER_GRACE_MS),
+            Some(RecoverAction::Restore)
+        );
+    }
+
+    #[test]
+    fn inject_sidecar_json_roundtrips() {
+        let sc = InjectSidecar {
+            target: "/abs/secret.env".into(),
+            backup: "/abs/.secret.env.vt-backup-ab".into(),
+            tmp: "/abs/.secret.env.vt-tmp-ab".into(),
+            deadline_ms: 1_723_000_000_000,
+        };
+        let bytes = serde_json::to_vec(&sc).unwrap();
+        let back: InjectSidecar = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(sc, back);
+    }
+
+    #[test]
+    fn absolutize_leaves_absolute_paths_untouched() {
+        let p = std::path::Path::new("/already/absolute");
+        assert_eq!(absolutize(p), p);
+        // A relative path becomes absolute (prefixed by some cwd).
+        assert!(absolutize(std::path::Path::new("rel/x")).is_absolute());
     }
 }

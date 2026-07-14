@@ -145,6 +145,50 @@ group/other-readable file logs a `chmod 600` warning since it holds secrets. See
 `config.example.toml` for the template. (The previous JSON file
 `~/.config/vt/cf_config.json` was removed; this TOML fallback replaces it.)
 
+### Agent auth cache (opt-in)
+
+`vt ssh agent` can cache a successful Touch ID / FIDO2 / password decision so
+repeat `sign` / `decrypt@vt` requests within a TTL skip the prompt. Both caches
+default to `none` (every request prompts):
+
+| flag | default TTL | scope |
+|---|---|---|
+| `--ssh-auth-cache-mode` + `--ssh-auth-cache-duration` | 120s | SSH `sign` + `sign@vt` (`vt ssh connect`), per key fingerprint — the two share one cache |
+| `--decrypt-auth-cache-mode` + `--decrypt-auth-cache-duration` | 30s | `decrypt@vt`, per record (`SHA-256(type‖salt‖host)`); any legacy item in a batch disables caching for that batch |
+
+Modes: `per-session` keys on the terminal session leader (`getsid` + start
+time); `per-app` keys on the nearest `.app/Contents/` ancestor (all tabs of one
+terminal app share a context). Both require the caller to have a controlling
+TTY — **orchestrated callers (AI agents / CI / make) spawn TTY-less commands
+with a fresh session per call, so they can never hit these modes.** `global` is
+the escape hatch for that case: ONE shared context for the whole agent, no TTY
+requirement — the coarsest blast radius (within the TTL any socket reacher,
+including every forwarded session, rides one grant; only the TTL and the
+lock/wake/idle flushes bound it). `auth@vt` / `run@vt` NEVER cache.
+
+Expiry is tracked on **both** the monotonic and the wall clock (macOS `Instant`
+freezes during sleep — either clock passing the TTL kills the entry), grants are
+strict-TTL (no sliding refresh), and both caches are flushed on: agent `lock`,
+screen lock, wake-from-sleep (detected via clock divergence), and idle key
+clearing. All prompts are serialized through a global one-permit semaphore so a
+hostile peer cannot stack dialogs; cached paths **re-check the cache after the
+queue wait** (grants land while the permit is still held), so an N-request
+burst for the same key/records costs one Touch ID, and the waiters resolve as
+silent cache hits.
+
+When audit push is configured (`--audit-url`/`--audit-key`), every agent-side
+cache hit also triggers a **免审批 notice** on the same notification channels
+as the Worker DEK-cache hit (Pushover / Slack / Slack App / Feishu), with the
+note 「缓存命中，免 Touch ID」. Throttled Worker-side to one notice per
+(op_kind, host) per 60s — the audit table still records every hit.
+
+**Forwarded-agent hazard (deliberate tradeoff, off by default):** the cache
+context is derived from the *local* peer process. Requests arriving over a
+forwarded socket (`ssh -A`, incl. ControlMaster-multiplexed sessions) all
+resolve to the local `ssh` process's terminal session, so within the TTL a
+process on the remote host can sign / fetch cached-record DEKs silently. Keep
+`none` when forwarding to hosts you don't fully trust.
+
 ### Agent audit push (opt-in)
 
 `vt ssh agent` can push one audit record per Touch ID decision (encrypt@vt /
@@ -233,7 +277,7 @@ Properties of the supervisor:
 - **Signal dispositions installed in the subcommand body, not `pre_exec`.** Rust's runtime resets signals between `execve` and our entry point; installing `SIG_IGN` for HUP/INT/TERM/PIPE/QUIT *after* runtime init and *before* the double-fork is the only way to make them survive into the grandchild. Verified via `/proc/$pid/status` `SigIgn` mask.
 - **Double-fork inside the subcommand body** orphans the sleeper to init (`PPID = 1`). The supervisor is invisible to user-cmd's process tree and `waitpid(-1)` loops.
 - **Stdio attached to `/dev/null`** so output never leaks back to the user's terminal.
-- **SIGKILL is the only kill that lands.** SIGSTOP would pause but not terminate. Everything else is ignored. Reboot or `kill -9` is out of vt's reach; the file is left plaintext on disk with an orphaned `.vt-backup-*` next to it (no automatic crash-recovery yet — see "Known gaps" below).
+- **SIGKILL is the only kill that lands.** SIGSTOP would pause but not terminate. Everything else is ignored. Reboot or `kill -9` is out of the supervisor's reach; the file is left plaintext on disk with an orphaned `.vt-backup-*` sibling — recoverable via the crash-recovery sidecar + `vt inject --recover` (see "Crash recovery" below).
 
 Other properties:
 
@@ -243,10 +287,28 @@ Other properties:
 - **Symlinks refused.** `O_NOFOLLOW` on the original `-r` file and on every backup/temp create means a squatted symlink can't redirect the write.
 - **Path agnostic.** Same routing as the other CLI verbs — tries SSH agent first when `VT_AUTH` is set, falls back to the CF passkey ceremony.
 
+**Crash recovery.** When the supervisor is armed, a sidecar JSON
+(`~/.local/state/vt/inject/<rand>.json`, mode 0600, carrying only
+`{target, backup, tmp, deadline_ms}` — no secret) is written *before any
+plaintext hits disk*. It is deleted on every normal restore path (parent's
+immediate-restore and the supervisor's post-timeout restore). If the machine
+reboots or the supervisor is SIGKILLed mid-sleep, the sidecar survives:
+`vt inject --recover` (run at login/boot — no `VT_AUTH` needed, it only moves
+the ciphertext backup back) sweeps the dir and restores any entry whose backup
+still exists and whose window has elapsed (past `deadline_ms + 5s` grace, so a
+still-sleeping supervisor is never raced). The pure decision is
+`plan_recovery` in `src/client.rs` (unit-tested); a not-yet-elapsed entry is
+reported as "still active" and left for its supervisor.
+
 Known gaps:
 
-- **No crash-recovery on reboot.** If the system reboots while the supervisor is sleeping, the supervisor dies and never restores. Plaintext stays at `target`, ciphertext sits at the orphaned `.{name}.vt-backup-*` sibling. Manual recovery is `mv .{name}.vt-backup-* target`. A future on-boot sweep (sidecar state files + `vt inject --recover`) is deferred.
+- **Reboot inside a long window.** `--recover` restores only past-deadline
+  entries, so plaintext exposed under a long `--timeout` stays exposed until
+  the window elapses; re-running `--recover` after that restores it. (Strictly
+  better than the previous "no recovery at all" — the sidecar guarantees the
+  exposure is discoverable.)
 - **Snapshot / backup leakage.** If Time Machine, ZFS snapshots, restic, etc., run while the plaintext is exposed, the snapshot retains plaintext indefinitely even after the supervisor restores. Out of scope.
+- **No master-key rotation.** `master_key == mac_key` is a deliberate unified-vault invariant, so revoking a Passkey or rotating `CACHE_SECKEY` does not re-key stored records: a leaked master leaves every past/future `vt://` decryptable. Accepted for now; a break-glass `vt rotate-master` (re-wrap under all Passkeys + re-encrypt every record) is not implemented.
 
 ## vt hook — transparent secrets for AI coding agents
 

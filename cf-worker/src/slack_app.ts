@@ -280,10 +280,11 @@ export async function sendCacheHitNotice(
   cfg: SlackAppConfig,
   meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd'>,
   salts: number,
+  note?: string,
 ): Promise<string> {
   // Reuse the shared cache-hit builder so the title + lines never drift from the
   // Pushover/Slack/Feishu text.
-  const { title, lines } = buildCacheHitLines(meta, salts);
+  const { title, lines } = buildCacheHitLines(meta, salts, note);
   const res = await apiCall('chat.postMessage', {
     channel: cfg.channel,
     text: title,

@@ -48,6 +48,33 @@ jobs:
           cargo check --locked
           cargo check --locked --target x86_64-unknown-linux-gnu
 
+  # The cf-worker is half the system (it verifies every ceremony) but ships via
+  # `wrangler deploy` with no compile gate of its own. Type-check it on every PR
+  # so a TS error in the DO / WebAuthn / Access path can't reach production.
+  worker:
+    name: cf-worker (typecheck + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cf-worker/package-lock.json
+
+      - name: Install deps
+        working-directory: cf-worker
+        run: npm ci
+
+      - name: Type-check (tsc --noEmit)
+        working-directory: cf-worker
+        run: npx tsc --noEmit
+
+      - name: Unit tests (vitest)
+        working-directory: cf-worker
+        run: npm test
+
   # The shipping artifact is a musl-static binary (see justfile `build-musl`).
   # Build it in CI so musl-specific link regressions (the ring/CRT segfault the
   # justfile warns about) surface on PRs, not at release time.

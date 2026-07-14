@@ -33,6 +33,14 @@ fn screen_state_now() -> SessionState {
     classify_session(cgsession::fetch_flags())
 }
 
+/// True when the GUI session can present an auth dialog right now (on
+/// console, login done, screen unlocked). Used by the SSH agent's cache
+/// watcher to flush standing grants when the screen locks. Uncached — the
+/// watcher polls on a multi-second tick, so no TTL cache is needed.
+pub fn session_interactive_now() -> bool {
+    matches!(screen_state_now(), SessionState::Interactive)
+}
+
 fn screen_state_cached() -> SessionState {
     static CACHE: OnceLock<Mutex<Option<(Instant, SessionState)>>> = OnceLock::new();
     let mu = CACHE.get_or_init(|| Mutex::new(None));

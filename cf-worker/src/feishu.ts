@@ -329,10 +329,11 @@ export async function sendCacheHitNotice(
   now: number,
   meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd'>,
   salts: number,
+  note?: string,
 ): Promise<string> {
   // Reuse the shared cache-hit builder so the card title + lines never drift
   // from the Pushover/Slack text.
-  const { title, lines } = buildCacheHitLines(meta, salts);
+  const { title, lines } = buildCacheHitLines(meta, salts, note);
   const card = {
     config: { wide_screen_mode: true },
     // plain_text (NOT lark_md): command/pwd are caller-supplied, so rendering as
