@@ -26,6 +26,13 @@ just install
 
 ## Quick Start
 
+> **Platform note.** Vault bootstrap and key storage (`init`, `secret *`,
+> `fido2 *`, `ssh agent`/`add`/`list`/`remove`/`comment`/`show`) are
+> macOS-only — they use the Keychain + Touch ID. A Linux host has no local
+> vault: it decrypts by pointing `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN` at the
+> Cloudflare Worker and approving each ceremony on a phone (see the passkey
+> deployment docs). Steps 1–2 below assume macOS.
+
 1. Initialize the vault (creates the `rusty.vault.store` keychain item):
    ```bash
    vt init
@@ -60,7 +67,11 @@ just install
 | `read <vt>` | Decrypt a vt protocol string |
 | `rewrap [--no-dry-run] [--backup] <file>...` | Re-encrypt legacy `vt://mac/...` URLs in files to the current envelope format (one Touch ID per batch) |
 | `inject [-r FILE] -- cmd...` | Transiently decrypt `vt://` in the file / env / argv, then exec the command |
+| `inject --recover` | Restore ciphertext for any file left decrypted by a crashed/rebooted supervisor (run at login/boot; no auth) |
 | `auth [--reason <text>]` | Trigger bio auth via SSH agent forwarding (for PAM/sudo) |
+| `run -- argv...` | (SSH-agent path) Ask a forwarded macOS agent to launch an allowlisted program locally after Touch ID |
+| `hook {claude,check,exec,install-shims}` | AI-agent command hook: decide/rewrite a proposed command per `~/.config/vt/agent.toml` so `vt://` env secrets decrypt on demand (see below) |
+| `fido2 {register,list,remove,remove-all}` | (macOS) Manage FIDO2/YubiKey credentials used as a Touch-ID fallback factor |
 | `secret export` | (macOS) Export the encrypted master secret |
 | `secret import` | (macOS) Import an encrypted master secret |
 | `secret rotate-passcode` | (macOS) Rotate the passcode for the master secret |
@@ -98,6 +109,9 @@ vt inject -- ./run.sh
 Options:
 - `-r, --replace-file <FILE>`: Decrypt vt:// in the file in place; restore from backup after timeout
 - `-t, --timeout <SECONDS>`: Seconds before the backup is rolled back over the decrypted original (default: 2)
+- `--recover`: Sweep `~/.local/state/vt/inject/` and restore any file a crashed
+  or rebooted restore supervisor left decrypted. Needs no auth (it only moves
+  the ciphertext backup back). Safe to run from a login/boot hook.
 
 ### SSH Agent
 

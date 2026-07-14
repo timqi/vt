@@ -127,6 +127,13 @@ enum Commands {
         only_env: Option<Vec<String>>,
 
         #[arg(
+            long,
+            conflicts_with_all = ["replace_file", "reason", "only_env", "args"],
+            help = "Restore ciphertext for any file left decrypted by a crashed or rebooted restore supervisor (sweeps the injection state dir). Run at login/boot. Needs no auth — it only moves the ciphertext backup back over the target."
+        )]
+        recover: bool,
+
+        #[arg(
             trailing_var_arg = true,
             help = "Additional arguments to pass to the spawned process"
         )]
@@ -527,8 +534,14 @@ async fn run(cli: Cli) -> Result<()> {
             timeout,
             reason,
             only_env,
+            recover,
             args,
         } => {
+            // Recovery only moves the ciphertext backup back over the target —
+            // no decryption, so no VT_AUTH required.
+            if *recover {
+                return client::inject_recover();
+            }
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(auth)?;
             client::inject(
