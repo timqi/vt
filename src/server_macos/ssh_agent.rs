@@ -1044,6 +1044,7 @@ impl VtSshAgentFactory {
 fn resolve_cache_context(
     peer_pid: Option<i32>,
     mode: AuthCacheMode,
+    peer_is_vt_relay: bool,
 ) -> Option<CacheContext> {
     if mode == AuthCacheMode::None {
         return None;
@@ -1056,12 +1057,11 @@ fn resolve_cache_context(
     // scripted/TTY-less; the remote side always is). Deliberately AHEAD of the
     // TTY gate so a relay without a controlling terminal still narrows to its
     // own connection rather than falling through to a coarse shared context.
-    // Detection is by kernel-derived argv (`is_vt_relay_invocation`); a spoofed
-    // argv only narrows the caller to its own context, never widens it.
-    if proc_info::get_proc_argv(pid)
-        .map(|argv| crate::ssh_sign::is_vt_relay_invocation(&argv))
-        .unwrap_or(false)
-    {
+    // `peer_is_vt_relay` is resolved once by the caller (kernel argv →
+    // `is_vt_relay_invocation`) and shared with the prompt origin marker, so
+    // the two can never disagree; a spoofed argv only narrows the caller to
+    // its own context, never widens it.
+    if peer_is_vt_relay {
         let start = proc_info::get_start_tvsec(pid)?;
         return Some((pid as u64, start));
     }
@@ -1118,8 +1118,17 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
         if let Some(pid) = peer_pid {
             tracing::debug!("New session from PID {}", pid);
         }
-        let sign_cache_context = resolve_cache_context(peer_pid, self.sign_cache_mode);
-        let decrypt_cache_context = resolve_cache_context(peer_pid, self.decrypt_cache_mode);
+        // One kernel-argv fetch per connection, shared by the cache narrowing
+        // and the prompt origin marker so they can never classify the peer
+        // differently.
+        let peer_is_vt_relay = peer_pid
+            .and_then(proc_info::get_proc_argv)
+            .map(|argv| crate::ssh_sign::is_vt_relay_invocation(&argv))
+            .unwrap_or(false);
+        let sign_cache_context =
+            resolve_cache_context(peer_pid, self.sign_cache_mode, peer_is_vt_relay);
+        let decrypt_cache_context =
+            resolve_cache_context(peer_pid, self.decrypt_cache_mode, peer_is_vt_relay);
         VtSshSession {
             keys: Arc::clone(&self.keys),
             last_activity: Arc::clone(&self.last_activity),
@@ -1132,6 +1141,7 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             prompt_sem: Arc::clone(&self.prompt_sem),
             audit_push: Arc::clone(&self.audit_push),
             peer_pid,
+            peer_is_vt_relay,
             sign_cache_context,
             decrypt_cache_context,
             disable_legacy_decrypt: self.disable_legacy_decrypt,
@@ -1157,6 +1167,10 @@ struct VtSshSession {
     /// Shared fire-and-forget audit push config (disabled = no-op).
     audit_push: Arc<AuditPushConfig>,
     peer_pid: Option<i32>,
+    /// Peer is a `vt ssh connect --forward-real-agent` relay (kernel-argv
+    /// check, resolved once at session creation): its requests originated on
+    /// a remote host and every prompt carries the relay-origin marker.
+    peer_is_vt_relay: bool,
     /// Resolved once at session creation. `None` = always prompt for sign.
     sign_cache_context: Option<CacheContext>,
     /// Resolved once at session creation. `None` = always prompt for decrypt.
@@ -1242,6 +1256,22 @@ fn decrypt_decision_from_authenticate(outcome: AuthOutcome) -> DecryptDecision {
 }
 
 impl VtSshSession {
+    /// Append the relay-origin marker when the peer is a
+    /// `vt ssh connect --forward-real-agent` relay — the request reached this
+    /// agent THROUGH that relay process (either a forwarded remote request or
+    /// the relay's own outbound handshake sign; the agent cannot tell the two
+    /// apart, so the wording stays neutral and does not claim "remote"). Called
+    /// right after the header so this agent-derived line precedes the
+    /// client-reported body/meta and a hostile caller cannot pad it off-screen.
+    /// Peer classification is kernel-derived and shared with the cache
+    /// narrowing; a spoofed argv only ADDS the marker to a local caller's
+    /// prompts, never removes it from a genuine relay's.
+    fn append_relay_origin(&self, message: &mut String) {
+        if self.peer_is_vt_relay {
+            message.push_str("\nvia forwarded vt relay");
+        }
+    }
+
     /// Build an `AgentAuditEntry` from the post-decision context and hand it to
     /// the fire-and-forget pusher. No-op when audit push is disabled. Holds NO
     /// cache lock; never blocks (spawn_push returns immediately).
@@ -1674,6 +1704,7 @@ impl VtSshSession {
             "on",
             &who,
         );
+        self.append_relay_origin(&mut local_auth_message);
         let body = sanitize_prompt_multiline(
             &req.command,
             PROMPT_COMMAND_MAX_LINE_LEN,
@@ -1778,6 +1809,7 @@ impl VtSshSession {
 
         let who = who_at_host(&req.meta.user, &req.host);
         let mut auth_message = header_with_who("auth", "on", &who);
+        self.append_relay_origin(&mut auth_message);
         let reason = sanitize_prompt(&req.reason, 100);
         if !reason.is_empty() {
             auth_message.push_str("\nreason: ");
@@ -2007,6 +2039,20 @@ impl VtSshSession {
         // Rich prompt from vt context (mirrors handle_decrypt formatting).
         let who = who_at_host(&req.meta.user, &req.host);
         let mut auth_message = header_with_who("ssh-sign", "for", &who);
+        self.append_relay_origin(&mut auth_message);
+        // sign@vt can name ANY agent key, so the prompt must say which one
+        // (comment, else SHA256 fingerprint — same label rule as
+        // `Session::sign`). This line is agent-derived truth (the requested
+        // key resolved against our own Keychain) and precedes the
+        // client-reported command body below; sanitize the comment like every
+        // other prompt field so a control-char/newline comment cannot inject
+        // fake lines.
+        auth_message.push_str("\nkey: ");
+        if privkey.comment().is_empty() {
+            auth_message.push_str(&fp_str);
+        } else {
+            auth_message.push_str(&sanitize_prompt(privkey.comment(), 80));
+        }
         let body = sanitize_prompt_multiline(
             &req.command,
             PROMPT_COMMAND_MAX_LINE_LEN,
@@ -3058,13 +3104,13 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         // works regardless of whether the runner has a controlling terminal.
         let me = std::process::id() as i32;
         assert_eq!(
-            resolve_cache_context(Some(me), AuthCacheMode::Global),
+            resolve_cache_context(Some(me), AuthCacheMode::Global, false),
             Some((0, 0))
         );
         // No peer PID → still uncacheable even in global mode.
-        assert_eq!(resolve_cache_context(None, AuthCacheMode::Global), None);
+        assert_eq!(resolve_cache_context(None, AuthCacheMode::Global, false), None);
         // None mode never caches.
-        assert_eq!(resolve_cache_context(Some(me), AuthCacheMode::None), None);
+        assert_eq!(resolve_cache_context(Some(me), AuthCacheMode::None, false), None);
     }
 
     // (Strict-TTL idempotence and expired-entry replacement are covered

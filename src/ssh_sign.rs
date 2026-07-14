@@ -635,16 +635,22 @@ enum ExtensionRoute {
     Refuse,
 }
 
-/// decrypt@vt / auth@vt are Touch-ID-gated upstream; encrypt@vt is
-/// unauthenticated by design (same as running it locally). run@vt is REFUSED —
-/// it spawns processes on the local machine and must never be reachable over a
-/// forwarded socket; this is the deliberate narrowing vs a raw `ssh -A` of the
-/// real agent. sign@vt (would expose ALL local keys) and anything unknown
-/// (incl. session-bind@openssh.com) are refused too.
+/// decrypt@vt / auth@vt / sign@vt are Touch-ID-gated upstream; encrypt@vt is
+/// unauthenticated by design (same as running it locally). sign@vt is relayed
+/// so a nested remote `vt ssh connect` signs with the Mac-held key instead of
+/// falling back to decrypt-then-sign (which lands the raw seed in remote
+/// process memory — relaying keeps the private key on the Mac and only the
+/// signature crosses). sign@vt can name ANY upstream agent key and the relay
+/// cannot filter by key (the payload is opaque), so the upstream prompt names
+/// the requested key and marks the relay origin, and its cache grants are
+/// narrowed to this connection. run@vt is REFUSED — it spawns processes on the
+/// local machine and must never be reachable over a forwarded socket; this is
+/// the deliberate narrowing vs a raw `ssh -A` of the real agent. Anything
+/// unknown (incl. session-bind@openssh.com) is refused too.
 #[cfg(unix)]
 fn route_extension(name: &str) -> ExtensionRoute {
     match name {
-        "decrypt@vt" | "encrypt@vt" | "auth@vt" => ExtensionRoute::Relay,
+        "decrypt@vt" | "encrypt@vt" | "auth@vt" | "sign@vt" => ExtensionRoute::Relay,
         _ => ExtensionRoute::Refuse,
     }
 }
@@ -1168,10 +1174,12 @@ mod tests {
 
     // ── --forward-real-agent relay op-filter ─────────────────────────────────
 
-    // Only the three phone-ceremony-equivalent vt ops may cross the relay.
+    // The vt ops that are Touch-ID-gated (or unauthenticated by design)
+    // upstream may cross the relay; sign@vt relays so a nested remote
+    // `vt ssh connect` never needs the decrypt-then-sign fallback.
     #[test]
-    fn relay_filter_allows_decrypt_encrypt_auth() {
-        for name in ["decrypt@vt", "encrypt@vt", "auth@vt"] {
+    fn relay_filter_allows_decrypt_encrypt_auth_sign() {
+        for name in ["decrypt@vt", "encrypt@vt", "auth@vt", "sign@vt"] {
             assert_eq!(
                 super::route_extension(name),
                 super::ExtensionRoute::Relay,
@@ -1186,13 +1194,12 @@ mod tests {
         assert_eq!(super::route_extension("run@vt"), super::ExtensionRoute::Refuse);
     }
 
-    // Unknown / out-of-scope extensions are refused: sign@vt (all local keys),
-    // OpenSSH's own session-bind, and arbitrary names. Also guards against
-    // prefix/suffix confusion — the match must be exact.
+    // Unknown / out-of-scope extensions are refused: OpenSSH's own
+    // session-bind and arbitrary names. Also guards against prefix/suffix
+    // confusion — the match must be exact.
     #[test]
     fn relay_filter_refuses_unknown_and_near_misses() {
         for name in [
-            "sign@vt",
             "session-bind@openssh.com",
             "query",
             "",

@@ -331,10 +331,21 @@ requests.
 
 | extension | route | why |
 |---|---|---|
-| `decrypt@vt`, `auth@vt` | relay | Touch-ID-gated on the upstream agent per request |
+| `decrypt@vt`, `auth@vt`, `sign@vt` | relay | Touch-ID-gated on the upstream agent per request; the sign@vt prompt names the requested key (agent-derived) and carries the relay-origin marker |
 | `encrypt@vt` | relay | unauthenticated by design (same as running it locally) |
 | `run@vt` | **refuse** | spawns processes on the local machine — never over a forwarded socket |
-| `sign@vt`, `session-bind@openssh.com`, anything else | refuse | `sign@vt` would expose ALL local keys; unknown ops stay unsupported (pre-flag behavior) |
+| `session-bind@openssh.com`, anything else | refuse | unknown ops stay unsupported (pre-flag behavior) |
+
+`sign@vt` was originally refused ("would expose ALL local keys"). Relaying it
+is the better trade: the refusal pushed a nested remote `vt ssh connect` (git
+on the remote host) into the decrypt-then-sign fallback, which decrypts the
+git key's raw Ed25519 seed INTO REMOTE PROCESS MEMORY after one approval —
+strictly worse than signing on the Mac, where the private key never leaves
+the agent and only signatures cross. The "all local keys" exposure is real
+(the relay cannot filter by key — the payload is opaque) and is mitigated
+upstream instead: every relayed sign is Touch-ID-gated, the prompt shows the
+agent-derived key label plus a `via forwarded vt relay` origin marker, and
+sign-cache grants (opt-in, default `none`) are narrowed to this connection.
 
 Refusals and an unreachable upstream socket both answer `SSH_AGENT_FAILURE`;
 the remote CLI treats that as recoverable and falls back to the passkey
@@ -387,6 +398,21 @@ sysctl fetch and the wiring are macOS-only.
   policy — and that cache is narrowed to this connection (see above), so a
   remote host rides only its own connection's grants within the TTL, never
   those of local tabs or other remote hosts.
+- `sign@vt`: the remote can request a signature with ANY key held by the Mac
+  agent — not just the advertised git identity — and the relay cannot narrow
+  that (opaque payload). Each request is Touch-ID-gated; the prompt's `key:`
+  line is agent-derived truth (comment, else SHA256 fingerprint) while
+  host/command are client-reported, and relayed prompts carry the
+  `via forwarded vt relay` marker. Sign-cache grants (opt-in, default `none`)
+  are per-connection: within the TTL the remote can silently re-sign with a
+  fingerprint approved on that same connection — the same residual class as
+  the decrypt cache. In exchange, when the Mac agent HOLDS the requested key,
+  the nested-`vt ssh connect` git flow signs on the Mac instead of decrypting
+  the raw key seed onto the remote host. If the agent does NOT hold the key
+  (e.g. the portable `git-ssh` identity is only a `vt://` record, not enrolled
+  in the Keychain), `sign@vt` misses and `decide_sign_route` still falls back
+  to decrypt-then-sign — the seed lands on the remote as before. The win is
+  conditional on the key living in the agent.
 - `encrypt@vt`: unauthenticated by design — a remote can mint new `vt://`
   records; it could already do that via the worker path.
 - `run@vt`: blocked at the relay. This is the deliberate narrowing vs raw

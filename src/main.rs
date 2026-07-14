@@ -304,7 +304,7 @@ pub enum SshCommands {
         #[arg(
             long = "forward-real-agent",
             default_value_t = false,
-            help = "Forward the ephemeral agent to the remote (agent forwarding) and relay decrypt@vt / encrypt@vt / auth@vt to the UPSTREAM real vt agent; run@vt and every other extension are refused. Lets `vt read` / `vt inject` on the remote use this host's Touch ID instead of paging the phone. Must precede the ssh arguments."
+            help = "Forward the ephemeral agent to the remote (agent forwarding) and relay decrypt@vt / encrypt@vt / auth@vt / sign@vt to the UPSTREAM real vt agent; run@vt and every other extension are refused. Lets `vt read` / `vt inject` / a nested `vt ssh connect` on the remote use this host's Touch ID instead of paging the phone. Must precede the ssh arguments."
         )]
         forward_real_agent: bool,
         #[arg(

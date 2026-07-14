@@ -321,9 +321,17 @@ and the child ssh is pinned with `-o ForwardAgent=<ephemeral sock>` (OpenSSH ≥
 real agent unfiltered). Filter (`route_extension` in `src/ssh_sign.rs`, pure +
 unit-tested, matched on the cleartext extension name — the payload stays an
 opaque AES-GCM(VT_AUTH) blob; the relay holds no VT_AUTH):
-`decrypt@vt`/`encrypt@vt`/`auth@vt` → relayed verbatim (fresh upstream
-connection per request); `run@vt`, `sign@vt`, and everything else → refused
-with `SSH_AGENT_FAILURE` (remote falls back to the passkey ceremony). This is
+`decrypt@vt`/`encrypt@vt`/`auth@vt`/`sign@vt` → relayed verbatim (fresh
+upstream connection per request); `run@vt` and everything else → refused
+with `SSH_AGENT_FAILURE` (remote falls back to the passkey ceremony).
+`sign@vt` relays (it was originally refused) so a nested remote
+`vt ssh connect` (git on the remote) signs with the Mac-held key instead of
+falling back to decrypt-then-sign, which landed the raw git-key seed in
+remote process memory. It can name ANY upstream agent key and the relay
+cannot filter by key, so the mitigation lives upstream: per-op Touch ID whose
+prompt shows the agent-derived `key:` label (comment, else fingerprint) and a
+`via forwarded vt relay` origin marker (all relayed-op prompts carry it), and
+per-connection sign-cache narrowing (below). This is
 the deliberate narrowing vs raw `ssh -A` of the real agent; residual risk is
 the same as any agent forwarding — while the connection is up, any process on
 the remote can trigger relayed (Touch-ID-gated) requests. The upstream agent's
