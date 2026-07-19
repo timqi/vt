@@ -220,7 +220,16 @@ instead alias: `alias gh='vt hook exec -- gh'`.)
   segment sees them. Quotes, backslash escapes, and `(`/`$(` nesting are
   respected (so `--title "a && b"` and `2>&1` don't mis-split). Remaining blind
   spots: a target **inside** `$(…)`, backticks, or a `(subshell)`, and a
-  background `cmd &` tail, are not separately analyzed.
+  background `cmd &` tail, are not separately analyzed. These are an **accepted
+  tradeoff** — closing them would require a full shell parser for a layer whose
+  block rules only guard against *accidental* leaks (the hook is not a sandbox).
+  Where enforcement matters, rely on the **PATH shims**: they intercept at exec
+  time with a clean argv, so a target reached via `$(…)`, a subshell, `bash -c`,
+  or a script still hits its shim regardless of shell nesting. Shim residual
+  gaps are only absolute-path invocations (`/usr/bin/gh`) and a PATH that
+  doesn't put the shim dir first. In short: PreToolUse segmentation is the
+  best-effort convenience layer (env injection + friendly denies); shims are
+  the block backstop.
 - **`bash -c "…"` is opaque.** If the agent runs `bash -c "OPENAI_API_KEY=vt://… python x"`,
   the hook sees `bash`, not `python`, and the inline assignment is not a process
   env var — so it won't match a `python` rule. Instruct the agent to invoke
