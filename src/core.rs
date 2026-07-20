@@ -333,12 +333,105 @@ pub struct DiagCacheReport {
     /// Currently-valid grants for THIS connection's context only (0 when the
     /// connection is uncacheable) — never a global count.
     pub live_entries: usize,
-    /// Whether this connection resolved a cache context at all.
-    pub cacheable: bool,
     /// Stable wire tag naming WHY the context resolved the way it did
-    /// (`ContextBasis::as_wire` on the agent); the CLI maps it to a human
-    /// sentence and passes unknown tags through verbatim.
+    /// ([`ContextBasis::as_wire`] on the agent); the CLI maps it back via
+    /// [`ContextBasis::from_wire`] and passes unknown tags through verbatim
+    /// (client/agent version skew degrades to an "unknown basis" line).
     pub context_basis: String,
+}
+
+/// Which rule of the agent's cache-context classifier decided the outcome.
+/// Lives here (not in the macOS-only agent module) so the agent's wire tags
+/// and the CLI's human explanations are one compile-checked mapping — adding
+/// a variant forces both [`Self::as_wire`] and [`Self::human`] arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextBasis {
+    /// Caching disabled (`--…-cache-mode none`).
+    ModeNone,
+    /// Peer PID unavailable → uncacheable.
+    NoPeerPid,
+    /// Peer is a `vt ssh connect --forward-real-agent` relay: per-connection.
+    VtRelay,
+    /// per-session/per-app TTY gate: peer has no controlling terminal.
+    NoTty,
+    /// Peer is an OpenSSH client: narrowed to that ssh process.
+    SshClient,
+    /// per-session: anchored on the terminal session leader.
+    SessionLeader,
+    /// per-app: anchored on the `.app` bundle ancestor.
+    AppAncestor,
+    /// per-app: no `.app` ancestor (tmux, ssh login session) → uncacheable.
+    NoAppAncestor,
+    /// global: the shared `(0, 0)` context.
+    Global,
+    /// A proc-info lookup (`get_start_tvsec` / `get_sid`) failed → uncacheable.
+    ProcLookupFailed,
+}
+
+impl ContextBasis {
+    /// Stable wire tag — a protocol surface; renaming a variant must not
+    /// change its tag.
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            ContextBasis::ModeNone => "mode-none",
+            ContextBasis::NoPeerPid => "no-peer-pid",
+            ContextBasis::VtRelay => "vt-relay",
+            ContextBasis::NoTty => "no-tty",
+            ContextBasis::SshClient => "ssh-client",
+            ContextBasis::SessionLeader => "session-leader",
+            ContextBasis::AppAncestor => "app-ancestor",
+            ContextBasis::NoAppAncestor => "no-app-ancestor",
+            ContextBasis::Global => "global",
+            ContextBasis::ProcLookupFailed => "proc-lookup-failed",
+        }
+    }
+
+    /// Inverse of [`Self::as_wire`]; `None` for a tag this client doesn't
+    /// know (a newer agent).
+    pub fn from_wire(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "mode-none" => ContextBasis::ModeNone,
+            "no-peer-pid" => ContextBasis::NoPeerPid,
+            "vt-relay" => ContextBasis::VtRelay,
+            "no-tty" => ContextBasis::NoTty,
+            "ssh-client" => ContextBasis::SshClient,
+            "session-leader" => ContextBasis::SessionLeader,
+            "app-ancestor" => ContextBasis::AppAncestor,
+            "no-app-ancestor" => ContextBasis::NoAppAncestor,
+            "global" => ContextBasis::Global,
+            "proc-lookup-failed" => ContextBasis::ProcLookupFailed,
+            _ => return None,
+        })
+    }
+
+    /// Operator-facing explanation shown by `vt doctor`.
+    pub fn human(&self) -> &'static str {
+        match self {
+            ContextBasis::ModeNone => "caching disabled (cache mode 'none', the default)",
+            ContextBasis::NoPeerPid => "agent could not identify the peer process",
+            ContextBasis::VtRelay => {
+                "narrowed to this relay connection (grants die with it; other \
+                 connections never share them)"
+            }
+            ContextBasis::NoTty => {
+                "no controlling TTY — per-session/per-app never cache for \
+                 orchestrated callers (CI / AI agents); use cache mode 'global'"
+            }
+            ContextBasis::SshClient => {
+                "peer is an ssh process: narrowed to this ssh connection. \
+                 One-shot ssh/git spawns never share grants; use ssh \
+                 ControlMaster to share within the TTL"
+            }
+            ContextBasis::SessionLeader => "cacheable within this terminal session",
+            ContextBasis::AppAncestor => "cacheable within this .app bundle",
+            ContextBasis::NoAppAncestor => {
+                "no .app ancestor (tmux / ssh login session) — per-app cannot \
+                 cache here"
+            }
+            ContextBasis::Global => "cacheable across ALL local callers (shared global context)",
+            ContextBasis::ProcLookupFailed => "process info lookup failed",
+        }
+    }
 }
 
 /// How the agent sees the connecting peer process.
@@ -662,6 +755,32 @@ mod tests {
         let mac_key = [0x42u8; 32];
         let salt = [0x11u8; SALT_LEN];
         derive_dek(&mac_key, &salt)
+    }
+
+    #[test]
+    fn context_basis_wire_round_trip_and_human_are_total() {
+        // Compile-time exhaustiveness lives in the match arms; this pins the
+        // wire tags (a protocol surface) and the from_wire inverse.
+        const ALL: [ContextBasis; 10] = [
+            ContextBasis::ModeNone,
+            ContextBasis::NoPeerPid,
+            ContextBasis::VtRelay,
+            ContextBasis::NoTty,
+            ContextBasis::SshClient,
+            ContextBasis::SessionLeader,
+            ContextBasis::AppAncestor,
+            ContextBasis::NoAppAncestor,
+            ContextBasis::Global,
+            ContextBasis::ProcLookupFailed,
+        ];
+        for b in ALL {
+            assert_eq!(ContextBasis::from_wire(b.as_wire()), Some(b));
+            assert!(!b.human().is_empty());
+        }
+        assert_eq!(ContextBasis::from_wire("future-tag"), None);
+        assert_eq!(ContextBasis::ModeNone.as_wire(), "mode-none");
+        assert_eq!(ContextBasis::VtRelay.as_wire(), "vt-relay");
+        assert_eq!(ContextBasis::SshClient.as_wire(), "ssh-client");
     }
 
     #[test]

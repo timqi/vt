@@ -53,8 +53,8 @@ pub struct DiagCacheReport {
     pub mode: String,                     // none|per-session|per-app|global
     pub ttl_secs: u64,
     pub live_entries: usize,              // unexpired entries right now
-    pub cacheable: bool,                  // this connection resolved a context
-    pub context_basis: String,            // see §3.2
+    pub context_basis: String,            // see §3.2 (cacheability is implied
+                                          // by the basis; no separate bool)
 }
 
 pub struct DiagPeerReport {
@@ -92,7 +92,11 @@ To explain *why* a context resolved the way it did without duplicating the
 logic (divergence risk), the function is refactored to return
 
 ```rust
-struct ContextResolution { context: Option<CacheContext>, basis: ContextBasis }
+// mode rides in the resolution (not as parallel session fields) so a
+// sign/decrypt pairing mix-up in diag reporting is unrepresentable; the
+// ContextBasis enum lives in core.rs so the agent's wire tags and the CLI's
+// human sentences are one compile-checked mapping.
+struct ContextResolution { mode: AuthCacheMode, context: Option<CacheContext>, basis: ContextBasis }
 
 enum ContextBasis {
     ModeNone,        // caching disabled for this op
