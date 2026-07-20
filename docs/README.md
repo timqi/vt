@@ -20,6 +20,7 @@ and update the relevant document in the same change.
 | Use SSH identities | [`README.md` — portable identity](../README.md#portable-ssh-identity-for-git-vt) | `src/ssh_sign.rs`, `src/client.rs` |
 | Understand extension errors | [`structured-errors.md`](structured-errors.md) | `src/core/wire.rs`, `src/client.rs` |
 | Enable agent audit push | [`agent-audit.md`](agent-audit.md) | `src/audit.rs`, `src/server_macos/audit.rs` |
+| Diagnose config/routing/caching (`vt doctor`) | [`diag-design.md`](diag-design.md) | `src/client.rs` (`doctor`), `src/server_macos/ssh_agent.rs` (`handle_diag`) |
 | Configure Slack App notifications | [`slack-app.md`](slack-app.md) | `cf-worker/src/slack_app.ts` |
 | Configure Feishu/Lark notifications | [`feishu.md`](feishu.md) | `cf-worker/src/feishu.ts` |
 
