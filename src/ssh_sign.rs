@@ -643,14 +643,17 @@ enum ExtensionRoute {
 /// signature crosses). sign@vt can name ANY upstream agent key and the relay
 /// cannot filter by key (the payload is opaque), so the upstream prompt names
 /// the requested key and marks the relay origin, and its cache grants are
-/// narrowed to this connection. run@vt is REFUSED — it spawns processes on the
+/// narrowed to this connection. diag@vt is relayed so a remote `vt doctor`
+/// can ask the upstream agent how it classifies this relay connection —
+/// read-only, no Touch ID, and it deliberately does not touch the upstream
+/// idle clock. run@vt is REFUSED — it spawns processes on the
 /// local machine and must never be reachable over a forwarded socket; this is
 /// the deliberate narrowing vs a raw `ssh -A` of the real agent. Anything
 /// unknown (incl. session-bind@openssh.com) is refused too.
 #[cfg(unix)]
 fn route_extension(name: &str) -> ExtensionRoute {
     match name {
-        "decrypt@vt" | "encrypt@vt" | "auth@vt" | "sign@vt" => ExtensionRoute::Relay,
+        "decrypt@vt" | "encrypt@vt" | "auth@vt" | "sign@vt" | "diag@vt" => ExtensionRoute::Relay,
         _ => ExtensionRoute::Refuse,
     }
 }
@@ -1176,10 +1179,11 @@ mod tests {
 
     // The vt ops that are Touch-ID-gated (or unauthenticated by design)
     // upstream may cross the relay; sign@vt relays so a nested remote
-    // `vt ssh connect` never needs the decrypt-then-sign fallback.
+    // `vt ssh connect` never needs the decrypt-then-sign fallback; diag@vt
+    // relays so a remote `vt doctor` can diagnose cache behavior.
     #[test]
-    fn relay_filter_allows_decrypt_encrypt_auth_sign() {
-        for name in ["decrypt@vt", "encrypt@vt", "auth@vt", "sign@vt"] {
+    fn relay_filter_allows_decrypt_encrypt_auth_sign_diag() {
+        for name in ["decrypt@vt", "encrypt@vt", "auth@vt", "sign@vt", "diag@vt"] {
             assert_eq!(
                 super::route_extension(name),
                 super::ExtensionRoute::Relay,

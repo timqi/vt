@@ -87,6 +87,10 @@ struct Cli {
 enum Commands {
     /// Show version information
     Version,
+    /// Diagnose config sources, transport routing, and agent cache behavior.
+    /// Read-only: asks a reachable vt agent (via diag@vt) how it classifies
+    /// this connection and why it is or isn't cacheable
+    Doctor,
     /// Will read plain text and output encrypted message for you
     Create,
     /// Decrypt an existing vt protocol as plaintext
@@ -304,7 +308,7 @@ pub enum SshCommands {
         #[arg(
             long = "forward-real-agent",
             default_value_t = false,
-            help = "Forward the ephemeral agent to the remote (agent forwarding) and relay decrypt@vt / encrypt@vt / auth@vt / sign@vt to the UPSTREAM real vt agent; run@vt and every other extension are refused. Lets `vt read` / `vt inject` / a nested `vt ssh connect` on the remote use this host's Touch ID instead of paging the phone. Must precede the ssh arguments."
+            help = "Forward the ephemeral agent to the remote (agent forwarding) and relay decrypt@vt / encrypt@vt / auth@vt / sign@vt / diag@vt to the UPSTREAM real vt agent; run@vt and every other extension are refused. Lets `vt read` / `vt inject` / a nested `vt ssh connect` on the remote use this host's Touch ID instead of paging the phone. Must precede the ssh arguments."
         )]
         forward_real_agent: bool,
         #[arg(
@@ -417,12 +421,16 @@ pub enum SshCommands {
     },
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
     match &cli.command {
         Commands::Version => {
             println!("vt {}", env!("VT_VERSION"));
             println!("commit {} ({})", env!("VT_GIT_SHA"), env!("VT_COMMIT_DATE"));
             return Ok(());
+        }
+        Commands::Doctor => {
+            let auth = require_auth(&cli.auth)?;
+            return client::doctor(&auth, &file_populated_keys).await;
         }
         #[cfg(target_os = "macos")]
         Commands::Init => server_macos::admin::init(),
@@ -650,7 +658,7 @@ fn main() {
     // ~/.config/vt/config.toml (override path via $VT_CONFIG). Env vars always
     // win. Must run before Cli::parse() (clap reads VT_AUTH from env) and while
     // still single-threaded (before the tokio runtime is built).
-    config::hydrate_env_from_file();
+    let file_populated_keys = config::hydrate_env_from_file();
 
     let cli = Cli::parse();
 
@@ -658,7 +666,7 @@ fn main() {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    if let Err(e) = rt.block_on(run(cli)) {
+    if let Err(e) = rt.block_on(run(cli, file_populated_keys)) {
         // Walk the error chain to find a `VtClientError`. The agent's
         // structured `ErrKind` maps to a stable exit code; transport
         // failures and any other error chain default to exit 1.

@@ -62,9 +62,13 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   requires a fresh approval. Never expose it through the phone-only backend or
   the `--forward-real-agent` relay.
 - `vt ssh connect --forward-real-agent` is opt-in. Its relay filter permits only
-  `encrypt@vt`, `decrypt@vt`, `auth@vt`, and `sign@vt`; it refuses `run@vt` and
+  `encrypt@vt`, `decrypt@vt`, `auth@vt`, `sign@vt`, and the read-only
+  `diag@vt`; it refuses `run@vt` and
   unknown extensions. The relay holds no `VT_AUTH`; authentication remains
   between the remote client and the upstream agent.
+- `diag@vt` is read-only and requires no Touch ID; it must never reset the
+  agent's idle-activity clock (a polling loop must not keep grants alive), and
+  its `live_entries` stays scoped to the caller's own cache context.
 - `vt inject -r` decrypts a file briefly and starts a self-exec'd restore
   supervisor. Keep the supervisor path before Tokio/clap initialization and
   keep `--recover` limited to restoring ciphertext backups.

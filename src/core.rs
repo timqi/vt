@@ -302,6 +302,56 @@ pub struct SignRes {
     pub signature: Vec<u8>,
 }
 
+/// Request: client → agent for `diag@vt` (read-only diagnostics; no Touch ID,
+/// never cached, not audit-pushed). Empty in v1; reserved for future filters.
+/// See `docs/diag-design.md`.
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+pub struct DiagReq {}
+
+/// Response for `diag@vt`: how the agent is configured and how it classifies
+/// THIS connection for caching purposes. Discloses no secret, no cache keys,
+/// and nothing about other sessions (`live_entries` is scoped to the caller's
+/// own resolved context).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DiagRes {
+    pub agent_version: String,
+    pub sign_cache: DiagCacheReport,
+    pub decrypt_cache: DiagCacheReport,
+    pub peer: DiagPeerReport,
+    /// Number of `run@vt` allowlist entries; 0 = run@vt disabled.
+    pub run_allow_len: usize,
+    /// Whether fire-and-forget audit push is enabled on the agent.
+    pub audit_push: bool,
+}
+
+/// Per-cache diagnostic report (one for sign, one for decrypt).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DiagCacheReport {
+    /// none | per-session | per-app | global
+    pub mode: String,
+    pub ttl_secs: u64,
+    /// Currently-valid grants for THIS connection's context only (0 when the
+    /// connection is uncacheable) — never a global count.
+    pub live_entries: usize,
+    /// Whether this connection resolved a cache context at all.
+    pub cacheable: bool,
+    /// Stable wire tag naming WHY the context resolved the way it did
+    /// (`ContextBasis::as_wire` on the agent); the CLI maps it to a human
+    /// sentence and passes unknown tags through verbatim.
+    pub context_basis: String,
+}
+
+/// How the agent sees the connecting peer process.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DiagPeerReport {
+    pub pid: Option<i32>,
+    /// Basename of the peer executable (never the full path).
+    pub exe: Option<String>,
+    pub has_tty: bool,
+    pub is_ssh_client: bool,
+    pub is_vt_relay: bool,
+}
+
 // ---- v2 URL parsing ---------------------------------------------------------
 
 /// Parsed `vt://...` URL. Strict parser (no `url::Url`, no normalization).

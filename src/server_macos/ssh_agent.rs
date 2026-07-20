@@ -23,8 +23,9 @@ use crate::core::wire::{
     outcome_to_err_strict, wrap_ok_envelope, ErrKind, WIRE_VERSION,
 };
 use crate::core::{
-    legacy_decrypt, AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, EncryptReq,
-    EncryptResItem, RunReq, RunRes, SignReq, SignRes, SALT_LEN,
+    legacy_decrypt, AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, DiagCacheReport,
+    DiagPeerReport, DiagReq, DiagRes, EncryptReq, EncryptResItem, RunReq, RunRes, SignReq,
+    SignRes, SALT_LEN,
 };
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
@@ -38,6 +39,7 @@ pub const EXT_DECRYPT: &str = "decrypt@vt";
 pub const EXT_AUTH: &str = "auth@vt";
 pub const EXT_RUN: &str = "run@vt";
 pub const EXT_SIGN: &str = "sign@vt";
+pub const EXT_DIAG: &str = "diag@vt";
 
 fn agent_err(e: anyhow::Error) -> AgentError {
     AgentError::Other(Box::new(std::io::Error::new(
@@ -236,6 +238,31 @@ impl AuthCache {
         let now_mono = Instant::now();
         let now_wall = SystemTime::now();
         self.entries.retain(|_, e| e.is_valid_at(now_mono, now_wall));
+    }
+
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl.as_secs()
+    }
+
+    /// Diagnostics (`diag@vt`): currently-valid entries for `context` ONLY —
+    /// same dual-clock predicate as [`is_authorized`]. Deliberately scoped to
+    /// one context so a caller (possibly a relayed remote) never learns how
+    /// many grants other sessions/tabs hold.
+    pub fn live_len(&self, context: CacheContext) -> usize {
+        self.live_len_at(context, Instant::now(), SystemTime::now())
+    }
+
+    /// Clock-injectable core of [`live_len`] (see [`is_authorized_at`]).
+    fn live_len_at(
+        &self,
+        context: CacheContext,
+        now_mono: Instant,
+        now_wall: SystemTime,
+    ) -> usize {
+        self.entries
+            .iter()
+            .filter(|((c, _), e)| *c == context && e.is_valid_at(now_mono, now_wall))
+            .count()
     }
 }
 
@@ -618,6 +645,10 @@ impl RunAllowlist {
 
     pub fn is_empty(&self) -> bool {
         self.bare_names.is_empty() && self.abs_paths.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.bare_names.len() + self.abs_paths.len()
     }
 
     /// Resolve a client-supplied argv[0] to a canonical absolute path that
@@ -1046,10 +1077,84 @@ fn resolve_cache_context(
     mode: AuthCacheMode,
     peer_is_vt_relay: bool,
 ) -> Option<CacheContext> {
-    if mode == AuthCacheMode::None {
-        return None;
+    classify_cache_context(peer_pid, mode, peer_is_vt_relay).context
+}
+
+/// A resolved cache context together with WHY it resolved that way — the
+/// `basis` feeds `diag@vt` so an operator can see which rule classified their
+/// connection without reading this file. [`resolve_cache_context`] is the
+/// `.context` projection; behavior must never depend on `basis`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextResolution {
+    pub context: Option<CacheContext>,
+    pub basis: ContextBasis,
+}
+
+/// Which branch of [`classify_cache_context`] decided the outcome. Wire tags
+/// (`as_wire`) are a stable protocol surface — renaming a variant must not
+/// change its tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextBasis {
+    /// Caching disabled (`--…-cache-mode none`).
+    ModeNone,
+    /// Peer PID unavailable → uncacheable.
+    NoPeerPid,
+    /// Peer is a `vt ssh connect --forward-real-agent` relay: per-connection.
+    VtRelay,
+    /// per-session/per-app TTY gate: peer has no controlling terminal.
+    NoTty,
+    /// Peer is an OpenSSH client: narrowed to that ssh process.
+    SshClient,
+    /// per-session: anchored on the terminal session leader.
+    SessionLeader,
+    /// per-app: anchored on the `.app` bundle ancestor.
+    AppAncestor,
+    /// per-app: no `.app` ancestor (tmux, ssh login session) → uncacheable.
+    NoAppAncestor,
+    /// global: the shared `(0, 0)` context.
+    Global,
+    /// Catch-all for the five fallible proc lookups (`get_start_tvsec` in the
+    /// vt-relay / ssh-client / session-leader / app-ancestor branches, and
+    /// `get_sid` itself) → uncacheable.
+    ProcLookupFailed,
+}
+
+impl ContextBasis {
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            ContextBasis::ModeNone => "mode-none",
+            ContextBasis::NoPeerPid => "no-peer-pid",
+            ContextBasis::VtRelay => "vt-relay",
+            ContextBasis::NoTty => "no-tty",
+            ContextBasis::SshClient => "ssh-client",
+            ContextBasis::SessionLeader => "session-leader",
+            ContextBasis::AppAncestor => "app-ancestor",
+            ContextBasis::NoAppAncestor => "no-app-ancestor",
+            ContextBasis::Global => "global",
+            ContextBasis::ProcLookupFailed => "proc-lookup-failed",
+        }
     }
-    let pid = peer_pid?;
+}
+
+/// Core of [`resolve_cache_context`], returning the basis alongside the
+/// context. No `?` early-returns: each fallible lookup assigns its basis
+/// explicitly so diag can report which branch failed. The precedence order
+/// (mode-none → peer pid → vt-relay → TTY gate → ssh narrowing → mode arm)
+/// is load-bearing and documented on [`resolve_cache_context`]; preserve it.
+fn classify_cache_context(
+    peer_pid: Option<i32>,
+    mode: AuthCacheMode,
+    peer_is_vt_relay: bool,
+) -> ContextResolution {
+    fn resolved(context: Option<CacheContext>, basis: ContextBasis) -> ContextResolution {
+        ContextResolution { context, basis }
+    }
+    if mode == AuthCacheMode::None {
+        return resolved(None, ContextBasis::ModeNone);
+    }
+    let Some(pid) = peer_pid else {
+        return resolved(None, ContextBasis::NoPeerPid);
+    };
     // vt-relay narrowing (`vt ssh connect --forward-real-agent`): when the peer
     // is the vt relay forwarding vt extensions from a remote host, give it the
     // SAME per-connection `(pid, start)` context a forwarded `ssh` gets — in
@@ -1062,8 +1167,10 @@ fn resolve_cache_context(
     // the two can never disagree; a spoofed argv only narrows the caller to
     // its own context, never widens it.
     if peer_is_vt_relay {
-        let start = proc_info::get_start_tvsec(pid)?;
-        return Some((pid as u64, start));
+        return match proc_info::get_start_tvsec(pid) {
+            Some(start) => resolved(Some((pid as u64, start)), ContextBasis::VtRelay),
+            None => resolved(None, ContextBasis::ProcLookupFailed),
+        };
     }
     // Per-session / per-app require the peer to have a controlling terminal.
     // launchd-managed daemons and other non-interactive peers always prompt
@@ -1075,30 +1182,41 @@ fn resolve_cache_context(
     if matches!(mode, AuthCacheMode::PerSession | AuthCacheMode::PerApp)
         && proc_info::get_tty_dev(pid).is_none()
     {
-        return None;
+        return resolved(None, ContextBasis::NoTty);
     }
     if proc_info::get_proc_path(pid)
         .as_deref()
         .is_some_and(is_ssh_client_path)
     {
-        let start = proc_info::get_start_tvsec(pid)?;
-        return Some((pid as u64, start));
+        return match proc_info::get_start_tvsec(pid) {
+            Some(start) => resolved(Some((pid as u64, start)), ContextBasis::SshClient),
+            None => resolved(None, ContextBasis::ProcLookupFailed),
+        };
     }
     match mode {
-        AuthCacheMode::None => None,
+        // Handled above; kept so the match stays total without a wildcard.
+        AuthCacheMode::None => resolved(None, ContextBasis::ModeNone),
         AuthCacheMode::PerSession => {
-            let sid = proc_info::get_sid(pid)?;
-            let start = proc_info::get_start_tvsec(sid)?;
-            Some((sid as u64, start))
+            let Some(sid) = proc_info::get_sid(pid) else {
+                return resolved(None, ContextBasis::ProcLookupFailed);
+            };
+            match proc_info::get_start_tvsec(sid) {
+                Some(start) => resolved(Some((sid as u64, start)), ContextBasis::SessionLeader),
+                None => resolved(None, ContextBasis::ProcLookupFailed),
+            }
         }
         AuthCacheMode::PerApp => {
-            let app_pid = proc_info::find_app_pid(pid)?;
-            let start = proc_info::get_start_tvsec(app_pid)?;
-            Some((app_pid as u64, start))
+            let Some(app_pid) = proc_info::find_app_pid(pid) else {
+                return resolved(None, ContextBasis::NoAppAncestor);
+            };
+            match proc_info::get_start_tvsec(app_pid) {
+                Some(start) => resolved(Some((app_pid as u64, start)), ContextBasis::AppAncestor),
+                None => resolved(None, ContextBasis::ProcLookupFailed),
+            }
         }
         // (0, 0) can never collide with a real context: sid/app_pid are
         // always > 0.
-        AuthCacheMode::Global => Some((0, 0)),
+        AuthCacheMode::Global => resolved(Some((0, 0)), ContextBasis::Global),
     }
 }
 
@@ -1110,6 +1228,22 @@ fn resolve_cache_context(
 /// the socket directly.
 fn is_ssh_client_path(path: &str) -> bool {
     path.rsplit('/').next() == Some("ssh")
+}
+
+/// Assemble one cache's `diag@vt` report. `live_entries` counts only the
+/// caller's own context (0 when uncacheable) — never the whole cache.
+fn diag_cache_report(
+    mode: AuthCacheMode,
+    cache: &AuthCache,
+    resolution: ContextResolution,
+) -> DiagCacheReport {
+    DiagCacheReport {
+        mode: mode.to_string(),
+        ttl_secs: cache.ttl_secs(),
+        live_entries: resolution.context.map_or(0, |c| cache.live_len(c)),
+        cacheable: resolution.context.is_some(),
+        context_basis: resolution.basis.as_wire().to_string(),
+    }
 }
 
 impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
@@ -1125,10 +1259,10 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             .and_then(proc_info::get_proc_argv)
             .map(|argv| crate::ssh_sign::is_vt_relay_invocation(&argv))
             .unwrap_or(false);
-        let sign_cache_context =
-            resolve_cache_context(peer_pid, self.sign_cache_mode, peer_is_vt_relay);
-        let decrypt_cache_context =
-            resolve_cache_context(peer_pid, self.decrypt_cache_mode, peer_is_vt_relay);
+        let sign_cache_resolution =
+            classify_cache_context(peer_pid, self.sign_cache_mode, peer_is_vt_relay);
+        let decrypt_cache_resolution =
+            classify_cache_context(peer_pid, self.decrypt_cache_mode, peer_is_vt_relay);
         VtSshSession {
             keys: Arc::clone(&self.keys),
             last_activity: Arc::clone(&self.last_activity),
@@ -1142,8 +1276,10 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             audit_push: Arc::clone(&self.audit_push),
             peer_pid,
             peer_is_vt_relay,
-            sign_cache_context,
-            decrypt_cache_context,
+            sign_cache_mode: self.sign_cache_mode,
+            decrypt_cache_mode: self.decrypt_cache_mode,
+            sign_cache_resolution,
+            decrypt_cache_resolution,
             disable_legacy_decrypt: self.disable_legacy_decrypt,
         }
     }
@@ -1171,10 +1307,16 @@ struct VtSshSession {
     /// check, resolved once at session creation): its requests originated on
     /// a remote host and every prompt carries the relay-origin marker.
     peer_is_vt_relay: bool,
-    /// Resolved once at session creation. `None` = always prompt for sign.
-    sign_cache_context: Option<CacheContext>,
-    /// Resolved once at session creation. `None` = always prompt for decrypt.
-    decrypt_cache_context: Option<CacheContext>,
+    /// Copied from the factory for `diag@vt` reporting only; cache behavior
+    /// reads the resolutions below.
+    sign_cache_mode: AuthCacheMode,
+    decrypt_cache_mode: AuthCacheMode,
+    /// Resolved once at session creation. `.context == None` = always prompt
+    /// for sign; `.basis` is diag-only.
+    sign_cache_resolution: ContextResolution,
+    /// Resolved once at session creation. `.context == None` = always prompt
+    /// for decrypt; `.basis` is diag-only.
+    decrypt_cache_resolution: ContextResolution,
     disable_legacy_decrypt: bool,
 }
 
@@ -1384,7 +1526,7 @@ impl VtSshSession {
     ) -> AuthDecision {
         // If we couldn't resolve a cache context at session creation (no
         // peer PID, no TTY, missing proc info), always prompt.
-        let Some(context) = self.sign_cache_context else {
+        let Some(context) = self.sign_cache_resolution.context else {
             return match self.authenticate_serialized(auth_message).await {
                 AuthOutcome::Success(_) => AuthDecision::Approved,
                 AuthOutcome::Rejected => AuthDecision::Rejected,
@@ -1462,7 +1604,7 @@ impl VtSshSession {
     ) -> DecryptDecision {
         // Cacheable iff there's a resolved context AND the batch is non-empty
         // pure-v2; everything else falls through to the always-prompt path.
-        let context = match self.decrypt_cache_context {
+        let context = match self.decrypt_cache_resolution.context {
             Some(c) if !has_legacy && !v2_items.is_empty() => c,
             // No cache eligibility: prompt once. Preserve the structured
             // ErrKind via `outcome_to_err_strict` so the client-facing error
@@ -1853,6 +1995,56 @@ impl VtSshSession {
         }
 
         let result = AuthRes { approved: true };
+        Ok(Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
+            (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
+        })?))
+    }
+
+    /// `diag@vt`: read-only diagnostics for `vt doctor`. No Touch ID (it
+    /// discloses no secret and mints no DEK), never cached, not audit-pushed
+    /// (no human decision to record), and — enforced in `extension()` — it
+    /// does not reset the idle-activity clock. `live_entries` is scoped to
+    /// THIS connection's resolved context; see `docs/diag-design.md` §3.4 for
+    /// the accepted disclosure tradeoffs.
+    async fn handle_diag(
+        &self,
+        decrypted: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+        let _req: DiagReq = serde_json::from_slice(decrypted)
+            .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
+
+        let peer_path = self.peer_pid.and_then(proc_info::get_proc_path);
+        let peer = DiagPeerReport {
+            pid: self.peer_pid,
+            exe: peer_path
+                .as_deref()
+                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string()),
+            has_tty: self
+                .peer_pid
+                .is_some_and(|pid| proc_info::get_tty_dev(pid).is_some()),
+            is_ssh_client: peer_path.as_deref().is_some_and(is_ssh_client_path),
+            is_vt_relay: self.peer_is_vt_relay,
+        };
+        let sign_cache = {
+            let cache = self.sign_auth_cache.read().await;
+            diag_cache_report(self.sign_cache_mode, &cache, self.sign_cache_resolution)
+        };
+        let decrypt_cache = {
+            let cache = self.decrypt_auth_cache.read().await;
+            diag_cache_report(
+                self.decrypt_cache_mode,
+                &cache,
+                self.decrypt_cache_resolution,
+            )
+        };
+        let result = DiagRes {
+            agent_version: env!("VT_VERSION").to_string(),
+            sign_cache,
+            decrypt_cache,
+            peer,
+            run_allow_len: self.run_allow.len(),
+            audit_push: self.audit_push.enabled,
+        };
         Ok(Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
             (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
         })?))
@@ -2364,12 +2556,18 @@ impl Session for VtSshSession {
         // Only handle vt custom protocol extensions; ignore standard SSH extensions
         if !matches!(
             extension.name.as_str(),
-            EXT_ENCRYPT | EXT_DECRYPT | EXT_AUTH | EXT_RUN | EXT_SIGN
+            EXT_ENCRYPT | EXT_DECRYPT | EXT_AUTH | EXT_RUN | EXT_SIGN | EXT_DIAG
         ) {
             return Ok(None);
         }
 
-        self.touch_activity().await;
+        // diag@vt must NOT reset the idle clock: it is read-only, requires no
+        // Touch ID, and is meant to be pollable — if it counted as activity,
+        // a monitoring loop (or a hostile peer) could keep the agent "active"
+        // forever and defeat the idle-timeout key clear and cache flush.
+        if extension.name.as_str() != EXT_DIAG {
+            self.touch_activity().await;
+        }
 
         // Load the store once, derive auth + passphrase ciphers, drop the
         // store. Mac_cipher is loaded on demand inside the encrypt/decrypt
@@ -2415,6 +2613,7 @@ impl Session for VtSshSession {
                 EXT_AUTH => self.handle_auth(&decrypted).await,
                 EXT_RUN => self.handle_run(&decrypted).await,
                 EXT_SIGN => self.handle_sign_vt(&decrypted).await,
+                EXT_DIAG => self.handle_diag(&decrypted).await,
                 _ => unreachable!(),
             };
 
@@ -3111,6 +3310,56 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         assert_eq!(resolve_cache_context(None, AuthCacheMode::Global, false), None);
         // None mode never caches.
         assert_eq!(resolve_cache_context(Some(me), AuthCacheMode::None, false), None);
+    }
+
+    #[test]
+    fn test_classify_cache_context_basis() {
+        let me = std::process::id() as i32;
+        // Precedence: ModeNone wins even with no peer pid.
+        let r = classify_cache_context(None, AuthCacheMode::None, false);
+        assert_eq!((r.context, r.basis), (None, ContextBasis::ModeNone));
+        let r = classify_cache_context(None, AuthCacheMode::Global, false);
+        assert_eq!((r.context, r.basis), (None, ContextBasis::NoPeerPid));
+        // Our own test binary is not `ssh`, so global resolves via the
+        // Global arm — and resolve_cache_context must agree (thin wrapper).
+        let r = classify_cache_context(Some(me), AuthCacheMode::Global, false);
+        assert_eq!((r.context, r.basis), (Some((0, 0)), ContextBasis::Global));
+        assert_eq!(
+            resolve_cache_context(Some(me), AuthCacheMode::Global, false),
+            r.context
+        );
+        // vt-relay narrowing beats every mode, keyed on the peer process.
+        let r = classify_cache_context(Some(me), AuthCacheMode::Global, true);
+        assert_eq!(r.basis, ContextBasis::VtRelay);
+        let ctx = r.context.expect("own pid must have a start time");
+        assert_eq!(ctx.0, me as u64);
+        // Wire tags are a stable protocol surface.
+        assert_eq!(ContextBasis::ModeNone.as_wire(), "mode-none");
+        assert_eq!(ContextBasis::VtRelay.as_wire(), "vt-relay");
+        assert_eq!(ContextBasis::NoTty.as_wire(), "no-tty");
+        assert_eq!(ContextBasis::SshClient.as_wire(), "ssh-client");
+        assert_eq!(ContextBasis::Global.as_wire(), "global");
+    }
+
+    #[test]
+    fn test_auth_cache_live_len_scoped_to_context() {
+        let mut cache = AuthCache::new(300);
+        let mine = (1u64, 100u64);
+        let other = (2u64, 100u64);
+        cache.grant(mine, "fp1");
+        cache.grant(mine, "fp2");
+        cache.grant(other, "fp3");
+        // Scoped: never counts another context's grants.
+        assert_eq!(cache.live_len(mine), 2);
+        assert_eq!(cache.live_len(other), 1);
+        assert_eq!(cache.live_len((3u64, 100u64)), 0);
+        // Dual-clock expiry: entries drop out when EITHER clock passes TTL,
+        // same predicate as is_authorized (wall advanced, mono frozen).
+        let now_mono = Instant::now();
+        let now_wall = SystemTime::now();
+        assert_eq!(cache.live_len_at(mine, now_mono, now_wall), 2);
+        let wall_late = now_wall + Duration::from_secs(301);
+        assert_eq!(cache.live_len_at(mine, now_mono, wall_late), 0);
     }
 
     // (Strict-TTL idempotence and expired-entry replacement are covered

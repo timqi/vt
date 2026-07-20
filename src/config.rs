@@ -68,20 +68,24 @@ fn warn_if_world_readable(_path: &Path) {}
 /// are logged at `warn` and otherwise ignored so a malformed file never bricks
 /// the CLI — the env-var path still works.
 ///
+/// Returns the keys it populated from the file, so `vt doctor` can attribute
+/// each effective value to `env` vs `config.toml` (a key present in the
+/// environment but absent from this list was set by the caller).
+///
 /// # Safety
 /// Must be called before any threads are spawned (i.e. before the tokio runtime
 /// is built), because it mutates the process environment via
 /// [`std::env::set_var`]. `main()` calls it at the very top, single-threaded.
-pub fn hydrate_env_from_file() {
+pub fn hydrate_env_from_file() -> Vec<String> {
     let Some(path) = config_path() else {
-        return;
+        return Vec::new();
     };
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
             tracing::warn!("could not read {}: {}", path.display(), e);
-            return;
+            return Vec::new();
         }
     };
     warn_if_world_readable(&path);
@@ -90,9 +94,10 @@ pub fn hydrate_env_from_file() {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("ignoring malformed config {}: {}", path.display(), e);
-            return;
+            return Vec::new();
         }
     };
+    let mut populated = Vec::new();
 
     for (key, value) in &table {
         // Structured sections (TOML tables / arrays) are not env-var
@@ -119,7 +124,9 @@ pub fn hydrate_env_from_file() {
             continue;
         };
         std::env::set_var(key, s);
+        populated.push(key.clone());
     }
+    populated
 }
 
 // ---------------------------------------------------------------------------

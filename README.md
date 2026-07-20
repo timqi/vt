@@ -93,6 +93,7 @@ For a persistent setup, put these values in `~/.config/vt/config.toml` using
 |---------|-------------|
 | `version` | Show version information |
 | `init` | (macOS) Initialize passcode and passphrase in keychain |
+| `doctor` | Diagnose config sources (env vs config.toml), transport routing, worker reachability, and — via the read-only `diag@vt` extension — how a reachable vt agent classifies this connection for caching and why |
 | `create` | Read plaintext from stdin, output encrypted vt protocol |
 | `read <vt>` | Decrypt a vt protocol string |
 | `rewrap [--no-dry-run] [--backup] <file>...` | Re-encrypt legacy `vt://mac/...` URLs in files to the current envelope format (one agent/phone approval per batch) |

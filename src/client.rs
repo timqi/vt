@@ -1753,6 +1753,279 @@ fn spawn_restore_supervisor(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// vt doctor — read-only diagnosis of config, routing, and agent cache behavior
+// ---------------------------------------------------------------------------
+
+/// Outcome of the dedicated `diag@vt` call. Unlike [`VTClient::try_agent_extension`],
+/// the wire shapes stay distinct (see `docs/diag-design.md` §4): an agent that
+/// merely *ignores* the unknown extension name (an older vt agent) answers SSH
+/// success with an empty payload, which is a different signal from an explicit
+/// `SSH_AGENT_FAILURE` (non-vt agent, wrong VT_AUTH, or a locked agent).
+#[cfg(unix)]
+enum DiagOutcome {
+    /// Socket missing/refused — no agent at all.
+    NoSocket,
+    /// SSH success, empty extension payload: the agent ignored `diag@vt`.
+    TooOld,
+    /// Explicit failure or an error envelope, with a display string.
+    Refused(String),
+    Report(Box<crate::core::DiagRes>),
+}
+
+#[cfg(unix)]
+fn call_diag(auth_token: &str) -> Result<DiagOutcome> {
+    let stream = match VTClient::connect_agent_socket()? {
+        Some(s) => s,
+        None => return Ok(DiagOutcome::NoSocket),
+    };
+    let auth_key = decode_auth_cipher_from_b64(auth_token)?;
+    let auth_cipher = AesGcmCrypto::new(&auth_key)?;
+    let payload = serde_json::to_vec(&crate::core::DiagReq::default())?;
+    let ext = Extension {
+        name: "diag@vt".to_string(),
+        details: Unparsed::from(auth_cipher.encrypt(&payload)?),
+    };
+    let mut client = ssh_agent_lib::blocking::Client::new(stream);
+    match client.extension(ext) {
+        Err(e) => Ok(DiagOutcome::Refused(e.to_string())),
+        Ok(None) => Ok(DiagOutcome::TooOld),
+        Ok(Some(resp)) => {
+            let envelope = match auth_cipher.decrypt(resp.details.as_ref()) {
+                Ok(b) => b,
+                Err(_) => {
+                    return Ok(DiagOutcome::Refused(
+                        "response did not decrypt under VT_AUTH".to_string(),
+                    ))
+                }
+            };
+            match parse_envelope(&envelope) {
+                Ok(body) => Ok(DiagOutcome::Report(Box::new(serde_json::from_slice(
+                    &body,
+                )?))),
+                Err(e) => Ok(DiagOutcome::Refused(e.to_string())),
+            }
+        }
+    }
+}
+
+/// Map a `ContextBasis` wire tag to an operator-facing explanation. Unknown
+/// tags (a newer agent) pass through verbatim.
+fn basis_human(tag: &str) -> String {
+    match tag {
+        "mode-none" => "caching disabled (cache mode 'none', the default)".to_string(),
+        "no-peer-pid" => "agent could not identify the peer process".to_string(),
+        "vt-relay" => "narrowed to this relay connection (grants die with it; \
+                       other connections never share them)"
+            .to_string(),
+        "no-tty" => "no controlling TTY — per-session/per-app never cache for \
+                     orchestrated callers (CI / AI agents); use cache mode 'global'"
+            .to_string(),
+        "ssh-client" => "peer is an ssh process: narrowed to this ssh connection. \
+                         One-shot ssh/git spawns never share grants; use ssh \
+                         ControlMaster to share within the TTL"
+            .to_string(),
+        "session-leader" => "cacheable within this terminal session".to_string(),
+        "app-ancestor" => "cacheable within this .app bundle".to_string(),
+        "no-app-ancestor" => "no .app ancestor (tmux / ssh login session) — \
+                              per-app cannot cache here"
+            .to_string(),
+        "global" => "cacheable across ALL local callers (shared global context)".to_string(),
+        "proc-lookup-failed" => "process info lookup failed".to_string(),
+        other => format!("unknown basis '{}' (newer agent?)", other),
+    }
+}
+
+fn doctor_redact(key: &str, value: &str) -> String {
+    // Both are bearer secrets; showing any prefix helps nobody in a terminal
+    // scrollback. Presence + length is enough to diagnose.
+    if matches!(key, "VT_AUTH" | "VT_PASSKEY_TOKEN") {
+        return format!("set (len {})", value.len());
+    }
+    if value.chars().count() > 60 {
+        let head: String = value.chars().take(60).collect();
+        return format!("{}… (len {})", head, value.len());
+    }
+    value.to_string()
+}
+
+/// `vt doctor`: diagnose config sources, transport routing, and (when an
+/// agent is reachable) cache behavior via `diag@vt`. Read-only, never
+/// hard-fails on findings — always exits 0; see `docs/diag-design.md`.
+pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<()> {
+    println!("vt doctor — vt {}", env!("VT_VERSION"));
+
+    // ── 1. Config ─────────────────────────────────────────────────────────
+    println!("\nConfig (env beats config.toml):");
+    match crate::config::config_path() {
+        Some(path) if path.exists() => {
+            println!("  file: {}", path.display());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    let mode = meta.permissions().mode() & 0o7777;
+                    if mode & 0o077 != 0 {
+                        println!(
+                            "  ⚠ file is group/other accessible (mode {:o}); it holds \
+                             secrets — run: chmod 600 {}",
+                            mode,
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        Some(path) => println!("  file: {} (absent — env vars only)", path.display()),
+        None => println!("  file: none (no home directory and no $VT_CONFIG)"),
+    }
+    const DOCTOR_KEYS: &[&str] = &[
+        "VT_BACKEND",
+        "VT_AUTH",
+        "VT_PASSKEY_URL",
+        "VT_PASSKEY_TOKEN",
+        "VT_GIT_SSH_PRIVATE_KEY",
+        "VT_GIT_SSH_PUB",
+        "VT_AGENT_CONFIG",
+    ];
+    for key in DOCTOR_KEYS {
+        match env::var(key) {
+            Ok(v) if v.is_empty() => println!("  {:24} set but EMPTY (env)", key),
+            Ok(v) => {
+                let source = if file_populated_keys.iter().any(|k| k == key) {
+                    "config.toml"
+                } else {
+                    "env"
+                };
+                println!("  {:24} {} ({})", key, doctor_redact(key, &v), source);
+            }
+            Err(_) => println!("  {:24} unset", key),
+        }
+    }
+
+    // ── 2. Routing ────────────────────────────────────────────────────────
+    println!("\nRouting:");
+    let has_auth = !auth_token.is_empty();
+    let has_passkey =
+        env::var("VT_PASSKEY_URL").is_ok() && env::var("VT_PASSKEY_TOKEN").is_ok();
+    match crate::config::Backend::from_env() {
+        Err(e) => println!("  ⚠ {}", e),
+        Ok(crate::config::Backend::Agent) => {
+            if has_auth {
+                println!("  VT_BACKEND=agent: SSH agent only, no passkey fallback");
+            } else {
+                println!("  ⚠ VT_BACKEND=agent but VT_AUTH is unset — every call will fail");
+            }
+        }
+        Ok(crate::config::Backend::Passkey) => {
+            if has_passkey {
+                println!("  VT_BACKEND=passkey: phone ceremony only, agent never probed");
+            } else {
+                println!(
+                    "  ⚠ VT_BACKEND=passkey but VT_PASSKEY_URL/VT_PASSKEY_TOKEN incomplete \
+                     — every call will fail"
+                );
+            }
+        }
+        Ok(crate::config::Backend::Auto) => match (has_auth, has_passkey) {
+            (true, true) => println!(
+                "  auto: try SSH agent first, fall back to phone passkey on \
+                 recoverable errors"
+            ),
+            (true, false) => println!(
+                "  auto: SSH agent only (passkey unconfigured — agent failures \
+                 have no fallback)"
+            ),
+            (false, true) => println!("  auto: phone passkey only (VT_AUTH unset — agent skipped)"),
+            (false, false) => {
+                println!("  ⚠ neither path configured — vt commands needing auth will fail")
+            }
+        },
+    }
+
+    // ── 3. Agent (diag@vt) ────────────────────────────────────────────────
+    println!("\nAgent:");
+    let socket = env::var("SSH_AUTH_SOCK")
+        .unwrap_or_else(|_| "~/.ssh/vt.sock (default; $SSH_AUTH_SOCK unset)".to_string());
+    println!("  socket: {}", socket);
+    #[cfg(unix)]
+    if !has_auth {
+        println!("  agent path disabled (VT_AUTH unset) — diag@vt skipped");
+    } else {
+        let token = auth_token.to_string();
+        let outcome = tokio::task::spawn_blocking(move || call_diag(&token)).await?;
+        match outcome {
+            Err(e) => println!("  ⚠ diag@vt transport error: {}", e),
+            Ok(DiagOutcome::NoSocket) => {
+                println!("  no agent listening (socket missing or connection refused)")
+            }
+            Ok(DiagOutcome::TooOld) => println!(
+                "  agent reachable but ignored diag@vt — a vt agent older than \
+                 this client (rebuild/restart it), or a non-vt agent"
+            ),
+            Ok(DiagOutcome::Refused(e)) => println!(
+                "  agent refused diag@vt ({}) — non-vt agent, wrong VT_AUTH, or \
+                 agent locked (ssh-add -X)",
+                e
+            ),
+            Ok(DiagOutcome::Report(d)) => {
+                println!("  agent version: {}", d.agent_version);
+                println!(
+                    "  peer (this process): pid {}, exe {}, tty {}, ssh-client {}, vt-relay {}",
+                    d.peer.pid.map_or("?".to_string(), |p| p.to_string()),
+                    d.peer.exe.as_deref().unwrap_or("?"),
+                    if d.peer.has_tty { "yes" } else { "no" },
+                    if d.peer.is_ssh_client { "yes" } else { "no" },
+                    if d.peer.is_vt_relay { "yes" } else { "no" },
+                );
+                for (label, c) in [("sign", &d.sign_cache), ("decrypt", &d.decrypt_cache)] {
+                    println!(
+                        "  {:8} mode {}, ttl {}s, live grants (this context): {}",
+                        format!("{}:", label),
+                        c.mode,
+                        c.ttl_secs,
+                        c.live_entries
+                    );
+                    println!("           → {}", basis_human(&c.context_basis));
+                }
+                println!(
+                    "  run@vt: {}; audit push: {}",
+                    if d.run_allow_len == 0 {
+                        "disabled".to_string()
+                    } else {
+                        format!("{} allowlist entries", d.run_allow_len)
+                    },
+                    if d.audit_push { "on" } else { "off" }
+                );
+                println!(
+                    "  (classification applies to connections opened the way this \
+                     one was; a different launcher may classify differently)"
+                );
+            }
+        }
+    }
+
+    // ── 4. Worker ─────────────────────────────────────────────────────────
+    println!("\nWorker:");
+    match env::var("VT_PASSKEY_URL") {
+        Err(_) => println!("  not configured (VT_PASSKEY_URL unset)"),
+        Ok(url) => {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?;
+            match client.get(&url).send().await {
+                Ok(resp) => println!("  {} reachable (HTTP {})", url, resp.status().as_u16()),
+                Err(e) => println!("  ⚠ {} unreachable: {}", url, e),
+            }
+            if env::var("VT_PASSKEY_TOKEN").is_err() {
+                println!("  ⚠ VT_PASSKEY_URL set but VT_PASSKEY_TOKEN unset");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Pre-tokio, pre-clap entry point for the detached restore supervisor.
 /// Dispatched from `main()` so this process never builds a tokio runtime,
 /// parses clap definitions, or loads tracing — its RSS is just vt's text
@@ -1958,6 +2231,71 @@ mod tests {
             matches!(vt_err, VtClientError::Transport(_)),
             "garbage must surface as Transport, got {:?}",
             vt_err
+        );
+    }
+
+    // ── vt doctor ────────────────────────────────────────────────────────
+
+    #[test]
+    fn doctor_redact_hides_secrets_and_truncates_on_char_boundaries() {
+        // Bearer secrets never echo their value.
+        let r = doctor_redact("VT_AUTH", "supersecrettoken");
+        assert!(!r.contains("supersecret"), "got {r}");
+        assert!(r.contains("len 16"));
+        // Long non-secrets truncate by CHARS, not bytes — a multi-byte char
+        // spanning the cut must not panic.
+        let long = "变".repeat(61);
+        let r = doctor_redact("VT_GIT_SSH_PUB", &long);
+        assert!(r.ends_with(&format!("… (len {})", long.len())));
+        assert_eq!(r.chars().take_while(|c| *c == '变').count(), 60);
+        // Short values pass through verbatim.
+        assert_eq!(doctor_redact("VT_BACKEND", "auto"), "auto");
+    }
+
+    #[test]
+    fn doctor_basis_human_is_total_over_known_tags_and_passes_unknown() {
+        for tag in [
+            "mode-none",
+            "no-peer-pid",
+            "vt-relay",
+            "no-tty",
+            "ssh-client",
+            "session-leader",
+            "app-ancestor",
+            "no-app-ancestor",
+            "global",
+            "proc-lookup-failed",
+        ] {
+            let human = basis_human(tag);
+            assert!(
+                !human.contains("unknown basis"),
+                "{tag} must map to a real sentence, got: {human}"
+            );
+        }
+        assert!(basis_human("future-tag").contains("future-tag"));
+    }
+
+    #[test]
+    fn diag_wire_round_trip() {
+        // Client-side view of the agent's DiagRes JSON — pins the field names
+        // the macOS handler serializes (they cross the wire; renames break
+        // old clients).
+        let json = r#"{
+            "agent_version": "v1",
+            "sign_cache": {"mode":"per-session","ttl_secs":120,"live_entries":1,"cacheable":true,"context_basis":"session-leader"},
+            "decrypt_cache": {"mode":"none","ttl_secs":30,"live_entries":0,"cacheable":false,"context_basis":"mode-none"},
+            "peer": {"pid":42,"exe":"zsh","has_tty":true,"is_ssh_client":false,"is_vt_relay":false},
+            "run_allow_len": 0,
+            "audit_push": false
+        }"#;
+        let d: crate::core::DiagRes = serde_json::from_str(json).unwrap();
+        assert_eq!(d.sign_cache.context_basis, "session-leader");
+        assert!(!d.decrypt_cache.cacheable);
+        assert_eq!(d.peer.exe.as_deref(), Some("zsh"));
+        // And the request serializes to an (empty) object.
+        assert_eq!(
+            serde_json::to_string(&crate::core::DiagReq::default()).unwrap(),
+            "{}"
         );
     }
 
