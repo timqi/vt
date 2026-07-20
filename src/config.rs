@@ -40,26 +40,33 @@ fn is_allowed_key(key: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// Best-effort permission check: the file holds secrets (`VT_AUTH`,
-/// `VT_PASSKEY_TOKEN`), so warn (don't fail) if it is group/other accessible.
+/// The config file's permission bits when they are too loose (group/other
+/// accessible), else `None`. Single owner of the 0o077 policy — consumed by
+/// the load-time warning below and by `vt doctor`, so the two can't drift.
 #[cfg(unix)]
-fn warn_if_world_readable(path: &Path) {
+pub fn insecure_config_mode(path: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let mode = meta.permissions().mode();
-        if mode & 0o077 != 0 {
-            tracing::warn!(
-                "{} is accessible to group/other (mode {:o}); it holds secrets — run: chmod 600 {}",
-                path.display(),
-                mode & 0o7777,
-                path.display()
-            );
-        }
-    }
+    let mode = std::fs::metadata(path).ok()?.permissions().mode();
+    (mode & 0o077 != 0).then_some(mode & 0o7777)
 }
 
 #[cfg(not(unix))]
-fn warn_if_world_readable(_path: &Path) {}
+pub fn insecure_config_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Best-effort permission check: the file holds secrets (`VT_AUTH`,
+/// `VT_PASSKEY_TOKEN`), so warn (don't fail) if it is group/other accessible.
+fn warn_if_world_readable(path: &Path) {
+    if let Some(mode) = insecure_config_mode(path) {
+        tracing::warn!(
+            "{} is accessible to group/other (mode {:o}); it holds secrets — run: chmod 600 {}",
+            path.display(),
+            mode,
+            path.display()
+        );
+    }
+}
 
 /// Load the config file and, for each allowed `VT_*` key that is **not already
 /// present in the environment**, set it. Env vars always take precedence.

@@ -23,9 +23,9 @@ use crate::core::wire::{
     outcome_to_err_strict, wrap_ok_envelope, ErrKind, WIRE_VERSION,
 };
 use crate::core::{
-    legacy_decrypt, AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, DiagCacheReport,
-    DiagPeerReport, DiagReq, DiagRes, EncryptReq, EncryptResItem, RunReq, RunRes, SignReq,
-    SignRes, SALT_LEN,
+    legacy_decrypt, AuthReq, AuthRes, ContextBasis, DecryptInput, DecryptReq, DecryptResItem,
+    DiagCacheReport, DiagPeerReport, DiagReq, DiagRes, EncryptReq, EncryptResItem, RunReq,
+    RunRes, SignReq, SignRes, SALT_LEN,
 };
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
@@ -1080,60 +1080,21 @@ fn resolve_cache_context(
     classify_cache_context(peer_pid, mode, peer_is_vt_relay).context
 }
 
-/// A resolved cache context together with WHY it resolved that way — the
-/// `basis` feeds `diag@vt` so an operator can see which rule classified their
-/// connection without reading this file. [`resolve_cache_context`] is the
-/// `.context` projection; behavior must never depend on `basis`.
+/// A resolved cache context together with the mode it was resolved under and
+/// WHY it resolved that way — the `basis` feeds `diag@vt` so an operator can
+/// see which rule classified their connection without reading this file.
+/// [`resolve_cache_context`] is the `.context` projection; behavior must
+/// never depend on `basis` or `mode`. Carrying `mode` here (rather than as
+/// parallel session fields) makes a sign/decrypt pairing mix-up in diag
+/// reporting unrepresentable.
+///
+/// [`ContextBasis`] lives in `crate::core` so the agent's wire tags and the
+/// CLI's human explanations are one compile-checked mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextResolution {
+    pub mode: AuthCacheMode,
     pub context: Option<CacheContext>,
     pub basis: ContextBasis,
-}
-
-/// Which branch of [`classify_cache_context`] decided the outcome. Wire tags
-/// (`as_wire`) are a stable protocol surface — renaming a variant must not
-/// change its tag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContextBasis {
-    /// Caching disabled (`--…-cache-mode none`).
-    ModeNone,
-    /// Peer PID unavailable → uncacheable.
-    NoPeerPid,
-    /// Peer is a `vt ssh connect --forward-real-agent` relay: per-connection.
-    VtRelay,
-    /// per-session/per-app TTY gate: peer has no controlling terminal.
-    NoTty,
-    /// Peer is an OpenSSH client: narrowed to that ssh process.
-    SshClient,
-    /// per-session: anchored on the terminal session leader.
-    SessionLeader,
-    /// per-app: anchored on the `.app` bundle ancestor.
-    AppAncestor,
-    /// per-app: no `.app` ancestor (tmux, ssh login session) → uncacheable.
-    NoAppAncestor,
-    /// global: the shared `(0, 0)` context.
-    Global,
-    /// Catch-all for the five fallible proc lookups (`get_start_tvsec` in the
-    /// vt-relay / ssh-client / session-leader / app-ancestor branches, and
-    /// `get_sid` itself) → uncacheable.
-    ProcLookupFailed,
-}
-
-impl ContextBasis {
-    pub fn as_wire(&self) -> &'static str {
-        match self {
-            ContextBasis::ModeNone => "mode-none",
-            ContextBasis::NoPeerPid => "no-peer-pid",
-            ContextBasis::VtRelay => "vt-relay",
-            ContextBasis::NoTty => "no-tty",
-            ContextBasis::SshClient => "ssh-client",
-            ContextBasis::SessionLeader => "session-leader",
-            ContextBasis::AppAncestor => "app-ancestor",
-            ContextBasis::NoAppAncestor => "no-app-ancestor",
-            ContextBasis::Global => "global",
-            ContextBasis::ProcLookupFailed => "proc-lookup-failed",
-        }
-    }
 }
 
 /// Core of [`resolve_cache_context`], returning the basis alongside the
@@ -1146,9 +1107,17 @@ fn classify_cache_context(
     mode: AuthCacheMode,
     peer_is_vt_relay: bool,
 ) -> ContextResolution {
-    fn resolved(context: Option<CacheContext>, basis: ContextBasis) -> ContextResolution {
-        ContextResolution { context, basis }
-    }
+    let resolved = |context: Option<CacheContext>, basis: ContextBasis| ContextResolution {
+        mode,
+        context,
+        basis,
+    };
+    // The `(pid, start_time)` anchor shared by every process-keyed branch;
+    // a failed start-time lookup is uniformly ProcLookupFailed → uncacheable.
+    let anchored = |pid: i32, basis: ContextBasis| match proc_info::get_start_tvsec(pid) {
+        Some(start) => resolved(Some((pid as u64, start)), basis),
+        None => resolved(None, ContextBasis::ProcLookupFailed),
+    };
     if mode == AuthCacheMode::None {
         return resolved(None, ContextBasis::ModeNone);
     }
@@ -1167,10 +1136,7 @@ fn classify_cache_context(
     // the two can never disagree; a spoofed argv only narrows the caller to
     // its own context, never widens it.
     if peer_is_vt_relay {
-        return match proc_info::get_start_tvsec(pid) {
-            Some(start) => resolved(Some((pid as u64, start)), ContextBasis::VtRelay),
-            None => resolved(None, ContextBasis::ProcLookupFailed),
-        };
+        return anchored(pid, ContextBasis::VtRelay);
     }
     // Per-session / per-app require the peer to have a controlling terminal.
     // launchd-managed daemons and other non-interactive peers always prompt
@@ -1188,32 +1154,19 @@ fn classify_cache_context(
         .as_deref()
         .is_some_and(is_ssh_client_path)
     {
-        return match proc_info::get_start_tvsec(pid) {
-            Some(start) => resolved(Some((pid as u64, start)), ContextBasis::SshClient),
-            None => resolved(None, ContextBasis::ProcLookupFailed),
-        };
+        return anchored(pid, ContextBasis::SshClient);
     }
     match mode {
         // Handled above; kept so the match stays total without a wildcard.
         AuthCacheMode::None => resolved(None, ContextBasis::ModeNone),
-        AuthCacheMode::PerSession => {
-            let Some(sid) = proc_info::get_sid(pid) else {
-                return resolved(None, ContextBasis::ProcLookupFailed);
-            };
-            match proc_info::get_start_tvsec(sid) {
-                Some(start) => resolved(Some((sid as u64, start)), ContextBasis::SessionLeader),
-                None => resolved(None, ContextBasis::ProcLookupFailed),
-            }
-        }
-        AuthCacheMode::PerApp => {
-            let Some(app_pid) = proc_info::find_app_pid(pid) else {
-                return resolved(None, ContextBasis::NoAppAncestor);
-            };
-            match proc_info::get_start_tvsec(app_pid) {
-                Some(start) => resolved(Some((app_pid as u64, start)), ContextBasis::AppAncestor),
-                None => resolved(None, ContextBasis::ProcLookupFailed),
-            }
-        }
+        AuthCacheMode::PerSession => match proc_info::get_sid(pid) {
+            Some(sid) => anchored(sid, ContextBasis::SessionLeader),
+            None => resolved(None, ContextBasis::ProcLookupFailed),
+        },
+        AuthCacheMode::PerApp => match proc_info::find_app_pid(pid) {
+            Some(app_pid) => anchored(app_pid, ContextBasis::AppAncestor),
+            None => resolved(None, ContextBasis::NoAppAncestor),
+        },
         // (0, 0) can never collide with a real context: sid/app_pid are
         // always > 0.
         AuthCacheMode::Global => resolved(Some((0, 0)), ContextBasis::Global),
@@ -1232,16 +1185,11 @@ fn is_ssh_client_path(path: &str) -> bool {
 
 /// Assemble one cache's `diag@vt` report. `live_entries` counts only the
 /// caller's own context (0 when uncacheable) — never the whole cache.
-fn diag_cache_report(
-    mode: AuthCacheMode,
-    cache: &AuthCache,
-    resolution: ContextResolution,
-) -> DiagCacheReport {
+fn diag_cache_report(cache: &AuthCache, resolution: ContextResolution) -> DiagCacheReport {
     DiagCacheReport {
-        mode: mode.to_string(),
+        mode: resolution.mode.to_string(),
         ttl_secs: cache.ttl_secs(),
         live_entries: resolution.context.map_or(0, |c| cache.live_len(c)),
-        cacheable: resolution.context.is_some(),
         context_basis: resolution.basis.as_wire().to_string(),
     }
 }
@@ -1276,8 +1224,6 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             audit_push: Arc::clone(&self.audit_push),
             peer_pid,
             peer_is_vt_relay,
-            sign_cache_mode: self.sign_cache_mode,
-            decrypt_cache_mode: self.decrypt_cache_mode,
             sign_cache_resolution,
             decrypt_cache_resolution,
             disable_legacy_decrypt: self.disable_legacy_decrypt,
@@ -1307,15 +1253,11 @@ struct VtSshSession {
     /// check, resolved once at session creation): its requests originated on
     /// a remote host and every prompt carries the relay-origin marker.
     peer_is_vt_relay: bool,
-    /// Copied from the factory for `diag@vt` reporting only; cache behavior
-    /// reads the resolutions below.
-    sign_cache_mode: AuthCacheMode,
-    decrypt_cache_mode: AuthCacheMode,
     /// Resolved once at session creation. `.context == None` = always prompt
-    /// for sign; `.basis` is diag-only.
+    /// for sign; `.mode`/`.basis` are diag-only.
     sign_cache_resolution: ContextResolution,
     /// Resolved once at session creation. `.context == None` = always prompt
-    /// for decrypt; `.basis` is diag-only.
+    /// for decrypt; `.mode`/`.basis` are diag-only.
     decrypt_cache_resolution: ContextResolution,
     disable_legacy_decrypt: bool,
 }
@@ -2027,15 +1969,11 @@ impl VtSshSession {
         };
         let sign_cache = {
             let cache = self.sign_auth_cache.read().await;
-            diag_cache_report(self.sign_cache_mode, &cache, self.sign_cache_resolution)
+            diag_cache_report(&cache, self.sign_cache_resolution)
         };
         let decrypt_cache = {
             let cache = self.decrypt_auth_cache.read().await;
-            diag_cache_report(
-                self.decrypt_cache_mode,
-                &cache,
-                self.decrypt_cache_resolution,
-            )
+            diag_cache_report(&cache, self.decrypt_cache_resolution)
         };
         let result = DiagRes {
             agent_version: env!("VT_VERSION").to_string(),
@@ -3331,14 +3269,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         // vt-relay narrowing beats every mode, keyed on the peer process.
         let r = classify_cache_context(Some(me), AuthCacheMode::Global, true);
         assert_eq!(r.basis, ContextBasis::VtRelay);
+        assert_eq!(r.mode, AuthCacheMode::Global);
         let ctx = r.context.expect("own pid must have a start time");
         assert_eq!(ctx.0, me as u64);
-        // Wire tags are a stable protocol surface.
-        assert_eq!(ContextBasis::ModeNone.as_wire(), "mode-none");
-        assert_eq!(ContextBasis::VtRelay.as_wire(), "vt-relay");
-        assert_eq!(ContextBasis::NoTty.as_wire(), "no-tty");
-        assert_eq!(ContextBasis::SshClient.as_wire(), "ssh-client");
-        assert_eq!(ContextBasis::Global.as_wire(), "global");
+        // (Wire-tag stability is pinned in core.rs tests, next to the enum.)
     }
 
     #[test]
