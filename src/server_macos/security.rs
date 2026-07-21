@@ -29,7 +29,7 @@ pub fn get_keychain(name: &str) -> Result<Vec<u8>> {
 /// Production lock-state lookup (uncached). Cheap; called at most once per
 /// second via `screen_state_cached` plus once per `evaluate_policy(false)`
 /// re-check.
-fn screen_state_now() -> SessionState {
+pub(crate) fn screen_state_now() -> SessionState {
     classify_session(cgsession::fetch_flags())
 }
 
@@ -468,16 +468,34 @@ pub fn create_and_save_passcode_passphrase(
 /// key (needed as HKDF IKM for v2 envelope DEK derivation). The raw key is
 /// returned in a `Zeroizing` wrapper so it is wiped from memory on drop;
 /// callers should drop it as soon as derivation is complete.
-pub fn load_mac_cipher(
+fn load_mac_key(
     store: &super::store::KeychainStore,
     passphrase_cipher: &AesGcmCrypto,
-) -> Result<(AesGcmCrypto, Zeroizing<[u8; 32]>)> {
+) -> Result<Zeroizing<[u8; 32]>> {
     let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
     let decrypted_passphrase =
         Zeroizing::new(passphrase_cipher.decrypt(&encrypted_passphrase)?);
     let mut key = Zeroizing::new([0u8; 32]);
     let slice: &[u8; 32] = decrypted_passphrase.as_slice().try_into()?;
     key.copy_from_slice(slice);
+    Ok(key)
+}
+
+/// Preflight the encrypted master key without constructing a long-lived cipher
+/// or retaining raw key material across a human authorization prompt.
+pub(crate) fn validate_mac_key_material(
+    store: &super::store::KeychainStore,
+    passphrase_cipher: &AesGcmCrypto,
+) -> Result<()> {
+    drop(load_mac_key(store, passphrase_cipher)?);
+    Ok(())
+}
+
+pub fn load_mac_cipher(
+    store: &super::store::KeychainStore,
+    passphrase_cipher: &AesGcmCrypto,
+) -> Result<(AesGcmCrypto, Zeroizing<[u8; 32]>)> {
+    let key = load_mac_key(store, passphrase_cipher)?;
     let cipher = AesGcmCrypto::new(&key)?;
     Ok((cipher, key))
 }

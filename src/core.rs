@@ -1,3 +1,4 @@
+pub mod authorization;
 pub mod crypto;
 pub mod session;
 pub mod wire;

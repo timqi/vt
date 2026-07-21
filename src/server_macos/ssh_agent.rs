@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -15,10 +16,14 @@ use ssh_agent_lib::proto::{
 use ssh_key::private::{KeypairData, PrivateKey};
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock};
 
+use crate::core::authorization::{
+    AuthorizationEngine, AuthorizationFailure, AuthorizationPermit, AuthorizationRequest,
+    CommitError, Decision, GrantScope, Operation, ReusePolicy, SubjectId,
+};
 use crate::core::crypto::{derive_dek, AesGcmCrypto};
-use crate::core::session::{AuthOutcome, UnavailableReason};
+use crate::core::session::AuthOutcome;
 use crate::core::wire::{
     outcome_to_err_strict, wrap_ok_envelope, ErrKind, WIRE_VERSION,
 };
@@ -29,7 +34,8 @@ use crate::core::{
 };
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
-use super::security::{authenticate, derive_passcode_ciphers, load_mac_cipher};
+use super::authorization::{new_engine, sleep_diverged};
+use super::security::{derive_passcode_ciphers, load_mac_cipher, validate_mac_key_material};
 use super::store::KeychainStore;
 use super::audit::{self, AgentAuditEntry, AuditPushConfig};
 
@@ -136,139 +142,11 @@ impl std::fmt::Display for AuthCacheMode {
 /// original context process (app or TTY owner) exits and its PID or tdev is
 /// recycled, the new process has a different start time and won't match a
 /// cached grant.
-pub type CacheContext = (u64, u64);
-
-/// A cache entry's expiry, tracked on two clocks.
-///
-/// `std::time::Instant` on macOS reads `CLOCK_UPTIME_RAW`, which does NOT
-/// advance while the system is asleep — an expiry tracked only on `Instant`
-/// pauses its countdown when the lid closes, so a grant issued just before
-/// sleep would still be live on wake hours (or days) later. The wall clock
-/// keeps counting through sleep but can be stepped backwards (NTP), which
-/// would stretch a wall-only expiry. An entry is therefore valid only while
-/// BOTH clocks agree: `mono` caps total awake time at the TTL, `wall` caps
-/// total real time at the TTL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CacheExpiry {
-    mono: Instant,
-    wall: SystemTime,
-}
-
-impl CacheExpiry {
-    fn is_valid_at(&self, now_mono: Instant, now_wall: SystemTime) -> bool {
-        now_mono < self.mono && now_wall < self.wall
-    }
-}
-
-pub struct AuthCache {
-    /// Each entry stores when it expires (computed at grant time).
-    entries: HashMap<(CacheContext, String), CacheExpiry>,
-    /// Lifetime of a fresh grant.
-    ttl: Duration,
-}
-
-impl AuthCache {
-    pub fn new(ttl_secs: u64) -> Self {
-        Self {
-            entries: HashMap::new(),
-            ttl: Duration::from_secs(ttl_secs),
-        }
-    }
-
-    /// `key` is a composed lookup digest ([`sign_cache_key`] /
-    /// [`decrypt_cache_key`]), not a raw fingerprint.
-    pub fn is_authorized(&self, context: CacheContext, key: &str) -> bool {
-        self.is_authorized_at(context, key, Instant::now(), SystemTime::now())
-    }
-
-    /// Clock-injectable core of [`is_authorized`], unit-testable for the
-    /// sleep scenario (mono frozen, wall advanced) without real sleeping.
-    fn is_authorized_at(
-        &self,
-        context: CacheContext,
-        key: &str,
-        now_mono: Instant,
-        now_wall: SystemTime,
-    ) -> bool {
-        self.entries
-            .get(&(context, key.to_string()))
-            .is_some_and(|e| e.is_valid_at(now_mono, now_wall))
-    }
-
-    /// Strict-TTL grant: a still-valid entry's expiry is left untouched.
-    /// Concurrent grants for the same key cannot extend the original TTL.
-    /// Expired entries (or absent ones) are replaced with a fresh expiry.
-    pub fn grant(&mut self, context: CacheContext, key: &str) {
-        self.grant_at(context, key, Instant::now(), SystemTime::now());
-    }
-
-    fn grant_at(
-        &mut self,
-        context: CacheContext,
-        key: &str,
-        now_mono: Instant,
-        now_wall: SystemTime,
-    ) {
-        let fresh = CacheExpiry {
-            mono: now_mono + self.ttl,
-            wall: now_wall + self.ttl,
-        };
-        self.entries
-            .entry((context, key.to_string()))
-            .and_modify(|e| {
-                if !e.is_valid_at(now_mono, now_wall) {
-                    *e = fresh;
-                }
-            })
-            .or_insert(fresh);
-    }
-
-    /// Drop every entry; returns how many were dropped (for flush logging).
-    pub fn clear(&mut self) -> usize {
-        let n = self.entries.len();
-        self.entries.clear();
-        n
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn sweep_expired(&mut self) {
-        let now_mono = Instant::now();
-        let now_wall = SystemTime::now();
-        self.entries.retain(|_, e| e.is_valid_at(now_mono, now_wall));
-    }
-
-    pub fn ttl_secs(&self) -> u64 {
-        self.ttl.as_secs()
-    }
-
-    /// Diagnostics (`diag@vt`): currently-valid entries for `context` ONLY —
-    /// same dual-clock predicate as [`is_authorized`]. Deliberately scoped to
-    /// one context so a caller (possibly a relayed remote) never learns how
-    /// many grants other sessions/tabs hold.
-    pub fn live_len(&self, context: CacheContext) -> usize {
-        self.live_len_at(context, Instant::now(), SystemTime::now())
-    }
-
-    /// Clock-injectable core of [`live_len`] (see [`is_authorized_at`]).
-    fn live_len_at(
-        &self,
-        context: CacheContext,
-        now_mono: Instant,
-        now_wall: SystemTime,
-    ) -> usize {
-        self.entries
-            .iter()
-            .filter(|((c, _), e)| *c == context && e.is_valid_at(now_mono, now_wall))
-            .count()
-    }
-}
+pub type CacheContext = SubjectId;
 
 /// True when `timeout` has elapsed since the last activity on EITHER clock —
-/// the same dual-clock rule as [`CacheExpiry`] (which documents why), applied
-/// to the idle timeout: without the wall clock a laptop that naps often could
+/// the same dual-clock rule as authorization grants, applied to the idle
+/// timeout: without the wall clock a laptop that naps often could
 /// stay "active" for days and never drop its keys.
 fn idle_exceeded(
     last_mono: Instant,
@@ -277,22 +155,18 @@ fn idle_exceeded(
     now_wall: SystemTime,
     timeout: Duration,
 ) -> bool {
-    let deadline = CacheExpiry {
-        mono: last_mono + timeout,
-        wall: last_wall + timeout,
-    };
-    !deadline.is_valid_at(now_mono, now_wall)
+    last_mono
+        .checked_add(timeout)
+        .is_some_and(|deadline| now_mono >= deadline)
+        || last_wall
+            .checked_add(timeout)
+            .is_some_and(|deadline| now_wall >= deadline)
 }
 
 // --- Cache watcher (screen lock + sleep/wake invalidation) ---
 
 /// How often the cache watcher samples screen-lock state and clock skew.
 const WATCHER_TICK: Duration = Duration::from_secs(5);
-/// Wall clock advancing this much further than the monotonic clock between
-/// two watcher ticks means the system slept (mono pauses during sleep).
-/// Large enough to also absorb small NTP steps without spurious clears.
-const WATCHER_SLEEP_DIVERGENCE: Duration = Duration::from_secs(30);
-
 /// Decide whether the auth caches must be flushed for this watcher tick.
 ///
 /// Two triggers, both "the human walked away" signals that must revoke
@@ -301,10 +175,11 @@ const WATCHER_SLEEP_DIVERGENCE: Duration = Duration::from_secs(30);
 ///      -switched, or logged out). Only the *transition* clears, so a grant
 ///      issued after unlock isn't immediately eaten by the steady locked
 ///      state of some other display.
-///   2. Sleep detected: wall time advanced ≥ [`WATCHER_SLEEP_DIVERGENCE`]
+///   2. Sleep detected: wall time advanced by the shared sleep-divergence
+///      threshold
 ///      more than monotonic time since the previous tick. `wall_delta` is
 ///      `None` when the wall clock stepped backwards — not a sleep signal;
-///      the dual-clock TTL ([`CacheExpiry`]) still bounds those entries.
+///      the authorization engine's dual-clock TTL still bounds those entries.
 fn watcher_should_clear(
     was_interactive: bool,
     is_interactive: bool,
@@ -314,10 +189,7 @@ fn watcher_should_clear(
     if was_interactive && !is_interactive {
         return true;
     }
-    match wall_delta {
-        Some(wall) => wall.saturating_sub(mono_delta) >= WATCHER_SLEEP_DIVERGENCE,
-        None => false,
-    }
+    sleep_diverged(mono_delta, wall_delta)
 }
 
 // --- macOS process introspection ---
@@ -756,70 +628,13 @@ pub const DEFAULT_AUTH_CACHE_DURATION_SECS: u64 = 120;
 /// material, whose blast radius is wider than a single-challenge signature.
 pub const DEFAULT_DECRYPT_AUTH_CACHE_DURATION_SECS: u64 = 30;
 
-/// Configuration for one of the agent's auth caches. Carries (mode, ttl)
-/// together so the sign and decrypt caches can't have their fields
-/// accidentally swapped at any of the call layers.
+/// Reuse policy inputs for one operation in the unified authorization engine.
+/// Carries (mode, ttl) together so sign and decrypt cannot have their fields
+/// accidentally swapped at any call layer.
 #[derive(Debug, Clone, Copy)]
 pub struct AuthCacheConfig {
     pub mode: AuthCacheMode,
     pub ttl_secs: u64,
-}
-
-/// Derive the decrypt-cache lookup string for a single v2 item.
-///
-/// Domain-tagged so a digest from this hash can never collide with a digest
-/// from any other use of SHA-256 in the codebase. `host` and `pwd` are
-/// length-prefixed so the boundaries between fields are unambiguous.
-///
-/// `host` and `pwd` come from the client-supplied request and are NOT
-/// trusted for security — they only partition the cache, so different
-/// hostnames / working directories don't share entries. This mirrors the
-/// advisory `pwd` component of the Worker-side DEK cache: a compromised peer
-/// can lie to force a miss (DoS) or to reuse another directory's still-cached
-/// grant on the same host, but it never widens the hard context boundary
-/// (the peer process tree). The pwd component is what scopes `global`-mode
-/// grants to one project tree for orchestrated callers.
-fn decrypt_cache_key(
-    t: crate::core::SecretType,
-    salt: &[u8; SALT_LEN],
-    host: &str,
-    pwd: &str,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"vt-decrypt-cache-v2");
-    h.update([t.as_byte()]);
-    h.update(salt);
-    h.update((host.len() as u32).to_le_bytes());
-    h.update(host.as_bytes());
-    h.update((pwd.len() as u32).to_le_bytes());
-    h.update(pwd.as_bytes());
-    hex_string(&h.finalize())
-}
-
-/// Derive the sign-cache lookup string: key fingerprint + client-reported
-/// working directory. Same advisory-`pwd` rationale as [`decrypt_cache_key`].
-/// Plain SSH `sign` requests (agent protocol, no `ClientMeta`) pass an empty
-/// pwd and so share one slot per fingerprint, unchanged from before; `sign@vt`
-/// requests carry `meta.pwd` and are partitioned by it.
-fn sign_cache_key(fingerprint: &str, pwd: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"vt-sign-cache-v1");
-    h.update((fingerprint.len() as u32).to_le_bytes());
-    h.update(fingerprint.as_bytes());
-    h.update((pwd.len() as u32).to_le_bytes());
-    h.update(pwd.as_bytes());
-    hex_string(&h.finalize())
-}
-
-fn hex_string(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
 }
 
 /// Load all SSH keys from the keychain store into a HashMap. The store and
@@ -983,13 +798,15 @@ pub struct VtSshAgentFactory {
     /// Last request time on both clocks — see [`idle_exceeded`] for why the
     /// monotonic clock alone can't drive the idle timeout.
     last_activity: Arc<RwLock<(Instant, SystemTime)>>,
-    locked: Arc<RwLock<bool>>,
+    locked: Arc<AtomicBool>,
+    /// Serializes SSH-agent lock/unlock state transitions. The synchronous
+    /// atomic remains the live authorization validator's fast state source.
+    lock_transition: Arc<Mutex<()>>,
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
     idle_cleared: Arc<RwLock<bool>>,
-    sign_auth_cache: Arc<RwLock<AuthCache>>,
-    decrypt_auth_cache: Arc<RwLock<AuthCache>>,
-    sign_cache_mode: AuthCacheMode,
-    decrypt_cache_mode: AuthCacheMode,
+    authorization: Arc<AuthorizationEngine>,
+    sign_cache: AuthCacheConfig,
+    decrypt_cache: AuthCacheConfig,
     /// When true, `decrypt@vt` rejects `Legacy` items (v0/v1 URLs). v2 envelope
     /// items continue to work. Lets users who have fully migrated harden the
     /// agent so the "agent emits plaintext over wire" path can never be
@@ -997,9 +814,6 @@ pub struct VtSshAgentFactory {
     disable_legacy_decrypt: bool,
     /// run@vt allowlist. Empty = feature disabled.
     run_allow: Arc<RunAllowlist>,
-    /// Global serializer for ALL human auth prompts; see
-    /// [`VtSshSession::authenticate_serialized`] for the rationale.
-    prompt_sem: Arc<Semaphore>,
     /// Fire-and-forget audit push config. Cloned per session like `run_allow`.
     /// Disabled config = audit push is a no-op.
     audit_push: Arc<AuditPushConfig>,
@@ -1014,19 +828,20 @@ impl VtSshAgentFactory {
         run_allow: RunAllowlist,
         audit_push: Arc<AuditPushConfig>,
     ) -> Self {
+        let locked = Arc::new(AtomicBool::new(false));
+        let authorization = new_engine(Arc::clone(&locked));
         Self {
             keys: Arc::new(RwLock::new(keys)),
             last_activity: Arc::new(RwLock::new((Instant::now(), SystemTime::now()))),
-            locked: Arc::new(RwLock::new(false)),
+            locked,
+            lock_transition: Arc::new(Mutex::new(())),
             lock_passphrase: Arc::new(RwLock::new(None)),
             idle_cleared: Arc::new(RwLock::new(false)),
-            sign_auth_cache: Arc::new(RwLock::new(AuthCache::new(sign_cache.ttl_secs))),
-            decrypt_auth_cache: Arc::new(RwLock::new(AuthCache::new(decrypt_cache.ttl_secs))),
-            sign_cache_mode: sign_cache.mode,
-            decrypt_cache_mode: decrypt_cache.mode,
+            authorization,
+            sign_cache,
+            decrypt_cache,
             disable_legacy_decrypt,
             run_allow: Arc::new(run_allow),
-            prompt_sem: Arc::new(Semaphore::new(1)),
             audit_push,
         }
     }
@@ -1072,6 +887,7 @@ impl VtSshAgentFactory {
 /// arrive from the same process). Repeated one-shot ssh invocations therefore
 /// no longer share a grant within the TTL; connections multiplexed through a
 /// ControlMaster master do (one long-lived process).
+#[cfg(test)]
 fn resolve_cache_context(
     peer_pid: Option<i32>,
     mode: AuthCacheMode,
@@ -1185,11 +1001,19 @@ fn is_ssh_client_path(path: &str) -> bool {
 
 /// Assemble one cache's `diag@vt` report. `live_entries` counts only the
 /// caller's own context (0 when uncacheable) — never the whole cache.
-fn diag_cache_report(cache: &AuthCache, resolution: ContextResolution) -> DiagCacheReport {
+async fn diag_cache_report(
+    authorization: &AuthorizationEngine,
+    operation: Operation,
+    ttl_secs: u64,
+    resolution: ContextResolution,
+) -> DiagCacheReport {
     DiagCacheReport {
         mode: resolution.mode.to_string(),
-        ttl_secs: cache.ttl_secs(),
-        live_entries: resolution.context.map_or(0, |c| cache.live_len(c)),
+        ttl_secs,
+        live_entries: match resolution.context {
+            Some(subject) => authorization.live_len(operation, subject).await,
+            None => 0,
+        },
         context_basis: resolution.basis.as_wire().to_string(),
     }
 }
@@ -1208,19 +1032,20 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             .map(|argv| crate::ssh_sign::is_vt_relay_invocation(&argv))
             .unwrap_or(false);
         let sign_cache_resolution =
-            classify_cache_context(peer_pid, self.sign_cache_mode, peer_is_vt_relay);
+            classify_cache_context(peer_pid, self.sign_cache.mode, peer_is_vt_relay);
         let decrypt_cache_resolution =
-            classify_cache_context(peer_pid, self.decrypt_cache_mode, peer_is_vt_relay);
+            classify_cache_context(peer_pid, self.decrypt_cache.mode, peer_is_vt_relay);
         VtSshSession {
             keys: Arc::clone(&self.keys),
             last_activity: Arc::clone(&self.last_activity),
             locked: Arc::clone(&self.locked),
+            lock_transition: Arc::clone(&self.lock_transition),
             lock_passphrase: Arc::clone(&self.lock_passphrase),
             idle_cleared: Arc::clone(&self.idle_cleared),
-            sign_auth_cache: Arc::clone(&self.sign_auth_cache),
-            decrypt_auth_cache: Arc::clone(&self.decrypt_auth_cache),
+            authorization: Arc::clone(&self.authorization),
+            sign_cache_ttl_secs: self.sign_cache.ttl_secs,
+            decrypt_cache_ttl_secs: self.decrypt_cache.ttl_secs,
             run_allow: Arc::clone(&self.run_allow),
-            prompt_sem: Arc::clone(&self.prompt_sem),
             audit_push: Arc::clone(&self.audit_push),
             peer_pid,
             peer_is_vt_relay,
@@ -1236,16 +1061,16 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
 struct VtSshSession {
     keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
     last_activity: Arc<RwLock<(Instant, SystemTime)>>,
-    locked: Arc<RwLock<bool>>,
+    locked: Arc<AtomicBool>,
+    lock_transition: Arc<Mutex<()>>,
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
     idle_cleared: Arc<RwLock<bool>>,
-    sign_auth_cache: Arc<RwLock<AuthCache>>,
-    decrypt_auth_cache: Arc<RwLock<AuthCache>>,
+    authorization: Arc<AuthorizationEngine>,
+    sign_cache_ttl_secs: u64,
+    decrypt_cache_ttl_secs: u64,
     /// Cloned per session for cheap reads; the underlying allowlist is
     /// constant for the lifetime of the agent process.
     run_allow: Arc<RunAllowlist>,
-    /// Shared across all sessions; see [`VtSshSession::authenticate_serialized`].
-    prompt_sem: Arc<Semaphore>,
     /// Shared fire-and-forget audit push config (disabled = no-op).
     audit_push: Arc<AuditPushConfig>,
     peer_pid: Option<i32>,
@@ -1260,83 +1085,6 @@ struct VtSshSession {
     /// for decrypt; `.mode`/`.basis` are diag-only.
     decrypt_cache_resolution: ContextResolution,
     disable_legacy_decrypt: bool,
-}
-
-/// Outcome of a `sign` authorization, carrying enough to audit it. Replaces
-/// the old `bool` so the emit point in `Session::sign` can distinguish a
-/// silent cache hit from a fresh approval and from a denial. `Unavailable`
-/// keeps the [`UnavailableReason`] so `sign@vt` can surface the structured
-/// ErrKind (SessionLocked/NoGuiSession) instead of flattening to Generic.
-enum AuthDecision {
-    CacheHit,
-    Approved,
-    Rejected,
-    Unavailable(UnavailableReason),
-}
-
-impl AuthDecision {
-    /// True when signing should proceed.
-    fn is_ok(&self) -> bool {
-        matches!(self, AuthDecision::CacheHit | AuthDecision::Approved)
-    }
-    fn outcome(&self) -> &'static str {
-        match self {
-            AuthDecision::CacheHit => "cache_hit",
-            AuthDecision::Approved => "approved",
-            AuthDecision::Rejected => "rejected",
-            AuthDecision::Unavailable(_) => "unavailable",
-        }
-    }
-}
-
-/// Outcome of a `decrypt@vt` batch authorization. Carries the structured
-/// `ErrKind` on the failure arm so the existing client-facing error mapping
-/// (`SessionLocked`/`NoGuiSession` → the right `DETAIL_*`) is preserved
-/// (NEW-1): a bare `Unavailable` would collapse that distinction.
-enum DecryptDecision {
-    CacheHit,
-    Approved,
-    Rejected,
-    Err(ErrKind),
-}
-
-impl DecryptDecision {
-    fn outcome(&self) -> &'static str {
-        match self {
-            DecryptDecision::CacheHit => "cache_hit",
-            DecryptDecision::Approved => "approved",
-            DecryptDecision::Rejected => "rejected",
-            DecryptDecision::Err(_) => "unavailable",
-        }
-    }
-}
-
-/// Run the blocking auth chain on the blocking pool. No serialization —
-/// callers must already hold the prompt permit (or deliberately not need
-/// one). Join error means the auth chain panicked; fail closed.
-async fn authenticate_on_blocking_pool(reason: &str) -> AuthOutcome {
-    let msg = reason.to_string();
-    match tokio::task::spawn_blocking(move || authenticate(&msg)).await {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            tracing::error!("auth prompt task failed: {}", e);
-            AuthOutcome::Unavailable(UnavailableReason::NotInteractive)
-        }
-    }
-}
-
-/// Map a single `authenticate()` outcome (the always-prompt, no-cache path)
-/// onto a `DecryptDecision`, preserving the structured `ErrKind` for the
-/// failure arms. `Rejected` is its own variant; a `None` from
-/// `outcome_to_err_strict` (future enum variant) fails closed to `Generic`.
-fn decrypt_decision_from_authenticate(outcome: AuthOutcome) -> DecryptDecision {
-    match outcome {
-        AuthOutcome::Success(_) => DecryptDecision::Approved,
-        AuthOutcome::Rejected => DecryptDecision::Rejected,
-        AuthOutcome::Unavailable(reason) => DecryptDecision::Err(
-            outcome_to_err_strict(AuthOutcome::Unavailable(reason)).unwrap_or(ErrKind::Generic),
-        ),
-    }
 }
 
 impl VtSshSession {
@@ -1390,8 +1138,8 @@ impl VtSshSession {
     }
 
     /// Ensure keys are loaded. If they were cleared by the idle sweeper,
-    /// silently reload from keychain. Touch ID is enforced per sign/extension
-    /// request via `check_or_prompt_auth()` using the normal cache rules.
+    /// silently reload from keychain. The unified authorization engine still
+    /// gates every operation before a loaded key can be used.
     async fn ensure_keys_loaded(&self) -> Result<(), AgentError> {
         let keys = self.keys.read().await;
         if !keys.is_empty() {
@@ -1409,6 +1157,12 @@ impl VtSshSession {
         let loaded = load_all_keys().map_err(agent_err)?;
         tracing::info!("Reloaded {} SSH keys", loaded.len());
         let mut keys = self.keys.write().await;
+        // A lock transition may have started while Keychain I/O was in
+        // progress. Check while holding the same key-map guard used by lock()
+        // so loaded private keys can never be installed after its clear.
+        if self.locked.load(Ordering::Acquire) {
+            return Ok(());
+        }
         *keys = loaded;
 
         // Reset idle_cleared flag
@@ -1421,249 +1175,6 @@ impl VtSshSession {
     async fn touch_activity(&self) {
         let mut last = self.last_activity.write().await;
         *last = (Instant::now(), SystemTime::now());
-    }
-
-    /// Run the blocking auth chain (`authenticate`) for `reason`, serialized
-    /// through the global one-permit prompt semaphore and moved off the async
-    /// workers via `spawn_blocking`.
-    ///
-    /// Serialization: every accepted socket runs in its own tokio task, so
-    /// without the permit a peer holding VT_AUTH (or any process reaching a
-    /// forwarded socket) could stack N concurrent dialogs at the user —
-    /// prompt-fatigue that trains reflexive approval. `spawn_blocking`:
-    /// `authenticate` blocks on a human for up to ~30s; run inline it would
-    /// pin one runtime worker per concurrent prompt and, at worker-count
-    /// prompts, stall the whole agent including unrelated sessions.
-    ///
-    /// The cached paths (`check_or_prompt_auth`,
-    /// `check_or_prompt_decrypt_batch`) don't use this wrapper: they acquire
-    /// the permit themselves so they can re-check the cache after the queue
-    /// wait. Use this only where no cache is involved.
-    async fn authenticate_serialized(&self, reason: &str) -> AuthOutcome {
-        // The semaphore is never closed, so acquire only fails if that ever
-        // changes; fail closed as "cannot prompt" rather than a user reject.
-        let Ok(_permit) = self.prompt_sem.acquire().await else {
-            return AuthOutcome::Unavailable(UnavailableReason::NotInteractive);
-        };
-        authenticate_on_blocking_pool(reason).await
-    }
-
-    /// Check auth cache or prompt the user. Returns an [`AuthDecision`]
-    /// distinguishing a silent cache hit from a fresh approval / denial so the
-    /// `Session::sign` call site can audit the outcome.
-    ///
-    /// Used for `sign` (SSH authentication) and `sign@vt` (`vt ssh connect`),
-    /// which share one cache — both authorize "sign with this key". `auth@vt`
-    /// always prompts because forwarded agents share one local process.
-    /// `decrypt@vt` has its own cache (see `check_or_prompt_decrypt_batch`).
-    ///
-    /// All three success methods (Biometric, FIDO2, Password) are cached:
-    /// FIDO2 (YubiKey touch) is treated as equivalent to Touch ID for
-    /// authorization purposes — a deliberate policy choice.
-    async fn check_or_prompt_auth(
-        &self,
-        fingerprint: &str,
-        pwd: &str,
-        auth_message: &str,
-    ) -> AuthDecision {
-        // If we couldn't resolve a cache context at session creation (no
-        // peer PID, no TTY, missing proc info), always prompt.
-        let Some(context) = self.sign_cache_resolution.context else {
-            return match self.authenticate_serialized(auth_message).await {
-                AuthOutcome::Success(_) => AuthDecision::Approved,
-                AuthOutcome::Rejected => AuthDecision::Rejected,
-                AuthOutcome::Unavailable(r) => AuthDecision::Unavailable(r),
-            };
-        };
-        let key = sign_cache_key(fingerprint, pwd);
-
-        // Fast path: cache hit without touching the prompt queue.
-        if self.sign_cache_hit(context, &key, fingerprint, "").await {
-            return AuthDecision::CacheHit;
-        }
-
-        // Queue for the prompt, then RE-CHECK the cache: a racing request for
-        // the same key may have been approved (and granted — grants happen
-        // while the permit is still held) during the wait, so an N-request
-        // burst costs one dialog instead of N.
-        let Ok(_permit) = self.prompt_sem.acquire().await else {
-            return AuthDecision::Unavailable(UnavailableReason::NotInteractive);
-        };
-        if self.sign_cache_hit(context, &key, fingerprint, " after prompt-queue wait").await {
-            return AuthDecision::CacheHit;
-        }
-
-        // Prompt (permit held, no cache locks held)
-        let method = match authenticate_on_blocking_pool(auth_message).await {
-            AuthOutcome::Success(m) => m,
-            AuthOutcome::Rejected => return AuthDecision::Rejected,
-            AuthOutcome::Unavailable(reason) => {
-                tracing::warn!(
-                    "Auth unavailable for fingerprint={} reason={:?}",
-                    fingerprint,
-                    reason
-                );
-                return AuthDecision::Unavailable(reason);
-            }
-        };
-
-        if method.is_cacheable() {
-            // Granted while the permit is still held, so queued waiters are
-            // guaranteed to observe this entry on their re-check.
-            let mut cache = self.sign_auth_cache.write().await;
-            cache.grant(context, &key);
-            tracing::debug!(
-                "Sign auth cache grant for context={:?} fingerprint={} method={:?}",
-                context,
-                fingerprint,
-                method
-            );
-        }
-
-        AuthDecision::Approved
-    }
-
-    /// Cache-aware authorization for a `decrypt@vt` batch.
-    ///
-    /// Any legacy item in the batch disables caching for the whole batch —
-    /// legacy items release plaintext, and the invariant "legacy-containing
-    /// batch always prompts" is load-bearing for that decision. Otherwise:
-    /// full hit skips Touch ID; partial hit prompts once and then grants the
-    /// whole batch (strict-TTL — see the grant loop below).
-    ///
-    /// Returns a [`DecryptDecision`]: `CacheHit`/`Approved` allow the decrypt,
-    /// `Rejected`/`Err(kind)` block it (the caller maps those to the structured
-    /// `ExtResponse::Err` envelope). Both failure arms `return` before any
-    /// `cache.grant` call, preserving the invariant that failure paths never
-    /// extend or create cache entries.
-    async fn check_or_prompt_decrypt_batch(
-        &self,
-        v2_items: &[(crate::core::SecretType, [u8; SALT_LEN])],
-        has_legacy: bool,
-        host: &str,
-        pwd: &str,
-        auth_message: &str,
-    ) -> DecryptDecision {
-        // Cacheable iff there's a resolved context AND the batch is non-empty
-        // pure-v2; everything else falls through to the always-prompt path.
-        let context = match self.decrypt_cache_resolution.context {
-            Some(c) if !has_legacy && !v2_items.is_empty() => c,
-            // No cache eligibility: prompt once. Preserve the structured
-            // ErrKind via `outcome_to_err_strict` so the client-facing error
-            // (SessionLocked/NoGuiSession) is not flattened (NEW-1). Fail
-            // closed: a `None` for a non-Success outcome (future enum variant)
-            // becomes an Err rather than a silent allow.
-            _ => {
-                return decrypt_decision_from_authenticate(
-                    self.authenticate_serialized(auth_message).await,
-                )
-            }
-        };
-
-        let keys: Vec<String> = v2_items
-            .iter()
-            .map(|(t, salt)| decrypt_cache_key(*t, salt, host, pwd))
-            .collect();
-
-        // Fast path: full hit without touching the prompt queue.
-        if self.decrypt_miss_count(context, &keys).await == 0 {
-            tracing::debug!(
-                "Decrypt auth cache hit for context={:?} ({} v2 items)",
-                context,
-                v2_items.len()
-            );
-            return DecryptDecision::CacheHit;
-        }
-
-        // Queue for the prompt, then RE-CHECK: a racing request covering the
-        // same records may have been approved (and granted — grants happen
-        // while the permit is still held) during the wait, so an N-request
-        // burst costs one dialog instead of N.
-        let Ok(_permit) = self.prompt_sem.acquire().await else {
-            return decrypt_decision_from_authenticate(AuthOutcome::Unavailable(
-                UnavailableReason::NotInteractive,
-            ));
-        };
-        let miss_count = self.decrypt_miss_count(context, &keys).await;
-        if miss_count == 0 {
-            tracing::debug!(
-                "Decrypt auth cache hit after prompt-queue wait for context={:?} ({} v2 items)",
-                context,
-                v2_items.len()
-            );
-            return DecryptDecision::CacheHit;
-        }
-
-        let method = match authenticate_on_blocking_pool(auth_message).await {
-            AuthOutcome::Success(m) => m,
-            AuthOutcome::Rejected => return DecryptDecision::Rejected,
-            AuthOutcome::Unavailable(reason) => {
-                tracing::warn!("decrypt@vt unavailable: {:?}", reason);
-                return DecryptDecision::Err(
-                    outcome_to_err_strict(AuthOutcome::Unavailable(reason))
-                        .unwrap_or(ErrKind::Generic),
-                );
-            }
-        };
-
-        if method.is_cacheable() {
-            // The user just approved the ENTIRE batch, so grant every key in
-            // it, not just the previously-missing ones — an entry that was
-            // valid at the check above but expired while the prompt sat on
-            // screen would otherwise stay expired despite the fresh approval.
-            // `grant_at` is strict-TTL: keys still valid at this instant keep
-            // their original expiry (no sliding refresh). Granted while the
-            // permit is still held, so queued waiters observe the entries on
-            // their re-check.
-            let now_mono = Instant::now();
-            let now_wall = SystemTime::now();
-            let mut cache = self.decrypt_auth_cache.write().await;
-            for k in &keys {
-                cache.grant_at(context, k, now_mono, now_wall);
-            }
-            tracing::debug!(
-                "Decrypt auth cache grant for context={:?} method={:?} cache_misses={}",
-                context,
-                method,
-                miss_count
-            );
-        }
-
-        DecryptDecision::Approved
-    }
-
-    /// Sign-cache lookup with a hit-path debug log; `phase` distinguishes the
-    /// fast-path check from the post-queue re-check in the log line. `key` is
-    /// the [`sign_cache_key`] digest; `fingerprint` is passed alongside only
-    /// so the log line stays human-readable.
-    async fn sign_cache_hit(
-        &self,
-        context: CacheContext,
-        key: &str,
-        fingerprint: &str,
-        phase: &str,
-    ) -> bool {
-        let hit = self.sign_auth_cache.read().await.is_authorized(context, key);
-        if hit {
-            tracing::debug!(
-                "Sign auth cache hit{} for context={:?} fingerprint={}",
-                phase,
-                context,
-                fingerprint
-            );
-        }
-        hit
-    }
-
-    /// Count how many of `keys` are NOT currently authorized for `context` —
-    /// 0 means a full cache hit. One clock capture per call.
-    async fn decrypt_miss_count(&self, context: CacheContext, keys: &[String]) -> usize {
-        let now_mono = Instant::now();
-        let now_wall = SystemTime::now();
-        let cache = self.decrypt_auth_cache.read().await;
-        keys.iter()
-            .filter(|k| !cache.is_authorized_at(context, k, now_mono, now_wall))
-            .count()
     }
 
     // ---- Structured-envelope dispatch helpers --------------------------------
@@ -1680,7 +1191,7 @@ impl VtSshSession {
         decrypted: &[u8],
         store: &KeychainStore,
         passphrase_cipher: &AesGcmCrypto,
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         // v2 envelope: agent allocates a fresh per-record (salt, DEK) pair
         // for each requested SecretType. The agent NEVER receives plaintext
         // on this path. The salt is generated server-side (never accepted
@@ -1727,7 +1238,7 @@ impl VtSshSession {
             req.types.len(),
             0,
         );
-        Ok(Zeroizing::new(bytes))
+        Ok(HandlerSuccess::without_authorization(Zeroizing::new(bytes)))
     }
 
     async fn handle_decrypt(
@@ -1735,7 +1246,7 @@ impl VtSshSession {
         decrypted: &[u8],
         store: &KeychainStore,
         passphrase_cipher: &AesGcmCrypto,
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         let req: DecryptReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
@@ -1781,6 +1292,16 @@ impl VtSshSession {
             return Err((ErrKind::LegacyDisabled, Some(DETAIL_LEGACY_DISABLED)));
         }
 
+        // Verify that the stored master key is present and decryptable before
+        // consulting reusable authorization state or prompting. Drop this
+        // short-lived copy immediately; the operation reloads it only after a
+        // permit is obtained, so raw key material is not held across a human
+        // prompt. Validation is deterministic over the already-loaded store
+        // and passphrase cipher, making the later load a non-fallible
+        // precondition in normal operation while retaining defensive mapping.
+        validate_mac_key_material(store, passphrase_cipher)
+            .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
+
         let who = who_at_host(&req.meta.user, &req.host);
         let n = req.items.len();
         let mut local_auth_message = header_with_who(
@@ -1799,43 +1320,59 @@ impl VtSshSession {
             local_auth_message.push_str(&body);
         }
         append_meta_lines(&mut local_auth_message, &req.meta);
-        // Cache-aware authorization. Pure v2 batches may skip the prompt on
-        // a full hit; any legacy item disables caching for the entire batch.
-        // Failure paths inside `check_or_prompt_decrypt_batch` never grant
-        // cache entries (verified by inspection of the helper).
-        let t0 = Instant::now();
-        let decision = self
-            .check_or_prompt_decrypt_batch(
-                &v2_inputs,
-                legacy_count > 0,
-                &req.host,
-                &req.meta.pwd,
-                &local_auth_message,
-            )
-            .await;
-        // Cache hits never prompted → 0 latency; otherwise prompt→decision.
-        let latency_ms = if matches!(decision, DecryptDecision::CacheHit) {
-            0
+        // Pure-v2 batches use one atomic scope per record and require an all-of
+        // hit. Any legacy member makes the entire request explicitly Fresh.
+        let (scopes, reuse) = if legacy_count > 0 {
+            (vec![GrantScope::fresh(Operation::Decrypt)], ReusePolicy::Fresh)
         } else {
-            t0.elapsed().as_millis() as u64
+            (
+                v2_inputs
+                    .iter()
+                    .map(|(t, salt)| {
+                        GrantScope::decrypt_v2(
+                            self.decrypt_cache_resolution.context,
+                            t.as_byte(),
+                            salt,
+                            &req.host,
+                            &req.meta.pwd,
+                        )
+                    })
+                    .collect(),
+                ReusePolicy::strict_ttl_secs(self.decrypt_cache_ttl_secs),
+            )
         };
-        self.emit_audit(
-            "decrypt",
-            decision.outcome(),
-            &req.host,
-            &req.meta,
-            &req.command,
-            "",
-            req.items.len(),
-            latency_ms,
-        );
-        match decision {
-            DecryptDecision::CacheHit | DecryptDecision::Approved => {}
-            DecryptDecision::Rejected => {
-                return Err((ErrKind::AuthRejected, auth_outcome_detail(ErrKind::AuthRejected)))
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::new(scopes, reuse, local_auth_message))
+            .await
+        {
+            Ok(permit) => {
+                self.emit_audit(
+                    "decrypt",
+                    permit.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    &req.command,
+                    "",
+                    req.items.len(),
+                    permit.latency_ms(),
+                );
+                permit
             }
-            DecryptDecision::Err(kind) => return Err((kind, auth_outcome_detail(kind))),
-        }
+            Err(failure) => {
+                self.emit_audit(
+                    "decrypt",
+                    failure.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    &req.command,
+                    "",
+                    req.items.len(),
+                    failure.latency_ms(),
+                );
+                return Err(authorization_failure_wire(&failure));
+            }
+        };
         let (mac_cipher, mac_key) = load_mac_cipher(store, passphrase_cipher)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
         let mut result: Vec<DecryptResItem> = Vec::with_capacity(req.items.len());
@@ -1868,8 +1405,10 @@ impl VtSshSession {
             }
         }
         drop(mac_key);
-        let bytes = serde_json::to_vec(&result)
-            .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?;
+        let bytes = Zeroizing::new(
+            serde_json::to_vec(&result)
+                .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?,
+        );
         // Scrub DEKs inside the response Vec before drop. `bytes` already
         // carries them (still wiped via `Zeroizing` below).
         for item in result.iter_mut() {
@@ -1877,13 +1416,13 @@ impl VtSshSession {
                 dek.zeroize();
             }
         }
-        Ok(Zeroizing::new(bytes))
+        Ok(HandlerSuccess::authorized(bytes, permit))
     }
 
     async fn handle_auth(
         &self,
         decrypted: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         let req: AuthReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
@@ -1901,45 +1440,47 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
-        // Always prompt Touch ID — no auth caching for auth@vt. Over
-        // forwarded agents, all remote sessions share the same local
-        // process, so caching would approve all sudo from any session.
-        let t0 = Instant::now();
-        let outcome = self.authenticate_serialized(&auth_message).await;
-        let latency_ms = t0.elapsed().as_millis() as u64;
-        let outcome_str = match &outcome {
-            AuthOutcome::Success(_) => "approved",
-            AuthOutcome::Rejected => "rejected",
-            AuthOutcome::Unavailable(_) => "unavailable",
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::fresh(
+                GrantScope::fresh(Operation::Auth),
+                auth_message,
+            ))
+            .await
+        {
+            Ok(permit) => {
+                self.emit_audit(
+                    "auth",
+                    permit.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    "",
+                    &req.reason,
+                    0,
+                    permit.latency_ms(),
+                );
+                permit
+            }
+            Err(failure) => {
+                self.emit_audit(
+                    "auth",
+                    failure.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    "",
+                    &req.reason,
+                    0,
+                    failure.latency_ms(),
+                );
+                return Err(authorization_failure_wire(&failure));
+            }
         };
-        self.emit_audit(
-            "auth",
-            outcome_str,
-            &req.host,
-            &req.meta,
-            "",
-            &req.reason,
-            0,
-            latency_ms,
-        );
-        match outcome {
-            AuthOutcome::Success(_) => {}
-            AuthOutcome::Rejected => {
-                return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
-            }
-            AuthOutcome::Unavailable(reason) => {
-                tracing::warn!("auth@vt unavailable: {:?}", reason);
-                // Fail closed on a future-variant miss in `outcome_to_err`.
-                let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
-                    .unwrap_or(ErrKind::Generic);
-                return Err((kind, auth_outcome_detail(kind)));
-            }
-        }
 
         let result = AuthRes { approved: true };
-        Ok(Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
+        let bytes = Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
             (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
-        })?))
+        })?);
+        Ok(HandlerSuccess::authorized(bytes, permit))
     }
 
     /// `diag@vt`: read-only diagnostics for `vt doctor`. No Touch ID (it
@@ -1951,7 +1492,7 @@ impl VtSshSession {
     async fn handle_diag(
         &self,
         decrypted: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         let _req: DiagReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
@@ -1967,14 +1508,20 @@ impl VtSshSession {
             is_ssh_client: peer_path.as_deref().is_some_and(is_ssh_client_path),
             is_vt_relay: self.peer_is_vt_relay,
         };
-        let sign_cache = {
-            let cache = self.sign_auth_cache.read().await;
-            diag_cache_report(&cache, self.sign_cache_resolution)
-        };
-        let decrypt_cache = {
-            let cache = self.decrypt_auth_cache.read().await;
-            diag_cache_report(&cache, self.decrypt_cache_resolution)
-        };
+        let sign_cache = diag_cache_report(
+            &self.authorization,
+            Operation::Sign,
+            self.sign_cache_ttl_secs,
+            self.sign_cache_resolution,
+        )
+        .await;
+        let decrypt_cache = diag_cache_report(
+            &self.authorization,
+            Operation::Decrypt,
+            self.decrypt_cache_ttl_secs,
+            self.decrypt_cache_resolution,
+        )
+        .await;
         let result = DiagRes {
             agent_version: env!("VT_VERSION").to_string(),
             sign_cache,
@@ -1983,9 +1530,10 @@ impl VtSshSession {
             run_allow_len: self.run_allow.len(),
             audit_push: self.audit_push.enabled,
         };
-        Ok(Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
-            (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
-        })?))
+        Ok(HandlerSuccess::without_authorization(Zeroizing::new(
+            serde_json::to_vec(&result)
+                .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?,
+        )))
     }
 
     /// Touch-ID-gated local command launcher. Every call prompts — no auth
@@ -1999,7 +1547,7 @@ impl VtSshSession {
     async fn handle_run(
         &self,
         decrypted: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         let req: RunReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
@@ -2051,43 +1599,45 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
-        // NEVER cache. run@vt is treated like auth@vt — every call prompts
-        // because a forwarded agent socket is shared across all remote
-        // sessions, and any cache here would let one session's approval
-        // be reused by another to run arbitrary allowlisted programs.
-        // Prompt serialization (one dialog at a time) is inside
-        // `authenticate_serialized`, shared with every other prompting path.
-        // run@vt: exe + argv joined as the audit `command` (reuses the prompt
-        // builders above). All emit points carry it.
+        // Validation, allowlist resolution, and canonicalization above all run
+        // before authorization. run@vt uses the shared engine but an explicit
+        // Fresh policy, so every invocation still requires a human approval.
         let run_command = format!("exe: {}\nargv: {}", exe_display, argv_for_prompt);
         let run_reason = req.reason.as_deref().unwrap_or("");
-        let t0 = Instant::now();
-        let outcome = self.authenticate_serialized(&auth_message).await;
-        let latency_ms = t0.elapsed().as_millis() as u64;
-        match outcome {
-            AuthOutcome::Success(_) => {}
-            AuthOutcome::Rejected => {
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::fresh(
+                GrantScope::fresh(Operation::Run),
+                auth_message,
+            ))
+            .await
+        {
+            Ok(permit) => permit,
+            Err(failure) => {
                 self.emit_audit(
-                    "run", "rejected", &req.host, &req.meta, &run_command, run_reason, 0,
-                    latency_ms,
+                    "run",
+                    failure.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    &run_command,
+                    run_reason,
+                    0,
+                    failure.latency_ms(),
                 );
-                return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
+                return Err(authorization_failure_wire(&failure));
             }
-            AuthOutcome::Unavailable(reason) => {
-                tracing::warn!("run@vt unavailable: {:?}", reason);
-                let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
-                    .unwrap_or(ErrKind::Generic);
-                self.emit_audit(
-                    "run", "unavailable", &req.host, &req.meta, &run_command, run_reason, 0,
-                    latency_ms,
-                );
-                return Err((kind, auth_outcome_detail(kind)));
-            }
-        }
+        };
         // Q5: emit `approved` at the human tap, BEFORE the spawn attempt, so a
         // denied launch (below) is distinguishable from a failed one (two rows).
         self.emit_audit(
-            "run", "approved", &req.host, &req.meta, &run_command, run_reason, 0, latency_ms,
+            "run",
+            permit.decision().audit_outcome(),
+            &req.host,
+            &req.meta,
+            &run_command,
+            run_reason,
+            0,
+            permit.latency_ms(),
         );
 
         // Spawn detached. `setsid` makes the child a new session leader so it
@@ -2116,9 +1666,10 @@ impl VtSshSession {
         );
 
         let result = RunRes { pid };
-        Ok(Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
+        let bytes = Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
             (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
-        })?))
+        })?);
+        Ok(HandlerSuccess::authorized(bytes, permit))
     }
 
     /// `sign@vt`: VT_AUTH-gated signing with a Keychain-held key, displaying vt
@@ -2127,15 +1678,16 @@ impl VtSshSession {
     /// auth-cipher envelope and carries human context. The private key never
     /// leaves the agent.
     ///
-    /// Shares the sign auth cache with the standard `SIGN_REQUEST` path (same
-    /// (context, fingerprint) key — both authorize "sign with this key"), so a
-    /// multi-host `vt ssh connect` fan-out costs one Touch ID within the TTL
-    /// instead of one per host. v1 always prompted; superseded by the cache
-    /// opt-in — mode `none` (default) restores per-request prompts.
+    /// Uses the same `Operation::Sign` grant store as standard `SIGN_REQUEST`,
+    /// with each scope partitioned by subject, fingerprint, and working
+    /// directory. Raw SSH requests have no client metadata and use an empty
+    /// working directory. A multi-host `sign@vt` fan-out from one workspace can
+    /// therefore reuse its own grant without silently discarding the pwd
+    /// boundary. Mode `none` (the default) restores per-request prompts.
     async fn handle_sign_vt(
         &self,
         decrypted: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         use ssh_agent_lib::ssh_encoding::Decode;
 
         let req: SignReq = serde_json::from_slice(decrypted)
@@ -2194,42 +1746,46 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
-        // Cache-aware authorization (same cache + double-check semantics as
-        // `Session::sign`). Distinguish reject vs unavailable so the client
-        // gets the right ErrKind (AuthRejected => no fallback, G3).
-        let t0 = Instant::now();
-        let decision = self
-            .check_or_prompt_auth(&fp_str, &req.meta.pwd, &auth_message)
-            .await;
-        let latency_ms = if matches!(decision, AuthDecision::CacheHit) {
-            0
-        } else {
-            t0.elapsed().as_millis() as u64
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::new(
+                vec![GrantScope::sign(
+                    self.sign_cache_resolution.context,
+                    &fp_str,
+                    &req.meta.pwd,
+                )],
+                ReusePolicy::strict_ttl_secs(self.sign_cache_ttl_secs),
+                auth_message,
+            ))
+            .await
+        {
+            Ok(permit) => {
+                self.emit_audit(
+                    "ssh-sign",
+                    permit.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    &req.command,
+                    "",
+                    0,
+                    permit.latency_ms(),
+                );
+                permit
+            }
+            Err(failure) => {
+                self.emit_audit(
+                    "ssh-sign",
+                    failure.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    &req.command,
+                    "",
+                    0,
+                    failure.latency_ms(),
+                );
+                return Err(authorization_failure_wire(&failure));
+            }
         };
-        // Audit the decision (op_kind="ssh-sign", same as the CF ceremony sign
-        // path) — without this, agent-side `vt ssh connect` signing left no
-        // audit row, a visibility gap vs every other handler.
-        self.emit_audit(
-            "ssh-sign",
-            decision.outcome(),
-            &req.host,
-            &req.meta,
-            &req.command,
-            "",
-            0,
-            latency_ms,
-        );
-        match decision {
-            AuthDecision::CacheHit | AuthDecision::Approved => {}
-            AuthDecision::Rejected => {
-                return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
-            }
-            AuthDecision::Unavailable(reason) => {
-                let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
-                    .unwrap_or(ErrKind::Generic);
-                return Err((kind, auth_outcome_detail(kind)));
-            }
-        }
 
         let sig = sign_data_with_privkey(&privkey, &req.data, req.flags)
             .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_FAILED)))?;
@@ -2237,10 +1793,30 @@ impl VtSshSession {
             algorithm: sig.algorithm().to_string(),
             signature: sig.as_bytes().to_vec(),
         };
-        serde_json::to_vec(&res)
+        let bytes = serde_json::to_vec(&res)
             .map(Zeroizing::new)
-            .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))
+            .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?;
+        Ok(HandlerSuccess::authorized(bytes, permit))
     }
+}
+
+/// Finish an agent lock transition independently of the requesting
+/// connection. Dropping the returned JoinHandle detaches rather than cancels
+/// the task, and the owned transition guard prevents a concurrent unlock from
+/// publishing `locked = false` before keys and grants are cleared.
+fn spawn_lock_finalizer(
+    transition: tokio::sync::OwnedMutexGuard<()>,
+    keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
+    authorization: Arc<AuthorizationEngine>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut keys = keys.write().await;
+        keys.clear();
+        drop(keys);
+
+        authorization.invalidate_all().await;
+        drop(transition);
+    })
 }
 
 /// Spawn `exe` with `args` as a detached background process. Returns the
@@ -2328,6 +1904,8 @@ const DETAIL_LEGACY_DISABLED: &str = "legacy decryption disabled (--no-legacy-de
 const DETAIL_AUTH_REJECTED: &str = "authentication was declined";
 const DETAIL_SCREEN_LOCKED: &str = "screen is locked";
 const DETAIL_NO_GUI: &str = "no active GUI session";
+const DETAIL_AUTH_INVALIDATED: &str = "authorization state changed; retry";
+const DETAIL_AUTH_INVALID_TTL: &str = "authorization cache duration is too large";
 const DETAIL_INTERNAL_SERIALIZE: &str = "agent failed to serialize response";
 // run@vt-specific failure reasons. All strings are static program info
 // (no host/argv/user data) and therefore safe to surface to a remote peer.
@@ -2374,6 +1952,51 @@ fn auth_outcome_detail(kind: ErrKind) -> Option<&'static str> {
     }
 }
 
+type WireFailure = (ErrKind, Option<&'static str>);
+
+struct HandlerSuccess {
+    bytes: Zeroizing<Vec<u8>>,
+    authorization: Option<AuthorizationPermit>,
+}
+
+impl HandlerSuccess {
+    fn authorized(bytes: Zeroizing<Vec<u8>>, authorization: AuthorizationPermit) -> Self {
+        Self {
+            bytes,
+            authorization: Some(authorization),
+        }
+    }
+
+    fn without_authorization(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self {
+            bytes,
+            authorization: None,
+        }
+    }
+}
+
+fn authorization_failure_wire(failure: &AuthorizationFailure) -> WireFailure {
+    match failure.decision() {
+        Decision::Rejected => (ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)),
+        Decision::Unavailable(reason) => {
+            let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
+                .unwrap_or(ErrKind::Generic);
+            (kind, auth_outcome_detail(kind))
+        }
+        Decision::Invalidated => (ErrKind::Transient, Some(DETAIL_AUTH_INVALIDATED)),
+        Decision::CacheHit | Decision::Approved(_) => {
+            (ErrKind::Generic, Some(DETAIL_AUTH_INVALIDATED))
+        }
+    }
+}
+
+async fn commit_authorization(permit: AuthorizationPermit) -> Result<(), WireFailure> {
+    permit.commit().await.map_err(|error| match error {
+        CommitError::Invalidated => (ErrKind::Transient, Some(DETAIL_AUTH_INVALIDATED)),
+        CommitError::InvalidTtl => (ErrKind::Generic, Some(DETAIL_AUTH_INVALID_TTL)),
+    })
+}
+
 // ---- Envelope serialization helpers -----------------------------------------
 
 /// Concrete shape used to serialize an `err` envelope. Mirrors the JSON
@@ -2390,16 +2013,17 @@ struct ErrEnvelope {
 #[async_trait]
 impl Session for VtSshSession {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        let locked = self.locked.read().await;
-        if *locked {
+        if self.locked.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
-        drop(locked);
 
         // Reload keys from keychain if cleared by idle timeout.
         // Listing public keys is not security-sensitive; Touch ID is
         // enforced on sign/extension requests.
         self.ensure_keys_loaded().await?;
+        if self.locked.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
 
         let keys = self.keys.read().await;
         let identities = keys
@@ -2413,11 +2037,9 @@ impl Session for VtSshSession {
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        let locked = self.locked.read().await;
-        if *locked {
+        if self.locked.load(Ordering::Acquire) {
             return Err(AgentError::Failure);
         }
-        drop(locked);
 
         self.ensure_keys_loaded().await?;
         self.touch_activity().await;
@@ -2425,7 +2047,7 @@ impl Session for VtSshSession {
         let fp_str = fingerprint_str(&request.pubkey);
 
         // Clone the key out and drop the read-lock BEFORE the Touch ID prompt.
-        // Holding the `keys` read-guard across check_or_prompt_auth (which can
+        // Holding the `keys` read-guard across authorization (which can
         // block on a human for up to ~30s) would starve every writer
         // (add/remove/unlock) for the prompt's duration — a non-VT_AUTH peer can
         // trigger SIGN_REQUESTs to weaponize this. (Mirrors handle_sign_vt.)
@@ -2450,38 +2072,57 @@ impl Session for VtSshSession {
             format!("sign: {} ({})", key_label, proc_name)
         };
 
-        // Check auth cache or prompt Touch ID. Plain agent-protocol signs
-        // carry no ClientMeta, so the pwd key component is empty.
-        let t0 = Instant::now();
-        let decision = self.check_or_prompt_auth(&fp_str, "", &auth_message).await;
-        let latency_ms = if matches!(decision, AuthDecision::CacheHit) {
-            0
-        } else {
-            t0.elapsed().as_millis() as u64
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::new(
+                vec![GrantScope::sign(
+                    self.sign_cache_resolution.context,
+                    &fp_str,
+                    "",
+                )],
+                ReusePolicy::strict_ttl_secs(self.sign_cache_ttl_secs),
+                auth_message.clone(),
+            ))
+            .await
+        {
+            Ok(permit) => {
+                self.emit_audit(
+                    "sign",
+                    permit.decision().audit_outcome(),
+                    "",
+                    &crate::core::ClientMeta::default(),
+                    &auth_message,
+                    "",
+                    0,
+                    permit.latency_ms(),
+                );
+                permit
+            }
+            Err(failure) => {
+                self.emit_audit(
+                    "sign",
+                    failure.decision().audit_outcome(),
+                    "",
+                    &crate::core::ClientMeta::default(),
+                    &auth_message,
+                    "",
+                    0,
+                    failure.latency_ms(),
+                );
+                return Err(AgentError::Failure);
+            }
         };
-        // Session::sign is the raw SSH auth path (op_kind='sign', distinct from
-        // auth@vt) — it carries no vt ClientMeta, so use the prompt label as the
-        // audit `command` and leave meta empty.
-        self.emit_audit(
-            "sign",
-            decision.outcome(),
-            "",
-            &crate::core::ClientMeta::default(),
-            &auth_message,
-            "",
-            0,
-            latency_ms,
-        );
-        if !decision.is_ok() {
-            return Err(AgentError::Failure);
-        }
 
-        sign_data_with_privkey(&privkey, &request.data, request.flags)
+        let signature = sign_data_with_privkey(&privkey, &request.data, request.flags)?;
+        permit
+            .commit()
+            .await
+            .map_err(|_| AgentError::Failure)?;
+        Ok(signature)
     }
 
     async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
-        let locked = self.locked.read().await;
-        if *locked {
+        if self.locked.load(Ordering::Acquire) {
             // The lock check fires before keychain ciphers are derived, so
             // we have no `auth_cipher` to encrypt a structured envelope
             // with. Surface as an unstructured SSH-wire failure — clients
@@ -2489,8 +2130,6 @@ impl Session for VtSshSession {
             // run `ssh-add -X`. See docs/structured-errors.md.
             return Err(AgentError::Failure);
         }
-        drop(locked);
-
         // Only handle vt custom protocol extensions; ignore standard SSH extensions
         if !matches!(
             extension.name.as_str(),
@@ -2538,7 +2177,7 @@ impl Session for VtSshSession {
         // never returns `AgentError` for vt-level failures; only true
         // transport-layer failures (e.g. an internal serialize call) bubble
         // up as unstructured.
-        let dispatch: Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> =
+        let dispatch: Result<HandlerSuccess, WireFailure> =
             match extension.name.as_str() {
                 EXT_ENCRYPT => {
                     self.handle_encrypt(&decrypted, &store, &passphrase_cipher)
@@ -2559,21 +2198,54 @@ impl Session for VtSshSession {
         // serialized inner body (which carries DEKs for encrypt/decrypt) is
         // only ever held in `Zeroizing` buffers — no intermediate
         // `serde_json::Value` allocation that wouldn't be wiped on drop.
-        let envelope_bytes: Zeroizing<Vec<u8>> = match dispatch {
-            Ok(inner_bytes) => Zeroizing::new(wrap_ok_envelope(&inner_bytes)),
-            Err((kind, detail)) => Zeroizing::new(
-                serde_json::to_vec(&ErrEnvelope {
-                    v: WIRE_VERSION,
-                    status: "err",
-                    kind,
-                    detail,
-                })
-                .map_err(|e| agent_err(e.into()))?,
+        let (envelope_bytes, authorization): (
+            Zeroizing<Vec<u8>>,
+            Option<AuthorizationPermit>,
+        ) = match dispatch {
+            Ok(success) => (
+                Zeroizing::new(wrap_ok_envelope(&success.bytes)),
+                success.authorization,
+            ),
+            Err((kind, detail)) => (
+                Zeroizing::new(
+                    serde_json::to_vec(&ErrEnvelope {
+                        v: WIRE_VERSION,
+                        status: "err",
+                        kind,
+                        detail,
+                    })
+                    .map_err(|e| agent_err(e.into()))?,
+                ),
+                None,
             ),
         };
 
-        // Encrypt envelope with auth cipher.
-        let encrypted_response = auth_cipher.encrypt(&envelope_bytes).map_err(agent_err)?;
+        // Encrypt the successful response before committing a pending grant.
+        // If envelope encryption fails, HandlerSuccess drops its non-cloneable
+        // permit and no approval becomes reusable.
+        //
+        // The commit-failure arm below is defensive: while this permit is
+        // alive its security read guard blocks epoch advancement, so
+        // `CommitError::Invalidated` cannot fire today. If a future change
+        // releases the guard before this point, note that the operation has
+        // already executed — a client retrying the resulting Transient error
+        // would re-run a non-idempotent handler (run@vt spawns twice).
+        let mut encrypted_response = auth_cipher.encrypt(&envelope_bytes).map_err(agent_err)?;
+        if let Some(permit) = authorization {
+            if let Err((kind, detail)) = commit_authorization(permit).await {
+                tracing::warn!("authorization commit invalidated after operation success");
+                let error_envelope = Zeroizing::new(
+                    serde_json::to_vec(&ErrEnvelope {
+                        v: WIRE_VERSION,
+                        status: "err",
+                        kind,
+                        detail,
+                    })
+                    .map_err(|e| agent_err(e.into()))?,
+                );
+                encrypted_response = auth_cipher.encrypt(&error_envelope).map_err(agent_err)?;
+            }
+        }
 
         Ok(Some(Extension {
             name: extension.name,
@@ -2582,11 +2254,9 @@ impl Session for VtSshSession {
     }
 
     async fn add_identity(&mut self, identity: AddIdentity) -> Result<(), AgentError> {
-        let locked = self.locked.read().await;
-        if *locked {
+        if self.locked.load(Ordering::Acquire) {
             return Err(AgentError::Failure);
         }
-        drop(locked);
 
         match identity.credential {
             Credential::Key { privkey, comment } => {
@@ -2687,21 +2357,28 @@ impl Session for VtSshSession {
     }
 
     async fn lock(&mut self, passphrase: String) -> Result<(), AgentError> {
-        let mut locked = self.locked.write().await;
-        if *locked {
+        let transition = Arc::clone(&self.lock_transition).lock_owned().await;
+        if self.locked.load(Ordering::Acquire) {
             return Err(AgentError::Failure);
         }
-        *locked = true;
         let mut lp = self.lock_passphrase.write().await;
         *lp = Some(hash_lock_passphrase(&passphrase));
+        // No await between publishing the locked state and spawning the
+        // finalizer: cancellation can only happen once the finalizer owns the
+        // transition guard and is guaranteed to keep running.
+        self.locked.store(true, Ordering::Release);
+        drop(lp);
 
-        // Clear keys from memory on lock
-        let mut keys = self.keys.write().await;
-        keys.clear();
-
-        // Clear both auth caches on lock.
-        self.sign_auth_cache.write().await.clear();
-        self.decrypt_auth_cache.write().await.clear();
+        // Wait for outstanding permits, then advance the epoch even if no
+        // grant exists. The finalizer keeps running if this connection drops.
+        let finalizer = spawn_lock_finalizer(
+            transition,
+            Arc::clone(&self.keys),
+            Arc::clone(&self.authorization),
+        );
+        finalizer
+            .await
+            .map_err(|error| agent_err(anyhow::anyhow!("lock finalizer failed: {error}")))?;
 
         tracing::info!("Agent locked");
         Ok(())
@@ -2711,8 +2388,8 @@ impl Session for VtSshSession {
         use subtle::ConstantTimeEq;
         use zeroize::Zeroize;
 
-        let mut locked = self.locked.write().await;
-        if !*locked {
+        let _transition = self.lock_transition.lock().await;
+        if !self.locked.load(Ordering::Acquire) {
             return Err(AgentError::Failure);
         }
         let candidate = hash_lock_passphrase(&passphrase);
@@ -2725,13 +2402,6 @@ impl Session for VtSshSession {
         if !matches {
             return Err(AgentError::Failure);
         }
-        *locked = false;
-        let mut lp = self.lock_passphrase.write().await;
-        if let Some(ref mut hash) = *lp {
-            hash.zeroize();
-        }
-        *lp = None;
-
         // Reload keys after unlock
         match load_all_keys() {
             Ok(loaded) => {
@@ -2742,6 +2412,20 @@ impl Session for VtSshSession {
                 tracing::warn!("Failed to reload keys after unlock: {}", e);
             }
         }
+
+        // A cancelled lock request may have published the locked bit before
+        // its caller disappeared. Revoke again before unlocking so no grant
+        // from before that transition can ever become live again.
+        self.authorization.invalidate_all().await;
+
+        // Keep the passphrase intact across every await above. If this future
+        // is cancelled, the agent remains locked and a later unlock can retry.
+        let mut lp = self.lock_passphrase.write().await;
+        if let Some(ref mut hash) = *lp {
+            hash.zeroize();
+        }
+        *lp = None;
+        self.locked.store(false, Ordering::Release);
 
         tracing::info!("Agent unlocked");
         Ok(())
@@ -2811,14 +2495,13 @@ pub async fn run_ssh_agent(
 
     // Spawn idle sweeper that clears keys from memory after inactivity.
     // Judged on both clocks (see `idle_exceeded`) so time asleep counts.
-    // Clearing keys also clears both auth caches: "idle long enough to drop
+    // Clearing keys also invalidates unified authorization grants: "idle long enough to drop
     // keys" implies the human is gone, so standing grants must not survive
     // the silent keychain reload that serves the next request.
     let sweeper_keys = Arc::clone(&factory.keys);
     let sweeper_last = Arc::clone(&factory.last_activity);
     let sweeper_idle_cleared = Arc::clone(&factory.idle_cleared);
-    let sweeper_sign_cache = Arc::clone(&factory.sign_auth_cache);
-    let sweeper_decrypt_cache = Arc::clone(&factory.decrypt_auth_cache);
+    let sweeper_authorization = Arc::clone(&factory.authorization);
     let sweeper_timeout = idle_timeout;
     tokio::spawn(async move {
         let check_interval = Duration::from_secs(60).min(sweeper_timeout);
@@ -2835,8 +2518,7 @@ pub async fn run_ssh_agent(
                 // Grants must not outlive the idle window even when no SSH
                 // keys are loaded (decrypt-only agents), so the cache flush
                 // is unconditional — not tied to the keys branch below.
-                let dropped = sweeper_sign_cache.write().await.clear()
-                    + sweeper_decrypt_cache.write().await.clear();
+                let dropped = sweeper_authorization.invalidate_all().await;
                 if dropped > 0 {
                     tracing::info!("Idle timeout, dropped {} auth cache grants", dropped);
                 }
@@ -2856,65 +2538,46 @@ pub async fn run_ssh_agent(
         }
     });
 
-    // Spawn the cache watcher: flushes both auth caches when the screen
-    // locks or the system wakes from sleep (sudo-timestamp semantics), and
-    // sweeps expired entries periodically. See `watcher_should_clear`.
-    if sign_cache.mode != AuthCacheMode::None || decrypt_cache.mode != AuthCacheMode::None {
-        let watcher_sign = Arc::clone(&factory.sign_auth_cache);
-        let watcher_decrypt = Arc::clone(&factory.decrypt_auth_cache);
-        tokio::spawn(async move {
-            // `None` while there's nothing cached: the WindowServer poll is
-            // skipped, so no lock-state history exists. On the first tick
-            // with entries the unknown history defaults to "was interactive"
-            // — grants can only be created under an interactive screen
-            // (`authenticate` pre-checks session state), so finding the
-            // screen locked with live entries means it locked after the
-            // grant and the transition must fire.
-            let mut was_interactive: Option<bool> = None;
-            let mut prev_mono = Instant::now();
-            let mut prev_wall = SystemTime::now();
-            loop {
-                tokio::time::sleep(WATCHER_TICK).await;
-                let now_mono = Instant::now();
-                let now_wall = SystemTime::now();
-                let empty = watcher_sign.read().await.is_empty()
-                    && watcher_decrypt.read().await.is_empty();
-                if empty {
-                    // Nothing to flush — with 30-120s TTLs this is the common
-                    // case, so skip the CGSession poll entirely.
-                    was_interactive = None;
-                } else {
-                    let is_interactive = super::security::session_interactive_now();
-                    if watcher_should_clear(
-                        was_interactive.unwrap_or(true),
-                        is_interactive,
-                        now_mono.saturating_duration_since(prev_mono),
-                        now_wall.duration_since(prev_wall).ok(),
-                    ) {
-                        let dropped = watcher_sign.write().await.clear()
-                            + watcher_decrypt.write().await.clear();
-                        tracing::info!(
-                            "Auth caches cleared on screen lock / wake ({} grants dropped)",
-                            dropped
-                        );
-                    } else {
-                        watcher_sign.write().await.sweep_expired();
-                        watcher_decrypt.write().await.sweep_expired();
-                    }
-                    was_interactive = Some(is_interactive);
-                }
-                prev_mono = now_mono;
-                prev_wall = now_wall;
+    // Poll even while the grant store is empty. A human prompt deliberately
+    // creates no grant until its protected operation succeeds, so using store
+    // emptiness as a watcher shortcut would miss lock/wake invalidation while
+    // that prompt is in flight.
+    let watcher_authorization = Arc::clone(&factory.authorization);
+    tokio::spawn(async move {
+        let mut was_interactive = super::security::session_interactive_now();
+        let mut prev_mono = Instant::now();
+        let mut prev_wall = SystemTime::now();
+        loop {
+            tokio::time::sleep(WATCHER_TICK).await;
+            let now_mono = Instant::now();
+            let now_wall = SystemTime::now();
+            let is_interactive = super::security::session_interactive_now();
+            if watcher_should_clear(
+                was_interactive,
+                is_interactive,
+                now_mono.saturating_duration_since(prev_mono),
+                now_wall.duration_since(prev_wall).ok(),
+            ) {
+                let dropped = watcher_authorization.invalidate_all().await;
+                tracing::info!(
+                    "Authorization grants invalidated on screen lock / wake ({} grants dropped)",
+                    dropped
+                );
+            } else {
+                watcher_authorization.sweep_expired().await;
             }
-        });
-        tracing::info!(
-            "Auth cache: sign(mode={}, ttl={}s) decrypt(mode={}, ttl={}s); auth@vt never cached",
-            sign_cache.mode,
-            sign_cache.ttl_secs,
-            decrypt_cache.mode,
-            decrypt_cache.ttl_secs,
-        );
-    }
+            was_interactive = is_interactive;
+            prev_mono = now_mono;
+            prev_wall = now_wall;
+        }
+    });
+    tracing::info!(
+        "Authorization: sign(mode={}, ttl={}s) decrypt(mode={}, ttl={}s) auth=fresh run=fresh",
+        sign_cache.mode,
+        sign_cache.ttl_secs,
+        decrypt_cache.mode,
+        decrypt_cache.ttl_secs,
+    );
 
     let listener = tokio::net::UnixListener::bind(&socket_path)?;
     tracing::info!(
@@ -2972,7 +2635,77 @@ pub async fn start_ssh_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::authorization::{
+        AuthorizationAuthenticator, AuthorizationValidator, ValidationError,
+    };
     use crate::core::session::AuthMethod;
+
+    struct TestAuthenticator;
+
+    #[async_trait]
+    impl AuthorizationAuthenticator for TestAuthenticator {
+        async fn authenticate(
+            &self,
+            _prompt: &str,
+            _revocation_pending: Arc<AtomicBool>,
+        ) -> AuthOutcome {
+            AuthOutcome::Success(AuthMethod::Biometric)
+        }
+    }
+
+    struct TestValidator;
+
+    impl AuthorizationValidator for TestValidator {
+        fn validate(
+            &self,
+            _revocation_pending: &AtomicBool,
+        ) -> std::result::Result<(), ValidationError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_lock_finalizer_holds_transition_and_clears_grants() {
+        let authorization =
+            AuthorizationEngine::new(Arc::new(TestAuthenticator), Arc::new(TestValidator));
+        let subject = (1, 2);
+        authorization
+            .authorize(AuthorizationRequest::new(
+                vec![GrantScope::sign(Some(subject), "cached", "")],
+                ReusePolicy::strict_ttl_secs(30),
+                "seed",
+            ))
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        let active = authorization
+            .authorize(AuthorizationRequest::new(
+                vec![GrantScope::sign(Some(subject), "active", "")],
+                ReusePolicy::strict_ttl_secs(30),
+                "active",
+            ))
+            .await
+            .unwrap();
+
+        let transition = Arc::new(Mutex::new(()));
+        let guard = Arc::clone(&transition).lock_owned().await;
+        let keys = Arc::new(RwLock::new(HashMap::<String, PrivateKey>::new()));
+        let finalizer =
+            spawn_lock_finalizer(guard, keys, Arc::clone(&authorization));
+        // Model cancellation of the connection waiting for lock() to finish.
+        // Tokio detaches the finalizer, which must retain the owned guard.
+        drop(finalizer);
+        assert!(transition.try_lock().is_err());
+
+        active.commit().await.unwrap();
+        let transition_guard = tokio::time::timeout(Duration::from_secs(1), transition.lock())
+            .await
+            .expect("detached lock finalizer did not complete");
+        drop(transition_guard);
+        assert_eq!(authorization.live_len(Operation::Sign, subject).await, 0);
+    }
 
     // sign@vt's signing core: an Ed25519 PrivateKey signs `data` and the
     // signature verifies under its own public key, tagged `ssh-ed25519`. This is
@@ -3221,18 +2954,6 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         assert_eq!(AuthCacheMode::PerApp.to_string(), "per-app");
     }
 
-    // --- AuthCache tests ---
-
-    #[test]
-    fn test_auth_cache_grant_and_hit() {
-        let mut cache = AuthCache::new(300);
-        let ctx = (1u64, 100u64);
-        assert!(!cache.is_authorized(ctx, "fp1"));
-
-        cache.grant(ctx, "fp1");
-        assert!(cache.is_authorized(ctx, "fp1"));
-    }
-
     #[test]
     fn test_resolve_cache_context_global_needs_no_tty() {
         // Global must resolve for ANY identified peer — including TTY-less
@@ -3273,188 +2994,6 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         let ctx = r.context.expect("own pid must have a start time");
         assert_eq!(ctx.0, me as u64);
         // (Wire-tag stability is pinned in core.rs tests, next to the enum.)
-    }
-
-    #[test]
-    fn test_auth_cache_live_len_scoped_to_context() {
-        let mut cache = AuthCache::new(300);
-        let mine = (1u64, 100u64);
-        let other = (2u64, 100u64);
-        cache.grant(mine, "fp1");
-        cache.grant(mine, "fp2");
-        cache.grant(other, "fp3");
-        // Scoped: never counts another context's grants.
-        assert_eq!(cache.live_len(mine), 2);
-        assert_eq!(cache.live_len(other), 1);
-        assert_eq!(cache.live_len((3u64, 100u64)), 0);
-        // Dual-clock expiry: entries drop out when EITHER clock passes TTL,
-        // same predicate as is_authorized (wall advanced, mono frozen).
-        let now_mono = Instant::now();
-        let now_wall = SystemTime::now();
-        assert_eq!(cache.live_len_at(mine, now_mono, now_wall), 2);
-        let wall_late = now_wall + Duration::from_secs(301);
-        assert_eq!(cache.live_len_at(mine, now_mono, wall_late), 0);
-    }
-
-    // (Strict-TTL idempotence and expired-entry replacement are covered
-    // deterministically by the clock-injected `_at` tests below — no
-    // sleep-based duplicates.)
-
-    #[test]
-    fn test_auth_cache_different_context_misses() {
-        let mut cache = AuthCache::new(300);
-        let ctx1 = (1u64, 100u64);
-        let ctx2 = (2u64, 100u64);
-        cache.grant(ctx1, "fp1");
-
-        // Same fingerprint, different context
-        assert!(!cache.is_authorized(ctx2, "fp1"));
-        // Same context, different fingerprint
-        assert!(!cache.is_authorized(ctx1, "fp2"));
-    }
-
-    #[test]
-    fn test_auth_cache_start_time_distinguishes_reused_pid() {
-        // Same PID, different start time → different context (PID reuse)
-        let mut cache = AuthCache::new(300);
-        let orig = (1234u64, 1_700_000_000u64);
-        let reused = (1234u64, 1_700_000_500u64);
-        cache.grant(orig, "fp1");
-
-        assert!(cache.is_authorized(orig, "fp1"));
-        assert!(!cache.is_authorized(reused, "fp1"));
-    }
-
-    #[test]
-    fn test_auth_cache_clear() {
-        let mut cache = AuthCache::new(300);
-        let ctx1 = (1u64, 100u64);
-        let ctx2 = (2u64, 100u64);
-        cache.grant(ctx1, "fp1");
-        cache.grant(ctx2, "fp2");
-        assert!(cache.is_authorized(ctx1, "fp1"));
-
-        cache.clear();
-        assert!(!cache.is_authorized(ctx1, "fp1"));
-        assert!(!cache.is_authorized(ctx2, "fp2"));
-    }
-
-    #[test]
-    fn test_auth_cache_sweep_expired() {
-        let mut cache = AuthCache::new(0); // 0 second = immediately expired
-        cache.grant((1u64, 100u64), "fp1");
-        cache.grant((2u64, 100u64), "fp2");
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        cache.sweep_expired();
-        assert!(cache.entries.is_empty());
-    }
-
-    // --- Dual-clock expiry tests (sleep / clock-step scenarios) ---
-    //
-    // Clock-injected regression tests for the grant-survives-sleep bug;
-    // see [`CacheExpiry`] for the CLOCK_UPTIME_RAW rationale.
-
-    #[test]
-    fn test_auth_cache_wall_clock_expires_grant_across_sleep() {
-        let mut cache = AuthCache::new(120);
-        let ctx = (1u64, 100u64);
-        let m0 = Instant::now();
-        let w0 = SystemTime::now();
-        cache.grant_at(ctx, "fp1", m0, w0);
-
-        // 1s of awake time, but 10 minutes of wall time passed (slept).
-        let asleep_mono = m0 + Duration::from_secs(1);
-        let asleep_wall = w0 + Duration::from_secs(600);
-        assert!(
-            !cache.is_authorized_at(ctx, "fp1", asleep_mono, asleep_wall),
-            "grant must not survive a sleep longer than the TTL"
-        );
-    }
-
-    #[test]
-    fn test_auth_cache_mono_clock_bounds_stalled_wall_clock() {
-        // Wall clock stalled or stepped backwards (NTP): the monotonic bound
-        // still caps total awake time at the TTL.
-        let mut cache = AuthCache::new(120);
-        let ctx = (1u64, 100u64);
-        let m0 = Instant::now();
-        let w0 = SystemTime::now();
-        cache.grant_at(ctx, "fp1", m0, w0);
-
-        let late_mono = m0 + Duration::from_secs(121);
-        let early_wall = w0 + Duration::from_secs(1);
-        assert!(
-            !cache.is_authorized_at(ctx, "fp1", late_mono, early_wall),
-            "a backwards/stalled wall clock must not extend the grant"
-        );
-    }
-
-    #[test]
-    fn test_auth_cache_valid_while_both_clocks_within_ttl() {
-        let mut cache = AuthCache::new(120);
-        let ctx = (1u64, 100u64);
-        let m0 = Instant::now();
-        let w0 = SystemTime::now();
-        cache.grant_at(ctx, "fp1", m0, w0);
-
-        assert!(cache.is_authorized_at(
-            ctx,
-            "fp1",
-            m0 + Duration::from_secs(60),
-            w0 + Duration::from_secs(60),
-        ));
-    }
-
-    #[test]
-    fn test_auth_cache_strict_ttl_not_extended_by_midway_regrant() {
-        // A re-grant at TTL/2 (e.g. racing prompt resolved late) must not
-        // move the original expiry.
-        let mut cache = AuthCache::new(120);
-        let ctx = (1u64, 100u64);
-        let m0 = Instant::now();
-        let w0 = SystemTime::now();
-        cache.grant_at(ctx, "fp1", m0, w0);
-        cache.grant_at(
-            ctx,
-            "fp1",
-            m0 + Duration::from_secs(60),
-            w0 + Duration::from_secs(60),
-        );
-
-        assert!(
-            !cache.is_authorized_at(
-                ctx,
-                "fp1",
-                m0 + Duration::from_secs(121),
-                w0 + Duration::from_secs(121),
-            ),
-            "midway re-grant must not extend the original expiry"
-        );
-    }
-
-    #[test]
-    fn test_auth_cache_regrant_after_wall_expiry_refreshes() {
-        // Fresh approval after a sleep-induced expiry must produce a live
-        // entry (models the decrypt batch grant-all-keys path where an entry
-        // expired while the prompt sat on screen).
-        let mut cache = AuthCache::new(120);
-        let ctx = (1u64, 100u64);
-        let m0 = Instant::now();
-        let w0 = SystemTime::now();
-        cache.grant_at(ctx, "fp1", m0, w0);
-
-        // Slept past the TTL, then the user re-approved.
-        let m1 = m0 + Duration::from_secs(1);
-        let w1 = w0 + Duration::from_secs(600);
-        assert!(!cache.is_authorized_at(ctx, "fp1", m1, w1));
-        cache.grant_at(ctx, "fp1", m1, w1);
-        assert!(cache.is_authorized_at(
-            ctx,
-            "fp1",
-            m1 + Duration::from_secs(1),
-            w1 + Duration::from_secs(1),
-        ));
     }
 
     // --- idle_exceeded tests ---
@@ -3539,84 +3078,6 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         assert!(!watcher_should_clear(true, true, mono, Some(Duration::from_secs(20))));
         // Wall stepped backwards (None): not a sleep signal.
         assert!(!watcher_should_clear(true, true, mono, None));
-    }
-
-    // --- decrypt_cache_key tests ---
-
-    #[test]
-    fn test_decrypt_cache_key_deterministic() {
-        let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
-        assert_eq!(k1, k2);
-        assert_eq!(k1.len(), 64); // SHA-256 hex
-    }
-
-    #[test]
-    fn test_decrypt_cache_key_changes_with_type() {
-        let salt = [0x42u8; SALT_LEN];
-        let k_raw = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
-        let k_totp = decrypt_cache_key(crate::core::SecretType::TOTP, &salt, "host1", "/p");
-        assert_ne!(k_raw, k_totp);
-    }
-
-    #[test]
-    fn test_decrypt_cache_key_changes_with_salt() {
-        let s1 = [0x42u8; SALT_LEN];
-        let s2 = [0x43u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &s1, "host1", "/p");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &s2, "host1", "/p");
-        assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn test_decrypt_cache_key_changes_with_host() {
-        let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host2", "/p");
-        assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn test_decrypt_cache_key_changes_with_pwd() {
-        // The pwd component is what scopes global-mode grants to one project
-        // tree; same record + host from a different directory must miss.
-        let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/proj/a");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/proj/b");
-        assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn test_decrypt_cache_key_length_prefix_prevents_collision() {
-        // Length-prefix means "ab"+"c" must hash differently from "a"+"bc"
-        // even though concatenation matches — there's no way for the host
-        // string to absorb adjacent context bytes.
-        let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "ab", "");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "abc", "");
-        assert_ne!(k1, k2);
-        // Field-shift between host and pwd must also be unambiguous.
-        let k3 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "ab", "c");
-        let k4 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "a", "bc");
-        assert_ne!(k3, k4);
-    }
-
-    // --- sign_cache_key tests ---
-
-    #[test]
-    fn test_sign_cache_key_partitions_by_pwd_and_fingerprint() {
-        let k = sign_cache_key("SHA256:abc", "/proj/a");
-        assert_eq!(k, sign_cache_key("SHA256:abc", "/proj/a"));
-        assert_eq!(k.len(), 64);
-        assert_ne!(k, sign_cache_key("SHA256:abc", "/proj/b"));
-        assert_ne!(k, sign_cache_key("SHA256:xyz", "/proj/a"));
-        // Plain agent-protocol signs key on an empty pwd — distinct from any
-        // real directory, stable across calls.
-        assert_eq!(sign_cache_key("SHA256:abc", ""), sign_cache_key("SHA256:abc", ""));
-        assert_ne!(sign_cache_key("SHA256:abc", ""), k);
-        // Field-shift between fingerprint and pwd must be unambiguous.
-        assert_ne!(sign_cache_key("ab", "c"), sign_cache_key("a", "bc"));
     }
 
     // --- is_ssh_client_path tests ---

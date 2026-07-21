@@ -70,10 +70,10 @@ pub struct DiagPeerReport {
 
 `handle_diag` on `VtSshSession`. The session already resolves both cache
 contexts at `new_session`; the handler reports those plus the *basis* for the
-resolution (§3.2) and counts live entries via a new
-`AuthCache::live_len(context)` with a clock-injectable
-`live_len_at(context, now_mono, now_wall)` core — **both clocks**, the same
-dual-clock validity predicate as `is_authorized` (review R3).
+resolution (§3.2) and counts live entries through
+`AuthorizationEngine::live_len(operation, subject)`. The unified grant store
+uses **both clocks**, the same dual-clock validity predicate as authorization
+lookup (review R3), and filters by typed operation plus the caller's subject.
 
 Two hard rules from review:
 
@@ -199,7 +199,8 @@ Exit code 0 always in v1 (diagnostic, not a health gate).
 | file | change |
 |---|---|
 | `src/core.rs` | DiagReq/DiagRes/DiagCacheReport/DiagPeerReport |
-| `src/server_macos/ssh_agent.rs` | EXT_DIAG, classification refactor, handle_diag, AuthCache::live_len |
+| `src/core/authorization.rs` | operation/subject-scoped live grant counts |
+| `src/server_macos/ssh_agent.rs` | EXT_DIAG, classification refactor, handle_diag |
 | `src/ssh_sign.rs` | relay `diag@vt` + tests |
 | `src/client.rs` | doctor body (config/routing/agent/worker sections) |
 | `src/config.rs` | hydrate returns populated keys |

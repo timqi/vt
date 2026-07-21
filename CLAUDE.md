@@ -24,6 +24,7 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
 | CLI and command routing | `src/main.rs` |
 | Transport selection and client protocol | `src/config.rs`, `src/client.rs`, `src/cf.rs` |
 | `vt://` format and cryptography | `src/core.rs`, `src/core/crypto.rs`, `src/core/wire.rs` |
+| Agent authorization scopes, grants, and revocation | `src/core/authorization.rs`, `src/server_macos/authorization.rs`, `src/server_macos/ssh_agent.rs` |
 | SSH identity and `vt ssh connect` | `src/ssh_sign.rs` |
 | macOS Keychain, Touch ID, and SSH agent | `src/server_macos/` |
 | AI-agent command hook | `src/hook.rs`, [`docs/hook.md`](docs/hook.md) |
@@ -48,6 +49,16 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   behavior and IP binding.
 - `auth@vt` and `run@vt` always require a fresh approval. Do not add them to
   auth caches.
+- `auth@vt`, `run@vt`, SSH signing, and `decrypt@vt` all use the unified
+  authorization engine. Reusable grants are operation- and subject-scoped,
+  and a non-cloneable permit is committed only after the protected operation
+  and, for extensions, response encryption succeed. A live permit holds the
+  global prompt slot and blocks revocation; handlers must not perform
+  unbounded-latency work while one is live.
+- A live locked/non-interactive check failure revokes all grants. Agent lock,
+  idle timeout, an observed screen lock, and a detected wake advance the
+  authorization epoch even when the grant store is empty, so an in-flight
+  prompt cannot recreate a revoked grant.
 - Plaintext secrets and private key seeds must not be written to disk or logs.
   Do not add credentials to examples, test output, or command-line arguments
   unless the existing design explicitly requires it.

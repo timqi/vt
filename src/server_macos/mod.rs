@@ -4,6 +4,7 @@
 //! point can assume macOS APIs are available.
 
 pub mod admin;
+pub mod authorization;
 pub mod audit;
 pub mod fido2;
 pub mod fido2_cli;
