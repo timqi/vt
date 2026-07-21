@@ -329,27 +329,15 @@ pub enum SshCommands {
         )]
         timeout: u64,
         #[arg(
-            long = "ssh-auth-cache-mode",
-            default_value = "none",
-            help = "Sign auth cache mode: none, per-session, per-app, or global. per-session/per-app require the caller to have a controlling terminal (TTY-less orchestrators like AI agents / CI never hit); global shares ONE context across all callers — the only mode that serves orchestrated callers, and the coarsest (cache keys still partition by the client-reported working directory). Forwarded agent sockets (ssh -A) get a per-connection context: a remote host reuses only its own approvals within the TTL, never grants from local tabs or other hosts. Still keep 'none' when forwarding to hosts you don't trust at all — within the TTL any process on that host reuses that connection's grants."
-        )]
-        auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
-        #[arg(
             long = "ssh-auth-cache-duration",
-            default_value_t = server_macos::ssh_agent::DEFAULT_AUTH_CACHE_DURATION_SECS,
-            help = "Sign auth cache duration in seconds"
+            default_value_t = 0,
+            help = "Sign approval reuse duration in seconds; 0 (default) = prompt every time. Grants are activity-scoped: raw ssh signs bind to the session-bind-verified destination server (repeated one-shot git/ssh calls to the same host reuse one approval); local sign@vt and ssh-keygen signing bind to the caller's git workspace; forwarded/relay traffic is confined per connection and never rides local approvals. Strict TTL, no sliding refresh; screen lock, sleep/wake, agent lock, and idle timeout revoke all grants immediately."
         )]
         auth_cache_duration: u64,
         #[arg(
-            long = "decrypt-auth-cache-mode",
-            default_value = "none",
-            help = "Decrypt auth cache mode: none, per-session, per-app, or global. Only v2 envelope URLs are cache-eligible; legacy items always prompt. Same mode semantics and forwarded-agent caveat as --ssh-auth-cache-mode."
-        )]
-        decrypt_auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
-        #[arg(
             long = "decrypt-auth-cache-duration",
-            default_value_t = server_macos::ssh_agent::DEFAULT_DECRYPT_AUTH_CACHE_DURATION_SECS,
-            help = "Decrypt auth cache duration in seconds (strict TTL, no sliding refresh)"
+            default_value_t = 0,
+            help = "Decrypt approval reuse duration in seconds; 0 (default) = prompt every time. Only v2 envelope URLs are cache-eligible; legacy items always prompt. Grants bind to the caller's git workspace (kernel-derived), or per relay connection when forwarded. Kept separate from the sign duration because a cached decrypt grant releases per-record DEK material."
         )]
         decrypt_auth_cache_duration: u64,
         #[arg(
@@ -463,9 +451,7 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
             #[cfg(target_os = "macos")]
             SshCommands::Agent {
                 timeout,
-                auth_cache_mode,
                 auth_cache_duration,
-                decrypt_auth_cache_mode,
                 decrypt_auth_cache_duration,
                 no_legacy_decrypt,
                 run_allow,
@@ -473,21 +459,15 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
                 audit_key,
                 no_audit_push,
             } => {
-                use server_macos::ssh_agent::{AuthCacheConfig, RunAllowlist};
+                use server_macos::ssh_agent::RunAllowlist;
                 let run_allow = RunAllowlist::parse(run_allow)
                     .map_err(|e| anyhow::anyhow!("--run-allow: {}", e))?;
                 let audit_push =
                     build_audit_push_config(audit_url, audit_key, *no_audit_push);
                 server_macos::ssh_agent::start_ssh_agent(
                     *timeout,
-                    AuthCacheConfig {
-                        mode: *auth_cache_mode,
-                        ttl_secs: *auth_cache_duration,
-                    },
-                    AuthCacheConfig {
-                        mode: *decrypt_auth_cache_mode,
-                        ttl_secs: *decrypt_auth_cache_duration,
-                    },
+                    *auth_cache_duration,
+                    *decrypt_auth_cache_duration,
                     *no_legacy_decrypt,
                     run_allow,
                     std::sync::Arc::new(audit_push),

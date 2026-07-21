@@ -2026,6 +2026,17 @@ pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<
             ),
             Ok(DiagOutcome::Report(d)) => {
                 println!("  agent version: {}", d.agent_version);
+                // The agent is a long-lived daemon and does not restart on CLI
+                // upgrade — skew is common right after an update and changes
+                // scope/diag behavior silently.
+                if d.agent_version != env!("VT_VERSION") {
+                    println!(
+                        "  ⚠ agent is v{}, this client is v{} — restart the agent \
+                         (`vt ssh agent`) so both run the same build",
+                        d.agent_version,
+                        env!("VT_VERSION")
+                    );
+                }
                 // Over --forward-real-agent the upstream agent's peer is the
                 // relay process on the agent's host — that IS the connection
                 // relayed requests ride, so label it honestly.
@@ -2045,9 +2056,8 @@ pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<
                 );
                 for (label, c) in [("sign", &d.sign_cache), ("decrypt", &d.decrypt_cache)] {
                     println!(
-                        "  {:8} mode {}, ttl {}s, live grants (this context): {}",
+                        "  {:8} ttl {}s, live grants (this caller): {}",
                         format!("{}:", label),
-                        c.mode,
                         c.ttl_secs,
                         c.live_entries
                     );
@@ -2340,8 +2350,8 @@ mod tests {
         // core (adding a variant forces an arm); here pin the two doctor-side
         // behaviors: wire tags resolve, unknown tags degrade by naming the tag.
         assert_eq!(
-            basis_human("session-leader"),
-            crate::core::ContextBasis::SessionLeader.human()
+            basis_human("session-bind"),
+            crate::core::ContextBasis::SessionBind.human()
         );
         assert!(basis_human("future-tag").contains("future-tag"));
     }
@@ -2353,14 +2363,14 @@ mod tests {
         // old clients).
         let json = r#"{
             "agent_version": "v1",
-            "sign_cache": {"mode":"per-session","ttl_secs":120,"live_entries":1,"context_basis":"session-leader"},
-            "decrypt_cache": {"mode":"none","ttl_secs":30,"live_entries":0,"context_basis":"mode-none"},
+            "sign_cache": {"ttl_secs":120,"live_entries":1,"context_basis":"session-bind"},
+            "decrypt_cache": {"ttl_secs":30,"live_entries":0,"context_basis":"disabled"},
             "peer": {"pid":42,"exe":"zsh","has_tty":true,"is_ssh_client":false,"is_vt_relay":false},
             "run_allow_len": 0,
             "audit_push": false
         }"#;
         let d: crate::core::DiagRes = serde_json::from_str(json).unwrap();
-        assert_eq!(d.sign_cache.context_basis, "session-leader");
+        assert_eq!(d.sign_cache.context_basis, "session-bind");
         assert_eq!(d.decrypt_cache.live_entries, 0);
         assert_eq!(d.peer.exe.as_deref(), Some("zsh"));
         // And the request serializes to an (empty) object.

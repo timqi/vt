@@ -50,9 +50,9 @@ pub struct DiagRes {
 }
 
 pub struct DiagCacheReport {
-    pub mode: String,                     // none|per-session|per-app|global
-    pub ttl_secs: u64,
-    pub live_entries: usize,              // unexpired entries right now
+    pub ttl_secs: u64,                    // 0 = Fresh (always prompt)
+    pub live_entries: usize,              // unexpired grants THIS caller
+                                          // could use right now
     pub context_basis: String,            // see §3.2 (cacheability is implied
                                           // by the basis; no separate bool)
 }
@@ -86,46 +86,39 @@ Two hard rules from review:
   must not learn how many grants other sessions/tabs on the Mac hold. Context
   `None` → `live_entries = 0`.
 
-### 3.2 Refactor: `resolve_cache_context` → classification with basis
+### 3.2 Basis reporting (activity scopes V2)
 
-To explain *why* a context resolved the way it did without duplicating the
-logic (divergence risk), the function is refactored to return
+> The original design described the caller-topology classifier
+> (`resolve_cache_context`, modes, TTY gate). That machinery was replaced by
+> activity scopes — see
+> [`authorization-scopes-v2.md`](authorization-scopes-v2.md). This section
+> describes the current basis surface.
+
+`ContextBasis` still lives in core.rs so the agent's wire tags and the CLI's
+human sentences are one compile-checked mapping. The V2 variants name how the
+connection is scope-classified:
 
 ```rust
-// mode rides in the resolution (not as parallel session fields) so a
-// sign/decrypt pairing mix-up in diag reporting is unrepresentable; the
-// ContextBasis enum lives in core.rs so the agent's wire tags and the CLI's
-// human sentences are one compile-checked mapping.
-struct ContextResolution { mode: AuthCacheMode, context: Option<CacheContext>, basis: ContextBasis }
-
 enum ContextBasis {
-    ModeNone,        // caching disabled for this op
-    NoPeerPid,       // peer PID unavailable → uncacheable
-    VtRelay,         // narrowed to relay (pid,start) — all modes
-    NoTty,           // per-session/per-app TTY gate → uncacheable
-    SshClient,       // narrowed to ssh (pid,start) — all modes
-    SessionLeader,   // per-session: (sid,start)
-    AppAncestor,     // per-app: (.app pid,start)
-    NoAppAncestor,   // per-app under tmux/ssh login → uncacheable
-    Global,          // shared (0,0) slot
-    ProcLookupFailed,// see below → uncacheable
+    Disabled,        // duration 0 (the default): every request prompts
+    NoPeerPid,       // peer PID unavailable → Fresh
+    RelayConnection, // grants confined to this relay connection
+    SessionBind,     // sign: destination proven by session-bind@openssh.com
+    Forwarding,      // sign: bound connection carries forwarded traffic → Fresh
+    Tainted,         // sign: a session-bind failed verification → Fresh
+    UnboundSsh,      // sign: ssh peer without session-bind → Fresh
+    Workspace,       // local peer scoped to its kernel .git workspace root
+    NoWorkspaceRoot, // cwd not inside a git checkout → Fresh
+    ProcLookupFailed,// proc-info/cwd/stat lookup failed → Fresh
 }
 ```
 
-`ProcLookupFailed` is the explicit catch-all for **all five** fallible proc
-lookups that today `?`-return `None` (review R5): `get_start_tvsec` in the
-vt-relay branch, in the ssh-client branch, on the session leader, and on the
-app ancestor, plus `get_sid` itself. The refactor must NOT use `?` early
-returns (they discard which branch failed) — each fallible lookup assigns its
-basis explicitly, and the existing precedence order (ModeNone → NoPeerPid →
-VtRelay → NoTty gate → SshClient → mode arm) is preserved exactly.
-
-`resolve_cache_context` becomes a thin `.context` wrapper — **existing callers
-and semantics unchanged**; `new_session` stores the full resolution (the two
-direct context reads inside the session gain a `.context`, review R6). The
-enum serializes to the wire as a stable string; the CLI maps it to a human
-sentence (e.g. `NoTty` → "caller has no controlling TTY — per-session/per-app
-never cache for orchestrated callers; use --…-cache-mode global").
+The sign basis is derived per connection from the bind state, relay flag, and
+workspace resolution; the decrypt basis from the relay flag and workspace
+resolution. The enum serializes to the wire as a stable string; the CLI maps
+it to a human sentence and passes unknown tags through verbatim. `vt doctor`
+additionally warns when `agent_version` differs from the client's own version
+(the agent is a long-lived daemon and does not restart on CLI upgrade).
 
 ### 3.3 Relay
 

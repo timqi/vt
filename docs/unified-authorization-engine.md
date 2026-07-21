@@ -75,12 +75,16 @@ share `Operation::Sign`, matching current behavior. Their existing `pwd`
 inputs still usually partition them because raw agent requests have no
 `ClientMeta` and use an empty `pwd`.
 
-`SubjectId` is the existing `(context_id, process_start_time)` context. The
-macOS adapter continues to derive it from session leader, app ancestor,
-global, ssh process, or vt relay classification. A missing subject makes a
-configured reusable request effectively fresh.
+`SubjectId` is an opaque `(u64, u64)` anchor. At the time of this document it
+was derived from caller topology (session leader / app ancestor / global /
+ssh process / vt relay); activity scopes V2
+([`authorization-scopes-v2.md`](authorization-scopes-v2.md)) replaced that
+derivation with destination / workspace / relay-connection subjects. A
+missing subject makes a configured reusable request effectively fresh.
 
-`ResourceDigest` remains domain-separated:
+`ResourceDigest` remains domain-separated. The V1 digests — kept for relay
+connections, with destination and workspace digest families added by V2 —
+were:
 
 - sign: fingerprint + client-reported `pwd`;
 - decrypt: secret type + salt + client-reported host + `pwd`.

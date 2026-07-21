@@ -44,6 +44,14 @@ pub struct GrantScope {
     key: Option<GrantKey>,
 }
 
+/// Subject for destination-bound sign grants. They are deliberately
+/// user-wide (any local caller could drive the real ssh to the same
+/// destination anyway); the destination host key lives in the resource
+/// digest. It cannot merge with a kernel `(pid, start_tvsec)` or workspace
+/// `(dev, ino)` subject because every scope family uses a distinct digest
+/// domain label — a subject collision alone never merges grants.
+pub const DESTINATION_SUBJECT: SubjectId = (0, 0);
+
 impl GrantScope {
     /// An explicitly non-reusable scope. `auth@vt`, `run@vt`, legacy decrypt,
     /// and callers without a resolvable subject use this constructor.
@@ -54,8 +62,8 @@ impl GrantScope {
         }
     }
 
-    /// Existing sign-cache semantics: fingerprint + advisory working directory,
-    /// bounded by the kernel-derived subject.
+    /// Relay sign scope: fingerprint + claimed working directory, bounded by
+    /// the relay connection's kernel-derived `(pid, start_tvsec)` subject.
     pub fn sign(subject: Option<SubjectId>, fingerprint: &str, pwd: &str) -> Self {
         let Some(subject) = subject else {
             return Self::fresh(Operation::Sign);
@@ -67,8 +75,59 @@ impl GrantScope {
         Self::reusable(Operation::Sign, subject, h.finalize().into())
     }
 
-    /// Existing decrypt-cache semantics: type + salt + advisory host/pwd,
-    /// bounded by the kernel-derived subject.
+    /// Destination-bound sign scope: the connection proved its destination
+    /// with a verified `session-bind@openssh.com`. `hostkey_wire` must be the
+    /// exact wire-encoded `KeyData` bytes of the destination host key —
+    /// string fingerprints are display-only and never hashed here.
+    pub fn sign_destination(hostkey_wire: &[u8], fingerprint: &str) -> Self {
+        let mut h = Sha256::new();
+        h.update(b"vt-authz-sign-dest-v1");
+        hash_field(&mut h, hostkey_wire);
+        hash_field(&mut h, fingerprint.as_bytes());
+        Self::reusable(Operation::Sign, DESTINATION_SUBJECT, h.finalize().into())
+    }
+
+    /// Workspace-bound sign scope (local `sign@vt` and unbound non-ssh raw
+    /// signers such as `ssh-keygen -Y sign`). `subject` is the workspace
+    /// root's `(st_dev, st_ino)`; `root_path` is the canonical root path
+    /// captured from the same file descriptor, bound into the digest so a
+    /// recycled inode under a different path cannot match.
+    pub fn sign_workspace(
+        subject: Option<SubjectId>,
+        root_path: &str,
+        fingerprint: &str,
+    ) -> Self {
+        let Some(subject) = subject else {
+            return Self::fresh(Operation::Sign);
+        };
+        let mut h = Sha256::new();
+        h.update(b"vt-authz-sign-ws-v1");
+        hash_field(&mut h, root_path.as_bytes());
+        hash_field(&mut h, fingerprint.as_bytes());
+        Self::reusable(Operation::Sign, subject, h.finalize().into())
+    }
+
+    /// Workspace-bound decrypt scope for local pure-v2 batches. Same subject
+    /// and path-binding rules as [`Self::sign_workspace`].
+    pub fn decrypt_workspace(
+        subject: Option<SubjectId>,
+        root_path: &str,
+        secret_type: u8,
+        salt: &[u8],
+    ) -> Self {
+        let Some(subject) = subject else {
+            return Self::fresh(Operation::Decrypt);
+        };
+        let mut h = Sha256::new();
+        h.update(b"vt-authz-decrypt-ws-v1");
+        hash_field(&mut h, root_path.as_bytes());
+        h.update([secret_type]);
+        hash_field(&mut h, salt);
+        Self::reusable(Operation::Decrypt, subject, h.finalize().into())
+    }
+
+    /// Relay decrypt scope: type + salt + claimed host/pwd, bounded by the
+    /// relay connection's kernel-derived subject.
     pub fn decrypt_v2(
         subject: Option<SubjectId>,
         secret_type: u8,
@@ -983,6 +1042,56 @@ mod tests {
                 )
                 .all_hit
         );
+    }
+
+    #[test]
+    fn scope_families_are_domain_separated() {
+        // The same source material must never produce the same grant key
+        // across scope families: a subject collision (e.g. workspace
+        // (dev, ino) numerically equal to a relay (pid, tvsec)) is harmless
+        // only because the digest domain labels differ.
+        let subject = (7, 42);
+        let relay_sign = GrantScope::sign(Some(subject), "fp", "/repo").key.unwrap();
+        let ws_sign = GrantScope::sign_workspace(Some(subject), "/repo", "fp")
+            .key
+            .unwrap();
+        let dest_sign = GrantScope::sign_destination(b"hostkey-wire", "fp")
+            .key
+            .unwrap();
+        assert_ne!(relay_sign, ws_sign);
+        assert_ne!(relay_sign, dest_sign);
+        assert_ne!(ws_sign, dest_sign);
+
+        let relay_dec = GrantScope::decrypt_v2(Some(subject), b'0', &[7; 16], "/repo", "/repo")
+            .key
+            .unwrap();
+        let ws_dec = GrantScope::decrypt_workspace(Some(subject), "/repo", b'0', &[7; 16])
+            .key
+            .unwrap();
+        assert_ne!(relay_dec, ws_dec);
+
+        // Destination scope partitions on host key and key fingerprint.
+        assert_ne!(
+            GrantScope::sign_destination(b"hostkey-a", "fp").key.unwrap(),
+            GrantScope::sign_destination(b"hostkey-b", "fp").key.unwrap()
+        );
+        assert_ne!(
+            GrantScope::sign_destination(b"hostkey-a", "fp-a").key.unwrap(),
+            GrantScope::sign_destination(b"hostkey-a", "fp-b").key.unwrap()
+        );
+        // Workspace scope partitions on root path; missing subject is fresh.
+        assert_ne!(
+            GrantScope::sign_workspace(Some(subject), "/repo-a", "fp")
+                .key
+                .unwrap(),
+            GrantScope::sign_workspace(Some(subject), "/repo-b", "fp")
+                .key
+                .unwrap()
+        );
+        assert!(GrantScope::sign_workspace(None, "/repo", "fp").key.is_none());
+        assert!(GrantScope::decrypt_workspace(None, "/repo", b'0', &[7; 16])
+            .key
+            .is_none());
     }
 
     #[test]

@@ -69,9 +69,11 @@ Keychain copy" idea does not apply here.
   agent's existing multi-algorithm signing core (Ed25519 / RSA-SHA2 / ECDSA
   P-256/P-384), so it is not pinned to Ed25519 even though the git identity from
   `vt ssh keygen` is Ed25519.
-- `sign@vt` shares the sign auth cache with the standard `SIGN_REQUEST` path
-  (opt-in via `--ssh-auth-cache-mode`; default `none` = always prompts). v1
-  shipped cache-free; see §6 for the revised decision.
+- `sign@vt` shares the sign grant store with the standard `SIGN_REQUEST` path
+  (opt-in via `--ssh-auth-cache-duration`; default `0` = always prompts). v1
+  shipped cache-free; see §6 for the revised decision and
+  [`authorization-scopes-v2.md`](authorization-scopes-v2.md) for the current
+  activity scopes.
 
 ## 3. Wire additions (`src/core.rs`, cross-platform)
 
@@ -232,13 +234,14 @@ Touch ID **per host** — exactly the prompt storm the sign cache exists to
 prevent.
 
 `sign@vt` and standard signing therefore both use `Operation::Sign` in the
-unified grant store (opt-in via `--ssh-auth-cache-mode`, default `none` = v1
-behaviour). Entries are still keyed by subject plus a
-fingerprint/working-directory digest. Raw agent requests have no client
-metadata and use an empty working directory, while `sign@vt` uses `meta.pwd`,
-so the two paths do not normally reuse one another's entry. A multi-host
-`sign@vt` fan-out from the same workspace does share one scope and avoids one
-prompt per host. The shared store carries all the standard protections:
+unified grant store (opt-in via `--ssh-auth-cache-duration`, default `0` = v1
+behaviour). Under activity scopes V2
+([`authorization-scopes-v2.md`](authorization-scopes-v2.md)) a local
+`sign@vt` caller is scoped to its kernel-derived git workspace, so a
+multi-host fan-out from one project shares one grant and avoids one prompt
+per host; raw ssh signs are scoped to their session-bind-verified destination
+instead, and relay callers stay confined per connection.
+The shared store carries all the standard protections:
 strict TTL, dual-clock expiry, lock/wake/idle flush, and the prompt-queue
 re-check that collapses concurrent bursts to one dialog.
 
@@ -365,8 +368,8 @@ async fn sign(&mut self, request: SignRequest) -> Result<ssh_key::Signature, Age
   is strictly weaker capability than the standard `sign` path already grants
   for the same key.
 - **G2 — cache.** Shares the standard sign operation/store (opt-in, default
-  `none` = always prompt), while subject + fingerprint + pwd still partition
-  individual grants; see §6.
+  duration `0` = always prompt), while the workspace / destination / relay
+  scopes still partition individual grants; see §6.
 - **G3 — fallback only on pre-prompt failure.** Enforced by reusing
   `should_fallback_to_cf`. All `handle_sign_vt` rejections that occur before the
   prompt are `BadRequest`/`Generic`; `Generic` ("key not here") falls back,

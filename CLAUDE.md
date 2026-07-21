@@ -55,6 +55,16 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   and, for extensions, response encryption succeed. A live permit holds the
   global prompt slot and blocks revocation; handlers must not perform
   unbounded-latency work while one is live.
+- Grants are activity-scoped
+  ([`docs/authorization-scopes-v2.md`](docs/authorization-scopes-v2.md)):
+  raw SSH signs bind to the session-bind-verified destination host key
+  (forwarding-capable or tainted connections are never cached); local vt
+  callers bind to their kernel-derived `.git` workspace root; relay traffic
+  is confined per connection. `session-bind@openssh.com` is plaintext and
+  must be handled before the VT_AUTH cipher path, and must not reset the
+  idle clock. The Touch ID prompt must state the reuse scope whenever an
+  approval can create a grant. Cache duration `0` (the default) maps to the
+  engine's first-class `Fresh` policy, never `StrictTtl(0)`.
 - A live locked/non-interactive check failure revokes all grants. Agent lock,
   idle timeout, an observed screen lock, and a detected wake advance the
   authorization epoch even when the grant store is empty, so an in-flight
