@@ -783,10 +783,11 @@ mod tests {
     fn context_basis_wire_round_trip_and_human_are_total() {
         // Compile-time exhaustiveness lives in the match arms; this pins the
         // wire tags (a protocol surface) and the from_wire inverse.
-        const ALL: [ContextBasis; 10] = [
+        const ALL: [ContextBasis; 11] = [
             ContextBasis::Disabled,
             ContextBasis::NoPeerPid,
             ContextBasis::RelayConnection,
+            ContextBasis::SshConnection,
             ContextBasis::SessionBind,
             ContextBasis::Forwarding,
             ContextBasis::Tainted,

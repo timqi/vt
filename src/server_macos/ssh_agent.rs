@@ -94,17 +94,6 @@ pub fn encode_ssh_keys_into(
 
 // --- Reuse policy -----------------------------------------------------------
 
-/// Map a configured cache duration to an engine reuse policy. `0` selects the
-/// engine's first-class `Fresh` policy (never reads or writes grants) — NOT
-/// `StrictTtl(0)`.
-fn reuse_policy(ttl_secs: u64) -> ReusePolicy {
-    if ttl_secs == 0 {
-        ReusePolicy::Fresh
-    } else {
-        ReusePolicy::strict_ttl_secs(ttl_secs)
-    }
-}
-
 /// Human-readable duration for the prompt reuse line ("8h", "90m", "45s").
 fn reuse_ttl_label(secs: u64) -> String {
     if secs % 3600 == 0 {
@@ -273,6 +262,17 @@ mod proc_info {
         pvi_rdir: VnodeInfoPath,
     }
 
+    /// NUL-terminated kernel path buffer → PathBuf. `None` on a missing
+    /// NUL, an empty path, or non-UTF-8 bytes (callers degrade to Fresh).
+    pub fn nul_terminated_path(buf: &[u8]) -> Option<std::path::PathBuf> {
+        let len = buf.iter().position(|&b| b == 0)?;
+        if len == 0 {
+            return None;
+        }
+        let s = std::str::from_utf8(&buf[..len]).ok()?;
+        Some(std::path::PathBuf::from(s))
+    }
+
     /// Kernel-derived current working directory of `pid`
     /// (`proc_pidinfo(PROC_PIDVNODEPATHINFO)` → `pvi_cdir.vip_path`). Same
     /// trust level as `get_proc_path`; `None` on any failure. The strict
@@ -294,13 +294,7 @@ mod proc_info {
         if ret != size {
             return None;
         }
-        let path = &info.pvi_cdir.vip_path;
-        let len = path.iter().position(|&b| b == 0)?;
-        if len == 0 {
-            return None;
-        }
-        let s = std::str::from_utf8(&path[..len]).ok()?;
-        Some(std::path::PathBuf::from(s))
+        nul_terminated_path(&info.pvi_cdir.vip_path)
     }
 
     /// Get the process start time (seconds since epoch).
@@ -771,11 +765,9 @@ pub struct VtSshAgentFactory {
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
     idle_cleared: Arc<RwLock<bool>>,
     authorization: Arc<AuthorizationEngine>,
-    /// 0 = Fresh (always prompt). Kept separate from decrypt because a cached
-    /// decrypt grant releases per-record DEK material, whose blast radius is
-    /// wider than a single-challenge signature.
-    sign_cache_ttl_secs: u64,
-    decrypt_cache_ttl_secs: u64,
+    /// 0 = Fresh (always prompt); named fields prevent sign/decrypt
+    /// transposition (see [`AuthCacheTtls`]).
+    cache_ttls: AuthCacheTtls,
     /// When true, `decrypt@vt` rejects `Legacy` items (v0/v1 URLs). v2 envelope
     /// items continue to work. Lets users who have fully migrated harden the
     /// agent so the "agent emits plaintext over wire" path can never be
@@ -806,8 +798,7 @@ impl VtSshAgentFactory {
             lock_passphrase: Arc::new(RwLock::new(None)),
             idle_cleared: Arc::new(RwLock::new(false)),
             authorization,
-            sign_cache_ttl_secs: cache_ttls.sign_secs,
-            decrypt_cache_ttl_secs: cache_ttls.decrypt_secs,
+            cache_ttls,
             disable_legacy_decrypt,
             run_allow: Arc::new(run_allow),
             audit_push,
@@ -830,19 +821,22 @@ impl VtSshAgentFactory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Workspace {
     subject: SubjectId,
-    root: PathBuf,
+    /// Stored as `String` because it is only ever built from validated UTF-8
+    /// and feeds the grant digest — a lossy conversion fallback here would
+    /// silently bind an empty root path.
+    root: String,
 }
 
 impl Workspace {
     fn root_str(&self) -> &str {
-        self.root.to_str().unwrap_or_default()
+        &self.root
     }
 
     /// Client-reported `pwd` is display metadata, but if it is present and
     /// does not lie inside this workspace the request degrades to Fresh — a
     /// consistency check against confused callers, not a security boundary.
     fn contains_claimed_pwd(&self, pwd: &str) -> bool {
-        pwd.is_empty() || std::path::Path::new(pwd).starts_with(&self.root)
+        pwd.is_empty() || std::path::Path::new(pwd).starts_with(std::path::Path::new(&self.root))
     }
 }
 
@@ -929,11 +923,10 @@ fn workspace_identity(root: &std::path::Path) -> Option<Workspace> {
         if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
             return None;
         }
-        let len = buf.iter().position(|&b| b == 0)?;
-        let path = std::str::from_utf8(&buf[..len]).ok()?;
+        let path = proc_info::nul_terminated_path(&buf)?;
         Some(Workspace {
             subject: (st.st_dev as u64, st.st_ino),
-            root: PathBuf::from(path),
+            root: path.to_str()?.to_string(),
         })
     })();
     unsafe { libc::close(fd) };
@@ -1081,20 +1074,20 @@ impl BindState {
     }
 }
 
-/// Best-effort display name for a bound destination: scan unhashed
-/// `~/.ssh/known_hosts` entries for a key whose blob equals `hostkey_wire`
-/// and return its first host name. Cosmetic only — the grant is keyed on the
+/// Best-effort display name for a bound destination: scan plain-name
+/// `~/.ssh/known_hosts` entries (via ssh-key's parser) for `hostkey` and
+/// return the first host name. Cosmetic only — the grant is keyed on the
 /// host key bytes, never on this name.
-fn known_hosts_name(hostkey_wire: &[u8]) -> Option<String> {
+fn known_hosts_name(hostkey: &KeyData) -> Option<String> {
     let path = dirs::home_dir()?.join(".ssh").join("known_hosts");
     let content = std::fs::read_to_string(path).ok()?;
-    known_hosts_name_in(&content, hostkey_wire)
+    known_hosts_name_in(&content, hostkey)
 }
 
 /// Human label for a destination-bound sign grant: known_hosts name when
 /// resolvable, always the host key fingerprint. Display-only.
-fn destination_label(hostkey_wire: &[u8], hostkey: &KeyData) -> String {
-    match known_hosts_name(hostkey_wire) {
+fn destination_label(hostkey: &KeyData) -> String {
+    match known_hosts_name(hostkey) {
         Some(name) => format!("{} ({})", name, fingerprint_str(hostkey)),
         None => fingerprint_str(hostkey),
     }
@@ -1117,39 +1110,19 @@ fn append_reuse_line(message: &mut String, label: &Option<String>, ttl_secs: u64
     }
 }
 
-fn known_hosts_name_in(content: &str, hostkey_wire: &[u8]) -> Option<String> {
-    use base64::Engine;
-    for line in content.lines() {
-        let line = line.trim();
-        // Skip comments, hashed hosts (|1|…), and @marker lines.
-        if line.is_empty() || line.starts_with('#') || line.starts_with('|') {
-            continue;
-        }
-        let mut fields = line.split_whitespace();
-        let (hosts, first) = match line.starts_with('@') {
-            true => {
-                fields.next();
-                match fields.next() {
-                    Some(h) => (h, h),
-                    None => continue,
-                }
-            }
-            false => match fields.next() {
-                Some(h) => (h, h),
-                None => continue,
-            },
-        };
-        let _ = first;
-        let _keytype = fields.next();
-        let Some(b64) = fields.next() else { continue };
-        let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(b64) else {
-            continue;
-        };
-        if blob == hostkey_wire {
-            return Some(hosts.split(',').next().unwrap_or(hosts).to_string());
-        }
-    }
-    None
+fn known_hosts_name_in(content: &str, hostkey: &KeyData) -> Option<String> {
+    use ssh_key::known_hosts::{HostPatterns, KnownHosts};
+    KnownHosts::new(content)
+        .filter_map(std::result::Result::ok)
+        // @revoked / @cert-authority entries do not name a host's own key.
+        .filter(|entry| entry.marker().is_none())
+        .filter(|entry| entry.public_key().key_data() == hostkey)
+        // Hashed (`|1|…`) entries are irreversible: skip them and keep
+        // looking for a plain-name entry of the same key.
+        .find_map(|entry| match entry.host_patterns() {
+            HostPatterns::Patterns(patterns) => patterns.first().cloned(),
+            HostPatterns::HashedName { .. } => None,
+        })
 }
 
 impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
@@ -1184,11 +1157,6 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
         } else {
             None
         };
-        let workspace = if confined_to_connection {
-            WorkspaceResolution::Unavailable
-        } else {
-            resolve_workspace(peer_pid)
-        };
         VtSshSession {
             keys: Arc::clone(&self.keys),
             last_activity: Arc::clone(&self.last_activity),
@@ -1197,8 +1165,7 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             lock_passphrase: Arc::clone(&self.lock_passphrase),
             idle_cleared: Arc::clone(&self.idle_cleared),
             authorization: Arc::clone(&self.authorization),
-            sign_cache_ttl_secs: self.sign_cache_ttl_secs,
-            decrypt_cache_ttl_secs: self.decrypt_cache_ttl_secs,
+            cache_ttls: self.cache_ttls,
             run_allow: Arc::clone(&self.run_allow),
             audit_push: Arc::clone(&self.audit_push),
             peer_pid,
@@ -1206,7 +1173,7 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             peer_is_vt_relay,
             peer_is_ssh_client,
             connection_subject,
-            workspace,
+            workspace: std::sync::OnceLock::new(),
             bind_state: BindState::Unbound,
             destination_label: None,
             disable_legacy_decrypt: self.disable_legacy_decrypt,
@@ -1224,8 +1191,7 @@ struct VtSshSession {
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
     idle_cleared: Arc<RwLock<bool>>,
     authorization: Arc<AuthorizationEngine>,
-    sign_cache_ttl_secs: u64,
-    decrypt_cache_ttl_secs: u64,
+    cache_ttls: AuthCacheTtls,
     /// Cloned per session for cheap reads; the underlying allowlist is
     /// constant for the lifetime of the agent process.
     run_allow: Arc<RunAllowlist>,
@@ -1249,7 +1215,11 @@ struct VtSshSession {
     /// connection then degrades to Fresh via the scope constructors).
     connection_subject: Option<SubjectId>,
     /// Workspace resolution for local peers (Unavailable for relay/ssh).
-    workspace: WorkspaceResolution,
+    /// Resolved lazily on first use — `resolve_workspace` does filesystem
+    /// I/O on a peer-controlled cwd, and `new_session` runs on the accept
+    /// loop, where a hung network mount would stall every client. Still
+    /// once per connection (never re-resolved per request).
+    workspace: std::sync::OnceLock<WorkspaceResolution>,
     /// Destination binding driven by `session-bind@openssh.com` (§3.2 of
     /// docs/authorization-scopes-v2.md). Mutated by `extension()`.
     bind_state: BindState,
@@ -1302,9 +1272,30 @@ impl VtSshSession {
         self.peer_is_vt_relay || self.peer_is_ssh_client
     }
 
+    /// Lazy once-per-connection workspace resolution (see the field doc).
+    /// Confined connections never resolve one.
+    fn workspace_resolution(&self) -> &WorkspaceResolution {
+        self.workspace.get_or_init(|| {
+            if self.confined_to_connection() {
+                WorkspaceResolution::Unavailable
+            } else {
+                resolve_workspace(self.peer_pid)
+            }
+        })
+    }
+
+    /// The workspace, but only when the client-reported `pwd` is consistent
+    /// with it (§4 consistency check) — the shared guard of the `sign@vt`
+    /// and decrypt workspace arms.
+    fn reusable_workspace(&self, claimed_pwd: &str) -> Option<&Workspace> {
+        self.workspace_resolution()
+            .workspace()
+            .filter(|ws| ws.contains_claimed_pwd(claimed_pwd))
+    }
+
     /// Scope for a raw `SIGN_REQUEST`.
     fn raw_sign_scope(&self, fingerprint: &str) -> (GrantScope, Option<String>) {
-        if self.sign_cache_ttl_secs == 0 {
+        if self.cache_ttls.sign_secs == 0 {
             return (GrantScope::fresh(Operation::Sign), None);
         }
         if self.peer_is_vt_relay {
@@ -1314,20 +1305,25 @@ impl VtSshSession {
             );
         }
         match &self.bind_state {
-            BindState::Bound { .. } => match self.bind_state.destination() {
-                Some((wire, hostkey)) => (
-                    GrantScope::sign_destination(wire, fingerprint),
-                    // Normally precomputed at bind time; fall back to an
-                    // on-demand lookup so the reuse line can never be
-                    // silently absent for a destination-bound approval.
-                    self.destination_label
-                        .clone()
-                        .or_else(|| Some(destination_label(wire, hostkey))),
-                ),
-                // Forwarding-capable: traffic may originate beyond hop one.
-                None => (GrantScope::fresh(Operation::Sign), None),
-            },
-            BindState::Tainted => (GrantScope::fresh(Operation::Sign), None),
+            BindState::Bound {
+                hostkey_wire,
+                hostkey,
+                forwarding: false,
+                ..
+            } => (
+                GrantScope::sign_destination(hostkey_wire, fingerprint),
+                // Precomputed at bind time; the on-demand fallback is
+                // unreachable in production (extension() sets the label on
+                // every successful bind) but keeps the reuse line
+                // self-contained for direct-construction tests.
+                self.destination_label
+                    .clone()
+                    .or_else(|| Some(destination_label(hostkey))),
+            ),
+            // Forwarding-capable: traffic may originate beyond hop one.
+            BindState::Bound { .. } | BindState::Tainted => {
+                (GrantScope::fresh(Operation::Sign), None)
+            }
             // No bind and the peer is ssh: authentication and forwarding are
             // indistinguishable — Fresh.
             BindState::Unbound if self.peer_is_ssh_client => {
@@ -1335,9 +1331,9 @@ impl VtSshSession {
             }
             // No bind, non-ssh local caller (ssh-keygen -Y sign etc.):
             // workspace scope.
-            BindState::Unbound => match self.workspace.workspace() {
+            BindState::Unbound => match self.workspace_resolution().workspace() {
                 Some(ws) => (
-                    GrantScope::sign_workspace(Some(ws.subject), ws.root_str(), fingerprint),
+                    GrantScope::sign_workspace(ws.subject, ws.root_str(), fingerprint),
                     Some(workspace_label(ws)),
                 ),
                 None => (GrantScope::fresh(Operation::Sign), None),
@@ -1347,7 +1343,7 @@ impl VtSshSession {
 
     /// Scope for `sign@vt` (local vt ⇒ workspace, relay/ssh ⇒ per-connection).
     fn sign_vt_scope(&self, fingerprint: &str, claimed_pwd: &str) -> (GrantScope, Option<String>) {
-        if self.sign_cache_ttl_secs == 0 {
+        if self.cache_ttls.sign_secs == 0 {
             return (GrantScope::fresh(Operation::Sign), None);
         }
         if self.confined_to_connection() {
@@ -1356,12 +1352,12 @@ impl VtSshSession {
                 self.connection_label(),
             );
         }
-        match self.workspace.workspace() {
-            Some(ws) if ws.contains_claimed_pwd(claimed_pwd) => (
-                GrantScope::sign_workspace(Some(ws.subject), ws.root_str(), fingerprint),
+        match self.reusable_workspace(claimed_pwd) {
+            Some(ws) => (
+                GrantScope::sign_workspace(ws.subject, ws.root_str(), fingerprint),
                 Some(workspace_label(ws)),
             ),
-            _ => (GrantScope::fresh(Operation::Sign), None),
+            None => (GrantScope::fresh(Operation::Sign), None),
         }
     }
 
@@ -1375,7 +1371,7 @@ impl VtSshSession {
 
     /// diag basis for the sign scope classification of THIS connection.
     fn sign_basis(&self) -> ContextBasis {
-        if self.sign_cache_ttl_secs == 0 {
+        if self.cache_ttls.sign_secs == 0 {
             return ContextBasis::Disabled;
         }
         if self.peer_is_vt_relay {
@@ -1395,7 +1391,7 @@ impl VtSshSession {
     /// diag basis for the vt-extension (sign@vt / decrypt) classification of
     /// THIS connection.
     fn decrypt_basis(&self) -> ContextBasis {
-        if self.decrypt_cache_ttl_secs == 0 {
+        if self.cache_ttls.decrypt_secs == 0 {
             return ContextBasis::Disabled;
         }
         if self.confined_to_connection() {
@@ -1405,13 +1401,35 @@ impl VtSshSession {
     }
 
     fn workspace_basis(&self) -> ContextBasis {
-        match &self.workspace {
+        match self.workspace_resolution() {
             WorkspaceResolution::Resolved(_) => ContextBasis::Workspace,
             WorkspaceResolution::NoRoot => ContextBasis::NoWorkspaceRoot,
             WorkspaceResolution::Unavailable => match self.peer_pid {
                 None => ContextBasis::NoPeerPid,
                 Some(_) => ContextBasis::ProcLookupFailed,
             },
+        }
+    }
+
+    /// Grants this connection's own classification could reuse — the single
+    /// basis→subject mapping behind both diag counts. `decrypt_basis` never
+    /// yields `SessionBind`, so one shared mapping is safe.
+    async fn live_grants(&self, basis: ContextBasis, operation: Operation) -> usize {
+        let subject = match basis {
+            ContextBasis::SessionBind => {
+                Some(crate::core::authorization::DESTINATION_SUBJECT)
+            }
+            ContextBasis::Workspace => {
+                self.workspace_resolution().workspace().map(|ws| ws.subject)
+            }
+            ContextBasis::RelayConnection | ContextBasis::SshConnection => {
+                self.connection_subject
+            }
+            _ => None,
+        };
+        match subject {
+            Some(subject) => self.authorization.live_len(operation, subject).await,
+            None => 0,
         }
     }
 
@@ -1423,7 +1441,7 @@ impl VtSshSession {
         claimed_pwd: &str,
     ) -> (Vec<GrantScope>, Option<String>) {
         let fresh = || vec![GrantScope::fresh(Operation::Decrypt)];
-        if self.decrypt_cache_ttl_secs == 0 {
+        if self.cache_ttls.decrypt_secs == 0 {
             return (fresh(), None);
         }
         if self.confined_to_connection() {
@@ -1443,13 +1461,13 @@ impl VtSshSession {
                 self.connection_label(),
             );
         }
-        match self.workspace.workspace() {
-            Some(ws) if ws.contains_claimed_pwd(claimed_pwd) => (
+        match self.reusable_workspace(claimed_pwd) {
+            Some(ws) => (
                 v2_inputs
                     .iter()
                     .map(|(t, salt)| {
                         GrantScope::decrypt_workspace(
-                            Some(ws.subject),
+                            ws.subject,
                             ws.root_str(),
                             t.as_byte(),
                             salt,
@@ -1458,7 +1476,7 @@ impl VtSshSession {
                     .collect(),
                 Some(workspace_label(ws)),
             ),
-            _ => (fresh(), None),
+            None => (fresh(), None),
         }
     }
 
@@ -1682,9 +1700,9 @@ impl VtSshSession {
             append_reuse_line(
                 &mut local_auth_message,
                 &reuse_label,
-                self.decrypt_cache_ttl_secs,
+                self.cache_ttls.decrypt_secs,
             );
-            (scopes, reuse_policy(self.decrypt_cache_ttl_secs))
+            (scopes, ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs))
         };
         let body = sanitize_prompt_multiline(
             &req.command,
@@ -1865,62 +1883,16 @@ impl VtSshSession {
         // grants a differently-classified caller would need. A caller whose
         // basis says "never cached" therefore always reports 0.
         let sign_basis = self.sign_basis();
-        let sign_live = match sign_basis {
-            ContextBasis::SessionBind => {
-                self.authorization
-                    .live_len(
-                        Operation::Sign,
-                        crate::core::authorization::DESTINATION_SUBJECT,
-                    )
-                    .await
-            }
-            ContextBasis::Workspace => match self.workspace.workspace() {
-                Some(ws) => {
-                    self.authorization
-                        .live_len(Operation::Sign, ws.subject)
-                        .await
-                }
-                None => 0,
-            },
-            ContextBasis::RelayConnection | ContextBasis::SshConnection => {
-                match self.connection_subject {
-                    Some(subject) => {
-                        self.authorization.live_len(Operation::Sign, subject).await
-                    }
-                    None => 0,
-                }
-            }
-            _ => 0,
-        };
+        let sign_live = self.live_grants(sign_basis, Operation::Sign).await;
         let decrypt_basis = self.decrypt_basis();
-        let decrypt_live = match decrypt_basis {
-            ContextBasis::Workspace => match self.workspace.workspace() {
-                Some(ws) => {
-                    self.authorization
-                        .live_len(Operation::Decrypt, ws.subject)
-                        .await
-                }
-                None => 0,
-            },
-            ContextBasis::RelayConnection | ContextBasis::SshConnection => {
-                match self.connection_subject {
-                    Some(subject) => {
-                        self.authorization
-                            .live_len(Operation::Decrypt, subject)
-                            .await
-                    }
-                    None => 0,
-                }
-            }
-            _ => 0,
-        };
+        let decrypt_live = self.live_grants(decrypt_basis, Operation::Decrypt).await;
         let sign_cache = DiagCacheReport {
-            ttl_secs: self.sign_cache_ttl_secs,
+            ttl_secs: self.cache_ttls.sign_secs,
             live_entries: sign_live,
             context_basis: sign_basis.as_wire().to_string(),
         };
         let decrypt_cache = DiagCacheReport {
-            ttl_secs: self.decrypt_cache_ttl_secs,
+            ttl_secs: self.cache_ttls.decrypt_secs,
             live_entries: decrypt_live,
             context_basis: decrypt_basis.as_wire().to_string(),
         };
@@ -2139,7 +2111,7 @@ impl VtSshSession {
         // Reuse line before the client-reported body/meta — same padding
         // rationale as the relay origin marker.
         let (scope, reuse_label) = self.sign_vt_scope(&fp_str, &req.meta.pwd);
-        append_reuse_line(&mut auth_message, &reuse_label, self.sign_cache_ttl_secs);
+        append_reuse_line(&mut auth_message, &reuse_label, self.cache_ttls.sign_secs);
         let body = sanitize_prompt_multiline(
             &req.command,
             PROMPT_COMMAND_MAX_LINE_LEN,
@@ -2155,7 +2127,7 @@ impl VtSshSession {
             .authorization
             .authorize(AuthorizationRequest::new(
                 vec![scope],
-                reuse_policy(self.sign_cache_ttl_secs),
+                ReusePolicy::from_ttl_secs(self.cache_ttls.sign_secs),
                 auth_message,
             ))
             .await
@@ -2457,7 +2429,7 @@ impl Session for VtSshSession {
             keys.get(&fp_str).ok_or(AgentError::Failure)?.clone()
         };
         let comment = privkey.comment();
-        let proc_name = self.peer_exe.clone().unwrap_or_default();
+        let proc_name = self.peer_exe.as_deref().unwrap_or("");
         let key_label = if comment.is_empty() {
             fp_str.clone()
         } else {
@@ -2469,13 +2441,13 @@ impl Session for VtSshSession {
             format!("sign: {} ({})", key_label, proc_name)
         };
         let (scope, reuse_label) = self.raw_sign_scope(&fp_str);
-        append_reuse_line(&mut auth_message, &reuse_label, self.sign_cache_ttl_secs);
+        append_reuse_line(&mut auth_message, &reuse_label, self.cache_ttls.sign_secs);
 
         let permit = match self
             .authorization
             .authorize(AuthorizationRequest::new(
                 vec![scope],
-                reuse_policy(self.sign_cache_ttl_secs),
+                ReusePolicy::from_ttl_secs(self.cache_ttls.sign_secs),
                 auth_message.clone(),
             ))
             .await
@@ -2537,7 +2509,7 @@ impl Session for VtSshSession {
                     self.destination_label = self
                         .bind_state
                         .destination()
-                        .map(|(wire, hostkey)| destination_label(wire, hostkey));
+                        .map(|(_, hostkey)| destination_label(hostkey));
                     applied
                 }
                 _ => Err(()),
@@ -3315,8 +3287,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             lock_passphrase: Arc::new(RwLock::new(None)),
             idle_cleared: Arc::new(RwLock::new(false)),
             authorization: new_engine(locked),
-            sign_cache_ttl_secs: sign_ttl,
-            decrypt_cache_ttl_secs: decrypt_ttl,
+            cache_ttls: AuthCacheTtls {
+                sign_secs: sign_ttl,
+                decrypt_secs: decrypt_ttl,
+            },
             run_allow: Arc::new(RunAllowlist::parse("").unwrap()),
             audit_push: Arc::new(AuditPushConfig::disabled()),
             peer_pid: Some(std::process::id() as i32),
@@ -3324,7 +3298,9 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             peer_is_vt_relay: false,
             peer_is_ssh_client: false,
             connection_subject: None,
-            workspace: WorkspaceResolution::NoRoot,
+            // Pre-set: the lazy resolver would otherwise resolve the test
+            // process's real repo workspace.
+            workspace: std::sync::OnceLock::from(WorkspaceResolution::NoRoot),
             bind_state: BindState::Unbound,
             destination_label: None,
             disable_legacy_decrypt: false,
@@ -3334,7 +3310,7 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     fn test_workspace() -> Workspace {
         Workspace {
             subject: (7, 42),
-            root: PathBuf::from("/repo"),
+            root: "/repo".to_string(),
         }
     }
 
@@ -3432,10 +3408,52 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     }
 
     #[test]
+    fn reuse_label_present_iff_scope_reusable() {
+        // §6 transparency invariant: the prompt reuse line exists exactly
+        // when the approval can create a standing grant — across every
+        // classification arm.
+        let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
+        let mut sessions = Vec::new();
+        // workspace-resolved local caller
+        let mut s = test_session(300, 300);
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
+        sessions.push(s);
+        // destination-bound ssh caller
+        let mut s = test_session(300, 300);
+        s.peer_is_ssh_client = true;
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", false))
+            .unwrap();
+        sessions.push(s);
+        // confined relay caller
+        let mut s = test_session(300, 300);
+        s.peer_is_vt_relay = true;
+        s.connection_subject = Some((123, 456));
+        sessions.push(s);
+        // disabled + no-workspace-root callers
+        sessions.push(test_session(0, 0));
+        sessions.push(test_session(300, 300));
+
+        for s in &sessions {
+            for pwd in ["", "/repo/sub", "/elsewhere"] {
+                let (scope, label) = s.sign_vt_scope("fp", pwd);
+                assert_eq!(scope.is_reusable(), label.is_some());
+                let (scope, label) = s.raw_sign_scope("fp");
+                assert_eq!(scope.is_reusable(), label.is_some());
+                let (scopes, label) = s.decrypt_scopes(&inputs, "h", pwd);
+                assert_eq!(
+                    scopes.iter().all(GrantScope::is_reusable),
+                    label.is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn raw_sign_scope_classification() {
         // Duration 0: Fresh, no reuse line, regardless of state.
         let mut s = test_session(0, 0);
-        s.workspace = WorkspaceResolution::Resolved(test_workspace());
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
         assert!(s.raw_sign_scope("fp").1.is_none());
         assert_eq!(s.sign_basis(), ContextBasis::Disabled);
 
@@ -3447,7 +3465,7 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
 
         // Unbound non-ssh with a workspace: workspace scope + label.
         let mut s = test_session(300, 0);
-        s.workspace = WorkspaceResolution::Resolved(test_workspace());
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
         let (_, label) = s.raw_sign_scope("fp");
         assert_eq!(label.as_deref(), Some("workspace /repo"));
         assert_eq!(s.sign_basis(), ContextBasis::Workspace);
@@ -3488,7 +3506,7 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     #[test]
     fn sign_vt_and_decrypt_scopes_respect_workspace_and_pwd() {
         let mut s = test_session(300, 300);
-        s.workspace = WorkspaceResolution::Resolved(test_workspace());
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
         // Claimed pwd inside the workspace: reusable.
         assert!(s.sign_vt_scope("fp", "/repo/sub").1.is_some());
         let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
@@ -3517,7 +3535,7 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         let mut s = test_session(300, 300);
         s.peer_is_ssh_client = true;
         s.connection_subject = Some((123, 456));
-        s.workspace = WorkspaceResolution::Resolved(test_workspace());
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
         let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
         assert_eq!(
             s.sign_vt_scope("fp", "/repo").1.as_deref(),
@@ -3627,9 +3645,12 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         let meta = std::fs::metadata(&root).unwrap();
         assert_eq!(ws.subject, (meta.dev(), meta.ino()));
         // F_GETPATH returns the resolved path (e.g. /tmp → /private/tmp).
-        assert_eq!(ws.root, std::fs::canonicalize(&root).unwrap());
+        assert_eq!(
+            PathBuf::from(&ws.root),
+            std::fs::canonicalize(&root).unwrap()
+        );
         assert!(ws.contains_claimed_pwd(""));
-        assert!(ws.contains_claimed_pwd(ws.root.join("sub").to_str().unwrap()));
+        assert!(ws.contains_claimed_pwd(&format!("{}/sub", ws.root)));
         assert!(!ws.contains_claimed_pwd("/somewhere/else"));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3645,24 +3666,25 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     // --- known_hosts display resolution ---
 
     #[test]
-    fn known_hosts_lookup_matches_key_blob_and_skips_hashed() {
+    fn known_hosts_lookup_matches_key_and_skips_hashed_and_marked() {
         use base64::Engine as _;
         use ssh_agent_lib::ssh_encoding::Encode;
         let host = test_hostkey();
+        let hostkey = host.public_key().key_data().clone();
         let mut wire = Vec::new();
-        host.public_key().key_data().encode(&mut wire).unwrap();
+        hostkey.encode(&mut wire).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&wire);
         let content = format!(
             "# comment line\n\
              |1|hashhash|morehash ssh-ed25519 {b64}\n\
-             other.example ssh-ed25519 AAAAnotthekey\n\
+             @revoked revoked.example ssh-ed25519 {b64}\n\
              github.com,gh.alias ssh-ed25519 {b64}\n"
         );
         assert_eq!(
-            known_hosts_name_in(&content, &wire).as_deref(),
+            known_hosts_name_in(&content, &hostkey).as_deref(),
             Some("github.com")
         );
-        assert_eq!(known_hosts_name_in("", &wire), None);
+        assert_eq!(known_hosts_name_in("", &hostkey), None);
     }
 
     // --- idle_exceeded tests ---

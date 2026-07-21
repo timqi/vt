@@ -91,15 +91,10 @@ impl GrantScope {
     /// signers such as `ssh-keygen -Y sign`). `subject` is the workspace
     /// root's `(st_dev, st_ino)`; `root_path` is the canonical root path
     /// captured from the same file descriptor, bound into the digest so a
-    /// recycled inode under a different path cannot match.
-    pub fn sign_workspace(
-        subject: Option<SubjectId>,
-        root_path: &str,
-        fingerprint: &str,
-    ) -> Self {
-        let Some(subject) = subject else {
-            return Self::fresh(Operation::Sign);
-        };
+    /// recycled inode under a different path cannot match. A resolved
+    /// workspace always has a subject, so unlike the relay constructors
+    /// there is no `Option` fallback.
+    pub fn sign_workspace(subject: SubjectId, root_path: &str, fingerprint: &str) -> Self {
         let mut h = Sha256::new();
         h.update(b"vt-authz-sign-ws-v1");
         hash_field(&mut h, root_path.as_bytes());
@@ -110,14 +105,11 @@ impl GrantScope {
     /// Workspace-bound decrypt scope for local pure-v2 batches. Same subject
     /// and path-binding rules as [`Self::sign_workspace`].
     pub fn decrypt_workspace(
-        subject: Option<SubjectId>,
+        subject: SubjectId,
         root_path: &str,
         secret_type: u8,
         salt: &[u8],
     ) -> Self {
-        let Some(subject) = subject else {
-            return Self::fresh(Operation::Decrypt);
-        };
         let mut h = Sha256::new();
         h.update(b"vt-authz-decrypt-ws-v1");
         hash_field(&mut h, root_path.as_bytes());
@@ -157,6 +149,15 @@ impl GrantScope {
             }),
         }
     }
+
+    /// True when an approval under this scope can create a standing grant —
+    /// the condition under which the prompt must carry a reuse line
+    /// (docs/authorization-scopes-v2.md §6). Currently exercised only by the
+    /// invariant tests.
+    #[cfg(test)]
+    pub fn is_reusable(&self) -> bool {
+        self.key.is_some()
+    }
 }
 
 fn hash_field(hasher: &mut Sha256, value: &[u8]) {
@@ -176,6 +177,18 @@ pub enum ReusePolicy {
 impl ReusePolicy {
     pub fn strict_ttl_secs(seconds: u64) -> Self {
         Self::StrictTtl(Duration::from_secs(seconds))
+    }
+
+    /// Map a configured cache duration to a policy: `0` selects the
+    /// first-class `Fresh` policy (never reads or writes grants) — NOT
+    /// `StrictTtl(0)`. Lives on the type so every engine consumer inherits
+    /// the rule.
+    pub fn from_ttl_secs(seconds: u64) -> Self {
+        if seconds == 0 {
+            Self::Fresh
+        } else {
+            Self::strict_ttl_secs(seconds)
+        }
     }
 }
 
@@ -301,18 +314,13 @@ impl GrantStore {
         now_mono: Instant,
         now_wall: SystemTime,
     ) -> Lookup {
-        let miss_count = keys
-            .iter()
-            .filter(|key| {
-                !self.entries.get(*key).is_some_and(|expiry| {
-                    expiry.is_valid_at(now_mono, now_wall) && expiry.ttl <= requested_ttl
-                })
-            })
-            .count();
         Lookup {
             epoch: self.epoch,
-            all_hit: miss_count == 0,
-            miss_count,
+            all_hit: keys.iter().all(|key| {
+                self.entries.get(key).is_some_and(|expiry| {
+                    expiry.is_valid_at(now_mono, now_wall) && expiry.ttl <= requested_ttl
+                })
+            }),
         }
     }
 
@@ -383,8 +391,6 @@ impl GrantStore {
 struct Lookup {
     epoch: u64,
     all_hit: bool,
-    #[allow(dead_code)]
-    miss_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1052,7 +1058,7 @@ mod tests {
         // only because the digest domain labels differ.
         let subject = (7, 42);
         let relay_sign = GrantScope::sign(Some(subject), "fp", "/repo").key.unwrap();
-        let ws_sign = GrantScope::sign_workspace(Some(subject), "/repo", "fp")
+        let ws_sign = GrantScope::sign_workspace(subject, "/repo", "fp")
             .key
             .unwrap();
         let dest_sign = GrantScope::sign_destination(b"hostkey-wire", "fp")
@@ -1065,7 +1071,7 @@ mod tests {
         let relay_dec = GrantScope::decrypt_v2(Some(subject), b'0', &[7; 16], "/repo", "/repo")
             .key
             .unwrap();
-        let ws_dec = GrantScope::decrypt_workspace(Some(subject), "/repo", b'0', &[7; 16])
+        let ws_dec = GrantScope::decrypt_workspace(subject, "/repo", b'0', &[7; 16])
             .key
             .unwrap();
         assert_ne!(relay_dec, ws_dec);
@@ -1079,19 +1085,19 @@ mod tests {
             GrantScope::sign_destination(b"hostkey-a", "fp-a").key.unwrap(),
             GrantScope::sign_destination(b"hostkey-a", "fp-b").key.unwrap()
         );
-        // Workspace scope partitions on root path; missing subject is fresh.
+        // Workspace scope partitions on root path.
         assert_ne!(
-            GrantScope::sign_workspace(Some(subject), "/repo-a", "fp")
+            GrantScope::sign_workspace(subject, "/repo-a", "fp")
                 .key
                 .unwrap(),
-            GrantScope::sign_workspace(Some(subject), "/repo-b", "fp")
+            GrantScope::sign_workspace(subject, "/repo-b", "fp")
                 .key
                 .unwrap()
         );
-        assert!(GrantScope::sign_workspace(None, "/repo", "fp").key.is_none());
-        assert!(GrantScope::decrypt_workspace(None, "/repo", b'0', &[7; 16])
-            .key
-            .is_none());
+        // Reusability is observable: it gates the prompt reuse line.
+        assert!(GrantScope::sign_workspace(subject, "/repo", "fp").is_reusable());
+        assert!(!GrantScope::fresh(Operation::Sign).is_reusable());
+        assert!(!GrantScope::sign(None, "fp", "/repo").is_reusable());
     }
 
     #[test]

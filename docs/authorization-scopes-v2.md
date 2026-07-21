@@ -210,7 +210,9 @@ Client-reported `pwd` remains display metadata. If it is present and does
 not lie inside the workspace root, the request degrades to Fresh
 (consistency check, not a boundary). Resolution happens once per connection
 (vt CLI connections are per-command; a process cwd does not change
-mid-connection in practice).
+mid-connection in practice), and **lazily on first use** rather than at
+accept time: the resolver does filesystem I/O on a peer-controlled cwd, and
+a hung network mount must stall only that connection, not the accept loop.
 
 Subject spaces overlap structurally (`(dev, ino)` vs relay `(pid, tvsec)`
 vs `(0, 0)`), but every scope family uses a distinct digest domain label,
