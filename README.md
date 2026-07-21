@@ -200,7 +200,7 @@ for how long:
 |--------|-------------|
 | `ssh` / `git fetch` / `git push` (OpenSSH ≥ 8.9) | The **destination server** (verified via `session-bind@openssh.com`): one approval covers repeated one-shot connections to the same host with the same key, from any local caller |
 | `ssh-keygen -Y sign` (git commit signing), local `vt ssh connect` | The caller's **git workspace** (kernel-derived `.git` root): one approval covers the project, including multi-host fan-outs and TTY-less AI agents / CI working in the same checkout |
-| Forwarded / relay traffic (`ssh -A`, `--forward-real-agent`) | Confined **per connection**; a remote host can reuse only its own approvals and never rides local grants. Forwarding-capable connections are never destination-cached |
+| Forwarded / relay traffic (`ssh -A`, `--forward-real-agent`) | vt extensions (`decrypt@vt`, `sign@vt`) are confined **per connection**: a remote host can reuse only its own approvals and never rides local grants. Raw SSH signs arriving through a forwarding-capable connection are never cached at all |
 | Outside any git repository, OpenSSH < 8.9, `auth@vt`, `run@vt`, legacy URLs | Never cached — always prompts |
 
 `--ssh-auth-cache-duration <SECS>` and `--decrypt-auth-cache-duration <SECS>`

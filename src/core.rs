@@ -311,8 +311,8 @@ pub struct DiagReq {}
 
 /// Response for `diag@vt`: how the agent is configured and how it classifies
 /// THIS connection for caching purposes. Discloses no secret, no cache keys,
-/// and nothing about other sessions (`live_entries` is scoped to the caller's
-/// own resolved context).
+/// and nothing about scopes the caller could not reuse (`live_entries`
+/// counts only grants the caller's own scope classification would hit).
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DiagRes {
     pub agent_version: String,
@@ -355,6 +355,9 @@ pub enum ContextBasis {
     /// `vt ssh connect --forward-real-agent` relay: grants confined to this
     /// connection.
     RelayConnection,
+    /// Plain ssh peer (possibly `ssh -A` carrying forwarded remote traffic):
+    /// vt extensions confined to this connection.
+    SshConnection,
     /// Destination proven by a verified `session-bind@openssh.com`.
     SessionBind,
     /// Bound connection marked forwarding-capable → Fresh.
@@ -380,6 +383,7 @@ impl ContextBasis {
             ContextBasis::Disabled => "disabled",
             ContextBasis::NoPeerPid => "no-peer-pid",
             ContextBasis::RelayConnection => "relay-connection",
+            ContextBasis::SshConnection => "ssh-connection",
             ContextBasis::SessionBind => "session-bind",
             ContextBasis::Forwarding => "forwarding",
             ContextBasis::Tainted => "tainted",
@@ -397,6 +401,7 @@ impl ContextBasis {
             "disabled" => ContextBasis::Disabled,
             "no-peer-pid" => ContextBasis::NoPeerPid,
             "relay-connection" => ContextBasis::RelayConnection,
+            "ssh-connection" => ContextBasis::SshConnection,
             "session-bind" => ContextBasis::SessionBind,
             "forwarding" => ContextBasis::Forwarding,
             "tainted" => ContextBasis::Tainted,
@@ -418,6 +423,10 @@ impl ContextBasis {
             ContextBasis::RelayConnection => {
                 "confined to this relay connection (grants die with it; other \
                  connections never share them)"
+            }
+            ContextBasis::SshConnection => {
+                "peer is an ssh process (may carry forwarded remote traffic) — \
+                 confined to this connection; grants die with it"
             }
             ContextBasis::SessionBind => {
                 "destination-bound: reuses one approval per (key, server) \

@@ -2031,7 +2031,7 @@ pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<
                 // scope/diag behavior silently.
                 if d.agent_version != env!("VT_VERSION") {
                     println!(
-                        "  ⚠ agent is v{}, this client is v{} — restart the agent \
+                        "  ⚠ agent is {}, this client is {} — restart the agent \
                          (`vt ssh agent`) so both run the same build",
                         d.agent_version,
                         env!("VT_VERSION")

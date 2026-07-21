@@ -89,7 +89,9 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   between the remote client and the upstream agent.
 - `diag@vt` is read-only and requires no Touch ID; it must never reset the
   agent's idle-activity clock (a polling loop must not keep grants alive), and
-  its `live_entries` stays scoped to the caller's own cache context.
+  its `live_entries` counts only grants the caller's own scope classification
+  could reuse — a caller whose basis never caches reports 0, never a
+  whole-store count.
 - `vt inject -r` decrypts a file briefly and starts a self-exec'd restore
   supervisor. Keep the supervisor path before Tokio/clap initialization and
   keep `--recover` limited to restoring ciphertext backups.

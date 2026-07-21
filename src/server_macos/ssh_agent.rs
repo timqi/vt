@@ -593,6 +593,16 @@ const RUN_ENV_PASSTHROUGH: &[&str] = &[
 /// Default idle timeout: 30 minutes.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 
+/// Cache durations for the two reusable operations, carried together with
+/// named fields so sign and decrypt cannot be transposed at any call layer —
+/// they carry deliberately different blast radii (a cached decrypt grant
+/// releases per-record DEK material). `0` = the engine's `Fresh` policy.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthCacheTtls {
+    pub sign_secs: u64,
+    pub decrypt_secs: u64,
+}
+
 /// Load all SSH keys from the keychain store into a HashMap. The store and
 /// derived ciphers are dropped after this returns so the master key does not
 /// linger in memory.
@@ -781,8 +791,7 @@ pub struct VtSshAgentFactory {
 impl VtSshAgentFactory {
     fn new(
         keys: HashMap<String, PrivateKey>,
-        sign_cache_ttl_secs: u64,
-        decrypt_cache_ttl_secs: u64,
+        cache_ttls: AuthCacheTtls,
         disable_legacy_decrypt: bool,
         run_allow: RunAllowlist,
         audit_push: Arc<AuditPushConfig>,
@@ -797,8 +806,8 @@ impl VtSshAgentFactory {
             lock_passphrase: Arc::new(RwLock::new(None)),
             idle_cleared: Arc::new(RwLock::new(false)),
             authorization,
-            sign_cache_ttl_secs,
-            decrypt_cache_ttl_secs,
+            sign_cache_ttl_secs: cache_ttls.sign_secs,
+            decrypt_cache_ttl_secs: cache_ttls.decrypt_secs,
             disable_legacy_decrypt,
             run_allow: Arc::new(run_allow),
             audit_push,
@@ -860,15 +869,43 @@ impl WorkspaceResolution {
 }
 
 /// Ascend from `start` to the nearest directory containing a `.git` entry
-/// (dir or file — worktrees use a file).
+/// (dir or file — worktrees use a file). Depth-capped as a syscall bound on
+/// pathological trees.
 fn find_git_root(start: &std::path::Path) -> Option<PathBuf> {
     let mut dir = start;
-    loop {
+    for _ in 0..64 {
         if dir.join(".git").exists() {
             return Some(dir.to_path_buf());
         }
         dir = dir.parent()?;
     }
+    None
+}
+
+/// A `.git` root is an acceptable workspace boundary only when it does not
+/// pool unrelated work into one bucket:
+///
+/// - a dotfiles repository AT `$HOME` (`git init ~`, yadm) would make every
+///   caller anywhere under the home directory share one grant scope — the
+///   exact broad bucket the `NoRoot ⇒ Fresh` rule exists to prevent;
+/// - symmetrically, when the cwd lives under `$HOME`, a root found ABOVE
+///   `$HOME` (e.g. a stray `/Users/.git`) is rejected rather than pooling
+///   every user directory.
+///
+/// Both degrade to Fresh, never to a wider scope.
+fn workspace_root_acceptable(
+    root: &std::path::Path,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> bool {
+    let Some(home) = home else { return true };
+    if root == home {
+        return false;
+    }
+    if cwd.starts_with(home) && !root.starts_with(home) {
+        return false;
+    }
+    true
 }
 
 /// Capture the workspace identity through one file descriptor:
@@ -915,6 +952,9 @@ fn resolve_workspace(peer_pid: Option<i32>) -> WorkspaceResolution {
     let Some(root) = find_git_root(&cwd) else {
         return WorkspaceResolution::NoRoot;
     };
+    if !workspace_root_acceptable(&root, &cwd, dirs::home_dir().as_deref()) {
+        return WorkspaceResolution::NoRoot;
+    }
     match workspace_identity(&root) {
         Some(ws) => WorkspaceResolution::Resolved(ws),
         None => WorkspaceResolution::Unavailable,
@@ -977,18 +1017,23 @@ impl BindState {
     }
 
     /// Apply one `session-bind` message. `Err(())` means the bind was
-    /// refused (and the state tainted); the caller replies with an agent
-    /// failure.
+    /// refused; the caller replies with an agent failure. Refusal mirrors
+    /// OpenSSH: an **unverifiable** bind (bad signature, or a host key this
+    /// build cannot decode/verify — certificates, curves without an enabled
+    /// feature) is refused WITHOUT poisoning the recorded state, so benign
+    /// cert/p521 infrastructure merely gets no destination caching instead of
+    /// an attack-flavored sticky Tainted. Only **consistency violations**
+    /// (duplicate session id under a different key, forwarding→auth
+    /// downgrade) taint, because they indicate the peer is playing games with
+    /// state we must remember.
     fn apply(&mut self, bind: &SessionBind) -> std::result::Result<(), ()> {
         use ssh_agent_lib::ssh_encoding::Encode;
 
         if bind.verify_signature().is_err() {
-            *self = BindState::Tainted;
             return Err(());
         }
         let mut wire = Vec::new();
         if bind.host_key.encode(&mut wire).is_err() {
-            *self = BindState::Tainted;
             return Err(());
         }
         match self {
@@ -1020,7 +1065,8 @@ impl BindState {
                     return Ok(());
                 }
                 if session_ids.len() >= MAX_SESSION_BINDS {
-                    *self = BindState::Tainted;
+                    // Local DoS cap: refuse the excess bind but keep the
+                    // recorded state intact (OpenSSH behavior).
                     return Err(());
                 }
                 session_ids.push(bind.session_id.clone());
@@ -1119,21 +1165,26 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             .and_then(proc_info::get_proc_argv)
             .map(|argv| crate::ssh_sign::is_vt_relay_invocation(&argv))
             .unwrap_or(false);
-        let peer_is_ssh_client = peer_pid
-            .and_then(proc_info::get_proc_path)
+        let peer_path = peer_pid.and_then(proc_info::get_proc_path);
+        let peer_is_ssh_client = peer_path.as_deref().is_some_and(is_ssh_client_path);
+        let peer_exe = peer_path
             .as_deref()
-            .is_some_and(is_ssh_client_path);
-        // Relay connections are confined to a `(pid, start_tvsec)` subject;
-        // local peers get a workspace resolution. Both once per connection so
-        // a scope lookup can never race proc-tree state against the request.
-        let relay_subject = if peer_is_vt_relay {
+            .map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
+        // Relay AND plain-ssh peers are confined to a `(pid, start_tvsec)`
+        // connection subject: both can carry traffic that originated on a
+        // remote host (forwarded agent socket), so neither may ever reach the
+        // workspace arm. Local vt peers get a workspace resolution instead.
+        // All resolved once per connection so a scope lookup can never race
+        // proc-tree state against the request.
+        let confined_to_connection = peer_is_vt_relay || peer_is_ssh_client;
+        let connection_subject = if confined_to_connection {
             peer_pid.and_then(|pid| {
                 proc_info::get_start_tvsec(pid).map(|start| (pid as u64, start))
             })
         } else {
             None
         };
-        let workspace = if peer_is_vt_relay {
+        let workspace = if confined_to_connection {
             WorkspaceResolution::Unavailable
         } else {
             resolve_workspace(peer_pid)
@@ -1151,11 +1202,13 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             run_allow: Arc::clone(&self.run_allow),
             audit_push: Arc::clone(&self.audit_push),
             peer_pid,
+            peer_exe,
             peer_is_vt_relay,
             peer_is_ssh_client,
-            relay_subject,
+            connection_subject,
             workspace,
             bind_state: BindState::Unbound,
+            destination_label: None,
             disable_legacy_decrypt: self.disable_legacy_decrypt,
         }
     }
@@ -1179,23 +1232,30 @@ struct VtSshSession {
     /// Shared fire-and-forget audit push config (disabled = no-op).
     audit_push: Arc<AuditPushConfig>,
     peer_pid: Option<i32>,
+    /// Peer executable basename (kernel `proc_pidpath`), captured once for
+    /// prompts and diag.
+    peer_exe: Option<String>,
     /// Peer is a `vt ssh connect --forward-real-agent` relay (kernel-argv
     /// check, resolved once at session creation): its requests originated on
     /// a remote host and every prompt carries the relay-origin marker.
     peer_is_vt_relay: bool,
-    /// Peer executable basename is `ssh` (kernel `proc_pidpath`). An unbound
-    /// ssh peer stays Fresh — without a session-bind the agent cannot
-    /// distinguish authentication from agent forwarding.
+    /// Peer executable basename is `ssh` (kernel `proc_pidpath`). An ssh
+    /// peer can carry forwarded remote traffic, so it is confined per
+    /// connection for vt extensions and its raw signs are cacheable only via
+    /// a non-forwarding session-bind.
     peer_is_ssh_client: bool,
-    /// `(pid, start_tvsec)` confinement subject for relay peers; `None` for
-    /// local peers or when the proc lookup failed (relay then degrades to
-    /// Fresh via the scope constructors).
-    relay_subject: Option<SubjectId>,
-    /// Workspace resolution for local peers (Unavailable for relays).
+    /// `(pid, start_tvsec)` confinement subject for relay and ssh peers;
+    /// `None` for local vt peers or when the proc lookup failed (the
+    /// connection then degrades to Fresh via the scope constructors).
+    connection_subject: Option<SubjectId>,
+    /// Workspace resolution for local peers (Unavailable for relay/ssh).
     workspace: WorkspaceResolution,
     /// Destination binding driven by `session-bind@openssh.com` (§3.2 of
     /// docs/authorization-scopes-v2.md). Mutated by `extension()`.
     bind_state: BindState,
+    /// Display label for the bound destination, computed once per bind so a
+    /// sign burst does not re-read known_hosts.
+    destination_label: Option<String>,
     disable_legacy_decrypt: bool,
 }
 
@@ -1223,6 +1283,25 @@ impl VtSshSession {
     // built from the same data the scope digest binds — the prompt must state
     // what is being granted (§6 transparency invariant).
 
+    /// The per-connection confinement arm shared by relay and plain-ssh
+    /// peers: `Some(label)` exactly when the connection subject resolved.
+    fn connection_label(&self) -> Option<String> {
+        self.connection_subject.map(|_| {
+            if self.peer_is_vt_relay {
+                "this relay connection".to_string()
+            } else {
+                "this forwarded ssh connection".to_string()
+            }
+        })
+    }
+
+    /// True when this connection may carry traffic that originated on a
+    /// remote host (vt relay or plain `ssh -A`): vt extensions must then be
+    /// confined per connection and must never reach the workspace arm.
+    fn confined_to_connection(&self) -> bool {
+        self.peer_is_vt_relay || self.peer_is_ssh_client
+    }
+
     /// Scope for a raw `SIGN_REQUEST`.
     fn raw_sign_scope(&self, fingerprint: &str) -> (GrantScope, Option<String>) {
         if self.sign_cache_ttl_secs == 0 {
@@ -1230,16 +1309,20 @@ impl VtSshSession {
         }
         if self.peer_is_vt_relay {
             return (
-                GrantScope::sign(self.relay_subject, fingerprint, ""),
-                self.relay_subject
-                    .map(|_| "this relay connection".to_string()),
+                GrantScope::sign(self.connection_subject, fingerprint, ""),
+                self.connection_label(),
             );
         }
         match &self.bind_state {
             BindState::Bound { .. } => match self.bind_state.destination() {
                 Some((wire, hostkey)) => (
                     GrantScope::sign_destination(wire, fingerprint),
-                    Some(destination_label(wire, hostkey)),
+                    // Normally precomputed at bind time; fall back to an
+                    // on-demand lookup so the reuse line can never be
+                    // silently absent for a destination-bound approval.
+                    self.destination_label
+                        .clone()
+                        .or_else(|| Some(destination_label(wire, hostkey))),
                 ),
                 // Forwarding-capable: traffic may originate beyond hop one.
                 None => (GrantScope::fresh(Operation::Sign), None),
@@ -1262,16 +1345,15 @@ impl VtSshSession {
         }
     }
 
-    /// Scope for `sign@vt` (local ⇒ workspace, relay ⇒ per-connection).
+    /// Scope for `sign@vt` (local vt ⇒ workspace, relay/ssh ⇒ per-connection).
     fn sign_vt_scope(&self, fingerprint: &str, claimed_pwd: &str) -> (GrantScope, Option<String>) {
         if self.sign_cache_ttl_secs == 0 {
             return (GrantScope::fresh(Operation::Sign), None);
         }
-        if self.peer_is_vt_relay {
+        if self.confined_to_connection() {
             return (
-                GrantScope::sign(self.relay_subject, fingerprint, claimed_pwd),
-                self.relay_subject
-                    .map(|_| "this relay connection".to_string()),
+                GrantScope::sign(self.connection_subject, fingerprint, claimed_pwd),
+                self.connection_label(),
             );
         }
         match self.workspace.workspace() {
@@ -1283,16 +1365,21 @@ impl VtSshSession {
         }
     }
 
+    fn connection_basis(&self) -> ContextBasis {
+        match self.connection_subject {
+            Some(_) if self.peer_is_vt_relay => ContextBasis::RelayConnection,
+            Some(_) => ContextBasis::SshConnection,
+            None => ContextBasis::ProcLookupFailed,
+        }
+    }
+
     /// diag basis for the sign scope classification of THIS connection.
     fn sign_basis(&self) -> ContextBasis {
         if self.sign_cache_ttl_secs == 0 {
             return ContextBasis::Disabled;
         }
         if self.peer_is_vt_relay {
-            return match self.relay_subject {
-                Some(_) => ContextBasis::RelayConnection,
-                None => ContextBasis::ProcLookupFailed,
-            };
+            return self.connection_basis();
         }
         match &self.bind_state {
             BindState::Bound {
@@ -1305,16 +1392,14 @@ impl VtSshSession {
         }
     }
 
-    /// diag basis for the decrypt scope classification of THIS connection.
+    /// diag basis for the vt-extension (sign@vt / decrypt) classification of
+    /// THIS connection.
     fn decrypt_basis(&self) -> ContextBasis {
         if self.decrypt_cache_ttl_secs == 0 {
             return ContextBasis::Disabled;
         }
-        if self.peer_is_vt_relay {
-            return match self.relay_subject {
-                Some(_) => ContextBasis::RelayConnection,
-                None => ContextBasis::ProcLookupFailed,
-            };
+        if self.confined_to_connection() {
+            return self.connection_basis();
         }
         self.workspace_basis()
     }
@@ -1341,13 +1426,13 @@ impl VtSshSession {
         if self.decrypt_cache_ttl_secs == 0 {
             return (fresh(), None);
         }
-        if self.peer_is_vt_relay {
+        if self.confined_to_connection() {
             return (
                 v2_inputs
                     .iter()
                     .map(|(t, salt)| {
                         GrantScope::decrypt_v2(
-                            self.relay_subject,
+                            self.connection_subject,
                             t.as_byte(),
                             salt,
                             claimed_host,
@@ -1355,8 +1440,7 @@ impl VtSshSession {
                         )
                     })
                     .collect(),
-                self.relay_subject
-                    .map(|_| "this relay connection".to_string()),
+                self.connection_label(),
             );
         }
         match self.workspace.workspace() {
@@ -1584,18 +1668,12 @@ impl VtSshSession {
             &who,
         );
         self.append_relay_origin(&mut local_auth_message);
-        let body = sanitize_prompt_multiline(
-            &req.command,
-            PROMPT_COMMAND_MAX_LINE_LEN,
-            PROMPT_COMMAND_MAX_LINES,
-        );
-        if !body.is_empty() {
-            local_auth_message.push('\n');
-            local_auth_message.push_str(&body);
-        }
-        append_meta_lines(&mut local_auth_message, &req.meta);
         // Pure-v2 batches use one atomic scope per record and require an all-of
         // hit. Any legacy member makes the entire request explicitly Fresh.
+        // The reuse line is agent-derived truth and is appended BEFORE the
+        // client-reported body/meta below, for the same reason as the relay
+        // origin marker: a hostile caller must not be able to pad the one
+        // line that says the tap creates a standing grant off-screen.
         let (scopes, reuse) = if legacy_count > 0 {
             (vec![GrantScope::fresh(Operation::Decrypt)], ReusePolicy::Fresh)
         } else {
@@ -1608,6 +1686,16 @@ impl VtSshSession {
             );
             (scopes, reuse_policy(self.decrypt_cache_ttl_secs))
         };
+        let body = sanitize_prompt_multiline(
+            &req.command,
+            PROMPT_COMMAND_MAX_LINE_LEN,
+            PROMPT_COMMAND_MAX_LINES,
+        );
+        if !body.is_empty() {
+            local_auth_message.push('\n');
+            local_auth_message.push_str(&body);
+        }
+        append_meta_lines(&mut local_auth_message, &req.meta);
         let permit = match self
             .authorization
             .authorize(AuthorizationRequest::new(scopes, reuse, local_auth_message))
@@ -1763,62 +1851,78 @@ impl VtSshSession {
         let _req: DiagReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
-        let peer_path = self.peer_pid.and_then(proc_info::get_proc_path);
         let peer = DiagPeerReport {
             pid: self.peer_pid,
-            exe: peer_path
-                .as_deref()
-                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string()),
+            exe: self.peer_exe.clone(),
             has_tty: self
                 .peer_pid
                 .is_some_and(|pid| proc_info::get_tty_dev(pid).is_some()),
             is_ssh_client: self.peer_is_ssh_client,
             is_vt_relay: self.peer_is_vt_relay,
         };
-        // live_entries stays scoped to grants THIS caller could actually use:
-        // destination grants are user-wide by design, workspace/relay counts
-        // use the caller's own subject. Never a whole-store count.
-        let mut sign_live = 0;
-        if self.sign_cache_ttl_secs > 0 && !self.peer_is_vt_relay {
-            sign_live += self
-                .authorization
-                .live_len(
-                    Operation::Sign,
-                    crate::core::authorization::DESTINATION_SUBJECT,
-                )
-                .await;
-        }
-        for subject in [
-            self.workspace.workspace().map(|ws| ws.subject),
-            self.relay_subject,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            sign_live += self.authorization.live_len(Operation::Sign, subject).await;
-        }
-        let mut decrypt_live = 0;
-        for subject in [
-            self.workspace.workspace().map(|ws| ws.subject),
-            self.relay_subject,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            decrypt_live += self
-                .authorization
-                .live_len(Operation::Decrypt, subject)
-                .await;
-        }
+        // live_entries counts only grants THIS connection's own scope
+        // classification could reuse — never a whole-store count, and never
+        // grants a differently-classified caller would need. A caller whose
+        // basis says "never cached" therefore always reports 0.
+        let sign_basis = self.sign_basis();
+        let sign_live = match sign_basis {
+            ContextBasis::SessionBind => {
+                self.authorization
+                    .live_len(
+                        Operation::Sign,
+                        crate::core::authorization::DESTINATION_SUBJECT,
+                    )
+                    .await
+            }
+            ContextBasis::Workspace => match self.workspace.workspace() {
+                Some(ws) => {
+                    self.authorization
+                        .live_len(Operation::Sign, ws.subject)
+                        .await
+                }
+                None => 0,
+            },
+            ContextBasis::RelayConnection | ContextBasis::SshConnection => {
+                match self.connection_subject {
+                    Some(subject) => {
+                        self.authorization.live_len(Operation::Sign, subject).await
+                    }
+                    None => 0,
+                }
+            }
+            _ => 0,
+        };
+        let decrypt_basis = self.decrypt_basis();
+        let decrypt_live = match decrypt_basis {
+            ContextBasis::Workspace => match self.workspace.workspace() {
+                Some(ws) => {
+                    self.authorization
+                        .live_len(Operation::Decrypt, ws.subject)
+                        .await
+                }
+                None => 0,
+            },
+            ContextBasis::RelayConnection | ContextBasis::SshConnection => {
+                match self.connection_subject {
+                    Some(subject) => {
+                        self.authorization
+                            .live_len(Operation::Decrypt, subject)
+                            .await
+                    }
+                    None => 0,
+                }
+            }
+            _ => 0,
+        };
         let sign_cache = DiagCacheReport {
             ttl_secs: self.sign_cache_ttl_secs,
             live_entries: sign_live,
-            context_basis: self.sign_basis().as_wire().to_string(),
+            context_basis: sign_basis.as_wire().to_string(),
         };
         let decrypt_cache = DiagCacheReport {
             ttl_secs: self.decrypt_cache_ttl_secs,
             live_entries: decrypt_live,
-            context_basis: self.decrypt_basis().as_wire().to_string(),
+            context_basis: decrypt_basis.as_wire().to_string(),
         };
         let result = DiagRes {
             agent_version: env!("VT_VERSION").to_string(),
@@ -2032,6 +2136,10 @@ impl VtSshSession {
         } else {
             auth_message.push_str(&sanitize_prompt(privkey.comment(), 80));
         }
+        // Reuse line before the client-reported body/meta — same padding
+        // rationale as the relay origin marker.
+        let (scope, reuse_label) = self.sign_vt_scope(&fp_str, &req.meta.pwd);
+        append_reuse_line(&mut auth_message, &reuse_label, self.sign_cache_ttl_secs);
         let body = sanitize_prompt_multiline(
             &req.command,
             PROMPT_COMMAND_MAX_LINE_LEN,
@@ -2043,8 +2151,6 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
-        let (scope, reuse_label) = self.sign_vt_scope(&fp_str, &req.meta.pwd);
-        append_reuse_line(&mut auth_message, &reuse_label, self.sign_cache_ttl_secs);
         let permit = match self
             .authorization
             .authorize(AuthorizationRequest::new(
@@ -2351,11 +2457,7 @@ impl Session for VtSshSession {
             keys.get(&fp_str).ok_or(AgentError::Failure)?.clone()
         };
         let comment = privkey.comment();
-        let proc_name = self
-            .peer_pid
-            .and_then(proc_info::get_proc_path)
-            .and_then(|p| p.rsplit('/').next().map(String::from))
-            .unwrap_or_default();
+        let proc_name = self.peer_exe.clone().unwrap_or_default();
         let key_label = if comment.is_empty() {
             fp_str.clone()
         } else {
@@ -2415,6 +2517,36 @@ impl Session for VtSshSession {
     }
 
     async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
+        // `session-bind@openssh.com` is a standard OpenSSH extension: plain
+        // SSH-wire bytes, never VT_AUTH-encrypted. It MUST be intercepted
+        // before the lock check and the keychain/auth-cipher path below —
+        // binding grants nothing by itself, must work on connections opened
+        // while the agent is locked, and would otherwise fail to decrypt so
+        // destination caching would silently never engage. It also must not
+        // touch the idle clock — it precedes any human-gated operation. A
+        // bind that fails to decode (host certificate, unsupported curve) is
+        // refused without changing state, mirroring `BindState::apply`. See
+        // docs/authorization-scopes-v2.md §3.1.
+        if extension.name.as_str() == "session-bind@openssh.com" {
+            let outcome = match extension.parse_message::<SessionBind>() {
+                Ok(Some(bind)) => {
+                    let applied = self.bind_state.apply(&bind);
+                    // The label is display-only; compute it once per bind
+                    // (≤ MAX_SESSION_BINDS per connection) instead of
+                    // re-reading known_hosts on every sign request.
+                    self.destination_label = self
+                        .bind_state
+                        .destination()
+                        .map(|(wire, hostkey)| destination_label(wire, hostkey));
+                    applied
+                }
+                _ => Err(()),
+            };
+            return match outcome {
+                Ok(()) => Ok(None), // plain SSH_AGENT_SUCCESS
+                Err(()) => Err(AgentError::Failure),
+            };
+        }
         if self.locked.load(Ordering::Acquire) {
             // The lock check fires before keychain ciphers are derived, so
             // we have no `auth_cipher` to encrypt a structured envelope
@@ -2422,27 +2554,6 @@ impl Session for VtSshSession {
             // map this to `ErrKind::Generic` (exit 1) and show a hint to
             // run `ssh-add -X`. See docs/structured-errors.md.
             return Err(AgentError::Failure);
-        }
-        // `session-bind@openssh.com` is a standard OpenSSH extension: plain
-        // SSH-wire bytes, never VT_AUTH-encrypted. It MUST be intercepted
-        // before the keychain/auth-cipher path below or every real client's
-        // bind would fail to decrypt and destination caching would silently
-        // never engage. It also must not touch the idle clock — it precedes
-        // any human-gated operation. See docs/authorization-scopes-v2.md §3.1.
-        if extension.name.as_str() == "session-bind@openssh.com" {
-            let bind = match extension.parse_message::<SessionBind>() {
-                Ok(Some(bind)) => bind,
-                // Malformed bind: taint the connection (fail closed for
-                // caching) and refuse, like an invalid signature would.
-                _ => {
-                    self.bind_state = BindState::Tainted;
-                    return Err(AgentError::Failure);
-                }
-            };
-            return match self.bind_state.apply(&bind) {
-                Ok(()) => Ok(None), // plain SSH_AGENT_SUCCESS
-                Err(()) => Err(AgentError::Failure),
-            };
         }
 
         // Only handle vt custom protocol extensions; ignore standard SSH extensions
@@ -2755,8 +2866,7 @@ impl Session for VtSshSession {
 pub async fn run_ssh_agent(
     print_env: bool,
     idle_timeout_secs: u64,
-    sign_cache_ttl_secs: u64,
-    decrypt_cache_ttl_secs: u64,
+    cache_ttls: AuthCacheTtls,
     disable_legacy_decrypt: bool,
     run_allow: RunAllowlist,
     audit_push: Arc<AuditPushConfig>,
@@ -2790,8 +2900,7 @@ pub async fn run_ssh_agent(
     let audit_enabled = audit_push.enabled;
     let factory = VtSshAgentFactory::new(
         keys,
-        sign_cache_ttl_secs,
-        decrypt_cache_ttl_secs,
+        cache_ttls,
         disable_legacy_decrypt,
         run_allow,
         audit_push,
@@ -2888,9 +2997,9 @@ pub async fn run_ssh_agent(
     });
     tracing::info!(
         "Authorization: sign(ttl={}s) decrypt(ttl={}s) auth=fresh run=fresh (0 = always prompt; \
-         scopes: destination/workspace/relay — see docs/authorization-scopes-v2.md)",
-        sign_cache_ttl_secs,
-        decrypt_cache_ttl_secs,
+         scopes: destination/workspace/connection — see docs/authorization-scopes-v2.md)",
+        cache_ttls.sign_secs,
+        cache_ttls.decrypt_secs,
     );
 
     let listener = tokio::net::UnixListener::bind(&socket_path)?;
@@ -2928,8 +3037,7 @@ pub async fn run_ssh_agent(
 /// Standalone entry point: runs the agent with env output.
 pub async fn start_ssh_agent(
     idle_timeout_secs: u64,
-    sign_cache_ttl_secs: u64,
-    decrypt_cache_ttl_secs: u64,
+    cache_ttls: AuthCacheTtls,
     disable_legacy_decrypt: bool,
     run_allow: RunAllowlist,
     audit_push: Arc<AuditPushConfig>,
@@ -2937,8 +3045,7 @@ pub async fn start_ssh_agent(
     run_ssh_agent(
         true,
         idle_timeout_secs,
-        sign_cache_ttl_secs,
-        decrypt_cache_ttl_secs,
+        cache_ttls,
         disable_legacy_decrypt,
         run_allow,
         audit_push,
@@ -3213,11 +3320,13 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             run_allow: Arc::new(RunAllowlist::parse("").unwrap()),
             audit_push: Arc::new(AuditPushConfig::disabled()),
             peer_pid: Some(std::process::id() as i32),
+            peer_exe: Some("test".to_string()),
             peer_is_vt_relay: false,
             peer_is_ssh_client: false,
-            relay_subject: None,
+            connection_subject: None,
             workspace: WorkspaceResolution::NoRoot,
             bind_state: BindState::Unbound,
+            destination_label: None,
             disable_legacy_decrypt: false,
         }
     }
@@ -3257,16 +3366,18 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     }
 
     #[test]
-    fn bind_state_bad_signature_taints_stickily() {
+    fn bind_state_bad_signature_refused_without_poisoning() {
         let host = test_hostkey();
         let mut bind = test_bind(&host, b"sid-1", false);
         bind.session_id = b"sid-other".to_vec(); // signature no longer matches
         let mut state = BindState::Unbound;
         assert!(state.apply(&bind).is_err());
-        assert!(matches!(state, BindState::Tainted));
-        // Sticky: a later valid bind is still refused.
-        assert!(state.apply(&test_bind(&host, b"sid-2", false)).is_err());
-        assert!(state.destination().is_none());
+        // Unverifiable binds (bad signature, cert/unsupported-curve host
+        // keys) are refused but do NOT poison the state: a later genuine
+        // bind still works (OpenSSH behavior).
+        assert!(matches!(state, BindState::Unbound));
+        assert!(state.apply(&test_bind(&host, b"sid-2", false)).is_ok());
+        assert!(state.destination().is_some());
     }
 
     #[test]
@@ -3308,15 +3419,16 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     }
 
     #[test]
-    fn bind_state_caps_recorded_session_ids() {
+    fn bind_state_caps_recorded_session_ids_without_poisoning() {
         let host = test_hostkey();
         let mut state = BindState::Unbound;
         for i in 0..MAX_SESSION_BINDS {
             let sid = format!("sid-{i}");
             assert!(state.apply(&test_bind(&host, sid.as_bytes(), false)).is_ok());
         }
+        // The excess bind is refused but the established binding survives.
         assert!(state.apply(&test_bind(&host, b"sid-overflow", false)).is_err());
-        assert!(matches!(state, BindState::Tainted));
+        assert!(state.destination().is_some());
     }
 
     #[test]
@@ -3365,7 +3477,7 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         // Relay: confined per connection.
         let mut s = test_session(300, 0);
         s.peer_is_vt_relay = true;
-        s.relay_subject = Some((123, 456));
+        s.connection_subject = Some((123, 456));
         assert_eq!(
             s.raw_sign_scope("fp").1.as_deref(),
             Some("this relay connection")
@@ -3389,12 +3501,66 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         // Relay: per-connection scope, not workspace.
         let mut s = test_session(300, 300);
         s.peer_is_vt_relay = true;
-        s.relay_subject = Some((123, 456));
+        s.connection_subject = Some((123, 456));
         assert_eq!(
             s.decrypt_scopes(&inputs, "h", "/x").1.as_deref(),
             Some("this relay connection")
         );
         assert_eq!(s.decrypt_basis(), ContextBasis::RelayConnection);
+    }
+
+    #[test]
+    fn ssh_peer_vt_extensions_are_confined_per_connection_never_workspace() {
+        // An `ssh -A` peer can carry a REMOTE host's vt extensions; even if a
+        // workspace were somehow resolved it must never be used — otherwise
+        // the remote rides local workspace grants.
+        let mut s = test_session(300, 300);
+        s.peer_is_ssh_client = true;
+        s.connection_subject = Some((123, 456));
+        s.workspace = WorkspaceResolution::Resolved(test_workspace());
+        let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
+        assert_eq!(
+            s.sign_vt_scope("fp", "/repo").1.as_deref(),
+            Some("this forwarded ssh connection")
+        );
+        assert_eq!(
+            s.decrypt_scopes(&inputs, "h", "/repo").1.as_deref(),
+            Some("this forwarded ssh connection")
+        );
+        assert_eq!(s.decrypt_basis(), ContextBasis::SshConnection);
+        // With no resolvable connection subject the arm degrades to Fresh.
+        s.connection_subject = None;
+        assert!(s.sign_vt_scope("fp", "/repo").1.is_none());
+        assert!(s.decrypt_scopes(&inputs, "h", "/repo").1.is_none());
+        assert_eq!(s.decrypt_basis(), ContextBasis::ProcLookupFailed);
+    }
+
+    #[test]
+    fn workspace_root_acceptability_rejects_home_pooling() {
+        let home = std::path::Path::new("/Users/x");
+        // A dotfiles repo AT $HOME must not become a workspace.
+        assert!(!workspace_root_acceptable(
+            home,
+            std::path::Path::new("/Users/x/Downloads"),
+            Some(home)
+        ));
+        // A root above $HOME for a cwd inside $HOME is rejected too.
+        assert!(!workspace_root_acceptable(
+            std::path::Path::new("/Users"),
+            std::path::Path::new("/Users/x/proj"),
+            Some(home)
+        ));
+        // Ordinary project roots pass, inside or outside $HOME.
+        assert!(workspace_root_acceptable(
+            std::path::Path::new("/Users/x/code/vt"),
+            std::path::Path::new("/Users/x/code/vt/src"),
+            Some(home)
+        ));
+        assert!(workspace_root_acceptable(
+            std::path::Path::new("/opt/work/repo"),
+            std::path::Path::new("/opt/work/repo/a"),
+            Some(home)
+        ));
     }
 
     #[tokio::test]
@@ -3413,16 +3579,21 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             .expect("bind must succeed without keychain");
         assert!(reply.is_none(), "plain SSH_AGENT_SUCCESS, no envelope");
         assert!(session.bind_state.destination().is_some());
+        assert!(
+            session.destination_label.is_some(),
+            "label precomputed at bind time"
+        );
         assert_eq!(session.sign_basis(), ContextBasis::SessionBind);
 
-        // Malformed bind: refused and tainted.
+        // Malformed bind: refused without poisoning state (an undecodable
+        // host key — certificates, unsupported curves — is not an attack).
         let mut session = test_session(300, 0);
         let malformed = Extension {
             name: "session-bind@openssh.com".to_string(),
             details: Unparsed::from(vec![1u8, 2, 3]),
         };
         assert!(session.extension(malformed).await.is_err());
-        assert!(matches!(session.bind_state, BindState::Tainted));
+        assert!(matches!(session.bind_state, BindState::Unbound));
     }
 
     // --- Workspace resolution tests ---

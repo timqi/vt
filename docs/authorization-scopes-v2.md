@@ -18,9 +18,9 @@ that operation's risk actually lives:
 | raw SSH sign, session-bound | key fingerprint × **destination host key** | The risk of a signature is "authenticate as me to some server". Which directory or process asked is incidental. |
 | raw SSH sign, unbound non-ssh peer | key fingerprint × **workspace** | `ssh-keygen -Y sign` (git commit signing) never binds; the local kernel-verified caller's project is the activity. |
 | `sign@vt` from local vt | key fingerprint × **workspace** | The local vt client is kernel-verified; a multi-host fan-out from one project is one human activity. |
-| `sign@vt` via relay | key fingerprint × claimed pwd, bounded **per relay connection** | Unchanged from V1: a remote host reuses only its own approvals. |
+| `sign@vt` via relay **or plain-ssh** connection | key fingerprint × claimed pwd, bounded **per connection** | Unchanged from V1: a connection that can carry forwarded remote traffic reuses only its own approvals and never reaches the workspace arm. |
 | `decrypt@vt` local, pure v2 | secret `(type, salt)` × **workspace** | Secrets belong to projects. "I am working in this project" is the approval unit. |
-| `decrypt@vt` via relay, pure v2 | secret `(type, salt)` × claimed host/pwd, bounded per relay connection | Unchanged from V1. |
+| `decrypt@vt` via relay or plain-ssh connection, pure v2 | secret `(type, salt)` × claimed host/pwd, bounded per connection | Unchanged from V1. |
 | legacy-containing `decrypt@vt` | — | Fresh, unchanged. |
 | `auth@vt` | — | Fresh by definition: it attests "a human is present now". |
 | `run@vt` | — | Fresh. A future reusable policy needs exe identity + argv digest + `max_uses`; out of scope. |
@@ -100,9 +100,18 @@ BindState = Unbound
 Rules (the shape follows OpenSSH's `process_ext_session_bind`; the numeric
 cap is a **local DoS-defense choice**, not a claimed protocol contract):
 
-- Signature verification failure, a duplicate `session_id` under a different
-  host key, a forwarding→non-forwarding downgrade for the same session id,
-  or more than 16 recorded ids ⇒ `Tainted` + extension failure reply.
+- An **unverifiable** bind — bad signature, or a host key this build cannot
+  decode or verify (host certificates, curves without an enabled crypto
+  feature such as nistp521) — is refused with an extension failure WITHOUT
+  changing recorded state, mirroring OpenSSH. Benign cert/p521
+  infrastructure therefore simply gets no destination caching (the ssh peer
+  stays `Unbound` ⇒ Fresh) instead of an attack-flavored diagnosis.
+- A **consistency violation** — duplicate `session_id` under a different
+  host key, or a forwarding→non-forwarding downgrade for the same session
+  id — ⇒ `Tainted` + failure reply: the peer is playing games with state
+  the agent must remember.
+- More than 16 recorded ids ⇒ refuse the excess bind, keep recorded state
+  (OpenSSH behavior).
 - First valid bind ⇒ `Bound` with that host key and flag.
 - A further valid bind for a **different** host key, or any bind with
   `is_forwarding = true`, marks the connection as forwarding-capable:
@@ -110,6 +119,10 @@ cap is a **local DoS-defense choice**, not a claimed protocol contract):
   longer destination-cacheable (state stays `Bound` with
   `forwarding = true`).
 - `Tainted` never recovers for the connection lifetime.
+
+The bind intercept sits before the agent-lock check (binding grants nothing
+by itself and must work on connections opened while locked) and never
+touches the idle clock.
 
 ### 3.3 Scope derivation for raw `SIGN_REQUEST`
 
@@ -152,18 +165,22 @@ prompt shows its SHA256 fingerprint and, best-effort, a hostname resolved by
 scanning unhashed `~/.ssh/known_hosts` entries for that key. The display
 name is cosmetic; the grant is keyed on the host key bytes only.
 
-### 3.4 `sign@vt`
+### 3.4 `sign@vt` and `decrypt@vt` connection confinement
 
-- Local peer (kernel-verified vt process, not the relay): workspace scope
-  (§4) — `digest = H("vt-authz-sign-ws-v1", key_fp)`, subject = workspace
-  identity. One approval covers a same-project multi-host fan-out
-  (`tssh h1 h2 …`), preserving the V1 fan-out behavior with a
-  kernel-verified boundary instead of a claimed `pwd`. Raw commit-signing
-  grants (§3.3) and `sign@vt` grants from the same workspace and key
-  intentionally share this scope family.
-- Relay peer (`vt ssh connect --forward-real-agent`, detected via kernel
-  argv as today): per-connection subject `(pid, start_tvsec)` with the V1
-  digest `H("vt-authorization-sign-v1", key_fp, claimed_pwd)`. Unchanged.
+- Local peer (kernel-verified vt process — neither the relay nor an ssh
+  binary): workspace scope (§4) — `digest = H("vt-authz-sign-ws-v1",
+  key_fp)`, subject = workspace identity. One approval covers a same-project
+  multi-host fan-out (`tssh h1 h2 …`), preserving the V1 fan-out behavior
+  with a kernel-verified boundary instead of a claimed `pwd`. Raw
+  commit-signing grants (§3.3) and `sign@vt` grants from the same workspace
+  and key intentionally share this scope family.
+- **Confined connections** — the relay (`vt ssh connect
+  --forward-real-agent`, detected via kernel argv as today) AND any peer
+  whose executable is the OpenSSH client: per-connection subject
+  `(pid, start_tvsec)` with the V1 digests. An ssh peer can be `ssh -A`
+  relaying a remote host's vt extensions; classifying it as a local caller
+  would hand the remote the local workspace scope, so both peer kinds are
+  confined identically and never reach the workspace arm.
 
 ## 4. Workspace identity
 
@@ -172,10 +189,14 @@ For local vt peers (decrypt and sign@vt) and unbound non-ssh raw signers:
 1. Read the peer's kernel cwd: `proc_pidinfo(pid, PROC_PIDVNODEPATHINFO)`
    (`pvi_cdir.vip_path`). Failure ⇒ Fresh.
 2. Ascend from cwd to the nearest ancestor containing a `.git` entry (dir
-   **or** file — worktrees use a file). **None found ⇒ Fresh** (diag basis
-   `no-workspace-root`). A cwd fallback would silently pool `$HOME`, `/tmp`,
-   and CI scratch directories into one broad unlabeled bucket; V2 fails
-   narrow instead.
+   **or** file — worktrees use a file), depth-capped as a syscall bound.
+   **None found ⇒ Fresh** (diag basis `no-workspace-root`). A cwd fallback
+   would silently pool `$HOME`, `/tmp`, and CI scratch directories into one
+   broad unlabeled bucket; V2 fails narrow instead. For the same reason a
+   root that IS `$HOME` (a dotfiles repository — `git init ~`, yadm) and a
+   root found above `$HOME` for a cwd inside `$HOME` are rejected ⇒ Fresh:
+   accepting them would make every caller under the home directory share one
+   grant bucket.
 3. Capture the workspace identity through **one file descriptor**:
    `open(root, O_RDONLY | O_DIRECTORY)` → `fstat(fd)` for `(st_dev, st_ino)`
    → `fcntl(fd, F_GETPATH)` for the canonical path → close. The dev/ino pair
@@ -244,13 +265,18 @@ scope digest uses (§4.3).
 
 `diag@vt` replaces `mode` + V1 `ContextBasis` with the scope classification:
 
-- sign report: `basis ∈ {session-bind, workspace, no-workspace-root,
-  relay-connection, unbound-ssh, tainted, disabled}`, `ttl_secs`,
-  `live_entries` = destination grants `live_len(Sign, (0,0))` + caller
-  workspace grants (when resolved).
+- sign report: `basis ∈ {session-bind, forwarding, tainted, unbound-ssh,
+  workspace, no-workspace-root, relay-connection, ssh-connection,
+  disabled, …}`;
 - decrypt report: `basis ∈ {workspace, no-workspace-root, relay-connection,
-  disabled}`, `ttl_secs`, `live_entries` scoped to the caller's workspace or
-  relay connection.
+  ssh-connection, disabled, …}`.
+
+`live_entries` counts only grants the caller's **own** classification would
+hit: a `session-bind` caller counts the user-wide destination grants (those
+are exactly what its requests reuse), a workspace caller its workspace
+grants, a confined connection its connection grants, and any never-cached
+basis reports 0 — never a whole-store count, and never grants a
+differently-classified caller would need.
 
 The agent is a long-lived daemon and does not restart on CLI upgrade, so
 `vt doctor` must handle a stale agent gracefully: compare the existing
@@ -297,6 +323,15 @@ remains read-only, prompt-free, and must still not reset the idle clock.
 - Raw signs from OpenSSH < 8.9 (no session-bind) are permanently Fresh —
   they previously could cache under an explicit `Global`/`PerSession` mode.
   macOS has shipped ≥ 8.9 since Ventura; treat via README note, no knob.
+- Servers using SSH host certificates or curves this build cannot verify
+  (nistp521) never become destination-cacheable: their binds are refused
+  without poisoning the connection, so raw signs to them stay Fresh.
+- A long-lived non-ssh local client (IDE git integration, a daemonized
+  signer) has its workspace snapshotted at connection time; if it later
+  `chdir`s to another repository on the same connection, its workspace
+  requests degrade to Fresh (pwd consistency check) and its raw-sign grants
+  stay keyed to the original root until it reconnects. Fail-narrow,
+  documented; reconnecting re-resolves.
 - `sign@vt` via relay signs with the relay's configured `--host` label, not
   a verified downstream destination (unchanged V1 behavior); it is
   per-connection confined and must never be described as destination-bound.

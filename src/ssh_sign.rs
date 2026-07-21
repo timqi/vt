@@ -822,21 +822,22 @@ impl ssh_agent_lib::agent::Session for SignerSession {
 
 // ── vt-relay peer detection (cross-platform pure logic) ──────────────────────
 //
-// The macOS `vt ssh agent` narrows the auth cache to a per-connection
-// `(pid, start_time)` context when the connecting peer is a forwarding agent.
-// A plain forwarded `ssh` is recognised by executable basename
-// (`is_ssh_client_path`). With `vt ssh connect --forward-real-agent`, the peer
-// reaching the real agent is instead the `vt` relay process, so the agent must
-// recognise IT too and give it the identical per-connection scoping — otherwise
-// relayed `decrypt@vt` would fall into the coarse ordinary local-caller context
-// and the "context dies with the ssh connection" guarantee would be lost.
+// The macOS `vt ssh agent` confines grants for connections that can carry
+// forwarded remote traffic to a per-connection `(pid, start_time)` subject
+// (activity scopes V2 — docs/authorization-scopes-v2.md). A plain forwarded
+// `ssh` is recognised by executable basename (`is_ssh_client_path`). With
+// `vt ssh connect --forward-real-agent`, the peer reaching the real agent is
+// instead the `vt` relay process, so the agent must recognise IT too and give
+// it the identical per-connection confinement — otherwise relayed
+// `decrypt@vt` would fall into the local-caller workspace scope and the
+// "grants die with the connection" guarantee would be lost.
 //
 // Detection is by the peer's argv (kernel-derived on macOS via KERN_PROCARGS2 —
 // same trust level as the `proc_pidpath` basename check). These functions are
 // PURE and intentionally UNGATED so they compile and are unit-tested on the
 // Linux/host target too (the macOS agent module that consumes them is
 // `#[cfg(target_os = "macos")]`-gated out of the Linux build). Only the sysctl
-// fetch + the wiring into `resolve_cache_context` are macOS-only.
+// fetch + the classification wiring in `new_session` are macOS-only.
 
 /// Basename of an argv[0] token (`/usr/local/bin/vt` → `vt`, `vt` → `vt`).
 pub(crate) fn program_basename(arg0: &str) -> &str {

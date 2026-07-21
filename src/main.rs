@@ -459,15 +459,17 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
                 audit_key,
                 no_audit_push,
             } => {
-                use server_macos::ssh_agent::RunAllowlist;
+                use server_macos::ssh_agent::{AuthCacheTtls, RunAllowlist};
                 let run_allow = RunAllowlist::parse(run_allow)
                     .map_err(|e| anyhow::anyhow!("--run-allow: {}", e))?;
                 let audit_push =
                     build_audit_push_config(audit_url, audit_key, *no_audit_push);
                 server_macos::ssh_agent::start_ssh_agent(
                     *timeout,
-                    *auth_cache_duration,
-                    *decrypt_auth_cache_duration,
+                    AuthCacheTtls {
+                        sign_secs: *auth_cache_duration,
+                        decrypt_secs: *decrypt_auth_cache_duration,
+                    },
                     *no_legacy_decrypt,
                     run_allow,
                     std::sync::Arc::new(audit_push),

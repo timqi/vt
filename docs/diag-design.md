@@ -8,11 +8,13 @@ feature's decision record — verify current behavior against `src/client.rs`
 
 vt's behavior is decided by three config layers (env → config.toml → defaults),
 routing rules (`VT_BACKEND` pin, agent probe, passkey fallback), and agent-side
-cache-context rules (TTY gate, ssh narrowing, vt-relay narrowing, pwd-scoped
-keys, modes defaulting to `none`). Each rule is individually justified, but the
-composition is opaque to the operator: the observable symptom is just "Touch ID
-prompted again" or "the phone buzzed", and diagnosing *why* currently requires
-reading `resolve_cache_context` in `src/server_macos/ssh_agent.rs`.
+scope-classification rules (session-bind destination binding, workspace
+resolution, relay/ssh connection confinement, durations defaulting to `0`).
+Each rule is individually justified, but the composition is opaque to the
+operator: the observable symptom is just "Touch ID prompted again" or "the
+phone buzzed", and diagnosing *why* otherwise requires reading the
+classification helpers (`sign_basis` / `decrypt_basis`) in
+`src/server_macos/ssh_agent.rs`.
 
 ## 2. Goal
 
@@ -20,9 +22,9 @@ One command — `vt doctor` — that answers:
 
 1. Which config values are in effect and where each came from (env vs file).
 2. Which transport path a call from *this* process would take, and why.
-3. On the agent path: what cache modes/TTLs the agent is running with, and how
-   the agent classifies *this caller's* connection (cacheable? which context?
-   which narrowing applied?).
+3. On the agent path: what cache durations the agent is running with, and how
+   the agent scope-classifies *this caller's* connection (cacheable? which
+   scope — destination, workspace, or connection?).
 
 Non-goals: fixing anything (pure diagnosis); worker-side deep checks (an
 HMAC-validating `/api/health` is deferred); auditing/pushing diag events.
@@ -81,10 +83,12 @@ Two hard rules from review:
   resets the idle clock before dispatch; a pollable no-Touch-ID extension must
   not keep the agent "active" forever and defeat the idle-timeout cache flush
   and key clear.
-- **`live_entries` is scoped to the caller's own resolved context** (review
-  R2), never a global count. A relayed remote (or an uncacheable local caller)
-  must not learn how many grants other sessions/tabs on the Mac hold. Context
-  `None` → `live_entries = 0`.
+- **`live_entries` counts only grants the caller's own scope classification
+  could reuse** (review R2), never a global count. A relayed remote (or an
+  uncacheable local caller) must not learn how many grants other scopes on
+  the Mac hold. A basis that never caches → `live_entries = 0`; a
+  destination-bound (`session-bind`) caller counts the user-wide destination
+  grants because those ARE the grants its own requests would hit.
 
 ### 3.2 Basis reporting (activity scopes V2)
 
@@ -180,9 +184,10 @@ Exit code 0 always in v1 (diagnostic, not a health gate).
 
 ## 5. Testing
 
-- Pure: `ContextBasis` mapping unit tests (all branches of the classifier,
-  extending the existing `resolve_cache_context` tests to assert basis);
-  DiagReq/DiagRes serde round-trip; basis→human-string mapping total.
+- Pure: `ContextBasis` mapping unit tests (all branches of the
+  `sign_basis`/`decrypt_basis` classifiers, asserted by the scope
+  classification tests); DiagReq/DiagRes serde round-trip; basis→human-string
+  mapping total.
 - `route_extension` test updated for `diag@vt`.
 - macOS handler compiles only under `cfg(target_os = "macos")` — verified by
   CI (macos-latest), not locally on Linux.
