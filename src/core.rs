@@ -369,7 +369,14 @@ pub enum ContextBasis {
     UnboundSsh,
     /// Local peer scoped to its kernel-derived `.git` workspace root.
     Workspace,
-    /// Kernel cwd has no `.git` ancestor → Fresh (deliberate fail-narrow).
+    /// Local peer with no `.git` ancestor, scoped to its kernel-derived cwd
+    /// directory itself (distinct grant family from `Workspace`).
+    CwdWorkspace,
+    /// Local peer whose cwd is a broad shared directory ($HOME, `/`, temp
+    /// roots): scoped to its kernel-derived parent process (application).
+    ParentApp,
+    /// Kernel cwd is too broad to scope and no usable parent process either
+    /// (parent is launchd / lookup failed) → Fresh.
     NoWorkspaceRoot,
     /// A proc-info lookup (start time / cwd / workspace stat) failed → Fresh.
     ProcLookupFailed,
@@ -389,6 +396,8 @@ impl ContextBasis {
             ContextBasis::Tainted => "tainted",
             ContextBasis::UnboundSsh => "unbound-ssh",
             ContextBasis::Workspace => "workspace",
+            ContextBasis::CwdWorkspace => "cwd-fallback",
+            ContextBasis::ParentApp => "parent-app",
             ContextBasis::NoWorkspaceRoot => "no-workspace-root",
             ContextBasis::ProcLookupFailed => "proc-lookup-failed",
         }
@@ -407,6 +416,8 @@ impl ContextBasis {
             "tainted" => ContextBasis::Tainted,
             "unbound-ssh" => ContextBasis::UnboundSsh,
             "workspace" => ContextBasis::Workspace,
+            "cwd-fallback" => ContextBasis::CwdWorkspace,
+            "parent-app" => ContextBasis::ParentApp,
             "no-workspace-root" => ContextBasis::NoWorkspaceRoot,
             "proc-lookup-failed" => ContextBasis::ProcLookupFailed,
             _ => return None,
@@ -447,9 +458,19 @@ impl ContextBasis {
                 "scoped to this git workspace: any caller working in the same \
                  checkout shares one approval within the TTL"
             }
+            ContextBasis::CwdWorkspace => {
+                "no git checkout: scoped to this exact working directory — \
+                 callers in the same directory share one approval within the \
+                 TTL"
+            }
+            ContextBasis::ParentApp => {
+                "broad working directory ($HOME, /, temp root): scoped to the \
+                 calling application — repeated requests from the same app \
+                 instance share one approval within the TTL"
+            }
             ContextBasis::NoWorkspaceRoot => {
-                "working directory is not inside a git checkout — never cached \
-                 (run from a repository to enable workspace scoping)"
+                "working directory is too broad to scope and the calling \
+                 application could not be identified — never cached"
             }
             ContextBasis::ProcLookupFailed => "process info lookup failed",
         }

@@ -112,7 +112,9 @@ enum ContextBasis {
     Tainted,         // sign: a session-bind failed verification → Fresh
     UnboundSsh,      // sign: ssh peer without session-bind → Fresh
     Workspace,       // local peer scoped to its kernel .git workspace root
-    NoWorkspaceRoot, // cwd not inside a git checkout → Fresh
+    CwdWorkspace,    // no .git root: scoped to the kernel cwd directory itself
+    ParentApp,       // broad cwd ($HOME, /, temp roots): scoped to the calling app
+    NoWorkspaceRoot, // cwd too broad and no usable parent process → Fresh
     ProcLookupFailed,// proc-info/cwd/stat lookup failed → Fresh
 }
 ```
