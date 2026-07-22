@@ -1,5 +1,7 @@
 /.vscode
 /target
+# VT.app bundle output (just app / install-app)
+/build
 GEMINI.md
 .claude/
 .codex
