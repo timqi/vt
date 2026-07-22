@@ -36,21 +36,39 @@ pub fn derive_dek(mac_key: &[u8; 32], salt: &[u8; 16]) -> [u8; 32] {
     okm
 }
 
-/// Derive the per-user/per-binary passphrase secret. Pure: SHA-256(SHA-256(
+/// Fixed final derivation term for wrap v2 (docs/app-bundle.md §2). Replaces
+/// the wrap-v1 binary-path term so the store no longer locks to an install
+/// location. Domain-separated from any real path by not starting with `/`.
+pub const WRAP_V2_LABEL: &str = "vt-wrap-v2";
+
+/// Derive the wrap-v1 (legacy) passphrase secret. Pure: SHA-256(SHA-256(
 /// `base64(passcode):$USER:bin_path`)). `bin_path` defaults to
-/// `current_exe()` when not supplied.
+/// `current_exe()` when not supplied. Kept for reading/upgrading v1 stores
+/// and for `vt secret rebind --to-v1` (downgrade before rolling back to an
+/// old binary); new stores are always wrap v2.
 pub fn derive_passphrase_secret(passcode: &[u8; 32], bin_path: Option<&str>) -> Result<[u8; 32]> {
-    // The b64 passcode and the concatenated derivation string both carry the
-    // master secret; keep them in scrubbed memory so they don't linger on the
-    // heap after the SHA-256 collapse.
-    let passcode = Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(passcode));
     let bin_path = match bin_path {
         Some(s) => s.to_string(),
         // `?` rather than `.unwrap()`: current_exe() can fail in restricted /
         // containerized contexts, and this is on the key-derivation path.
         None => env::current_exe()?.to_string_lossy().to_string(),
     };
-    let derived_str = Zeroizing::new(format!("{}:{}:{}", passcode.as_str(), env::var("USER")?, bin_path));
+    derive_passphrase_secret_with_term(passcode, &bin_path)
+}
+
+/// Derive the wrap-v2 passphrase secret: the derivation string ends in the
+/// fixed [`WRAP_V2_LABEL`] instead of a binary path, so moving or renaming
+/// the binary (e.g. into VT.app) does not invalidate the wrap.
+pub fn derive_passphrase_secret_v2(passcode: &[u8; 32]) -> Result<[u8; 32]> {
+    derive_passphrase_secret_with_term(passcode, WRAP_V2_LABEL)
+}
+
+fn derive_passphrase_secret_with_term(passcode: &[u8; 32], term: &str) -> Result<[u8; 32]> {
+    // The b64 passcode and the concatenated derivation string both carry the
+    // master secret; keep them in scrubbed memory so they don't linger on the
+    // heap after the SHA-256 collapse.
+    let passcode = Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(passcode));
+    let derived_str = Zeroizing::new(format!("{}:{}:{}", passcode.as_str(), env::var("USER")?, term));
     let hash = Sha256::digest(&Sha256::digest(derived_str.as_bytes()));
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash[..32]);

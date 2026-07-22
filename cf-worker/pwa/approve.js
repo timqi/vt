@@ -58,9 +58,11 @@
         cacheSec.appendChild(el('h2', null, '缓存解密授权'));
         var warn = el('p', 'hint cache-warn');
         // Cache ctx binds source IP (hard) + working directory (advisory) — see
-        // docs/dek-cache.md. Built as nodes to keep the <strong> emphasis under CSP.
+        // docs/dek-cache.md. The copy states each half's trust level so the
+        // promised boundary matches the implemented one. Built as nodes to keep
+        // the <strong> emphasis under CSP.
         warn.appendChild(document.createTextNode('选择后，在该时长内、'));
-        warn.appendChild(el('strong', null, '同一来源 IP 且同一工作目录'));
+        warn.appendChild(el('strong', null, '同一来源 IP（已验证）且同一工作目录（客户端自报）'));
         warn.appendChild(document.createTextNode('对这些记录的解密将'));
         warn.appendChild(el('strong', null, '免手机审批'));
         warn.appendChild(document.createTextNode('。默认不缓存。'));
@@ -112,6 +114,10 @@
             var meta = data.metadata;
             refs.meta.innerHTML = '';
             if (meta) {
+                // Only `ip` is worker-verified (CF-Connecting-IP); every other
+                // field is client-reported display data — labeled so an
+                // approver weighs them accordingly (the footnote below states
+                // the rule once).
                 var fields = [
                     ['op_kind',    '类型'],
                     ['host',       '主机'],
@@ -121,7 +127,7 @@
                     ['tty',        '终端'],
                     ['ppid_cmd',   '父进程'],
                     ['ssh_client', 'SSH 来源'],
-                    ['ip',         'IP'],
+                    ['ip',         'IP（已验证）'],
                     ['reason',     '原因']
                 ];
                 for (var i = 0; i < fields.length; i++) {
@@ -132,6 +138,19 @@
                     row.appendChild(el('dd', null, String(meta[key])));
                     refs.meta.appendChild(row);
                 }
+                // Decrypt batch size — worker-derived (the DEKs this approval
+                // would mint), not client-claimed meta. An anomalous batch is
+                // exactly what an approver should see before tapping 同意.
+                var salts = Array.isArray(data.salts_b64u) ? data.salts_b64u.length : 0;
+                if (salts > 0) {
+                    var srow = document.createElement('div');
+                    srow.appendChild(el('dt', null, '记录数'));
+                    srow.appendChild(el('dd', null, String(salts) + ' 条'));
+                    refs.meta.appendChild(srow);
+                }
+                var note = el('p', 'hint vt-ap-meta-note',
+                    '除 IP 外均为客户端自报信息，仅供参考。');
+                refs.meta.parentNode.appendChild(note);
             }
         }
 

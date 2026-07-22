@@ -55,10 +55,17 @@ const MAX_ADMIN_SOCKETS = 8;
 // Column projection shared by opAuditQuery and the real-time broadcast, so a
 // pushed row is byte-for-byte the same shape the REST query returns (no field
 // can leak into the stream that the query itself does not already expose).
+// Decrypt batch size of a ceremony — worker-derived (from the salts array the
+// DEKs are minted for), not client-claimed meta. Joins the notification head
+// line as `user@host · N 条`.
+const chSalts = (ch: Challenge): number =>
+  Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0;
+
 const AUDIT_SELECT_COLS =
   `id, token_id, created_ms, finalized_ms, status, op_kind, command, reason,
    host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms,
-   verify_failures, cache_ttl_s, ppid, source, seq`;
+   verify_failures, cache_ttl_s, ppid, source, seq,
+   peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed`;
 
 // DEK cache entry key. ctx binds the entry to (a) the requester's worker-derived
 // IP (CF-Connecting-IP — unspoofable by the client, the hard boundary) AND (b)
@@ -180,7 +187,14 @@ export class AccountDO extends DurableObject<Env> {
            cache_ttl_s INTEGER,
            ppid INTEGER,
            source TEXT NOT NULL DEFAULT 'ceremony',
-           seq INTEGER
+           seq INTEGER,
+           peer_exe TEXT,
+           key_fp TEXT,
+           dest TEXT,
+           scope_family TEXT,
+           scope_label TEXT,
+           grant_ttl_s INTEGER,
+           relayed INTEGER
          )`,
       );
       // Additive migrations for older audit tables (token_id present but newer
@@ -220,6 +234,21 @@ export class AccountDO extends DurableObject<Env> {
       if (colsAfterSource.length > 0 && !colsAfterSource.some(c => c.name === 'seq')) {
         this.ctx.storage.sql.exec(`ALTER TABLE audit ADD COLUMN seq INTEGER`);
         this.ctx.storage.sql.exec(`UPDATE audit SET seq = id WHERE seq IS NULL`);
+      }
+      // Agent-authoritative audit context (docs/approval-transparency.md §B).
+      // Re-snapshot table_info — the `source`/`seq` ALTERs above invalidated
+      // the earlier snapshots (per the note on the `source` migration). All
+      // seven are plain nullable adds: NULL on pre-migration rows means "the
+      // agent never sent the field", which is exactly the ingest convention.
+      const colsForAgentCtx = this.ctx.storage.sql
+        .exec<{ name: string }>(`PRAGMA table_info(audit)`)
+        .toArray();
+      if (colsForAgentCtx.length > 0 && !colsForAgentCtx.some(c => c.name === 'peer_exe')) {
+        for (const col of ['peer_exe TEXT', 'key_fp TEXT', 'dest TEXT',
+                           'scope_family TEXT', 'scope_label TEXT',
+                           'grant_ttl_s INTEGER', 'relayed INTEGER']) {
+          this.ctx.storage.sql.exec(`ALTER TABLE audit ADD COLUMN ${col}`);
+        }
       }
       // Drop the short-lived standalone cache_audit table from an earlier build
       // of this branch — its events now live in the unified audit table.
@@ -415,8 +444,9 @@ export class AccountDO extends DurableObject<Env> {
     try {
       const cursor = this.ctx.storage.sql.exec(
         `INSERT INTO audit
-           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, ppid, source, seq)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?)
+           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, ppid, source, seq,
+            peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(token_id) DO NOTHING`,
         op.token_id, op.ts_ms, op.ts_ms, op.outcome,
         m.op_kind ?? null, m.command ?? null, m.reason ?? null, m.host ?? null,
@@ -424,6 +454,11 @@ export class AccountDO extends DurableObject<Env> {
         m.ssh_client ?? null, m.ip ?? null, op.salts, op.latency_ms,
         typeof m.ppid === 'number' ? m.ppid : null,
         this.nextSeq(),
+        // Agent-authoritative context: the ingest already normalized these to
+        // string/number/null — `?? null` only guards a malformed internal op.
+        op.peer_exe ?? null, op.key_fp ?? null, op.dest ?? null,
+        op.scope_family ?? null, op.scope_label ?? null,
+        op.grant_ttl_s ?? null, op.relayed ?? null,
       );
       // Skip the broadcast on an idempotent-retry no-op (agent's 1-retry).
       if (cursor.rowsWritten > 0) this.broadcastRow(op.token_id, 'insert');
@@ -664,7 +699,8 @@ export class AccountDO extends DurableObject<Env> {
   // failure mode of the race is a card that never leaves "⏳", which this closes.
   private async feishuSendAndStore(cfg: FeishuConfig, ch: Challenge, approveUrl: string): Promise<void> {
     try {
-      const id = await sendApprovalCard(cfg, this.feishuKv(), Date.now(), ch.meta.op_kind, ch.meta, approveUrl);
+      const id = await sendApprovalCard(
+        cfg, this.feishuKv(), Date.now(), ch.meta.op_kind, ch.meta, approveUrl, chSalts(ch));
       if (!id) { logErr('feishu.send_failed', 'no message_id'); return; }
       const cur = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
       if (!cur) return; // expired + swept before the send returned
@@ -675,7 +711,9 @@ export class AccountDO extends DurableObject<Env> {
         // id. Approver label is unavailable on this path (opApprove already ran
         // without an id) — degrade to latency-only; this race is rare + cosmetic.
         const latencyMs = cur.finalized_ms != null ? cur.finalized_ms - cur.created_ms : undefined;
-        const w = await editCard(cfg, this.feishuKv(), Date.now(), id, cur.status as FeishuState, cur.meta.op_kind, cur.meta, { latencyMs });
+        const w = await editCard(
+          cfg, this.feishuKv(), Date.now(), id, cur.status as FeishuState,
+          cur.meta.op_kind, cur.meta, { latencyMs }, chSalts(cur));
         if (w) logErr('feishu.edit_failed', w);
       }
     } catch (e) { logErr('feishu.send_failed', e); }
@@ -697,7 +735,7 @@ export class AccountDO extends DurableObject<Env> {
     const mid = ch.feishu_message_id;
     const meta = ch.meta;
     this.ctx.waitUntil(
-      editCard(cfg, this.feishuKv(), Date.now(), mid, state, meta.op_kind, meta, extra)
+      editCard(cfg, this.feishuKv(), Date.now(), mid, state, meta.op_kind, meta, extra, chSalts(ch))
         .then((w) => { if (w) logErr('feishu.edit_failed', w); })
         .catch((e) => logErr('feishu.edit_failed', e)),
     );
@@ -720,7 +758,7 @@ export class AccountDO extends DurableObject<Env> {
   // race: if the decision landed first, edit straight to the terminal state.
   private async slackAppSendAndStore(cfg: SlackAppConfig, ch: Challenge, approveUrl: string): Promise<void> {
     try {
-      const ref = await sendSlackAppCard(cfg, ch.meta.op_kind, ch.meta, approveUrl);
+      const ref = await sendSlackAppCard(cfg, ch.meta.op_kind, ch.meta, approveUrl, chSalts(ch));
       if (!ref) { logErr('slackapp.send_failed', 'no ts'); return; }
       const cur = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
       if (!cur) return; // expired + swept before the send returned
@@ -731,7 +769,9 @@ export class AccountDO extends DurableObject<Env> {
         // ref. Approver label is unavailable on this path (opApprove already ran
         // without a ref) — degrade to latency-only; this race is rare + cosmetic.
         const latencyMs = cur.finalized_ms != null ? cur.finalized_ms - cur.created_ms : undefined;
-        const w = await editSlackAppCard(cfg, ref, cur.status as SlackAppState, cur.meta.op_kind, cur.meta, { latencyMs });
+        const w = await editSlackAppCard(
+          cfg, ref, cur.status as SlackAppState, cur.meta.op_kind, cur.meta,
+          { latencyMs }, chSalts(cur));
         if (w) logErr('slackapp.edit_failed', w);
       }
     } catch (e) { logErr('slackapp.send_failed', e); }
@@ -751,7 +791,7 @@ export class AccountDO extends DurableObject<Env> {
     const ref: SlackAppMsgRef = ch.slackapp;
     const meta = ch.meta;
     this.ctx.waitUntil(
-      editSlackAppCard(cfg, ref, state, meta.op_kind, meta, extra)
+      editSlackAppCard(cfg, ref, state, meta.op_kind, meta, extra, chSalts(ch))
         .then((w) => { if (w) logErr('slackapp.edit_failed', w); })
         .catch((e) => logErr('slackapp.edit_failed', e)),
     );

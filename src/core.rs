@@ -1,3 +1,4 @@
+pub mod authorization;
 pub mod crypto;
 pub mod session;
 pub mod wire;
@@ -310,8 +311,8 @@ pub struct DiagReq {}
 
 /// Response for `diag@vt`: how the agent is configured and how it classifies
 /// THIS connection for caching purposes. Discloses no secret, no cache keys,
-/// and nothing about other sessions (`live_entries` is scoped to the caller's
-/// own resolved context).
+/// and nothing about scopes the caller could not reuse (`live_entries`
+/// counts only grants the caller's own scope classification would hit).
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DiagRes {
     pub agent_version: String,
@@ -324,47 +325,60 @@ pub struct DiagRes {
     pub audit_push: bool,
 }
 
-/// Per-cache diagnostic report (one for sign, one for decrypt).
+/// Per-operation diagnostic report (one for sign, one for decrypt).
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DiagCacheReport {
-    /// none | per-session | per-app | global
-    pub mode: String,
+    /// Configured cache duration; 0 = Fresh (always prompt).
     pub ttl_secs: u64,
-    /// Currently-valid grants for THIS connection's context only (0 when the
-    /// connection is uncacheable) — never a global count.
+    /// Currently-valid grants THIS caller could use (its workspace / relay
+    /// connection, plus user-wide destination grants for sign) — never a
+    /// whole-store count.
     pub live_entries: usize,
-    /// Stable wire tag naming WHY the context resolved the way it did
+    /// Stable wire tag naming how this connection is scope-classified
     /// ([`ContextBasis::as_wire`] on the agent); the CLI maps it back via
     /// [`ContextBasis::from_wire`] and passes unknown tags through verbatim
     /// (client/agent version skew degrades to an "unknown basis" line).
     pub context_basis: String,
 }
 
-/// Which rule of the agent's cache-context classifier decided the outcome.
-/// Lives here (not in the macOS-only agent module) so the agent's wire tags
-/// and the CLI's human explanations are one compile-checked mapping — adding
-/// a variant forces both [`Self::as_wire`] and [`Self::human`] arms.
+/// How the agent scope-classifies a connection (activity scopes V2 —
+/// docs/authorization-scopes-v2.md). Lives here (not in the macOS-only agent
+/// module) so the agent's wire tags and the CLI's human explanations are one
+/// compile-checked mapping — adding a variant forces both [`Self::as_wire`]
+/// and [`Self::human`] arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextBasis {
-    /// Caching disabled (`--…-cache-mode none`).
-    ModeNone,
-    /// Peer PID unavailable → uncacheable.
+    /// Cache duration is 0 (the default): every request prompts.
+    Disabled,
+    /// Peer PID unavailable → Fresh.
     NoPeerPid,
-    /// Peer is a `vt ssh connect --forward-real-agent` relay: per-connection.
-    VtRelay,
-    /// per-session/per-app TTY gate: peer has no controlling terminal.
-    NoTty,
-    /// Peer is an OpenSSH client: narrowed to that ssh process.
-    SshClient,
-    /// per-session: anchored on the terminal session leader.
-    SessionLeader,
-    /// per-app: anchored on the `.app` bundle ancestor.
-    AppAncestor,
-    /// per-app: no `.app` ancestor (tmux, ssh login session) → uncacheable.
-    NoAppAncestor,
-    /// global: the shared `(0, 0)` context.
-    Global,
-    /// A proc-info lookup (`get_start_tvsec` / `get_sid`) failed → uncacheable.
+    /// `vt ssh connect --forward-real-agent` relay: grants confined to this
+    /// connection.
+    RelayConnection,
+    /// Plain ssh peer (possibly `ssh -A` carrying forwarded remote traffic):
+    /// vt extensions confined to this connection.
+    SshConnection,
+    /// Destination proven by a verified `session-bind@openssh.com`.
+    SessionBind,
+    /// Bound connection marked forwarding-capable → Fresh.
+    Forwarding,
+    /// A session-bind failed verification/consistency; sticky → Fresh.
+    Tainted,
+    /// ssh peer that never sent a session-bind (OpenSSH < 8.9 or a filtered
+    /// path) → Fresh.
+    UnboundSsh,
+    /// Local peer scoped to its kernel-derived `.git` workspace root.
+    Workspace,
+    /// Local peer with no `.git` ancestor, scoped to its kernel-derived cwd
+    /// directory itself (distinct grant family from `Workspace`).
+    CwdWorkspace,
+    /// Local peer whose cwd is a broad shared directory ($HOME, `/`, temp
+    /// roots): scoped to its kernel-derived parent process (application).
+    ParentApp,
+    /// Kernel cwd is too broad to scope and no usable parent process either
+    /// (parent is launchd / lookup failed) → Fresh.
+    NoWorkspaceRoot,
+    /// A proc-info lookup (start time / cwd / workspace stat) failed → Fresh.
     ProcLookupFailed,
 }
 
@@ -373,15 +387,18 @@ impl ContextBasis {
     /// change its tag.
     pub fn as_wire(&self) -> &'static str {
         match self {
-            ContextBasis::ModeNone => "mode-none",
+            ContextBasis::Disabled => "disabled",
             ContextBasis::NoPeerPid => "no-peer-pid",
-            ContextBasis::VtRelay => "vt-relay",
-            ContextBasis::NoTty => "no-tty",
-            ContextBasis::SshClient => "ssh-client",
-            ContextBasis::SessionLeader => "session-leader",
-            ContextBasis::AppAncestor => "app-ancestor",
-            ContextBasis::NoAppAncestor => "no-app-ancestor",
-            ContextBasis::Global => "global",
+            ContextBasis::RelayConnection => "relay-connection",
+            ContextBasis::SshConnection => "ssh-connection",
+            ContextBasis::SessionBind => "session-bind",
+            ContextBasis::Forwarding => "forwarding",
+            ContextBasis::Tainted => "tainted",
+            ContextBasis::UnboundSsh => "unbound-ssh",
+            ContextBasis::Workspace => "workspace",
+            ContextBasis::CwdWorkspace => "cwd-fallback",
+            ContextBasis::ParentApp => "parent-app",
+            ContextBasis::NoWorkspaceRoot => "no-workspace-root",
             ContextBasis::ProcLookupFailed => "proc-lookup-failed",
         }
     }
@@ -390,15 +407,18 @@ impl ContextBasis {
     /// know (a newer agent).
     pub fn from_wire(tag: &str) -> Option<Self> {
         Some(match tag {
-            "mode-none" => ContextBasis::ModeNone,
+            "disabled" => ContextBasis::Disabled,
             "no-peer-pid" => ContextBasis::NoPeerPid,
-            "vt-relay" => ContextBasis::VtRelay,
-            "no-tty" => ContextBasis::NoTty,
-            "ssh-client" => ContextBasis::SshClient,
-            "session-leader" => ContextBasis::SessionLeader,
-            "app-ancestor" => ContextBasis::AppAncestor,
-            "no-app-ancestor" => ContextBasis::NoAppAncestor,
-            "global" => ContextBasis::Global,
+            "relay-connection" => ContextBasis::RelayConnection,
+            "ssh-connection" => ContextBasis::SshConnection,
+            "session-bind" => ContextBasis::SessionBind,
+            "forwarding" => ContextBasis::Forwarding,
+            "tainted" => ContextBasis::Tainted,
+            "unbound-ssh" => ContextBasis::UnboundSsh,
+            "workspace" => ContextBasis::Workspace,
+            "cwd-fallback" => ContextBasis::CwdWorkspace,
+            "parent-app" => ContextBasis::ParentApp,
+            "no-workspace-root" => ContextBasis::NoWorkspaceRoot,
             "proc-lookup-failed" => ContextBasis::ProcLookupFailed,
             _ => return None,
         })
@@ -407,28 +427,51 @@ impl ContextBasis {
     /// Operator-facing explanation shown by `vt doctor`.
     pub fn human(&self) -> &'static str {
         match self {
-            ContextBasis::ModeNone => "caching disabled (cache mode 'none', the default)",
+            ContextBasis::Disabled => {
+                "caching disabled (duration 0, the default): every request prompts"
+            }
             ContextBasis::NoPeerPid => "agent could not identify the peer process",
-            ContextBasis::VtRelay => {
-                "narrowed to this relay connection (grants die with it; other \
+            ContextBasis::RelayConnection => {
+                "confined to this relay connection (grants die with it; other \
                  connections never share them)"
             }
-            ContextBasis::NoTty => {
-                "no controlling TTY — per-session/per-app never cache for \
-                 orchestrated callers (CI / AI agents); use cache mode 'global'"
+            ContextBasis::SshConnection => {
+                "peer is an ssh process (may carry forwarded remote traffic) — \
+                 confined to this connection; grants die with it"
             }
-            ContextBasis::SshClient => {
-                "peer is an ssh process: narrowed to this ssh connection. \
-                 One-shot ssh/git spawns never share grants; use ssh \
-                 ControlMaster to share within the TTL"
+            ContextBasis::SessionBind => {
+                "destination-bound: reuses one approval per (key, server) \
+                 across all local callers within the TTL"
             }
-            ContextBasis::SessionLeader => "cacheable within this terminal session",
-            ContextBasis::AppAncestor => "cacheable within this .app bundle",
-            ContextBasis::NoAppAncestor => {
-                "no .app ancestor (tmux / ssh login session) — per-app cannot \
-                 cache here"
+            ContextBasis::Forwarding => {
+                "connection carries forwarded agent traffic — never cached"
             }
-            ContextBasis::Global => "cacheable across ALL local callers (shared global context)",
+            ContextBasis::Tainted => {
+                "a session-bind failed verification on this connection — never \
+                 cached until reconnect"
+            }
+            ContextBasis::UnboundSsh => {
+                "ssh peer without session-bind (OpenSSH < 8.9?) — cannot \
+                 distinguish auth from forwarding, never cached"
+            }
+            ContextBasis::Workspace => {
+                "scoped to this git workspace: any caller working in the same \
+                 checkout shares one approval within the TTL"
+            }
+            ContextBasis::CwdWorkspace => {
+                "no git checkout: scoped to this exact working directory — \
+                 callers in the same directory share one approval within the \
+                 TTL"
+            }
+            ContextBasis::ParentApp => {
+                "broad working directory ($HOME, /, temp root): scoped to the \
+                 calling application — repeated requests from the same app \
+                 instance share one approval within the TTL"
+            }
+            ContextBasis::NoWorkspaceRoot => {
+                "working directory is too broad to scope and the calling \
+                 application could not be identified — never cached"
+            }
             ContextBasis::ProcLookupFailed => "process info lookup failed",
         }
     }
@@ -443,6 +486,45 @@ pub struct DiagPeerReport {
     pub has_tty: bool,
     pub is_ssh_client: bool,
     pub is_vt_relay: bool,
+}
+
+// ---- ui-status@vt (docs/app-bundle.md §5) -----------------------------------
+
+pub const UI_STATUS_ACTION_STATUS: &str = "status";
+pub const UI_STATUS_ACTION_REVOKE_ALL: &str = "revoke_all";
+
+/// Request: shell → agent for `ui-status@vt`. Plaintext JSON (the shell
+/// holds no VT_AUTH), gated by the 32-byte spawn token the shell passed the
+/// agent over an inherited pipe at startup. Like `diag@vt` it never resets
+/// the idle clock; unlike `diag@vt` a valid token sees the WHOLE grant
+/// store — the one deliberate exception to caller-scoped visibility.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct UiStatusReq {
+    /// base64-url-no-pad of the 32-byte spawn token.
+    pub token: String,
+    /// [`UI_STATUS_ACTION_STATUS`] or [`UI_STATUS_ACTION_REVOKE_ALL`]
+    /// (authority-reducing only — there is deliberately no action that
+    /// grants, extends, or approves anything).
+    pub action: String,
+}
+
+/// Response for `ui-status@vt`. No secrets, digests, or key material;
+/// grant `display` strings are the same text the Touch ID prompts showed.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct UiStatusRes {
+    pub agent_version: String,
+    pub locked: bool,
+    pub sign_ttl_secs: u64,
+    pub decrypt_ttl_secs: u64,
+    /// Idle timeout in seconds — surfaced so the shell can show *why* grants
+    /// clear after a quiet spell (docs/app-bundle.md §10). Policy, not secret.
+    pub idle_timeout_secs: u64,
+    pub run_allow_len: usize,
+    pub audit_push: bool,
+    /// Grants dropped, present only in a `revoke_all` reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<usize>,
+    pub grants: Vec<crate::core::authorization::GrantSnapshot>,
 }
 
 // ---- v2 URL parsing ---------------------------------------------------------
@@ -761,16 +843,17 @@ mod tests {
     fn context_basis_wire_round_trip_and_human_are_total() {
         // Compile-time exhaustiveness lives in the match arms; this pins the
         // wire tags (a protocol surface) and the from_wire inverse.
-        const ALL: [ContextBasis; 10] = [
-            ContextBasis::ModeNone,
+        const ALL: [ContextBasis; 11] = [
+            ContextBasis::Disabled,
             ContextBasis::NoPeerPid,
-            ContextBasis::VtRelay,
-            ContextBasis::NoTty,
-            ContextBasis::SshClient,
-            ContextBasis::SessionLeader,
-            ContextBasis::AppAncestor,
-            ContextBasis::NoAppAncestor,
-            ContextBasis::Global,
+            ContextBasis::RelayConnection,
+            ContextBasis::SshConnection,
+            ContextBasis::SessionBind,
+            ContextBasis::Forwarding,
+            ContextBasis::Tainted,
+            ContextBasis::UnboundSsh,
+            ContextBasis::Workspace,
+            ContextBasis::NoWorkspaceRoot,
             ContextBasis::ProcLookupFailed,
         ];
         for b in ALL {
@@ -778,9 +861,13 @@ mod tests {
             assert!(!b.human().is_empty());
         }
         assert_eq!(ContextBasis::from_wire("future-tag"), None);
-        assert_eq!(ContextBasis::ModeNone.as_wire(), "mode-none");
-        assert_eq!(ContextBasis::VtRelay.as_wire(), "vt-relay");
-        assert_eq!(ContextBasis::SshClient.as_wire(), "ssh-client");
+        assert_eq!(ContextBasis::Disabled.as_wire(), "disabled");
+        assert_eq!(ContextBasis::SessionBind.as_wire(), "session-bind");
+        assert_eq!(ContextBasis::Workspace.as_wire(), "workspace");
+        assert_eq!(
+            ContextBasis::RelayConnection.as_wire(),
+            "relay-connection"
+        );
     }
 
     #[test]

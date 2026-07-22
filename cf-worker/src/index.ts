@@ -320,7 +320,10 @@ app.post('/api/challenge', async (c) => {
   const origin = c.env.WORKER_ORIGIN;
   const approveUrl = `${origin}/a/${approveToken}`;
 
-  const pushWarning = await notifyApproval(c.env, ch.meta.op_kind, ch.meta, approveUrl);
+  const pushWarning = await notifyApproval(
+    c.env, ch.meta.op_kind, ch.meta, approveUrl,
+    Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0,
+  );
   if (pushWarning) logErr('notify.failed', pushWarning, { at: tokenPrefix(approveToken) });
 
   log('challenge.created', {
@@ -451,6 +454,16 @@ app.post('/api/audit-ingest', async (c) => {
 
   const clampInt = (v: unknown): number =>
     (typeof v === 'number' && Number.isFinite(v) && v >= 0) ? Math.floor(v) : 0;
+  // Null-preserving variants for the agent-authoritative fields: an old agent
+  // that never sent the field must store SQL NULL, distinguishable from a new
+  // agent's explicit ''/0/false ("not applicable"). capMeta/clampInt would
+  // coerce absent to ''/0 and erase that distinction.
+  const capOrNull = (v: unknown, max: number): string | null =>
+    v === undefined || v === null ? null : capMeta(v, max);
+  const clampIntOrNull = (v: unknown): number | null =>
+    v === undefined || v === null ? null : clampInt(v);
+  const boolOrNull = (v: unknown): number | null =>
+    typeof v === 'boolean' ? (v ? 1 : 0) : null;
   // ts_ms must itself be within the replay window — otherwise an HMAC-verified
   // (but buggy/compromised) agent could write a far-future ts_ms that escapes
   // the 90-day retention sweep, or a ts_ms=0 row that's swept immediately.
@@ -465,6 +478,13 @@ app.post('/api/audit-ingest', async (c) => {
     latency_ms: clampInt(entry.latency_ms),
     ts_ms: tsMs,
     meta: capChallengeMeta(entry.meta, c.req.header('CF-Connecting-IP')),
+    peer_exe: capOrNull(entry.peer_exe, 160),
+    key_fp: capOrNull(entry.key_fp, 160),
+    dest: capOrNull(entry.dest, 160),
+    scope_family: capOrNull(entry.scope_family, 32),
+    scope_label: capOrNull(entry.scope_label, 160),
+    grant_ttl_s: clampIntOrNull(entry.grant_ttl_s),
+    relayed: boolOrNull(entry.relayed),
   };
 
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));

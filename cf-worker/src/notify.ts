@@ -11,17 +11,23 @@ function truncate(s: string, max = 512): string {
   return s.length <= max ? s : s.slice(0, max - 1) + '…';
 }
 
-// The shared context lines (who / pwd / cmd / ssh / ip / reason) that every
-// notification body carries. Approval and cache-hit notices differ only in their
-// title and trailing line, so they build on this common block — keeping the two
-// from silently drifting if a field is added later. Exported so feishu.ts renders
-// the SAME context block (as plain_text) rather than keeping a third copy.
+// The shared context lines (who / pwd / cmd / via / ssh / ip / reason) that
+// every notification body carries. Approval and cache-hit notices differ only in
+// their title and trailing line, so they build on this common block — keeping the
+// two from silently drifting if a field is added later. Exported so feishu.ts
+// renders the SAME context block (as plain_text) rather than keeping a third copy.
+// `salts` (the decrypt batch size, from the ceremony's salts_b64u — worker-derived,
+// not client-claimed meta) joins the head line as `user@host · N 条`, mirroring the
+// cache-hit head: an anomalous batch is exactly what an approver should see before
+// tapping the link. 0 (auth/encrypt, or callers without a ceremony) drops the segment.
 export function metaLines(
-  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
+  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ssh_client' | 'ip' | 'reason'>,
+  salts = 0,
 ): string[] {
   const who = [meta.user, meta.host].filter(Boolean).join('@');
   const lines: string[] = [];
-  if (who) lines.push(who);
+  const head = [who, salts > 0 ? `${salts} 条` : ''].filter(Boolean).join(' · ');
+  if (head) lines.push(head);
   if (meta.pwd) lines.push(`pwd: ${meta.pwd}`);
   if (meta.command) {
     // The CLI sends `command` as a self-labelled multi-line body
@@ -29,6 +35,11 @@ export function metaLines(
     // would duplicate the labels. Inline single-line legacy commands.
     lines.push(meta.command.includes('\n') ? meta.command : `cmd: ${meta.command}`);
   }
+  // The parent-process line mirrors the approval page's 父进程 row: users often
+  // decide from the notification alone, and "which program asked" is a
+  // higher-signal field than tty (still omitted here). Client-claimed, like
+  // every meta field except ip.
+  if (meta.ppid_cmd) lines.push(`via: ${meta.ppid_cmd}`);
   if (meta.ssh_client) lines.push(`ssh: ${meta.ssh_client}`);
   if (meta.ip) lines.push(`ip: ${meta.ip}`);
   if (meta.reason) lines.push(`reason: ${meta.reason}`);
@@ -38,11 +49,12 @@ export function metaLines(
 // Compose the human-facing approval message once; every channel reuses it.
 export function buildApprovalMessage(
   opKind: string,
-  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
+  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ssh_client' | 'ip' | 'reason'>,
   approveUrl: string,
+  salts = 0,
 ): { title: string; body: string } {
   const title = opKind ? `VT 审批: ${opKind}` : 'VT 审批请求';
-  const lines = metaLines(meta);
+  const lines = metaLines(meta, salts);
   lines.push(approveUrl);
   return { title, body: lines.join('\n') };
 }
@@ -144,8 +156,9 @@ export async function notifyApproval(
   opKind: string,
   meta: ChallengeMeta,
   approveUrl: string,
+  salts = 0,
 ): Promise<string> {
-  const { title, body } = buildApprovalMessage(opKind, meta, approveUrl);
+  const { title, body } = buildApprovalMessage(opKind, meta, approveUrl, salts);
   return fanOut(env, title, body);
 }
 

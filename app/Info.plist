@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.rustyvault.vt</string>
+	<key>CFBundleName</key>
+	<string>VT</string>
+	<key>CFBundleDisplayName</key>
+	<string>VT</string>
+	<!-- "VTApp", not "VT": the Rust CLI lives beside it as "vt", and the
+	     default APFS volume is case-insensitive — "VT" and "vt" would be
+	     the same file. Menu bar / notifications show CFBundleDisplayName. -->
+	<key>CFBundleExecutable</key>
+	<string>VTApp</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleShortVersionString</key>
+	<string>VT_BUNDLE_VERSION</string>
+	<key>CFBundleVersion</key>
+	<string>VT_BUNDLE_VERSION</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>VT</string>
+</dict>
+</plist>

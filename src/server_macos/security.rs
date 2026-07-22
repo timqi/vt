@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-use crate::core::crypto::{derive_passphrase_secret, AesGcmCrypto};
+use crate::core::crypto::{derive_passphrase_secret, derive_passphrase_secret_v2, AesGcmCrypto};
 use crate::core::session::{
     classify_session, lock_cache_check, throttle_check, AuthMethod, AuthOutcome, NotifyKind,
     SessionState, UnavailableReason,
@@ -29,7 +29,7 @@ pub fn get_keychain(name: &str) -> Result<Vec<u8>> {
 /// Production lock-state lookup (uncached). Cheap; called at most once per
 /// second via `screen_state_cached` plus once per `evaluate_policy(false)`
 /// re-check.
-fn screen_state_now() -> SessionState {
+pub(crate) fn screen_state_now() -> SessionState {
     classify_session(cgsession::fetch_flags())
 }
 
@@ -119,10 +119,36 @@ mod cgsession {
     }
 }
 
+/// When the running binary lives inside an `.app` bundle
+/// (`…/Contents/MacOS/<exe>`), return the path of the bundled `VTApp` shell
+/// binary, which doubles as the `UNUserNotificationCenter` helper
+/// (docs/app-bundle.md §3). The notification then carries VT's own bundle
+/// identity/icon instead of Script Editor's. The shell is named `VTApp`
+/// because the default APFS volume is case-insensitive — `VT` would collide
+/// with the `vt` CLI beside it.
+fn bundle_notify_helper() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let macos_dir = exe.parent()?;
+    if macos_dir.file_name()? != "MacOS" {
+        return None;
+    }
+    let contents = macos_dir.parent()?;
+    if contents.file_name()? != "Contents"
+        || contents.parent()?.extension().is_none_or(|e| e != "app")
+    {
+        return None;
+    }
+    let helper = macos_dir.join("VTApp");
+    (helper.is_file() && helper != exe).then_some(helper)
+}
+
 fn notify_macos(title: &str, body: &str) {
-    // Sanitize BOTH fields identically before interpolating into AppleScript.
-    // All current callers pass static titles, but sanitizing the title too
-    // removes a latent injection if a future caller ever passes dynamic text.
+    // Sanitize BOTH fields identically before they leave the agent — the
+    // same filter guards the AppleScript interpolation of the fallback and
+    // the argv of the helper (control chars could still garble the native
+    // notification UI). All current callers pass static titles, but
+    // sanitizing the title too removes a latent injection if a future
+    // caller ever passes dynamic text.
     let sanitize = |s: &str, max: usize| -> String {
         s.chars()
             .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
@@ -131,14 +157,33 @@ fn notify_macos(title: &str, body: &str) {
     };
     let safe = sanitize(body, 150);
     let safe_title = sanitize(title, 100);
-    let script = format!(
-        r#"display notification "{}" with title "{}""#,
-        safe, safe_title
-    );
-    let _ = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .status();
+
+    // Fire-and-forget on a reaper thread: notifying must never add latency
+    // to (or fail) the operation that triggered it, and the helper's
+    // first-use permission dialog has unbounded latency. The thread waits on
+    // the child so no zombie is left; the ≥30 s per-kind throttle bounds
+    // thread churn.
+    std::thread::spawn(move || {
+        if let Some(helper) = bundle_notify_helper() {
+            // Argv only — no shell, no AppleScript interpolation.
+            let ok = std::process::Command::new(&helper)
+                .args(["notify", "--title", &safe_title, "--body", &safe])
+                .status()
+                .is_ok_and(|s| s.success());
+            if ok {
+                return;
+            }
+            tracing::debug!("bundled notify helper failed, falling back to osascript");
+        }
+        let script = format!(
+            r#"display notification "{}" with title "{}""#,
+            safe, safe_title
+        );
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status();
+    });
 }
 
 /// The `reason` we get is the full Touch ID prompt body — now multi-line
@@ -147,6 +192,27 @@ fn notify_macos(title: &str, body: &str) {
 /// before rejecting, so the header alone is what's useful here.
 fn first_line(s: &str) -> &str {
     s.split('\n').next().unwrap_or(s)
+}
+
+/// Cache-hit transparency notification (docs/app-bundle.md §3). Called by
+/// the agent only AFTER `permit.commit()` returned — never while a permit
+/// (and thus the security read gate) is live — and is itself fire-and-forget
+/// via `notify_macos`'s reaper thread. Throttled per kind so a burst
+/// (multi-sign `git push`) notifies once per 30 s window.
+pub(super) fn notify_cache_hit(operation: &str, scope_display: &str, remaining: Option<std::time::Duration>) {
+    if !notify_throttle_should_fire(NotifyKind::CacheHit) {
+        tracing::debug!("cache-hit notification suppressed (throttled)");
+        return;
+    }
+    let left = match remaining {
+        Some(d) => {
+            let secs = d.as_secs();
+            format!(" · {}m{:02}s left", secs / 60, secs % 60)
+        }
+        None => String::new(),
+    };
+    let body = format!("{operation} · {scope_display}{left}");
+    notify_macos("VT: cached grant used (no Touch ID)", &body);
 }
 
 fn notify_touch_id_rejected(reason: &str) {
@@ -422,10 +488,7 @@ pub fn local_authentication(reason: &str) -> bool {
 /// `vt secret import`, and `vt secret rotate-passcode` — all three either
 /// create the store fresh (init/import) or replace it wholesale (rotate),
 /// so this single call is the only write.
-pub fn create_and_save_passcode_passphrase(
-    real_passphrase: &[u8; 32],
-    bin_path: Option<&str>,
-) -> Result<()> {
+pub fn create_and_save_passcode_passphrase(real_passphrase: &[u8; 32]) -> Result<()> {
     use super::store::KeychainStore;
 
     let origin_auth_token = AesGcmCrypto::generate_key();
@@ -438,7 +501,8 @@ pub fn create_and_save_passcode_passphrase(
     passcode_and_auth_token.extend_from_slice(&passcode);
     passcode_and_auth_token.extend_from_slice(&auth_token);
 
-    let passphrase_secret = derive_passphrase_secret(&passcode, bin_path)?;
+    // New stores are always wrap v2 (KeychainStore::new sets wrap_v).
+    let passphrase_secret = derive_passphrase_secret_v2(&passcode)?;
     let aes = AesGcmCrypto::new(&passphrase_secret)?;
     let encrypted_passphrase = aes.encrypt(real_passphrase)?;
 
@@ -468,39 +532,144 @@ pub fn create_and_save_passcode_passphrase(
 /// key (needed as HKDF IKM for v2 envelope DEK derivation). The raw key is
 /// returned in a `Zeroizing` wrapper so it is wiped from memory on drop;
 /// callers should drop it as soon as derivation is complete.
-pub fn load_mac_cipher(
+fn load_mac_key(
     store: &super::store::KeychainStore,
     passphrase_cipher: &AesGcmCrypto,
-) -> Result<(AesGcmCrypto, Zeroizing<[u8; 32]>)> {
+) -> Result<Zeroizing<[u8; 32]>> {
     let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
     let decrypted_passphrase =
         Zeroizing::new(passphrase_cipher.decrypt(&encrypted_passphrase)?);
     let mut key = Zeroizing::new([0u8; 32]);
     let slice: &[u8; 32] = decrypted_passphrase.as_slice().try_into()?;
     key.copy_from_slice(slice);
+    Ok(key)
+}
+
+/// Preflight the encrypted master key without constructing a long-lived cipher
+/// or retaining raw key material across a human authorization prompt.
+pub(crate) fn validate_mac_key_material(
+    store: &super::store::KeychainStore,
+    passphrase_cipher: &AesGcmCrypto,
+) -> Result<()> {
+    drop(load_mac_key(store, passphrase_cipher)?);
+    Ok(())
+}
+
+pub fn load_mac_cipher(
+    store: &super::store::KeychainStore,
+    passphrase_cipher: &AesGcmCrypto,
+) -> Result<(AesGcmCrypto, Zeroizing<[u8; 32]>)> {
+    let key = load_mac_key(store, passphrase_cipher)?;
     let cipher = AesGcmCrypto::new(&key)?;
     Ok((cipher, key))
 }
 
 /// Derive `(auth_cipher, passphrase_cipher)` from the passcode bytes inside
-/// an already-loaded store. Pure CPU work; does not touch the keychain.
+/// an already-loaded store, selecting the wrap derivation by `store.wrap_v`.
+/// Pure CPU work; does not touch the keychain.
 pub fn derive_passcode_ciphers(
     store: &super::store::KeychainStore,
 ) -> Result<(AesGcmCrypto, AesGcmCrypto)> {
+    let (passcode_arr, auth_token) = split_passcode(store)?;
+    let passphrase_secret = wrap_secret_for(store.wrap_v, &passcode_arr, None)?;
+    let passphrase_cipher = AesGcmCrypto::new(&passphrase_secret)?;
+    let auth_cipher = AesGcmCrypto::new(&auth_token)?;
+
+    Ok((auth_cipher, passphrase_cipher))
+}
+
+fn split_passcode(store: &super::store::KeychainStore) -> Result<([u8; 32], [u8; 32])> {
     let passcode = store.passcode_and_auth_token_bytes()?;
     ensure!(
         passcode.len() == 64,
         "Passcode length is {}, expected 64",
         passcode.len()
     );
-    let passcode_arr: [u8; 32] = passcode[..32].try_into()?;
-    let auth_token: [u8; 32] = passcode[32..].try_into()?;
+    Ok((passcode[..32].try_into()?, passcode[32..].try_into()?))
+}
 
-    let passphrase_secret = derive_passphrase_secret(&passcode_arr, None)?;
-    let passphrase_cipher = AesGcmCrypto::new(&passphrase_secret)?;
-    let auth_cipher = AesGcmCrypto::new(&auth_token)?;
+/// Wrap-key derivation for a given `wrap_v`. `bin_path` only applies to v1
+/// (`None` → `current_exe()`); unknown versions error out so a store written
+/// by a newer vt fails loudly instead of mis-deriving.
+fn wrap_secret_for(wrap_v: u32, passcode: &[u8; 32], bin_path: Option<&str>) -> Result<[u8; 32]> {
+    use super::store::{WRAP_V1, WRAP_V2};
+    match wrap_v {
+        WRAP_V1 => derive_passphrase_secret(passcode, bin_path),
+        WRAP_V2 => derive_passphrase_secret_v2(passcode),
+        other => anyhow::bail!(
+            "rusty.vault.store has wrap version {other}, this binary supports up to {WRAP_V2} — upgrade vt"
+        ),
+    }
+}
 
-    Ok((auth_cipher, passphrase_cipher))
+/// Rewrap `encrypted_passphrase` in place to `target_wrap` (v2 label, or v1
+/// bound to THIS binary's path for `--to-v1`). Pure over the store value —
+/// callers wrap it in `KeychainStore::modify` for the cross-process flock.
+/// Tries, in order: the store's recorded wrap, then (for v1 stores) the
+/// explicit `old_bin_path` string — the old binary need not exist, only its
+/// path enters the derivation. Preserves `passcode_and_auth_token` (VT_AUTH),
+/// `encrypted_ssh_keys`, and `encrypted_fido2` untouched.
+pub(super) fn rewrap_passphrase(
+    store: &mut super::store::KeychainStore,
+    old_bin_path: Option<&str>,
+    target_wrap: u32,
+) -> Result<()> {
+    use super::store::WRAP_V1;
+    let (passcode_arr, _) = split_passcode(store)?;
+    let encrypted = store.encrypted_passphrase_bytes()?;
+
+    let mut candidates: Vec<(u32, Option<String>)> = vec![(store.wrap_v, None)];
+    if store.wrap_v == WRAP_V1 {
+        if let Some(p) = old_bin_path {
+            candidates.push((WRAP_V1, Some(p.to_string())));
+        }
+    }
+
+    let mut passphrase: Option<Zeroizing<Vec<u8>>> = None;
+    for (wrap_v, path) in &candidates {
+        let secret = wrap_secret_for(*wrap_v, &passcode_arr, path.as_deref())?;
+        if let Ok(plain) = AesGcmCrypto::new(&secret)?.decrypt(&encrypted) {
+            passphrase = Some(Zeroizing::new(plain));
+            break;
+        }
+    }
+    let passphrase = passphrase.ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not unwrap the master passphrase with the store's recorded wrap \
+             (v{}){} — pass --old-bin-path <absolute path of the binary that wrote the store>",
+            store.wrap_v,
+            if old_bin_path.is_some() { " or the given --old-bin-path" } else { "" }
+        )
+    })?;
+
+    let new_secret = wrap_secret_for(target_wrap, &passcode_arr, None)?;
+    let rewrapped = AesGcmCrypto::new(&new_secret)?.encrypt(&passphrase)?;
+    store.set_encrypted_passphrase(&rewrapped, target_wrap);
+    Ok(())
+}
+
+/// Transparent wrap v1→v2 upgrade, run at agent startup (docs/app-bundle.md
+/// §2). Under the store flock: re-checks `wrap_v == 1`, rewraps only
+/// `encrypted_passphrase`, never touches passcode/auth_token/SSH/FIDO2
+/// blobs. Returns Ok(false) if the store is absent or already v2; unwrap
+/// failure (binary already moved before upgrading) is left to
+/// `vt secret rebind` and reported as an error for the caller to log.
+pub fn upgrade_wrap_v2_if_needed() -> Result<bool> {
+    use super::store::{KeychainStore, WRAP_V1, WRAP_V2};
+    if !matches!(KeychainStore::load(), Ok(s) if s.wrap_v == WRAP_V1) {
+        return Ok(false);
+    }
+    let mut upgraded = false;
+    KeychainStore::modify(|store| {
+        // Re-check under the lock: another process may have upgraded first.
+        if store.wrap_v != WRAP_V1 {
+            return Ok(());
+        }
+        rewrap_passphrase(store, None, WRAP_V2)?;
+        upgraded = true;
+        Ok(())
+    })?;
+    Ok(upgraded)
 }
 
 
@@ -514,8 +683,94 @@ mod tests {
     #[ignore]
     fn test_create_and_save_passcode_passphrase() {
         let real_passphrase = AesGcmCrypto::generate_key();
-        let result = create_and_save_passcode_passphrase(&real_passphrase, None);
+        let result = create_and_save_passcode_passphrase(&real_passphrase);
         assert!(result.is_ok())
+    }
+
+    /// Pure rewrap round-trip over an in-memory store: v1 (explicit old
+    /// path) -> v2 -> v1, asserting the master passphrase survives and the
+    /// non-passphrase fields are byte-for-byte untouched. No keychain access.
+    #[test]
+    fn test_rewrap_round_trip_preserves_store() {
+        use super::super::store::{KeychainStore, WRAP_V1, WRAP_V2};
+        use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
+
+        let passcode = AesGcmCrypto::generate_key();
+        let auth_token = AesGcmCrypto::generate_key();
+        let mut passcode_and_auth_token = Vec::new();
+        passcode_and_auth_token.extend_from_slice(&passcode);
+        passcode_and_auth_token.extend_from_slice(&auth_token);
+
+        let master = AesGcmCrypto::generate_key();
+        let old_path = "/old/install/location/vt";
+        let v1_secret = derive_passphrase_secret(&passcode, Some(old_path)).unwrap();
+        let v1_wrapped = AesGcmCrypto::new(&v1_secret).unwrap().encrypt(&master).unwrap();
+
+        let mut store = KeychainStore::new(&passcode_and_auth_token, &v1_wrapped);
+        store.set_encrypted_passphrase(&v1_wrapped, WRAP_V1);
+        store.set_encrypted_ssh_keys(b"ssh-blob");
+        store.set_encrypted_fido2(b"fido2-blob");
+        let tokens_before = store.passcode_and_auth_token.clone();
+
+        // v1 (old path) -> v2: recorded-wrap candidate fails (current_exe !=
+        // old_path), the explicit old path candidate succeeds.
+        rewrap_passphrase(&mut store, Some(old_path), WRAP_V2).unwrap();
+        assert_eq!(store.wrap_v, WRAP_V2);
+        let v2_secret = derive_passphrase_secret_v2(&passcode).unwrap();
+        let unwrapped = AesGcmCrypto::new(&v2_secret)
+            .unwrap()
+            .decrypt(&store.encrypted_passphrase_bytes().unwrap())
+            .unwrap();
+        assert_eq!(unwrapped, master);
+
+        // v2 -> v1 (current_exe binding), the --to-v1 escape hatch.
+        rewrap_passphrase(&mut store, None, WRAP_V1).unwrap();
+        assert_eq!(store.wrap_v, WRAP_V1);
+        let v1_now = derive_passphrase_secret(&passcode, None).unwrap();
+        let unwrapped = AesGcmCrypto::new(&v1_now)
+            .unwrap()
+            .decrypt(&store.encrypted_passphrase_bytes().unwrap())
+            .unwrap();
+        assert_eq!(unwrapped, master);
+
+        // Everything except the passphrase wrap is untouched.
+        assert_eq!(store.passcode_and_auth_token, tokens_before);
+        assert_eq!(
+            store.encrypted_ssh_keys.as_deref(),
+            Some(BASE64_URL_SAFE_NO_PAD.encode(b"ssh-blob").as_str())
+        );
+        assert_eq!(
+            store.encrypted_fido2.as_deref(),
+            Some(BASE64_URL_SAFE_NO_PAD.encode(b"fido2-blob").as_str())
+        );
+    }
+
+    /// A wrap version this binary does not know must fail loudly, and a
+    /// failed unwrap must name the remedy without leaking key material.
+    #[test]
+    fn test_rewrap_unknown_and_wrong_path_errors() {
+        use super::super::store::{KeychainStore, WRAP_V1, WRAP_V2};
+
+        let passcode = AesGcmCrypto::generate_key();
+        let mut tokens = Vec::new();
+        tokens.extend_from_slice(&passcode);
+        tokens.extend_from_slice(&AesGcmCrypto::generate_key());
+
+        let master = AesGcmCrypto::generate_key();
+        let v1_secret = derive_passphrase_secret(&passcode, Some("/gone/vt")).unwrap();
+        let wrapped = AesGcmCrypto::new(&v1_secret).unwrap().encrypt(&master).unwrap();
+        let mut store = KeychainStore::new(&tokens, &wrapped);
+        store.set_encrypted_passphrase(&wrapped, WRAP_V1);
+
+        // No candidate matches: recorded wrap derives from current_exe, and
+        // the supplied old path is wrong.
+        let err = rewrap_passphrase(&mut store, Some("/also/wrong/vt"), WRAP_V2).unwrap_err();
+        assert!(err.to_string().contains("--old-bin-path"), "{err}");
+        assert_eq!(store.wrap_v, WRAP_V1, "failed rewrap must not mutate the store");
+
+        store.wrap_v = 99;
+        let err = rewrap_passphrase(&mut store, None, WRAP_V2).unwrap_err();
+        assert!(err.to_string().contains("wrap version 99"), "{err}");
     }
 
     #[test]

@@ -83,27 +83,35 @@ fn warn_if_world_readable(path: &Path) {
 /// Must be called before any threads are spawned (i.e. before the tokio runtime
 /// is built), because it mutates the process environment via
 /// [`std::env::set_var`]. `main()` calls it at the very top, single-threaded.
-pub fn hydrate_env_from_file() -> Vec<String> {
-    let Some(path) = config_path() else {
-        return Vec::new();
-    };
+/// Read and TOML-parse the config file once. `None` when the file is absent
+/// (silent — the common case) or unreadable/malformed (warned). Shared read
+/// path for `hydrate_env_from_file` and `load_agent_file_config` so the file
+/// is opened and parsed through one place with one error policy.
+fn read_config_table() -> Option<(PathBuf, toml::Table)> {
+    let path = config_path()?;
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             tracing::warn!("could not read {}: {}", path.display(), e);
-            return Vec::new();
+            return None;
         }
+    };
+    match contents.parse::<toml::Table>() {
+        Ok(table) => Some((path, table)),
+        Err(e) => {
+            tracing::warn!("ignoring malformed config {}: {}", path.display(), e);
+            None
+        }
+    }
+}
+
+pub fn hydrate_env_from_file() -> Vec<String> {
+    let Some((path, table)) = read_config_table() else {
+        return Vec::new();
     };
     warn_if_world_readable(&path);
 
-    let table: toml::Table = match contents.parse() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("ignoring malformed config {}: {}", path.display(), e);
-            return Vec::new();
-        }
-    };
     let mut populated = Vec::new();
 
     for (key, value) in &table {
@@ -134,6 +142,49 @@ pub fn hydrate_env_from_file() -> Vec<String> {
         populated.push(key.clone());
     }
     populated
+}
+
+// ---------------------------------------------------------------------------
+// [agent] section — file defaults for `vt ssh agent` flags
+
+/// Optional `[agent]` table in the same config file: startup *defaults* for
+/// `vt ssh agent`, so a supervisor (the VT.app shell) can spawn the agent
+/// without hardcoding the operator's flags (docs/app-bundle.md §4). Explicit
+/// CLI flags always override these; the env-over-file invariant is untouched
+/// because no key here is an env var (`hydrate_env_from_file` skips tables).
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct AgentFileConfig {
+    /// `--timeout`
+    pub timeout: Option<u64>,
+    /// `--ssh-auth-cache-duration` (0 = Fresh)
+    pub ssh_auth_cache_duration: Option<u64>,
+    /// `--decrypt-auth-cache-duration` (0 = Fresh)
+    pub decrypt_auth_cache_duration: Option<u64>,
+    /// Cache-hit transparency notifications (`--no-cache-hit-notify` inverts)
+    pub cache_hit_notify: Option<bool>,
+    /// `--run-allow` allowlist (comma-separated, same grammar as the flag).
+    /// Not a secret — agent policy. Lets a supervisor (VT.app) keep run@vt
+    /// enabled without hardcoding the list.
+    pub run_allow: Option<String>,
+}
+
+/// Read the `[agent]` section. Absent file/section or a malformed table all
+/// degrade to defaults with a warning — same "never brick the CLI" stance as
+/// `hydrate_env_from_file`, and reusing its read/parse path.
+pub fn load_agent_file_config() -> AgentFileConfig {
+    let Some((path, table)) = read_config_table() else {
+        return AgentFileConfig::default();
+    };
+    let Some(agent) = table.get("agent") else {
+        return AgentFileConfig::default();
+    };
+    match agent.clone().try_into() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!("ignoring malformed [agent] section in {}: {}", path.display(), e);
+            AgentFileConfig::default()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

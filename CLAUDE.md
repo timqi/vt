@@ -24,9 +24,11 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
 | CLI and command routing | `src/main.rs` |
 | Transport selection and client protocol | `src/config.rs`, `src/client.rs`, `src/cf.rs` |
 | `vt://` format and cryptography | `src/core.rs`, `src/core/crypto.rs`, `src/core/wire.rs` |
+| Agent authorization scopes, grants, and revocation | `src/core/authorization.rs`, `src/server_macos/authorization.rs`, `src/server_macos/ssh_agent.rs` |
 | SSH identity and `vt ssh connect` | `src/ssh_sign.rs` |
 | macOS Keychain, Touch ID, and SSH agent | `src/server_macos/` |
 | AI-agent command hook | `src/hook.rs`, [`docs/hook.md`](docs/hook.md) |
+| VT.app menu-bar shell and bundle packaging | `app/VTShell.swift`, `app/Info.plist`, `justfile` (`app`, `install-app`), [`docs/app-bundle.md`](docs/app-bundle.md) |
 | Worker routes and admin pages | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/` |
 | Worker ceremony/cache lifecycle | `cf-worker/src/do_account.ts` |
 | Worker notification channels | `cf-worker/src/notify.ts`, `pushover.ts`, `slack.ts`, `slack_app.ts`, `feishu.ts` |
@@ -48,6 +50,62 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   behavior and IP binding.
 - `auth@vt` and `run@vt` always require a fresh approval. Do not add them to
   auth caches.
+- `auth@vt`, `run@vt`, SSH signing, and `decrypt@vt` all use the unified
+  authorization engine. Reusable grants are operation- and subject-scoped,
+  and a non-cloneable permit is committed only after the protected operation
+  and, for extensions, response encryption succeed. A live permit holds the
+  global prompt slot and blocks revocation; handlers must not perform
+  unbounded-latency work while one is live.
+- Grants are activity-scoped
+  ([`docs/authorization-scopes-v2.md`](docs/authorization-scopes-v2.md)):
+  raw SSH signs bind to the session-bind-verified destination host key
+  (forwarding-capable or tainted connections are never cached); local vt
+  callers bind to their kernel-derived `.git` workspace root, falling back
+  to the exact cwd directory, then — for broad shared cwds (`$HOME`, its
+  ancestors, temp roots) — to the kernel-derived parent application. Each
+  fallback is a distinct grant family with its own digest domain; relay
+  traffic is confined per connection. `session-bind@openssh.com` is plaintext and
+  must be handled before the VT_AUTH cipher path, and must not reset the
+  idle clock. The Touch ID prompt must state the reuse scope whenever an
+  approval can create a grant, and agent-derived truth lines (relay marker,
+  `caller:`, raw-sign `dest:`/taint warning, reuse) must precede every
+  client-reported line
+  ([`docs/approval-transparency.md`](docs/approval-transparency.md)). Cache
+  duration `0` (the default) maps to the engine's first-class `Fresh`
+  policy, never `StrictTtl(0)`.
+- A live locked/non-interactive check failure revokes all grants. Agent lock,
+  idle timeout, an observed screen lock, and a detected wake advance the
+  authorization epoch even when the grant store is empty, so an in-flight
+  prompt cannot recreate a revoked grant. Screen lock and idle timeout also
+  wipe decrypted SSH keys from memory (not just grants); `ensure_keys_loaded`
+  must refuse to reload keys while the screen is non-interactive — checked
+  both before and after the keychain read — so a request during lock cannot
+  repopulate RAM ([`docs/app-bundle.md`](docs/app-bundle.md) §10). Idle
+  timeout is floored at 60s (idle `0` is not a `Fresh`-style special case;
+  it would busy-loop the sweeper).
+- `ui-status@vt` is the ONE deliberate whole-store visibility channel
+  ([`docs/app-bundle.md`](docs/app-bundle.md) §5): plaintext, dispatched with
+  `session-bind@openssh.com` before the lock check and the VT_AUTH cipher
+  path, gated by the 32-byte spawn token the VT.app shell pipes to
+  `--ui-token-fd` (never env/argv/file; constant-time compare; no token ⇒
+  every request fails unstructured). It never resets the idle clock, is never
+  audit-pushed, and its only actions are `status` and the authority-reducing
+  `revoke_all` — no action may grant, extend, or approve. The relay filter
+  must keep refusing it. Grant `display` labels are memory-only.
+- The master-key wrap is versioned (`KeychainStore.wrap_v`): new stores are
+  always wrap v2 (path-independent `vt-wrap-v2` label); v1 stores upgrade
+  transparently at agent startup via the flock-guarded minimal mutator that
+  touches ONLY `encrypted_passphrase` + `wrap_v`. Never route a rewrap
+  through `create_and_save_passcode_passphrase` — it mints a fresh
+  passcode/auth_token and would silently rotate every client's VT_AUTH.
+  `vt secret rebind` is the manual migration/rollback path.
+- Notifications must never block or fail a protected operation: `notify_macos`
+  is fire-and-forget (reaper thread), prefers the bundled `VTApp notify`
+  helper (bundle identity) with `osascript` fallback, and both paths share
+  one sanitize. Cache-hit notifications fire only AFTER `permit.commit()`
+  returns — a live permit blocks revocation, so no unbounded-latency work
+  (e.g. the first-use notification permission dialog) may run while one is
+  held.
 - Plaintext secrets and private key seeds must not be written to disk or logs.
   Do not add credentials to examples, test output, or command-line arguments
   unless the existing design explicitly requires it.
@@ -68,7 +126,9 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   between the remote client and the upstream agent.
 - `diag@vt` is read-only and requires no Touch ID; it must never reset the
   agent's idle-activity clock (a polling loop must not keep grants alive), and
-  its `live_entries` stays scoped to the caller's own cache context.
+  its `live_entries` counts only grants the caller's own scope classification
+  could reuse — a caller whose basis never caches reports 0, never a
+  whole-store count.
 - `vt inject -r` decrypts a file briefly and starts a self-exec'd restore
   supervisor. Keep the supervisor path before Tokio/clap initialization and
   keep `--recover` limited to restoring ciphertext backups.

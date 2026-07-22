@@ -29,14 +29,37 @@ common paths are:
 
 ## Installation
 
-Download prebuilt binaries from [GitHub Releases](https://github.com/timqi/vt/releases) (macOS arm64, Linux amd64).
+Download prebuilt artifacts from [GitHub Releases](https://github.com/timqi/vt/releases):
+the bare `vt` binary (macOS arm64, Linux amd64) and, for macOS, **VT.app** — a
+menu-bar app bundling the same `vt` CLI plus native VT-branded notifications
+(including cache-hit transparency), live grant status with one-click
+revoke-all, and agent supervision.
 
 Or build from source (recipes live in the `justfile`, run `just` to list them):
 
 ```bash
-# Builds (musl-static on Linux, native on macOS) and installs to ~/.local/bin
+# CLI only: builds (musl-static on Linux, native on macOS) and installs to ~/.local/bin
 just install
+
+# macOS menu-bar app: assembles VT.app, installs to /Applications, symlinks ~/.local/bin/vt
+just install-app
 ```
+
+Installing the **downloaded** VT.app tarball (vs `just install-app`):
+
+```bash
+tar xzf VT-app-darwin-arm64-*.tar.gz            # CLI extract avoids Gatekeeper quarantine
+mv VT.app /Applications/
+ln -sf /Applications/VT.app/Contents/MacOS/vt ~/.local/bin/vt   # put the CLI on PATH
+# If Gatekeeper still blocks it (e.g. extracted via Finder):
+#   xattr -dr com.apple.quarantine /Applications/VT.app
+```
+
+The release build is **ad-hoc signed**, so each release re-triggers the
+one-time Keychain authorization prompt on first launch. See
+[docs/app-bundle.md](docs/app-bundle.md) — including the one-time
+`vt secret rebind` migration if your keychain store was created by a `vt`
+binary at another path.
 
 ## Quick Start
 
@@ -168,11 +191,9 @@ vt ssh show SHA256:...
 # Start the SSH agent (it listens on ~/.ssh/vt.sock):
 eval $(vt ssh agent)
 
-# Start with auth caching (skip repeated Touch ID within a time window):
-# per-session: cache by terminal session (TTY)
-eval $(vt ssh agent --ssh-auth-cache-mode per-session --ssh-auth-cache-duration 300)
-# per-app: cache by application (e.g., Terminal.app, iTerm2)
-eval $(vt ssh agent --ssh-auth-cache-mode per-app --ssh-auth-cache-duration 300)
+# Start with approval reuse (skip repeated Touch ID within a time window;
+# grants are activity-scoped — see "Auth Caching" below):
+eval $(vt ssh agent --ssh-auth-cache-duration 28800 --decrypt-auth-cache-duration 3600)
 
 # Set SSH_AUTH_SOCK to use the agent (add to your shell profile)
 export SSH_AUTH_SOCK=~/.ssh/vt.sock
@@ -193,25 +214,34 @@ Keys are stored as a single encrypted JSON blob inside `rusty.vault.store` (unde
 
 #### Auth Caching
 
-By default, Touch ID is required for every sign/decrypt request. You can enable auth caching to skip repeated prompts within a time window:
+By default (`--ssh-auth-cache-duration 0`), Touch ID is required for every
+sign/decrypt request. Setting a duration enables **activity-scoped** approval
+reuse — the Touch ID prompt always states exactly what is being granted and
+for how long:
 
-| Mode | `--ssh-auth-cache-mode` | Scope |
-|------|-------------------------|-------|
-| None (default) | `none` | Touch ID every time |
-| Per-session | `per-session` | Shared within same terminal/TTY |
-| Per-app | `per-app` | Shared within same application (e.g., Terminal.app) |
-| Global | `global` | Shared by orchestrated callers; still partitioned by reported working directory |
+| Caller | Grant scope |
+|--------|-------------|
+| `ssh` / `git fetch` / `git push` (OpenSSH ≥ 8.9) | The **destination server** (verified via `session-bind@openssh.com`): one approval covers repeated one-shot connections to the same host with the same key, from any local caller |
+| `ssh-keygen -Y sign` (git commit signing), local `vt ssh connect` | The caller's **git workspace** (kernel-derived `.git` root): one approval covers the project, including multi-host fan-outs and TTY-less AI agents / CI working in the same checkout |
+| Local caller outside any git repository | The caller's **exact working directory** (kernel-derived, a separate grant family from git workspaces) |
+| Local caller from a broad shared directory (`$HOME`, `/`, temp roots) | The **calling application** (kernel-derived parent process): repeated requests from the same app instance — e.g. a daemon probing `gh` through the hook — share one approval; grants die when the app exits |
+| Forwarded / relay traffic (`ssh -A`, `--forward-real-agent`) | vt extensions (`decrypt@vt`, `sign@vt`) are confined **per connection**: a remote host can reuse only its own approvals and never rides local grants. Raw SSH signs arriving through a forwarding-capable connection are never cached at all |
+| OpenSSH < 8.9, `auth@vt`, `run@vt`, legacy URLs | Never cached — always prompts |
 
-`--ssh-auth-cache-duration <SECONDS>` controls the sign cache TTL (default:
-120s). `--decrypt-auth-cache-mode` and
-`--decrypt-auth-cache-duration` configure a separate cache for v2 envelope
-decrypts (default: disabled, 30s when a duration is supplied). Legacy URLs are
-never eligible for the decrypt cache. Both caches are cleared when the agent
-locks, the screen locks, the Mac wakes from sleep, or the idle timeout clears
-keys. `per-session` and `per-app` require a controlling TTY; `global` is the
-mode intended for TTY-less orchestrators. Forwarded-agent contexts are narrowed
-to the connection; keep caching disabled (`none`) when forwarding to hosts you
-do not trust.
+`--ssh-auth-cache-duration <SECS>` and `--decrypt-auth-cache-duration <SECS>`
+are separate knobs (a cached decrypt grant releases per-record DEK material,
+so you may want it shorter or disabled). TTLs are strict (no sliding
+refresh), and every grant is revoked immediately when the agent locks, the
+screen locks, the Mac sleeps/wakes, or the idle timeout fires — the duration
+is effectively "within this presence session, at most N hours", so generous
+values (8h sign / 1h decrypt) are reasonable.
+
+For **unattended periodic jobs** (editor auto-fetch, cron), caching is the
+wrong tool — any TTL eventually prompts while you are away. Give fetch a
+read-only credential instead (a GitHub read-only deploy key via a `Host`
+alias with `IdentitiesOnly yes`, or HTTPS with a `contents:read` token), or
+keep an ssh `ControlMaster`/`ControlPersist` window longer than the fetch
+interval so the connection never re-authenticates.
 
 ### Portable SSH identity for git (`vt://`)
 

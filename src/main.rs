@@ -277,9 +277,20 @@ pub enum SecretCommands {
     /// Import an encrypted master secret
     Import,
     /// Rotate the passcode for the master secret
-    RotatePasscode {
-        #[arg(long, help = "Absolute path to the new vt binary")]
-        bin_absolute_path: Option<String>,
+    RotatePasscode,
+    /// Migrate the master-key wrap to the path-independent v2 derivation
+    /// (or back to v1 with --to-v1 before rolling back to an old binary)
+    Rebind {
+        #[arg(
+            long,
+            help = "Absolute path of the vt binary that wrote the store, for v1 stores bound to a location this binary no longer occupies. The old binary need not exist — only the path string enters the derivation."
+        )]
+        old_bin_path: Option<String>,
+        #[arg(
+            long,
+            help = "Rewrap back to the legacy v1 derivation bound to THIS binary's current path (escape hatch before downgrading vt)"
+        )]
+        to_v1: bool,
     },
 }
 
@@ -321,37 +332,32 @@ pub enum SshCommands {
     /// Start the SSH agent (listens on ~/.ssh/vt.sock)
     #[cfg(target_os = "macos")]
     Agent {
+        // The three duration knobs are `Option` so "flag passed" is
+        // distinguishable from "compiled default": effective value is
+        // flag > config.toml `[agent]` > built-in default
+        // (docs/app-bundle.md §4).
         #[arg(
             short = 't',
             long = "timeout",
-            default_value_t = server_macos::ssh_agent::DEFAULT_IDLE_TIMEOUT_SECS,
-            help = "Idle timeout in seconds before clearing keys from memory"
+            help = "Idle timeout in seconds before clearing keys from memory and revoking all grants (default 7200 = 2h; config.toml [agent].timeout overrides the default). Screen lock and sleep/wake revoke far sooner regardless; lower this on hosts without reliable auto-lock."
         )]
-        timeout: u64,
-        #[arg(
-            long = "ssh-auth-cache-mode",
-            default_value = "none",
-            help = "Sign auth cache mode: none, per-session, per-app, or global. per-session/per-app require the caller to have a controlling terminal (TTY-less orchestrators like AI agents / CI never hit); global shares ONE context across all callers — the only mode that serves orchestrated callers, and the coarsest (cache keys still partition by the client-reported working directory). Forwarded agent sockets (ssh -A) get a per-connection context: a remote host reuses only its own approvals within the TTL, never grants from local tabs or other hosts. Still keep 'none' when forwarding to hosts you don't trust at all — within the TTL any process on that host reuses that connection's grants."
-        )]
-        auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
+        timeout: Option<u64>,
         #[arg(
             long = "ssh-auth-cache-duration",
-            default_value_t = server_macos::ssh_agent::DEFAULT_AUTH_CACHE_DURATION_SECS,
-            help = "Sign auth cache duration in seconds"
+            help = "Sign approval reuse duration in seconds; 0 (default) = prompt every time. Grants are activity-scoped: raw ssh signs bind to the session-bind-verified destination server (repeated one-shot git/ssh calls to the same host reuse one approval); local sign@vt and ssh-keygen signing bind to the caller's git workspace; forwarded/relay traffic is confined per connection and never rides local approvals. Strict TTL, no sliding refresh; screen lock, sleep/wake, agent lock, and idle timeout revoke all grants immediately. config.toml [agent].ssh_auth_cache_duration overrides the default."
         )]
-        auth_cache_duration: u64,
-        #[arg(
-            long = "decrypt-auth-cache-mode",
-            default_value = "none",
-            help = "Decrypt auth cache mode: none, per-session, per-app, or global. Only v2 envelope URLs are cache-eligible; legacy items always prompt. Same mode semantics and forwarded-agent caveat as --ssh-auth-cache-mode."
-        )]
-        decrypt_auth_cache_mode: server_macos::ssh_agent::AuthCacheMode,
+        auth_cache_duration: Option<u64>,
         #[arg(
             long = "decrypt-auth-cache-duration",
-            default_value_t = server_macos::ssh_agent::DEFAULT_DECRYPT_AUTH_CACHE_DURATION_SECS,
-            help = "Decrypt auth cache duration in seconds (strict TTL, no sliding refresh)"
+            help = "Decrypt approval reuse duration in seconds; 0 (default) = prompt every time. Only v2 envelope URLs are cache-eligible; legacy items always prompt. Grants bind to the caller's git workspace (kernel-derived), or per relay connection when forwarded. Kept separate from the sign duration because a cached decrypt grant releases per-record DEK material. config.toml [agent].decrypt_auth_cache_duration overrides the default."
         )]
-        decrypt_auth_cache_duration: u64,
+        decrypt_auth_cache_duration: Option<u64>,
+        #[arg(
+            long = "no-cache-hit-notify",
+            default_value_t = false,
+            help = "Disable the system notification fired when a cached grant satisfies sign/decrypt without a Touch ID prompt. Also configurable as [agent].cache_hit_notify in config.toml."
+        )]
+        no_cache_hit_notify: bool,
         #[arg(
             long = "no-legacy-decrypt",
             default_value_t = false,
@@ -360,10 +366,9 @@ pub enum SshCommands {
         no_legacy_decrypt: bool,
         #[arg(
             long = "run-allow",
-            default_value = "",
-            help = "Comma-separated allowlist for `run@vt` (e.g. `zed,code,/Applications/Zed.app/Contents/MacOS/cli`). Bare names match argv[0] without `/` and are resolved via the agent's own PATH; entries containing `/` must be absolute and match argv[0] post-canonicalization. Empty (the default) disables run@vt entirely."
+            help = "Comma-separated allowlist for `run@vt` (e.g. `zed,code,/Applications/Zed.app/Contents/MacOS/cli`). Bare names match argv[0] without `/` and are resolved via the agent's own PATH; entries containing `/` must be absolute and match argv[0] post-canonicalization. Unset falls back to config.toml [agent].run_allow, then empty (run@vt disabled)."
         )]
-        run_allow: String,
+        run_allow: Option<String>,
         #[arg(
             long = "audit-url",
             help = "Worker base URL for agent audit push, e.g. https://vt-passkey.example.com. Unset (the default) disables audit push."
@@ -380,6 +385,11 @@ pub enum SshCommands {
             help = "Disable audit push even when --audit-url is set."
         )]
         no_audit_push: bool,
+        #[arg(
+            long = "ui-token-fd",
+            help = "File descriptor to read the 32-byte ui-status@vt token from at startup (inherited pipe). Set only by the VT.app shell supervisor — a pipe, never an env var (visible in `ps e`) or a file. Without it, ui-status@vt refuses every request."
+        )]
+        ui_token_fd: Option<i32>,
     },
     /// Add an SSH private key to the keychain
     #[cfg(target_os = "macos")]
@@ -438,8 +448,9 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
         Commands::Secret(secret_command) => match secret_command {
             SecretCommands::Export => server_macos::admin::export_secret().await,
             SecretCommands::Import => server_macos::admin::import_secret().await,
-            SecretCommands::RotatePasscode { bin_absolute_path } => {
-                server_macos::admin::rotate_passcode(bin_absolute_path.clone()).await
+            SecretCommands::RotatePasscode => server_macos::admin::rotate_passcode().await,
+            SecretCommands::Rebind { old_bin_path, to_v1 } => {
+                server_macos::admin::rebind(old_bin_path.clone(), *to_v1).await
             }
         },
         Commands::Ssh(ssh_command) => match ssh_command {
@@ -463,34 +474,71 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
             #[cfg(target_os = "macos")]
             SshCommands::Agent {
                 timeout,
-                auth_cache_mode,
                 auth_cache_duration,
-                decrypt_auth_cache_mode,
                 decrypt_auth_cache_duration,
+                no_cache_hit_notify,
                 no_legacy_decrypt,
                 run_allow,
                 audit_url,
                 audit_key,
                 no_audit_push,
+                ui_token_fd,
             } => {
-                use server_macos::ssh_agent::{AuthCacheConfig, RunAllowlist};
-                let run_allow = RunAllowlist::parse(run_allow)
-                    .map_err(|e| anyhow::anyhow!("--run-allow: {}", e))?;
+                use server_macos::ssh_agent::{AuthCacheTtls, RunAllowlist};
                 let audit_push =
                     build_audit_push_config(audit_url, audit_key, *no_audit_push);
+                // flag > config.toml [agent] > built-in default
+                // (docs/app-bundle.md §4).
+                let file_cfg = config::load_agent_file_config();
+                let run_allow_spec = run_allow
+                    .clone()
+                    .or(file_cfg.run_allow)
+                    .unwrap_or_default();
+                let run_allow = RunAllowlist::parse(&run_allow_spec)
+                    .map_err(|e| anyhow::anyhow!("run-allow: {}", e))?;
+                // Floor the idle timeout at 60s: unlike the cache durations,
+                // idle `0` is NOT a "Fresh" special case — it would make the
+                // sweeper busy-loop (check_interval = min(60, timeout) = 0).
+                // Guards the config / CLI / UserDefaults-restart paths.
+                let timeout = timeout
+                    .or(file_cfg.timeout)
+                    .unwrap_or(server_macos::ssh_agent::DEFAULT_IDLE_TIMEOUT_SECS)
+                    .max(60);
+                let sign_secs = auth_cache_duration
+                    .or(file_cfg.ssh_auth_cache_duration)
+                    .unwrap_or(0);
+                let decrypt_secs = decrypt_auth_cache_duration
+                    .or(file_cfg.decrypt_auth_cache_duration)
+                    .unwrap_or(0);
+                let notify_cache_hits =
+                    !*no_cache_hit_notify && file_cfg.cache_hit_notify.unwrap_or(true);
+                let ui_token = match ui_token_fd {
+                    Some(fd) => {
+                        use std::io::Read;
+                        use std::os::unix::io::FromRawFd;
+                        // SAFETY: the fd number was handed to us by the
+                        // spawning supervisor explicitly for this purpose;
+                        // we take ownership exactly once, read 32 bytes,
+                        // and drop (close) it before the agent serves.
+                        let mut pipe = unsafe { std::fs::File::from_raw_fd(*fd) };
+                        let mut token = [0u8; 32];
+                        pipe.read_exact(&mut token)
+                            .map_err(|e| anyhow::anyhow!("--ui-token-fd {fd}: {e}"))?;
+                        Some(token)
+                    }
+                    None => None,
+                };
                 server_macos::ssh_agent::start_ssh_agent(
-                    *timeout,
-                    AuthCacheConfig {
-                        mode: *auth_cache_mode,
-                        ttl_secs: *auth_cache_duration,
-                    },
-                    AuthCacheConfig {
-                        mode: *decrypt_auth_cache_mode,
-                        ttl_secs: *decrypt_auth_cache_duration,
+                    timeout,
+                    AuthCacheTtls {
+                        sign_secs,
+                        decrypt_secs,
                     },
                     *no_legacy_decrypt,
                     run_allow,
                     std::sync::Arc::new(audit_push),
+                    notify_cache_hits,
+                    ui_token,
                 )
                 .await
             }

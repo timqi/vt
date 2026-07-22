@@ -21,6 +21,31 @@ use zeroize::Zeroizing;
 
 use crate::cf::{cf_post_with_timeout, hmac_auth_header_raw, ChallengeMeta};
 
+/// Agent-derived audit context: kernel/agent-authoritative fields that ride
+/// as top-level siblings of the client-claimed `meta`
+/// (docs/approval-transparency.md §B) — the trust boundary between the two
+/// is the point. The agent always sends every field, using `""`/`0`/`false`
+/// for "not applicable" (fresh scope, unknown peer, non-sign op); the Worker
+/// stores a field that is *absent* (old agent) as SQL NULL, keeping the two
+/// distinguishable.
+#[derive(Clone, Default, Serialize)]
+pub struct AgentAuditContext {
+    /// Kernel-verified peer executable basename (`proc_pidpath`); "" unknown.
+    pub peer_exe: String,
+    /// Sign operations: `SHA256:…` of the signing key; "" otherwise.
+    pub key_fp: String,
+    /// Verified non-forwarding session-bind destination label; "" otherwise.
+    pub dest: String,
+    /// `ScopeFamily::as_wire` of the reusable scope; "" = fresh.
+    pub scope_family: String,
+    /// The exact label the prompt's reuse line displayed; "" = fresh.
+    pub scope_label: String,
+    /// Effective TTL of the reusable scope in seconds; 0 = fresh.
+    pub grant_ttl_s: u64,
+    /// Peer is a `vt ssh connect --forward-real-agent` relay (kernel argv).
+    pub relayed: bool,
+}
+
 /// One agent-side audit record. Serialized as the `entry` field of the ingest
 /// body. `meta` carries the full [`ChallengeMeta`] wire shape (all 11 fields)
 /// so the Worker's `capChallengeMeta` sanitizer has everything it expects;
@@ -44,6 +69,11 @@ pub struct AgentAuditEntry {
     pub token_id: String,
     /// Full display context (host/user/pwd/tty/ppid_cmd/ssh_client/ppid/…).
     pub meta: ChallengeMeta,
+    /// Agent-authoritative context, flattened to top-level siblings on the
+    /// wire (peer_exe / key_fp / dest / scope_family / scope_label /
+    /// grant_ttl_s / relayed).
+    #[serde(flatten)]
+    pub agent: AgentAuditContext,
 }
 
 impl AgentAuditEntry {
@@ -62,6 +92,7 @@ impl AgentAuditEntry {
         salts: usize,
         latency_ms: u64,
         agent_id: &str,
+        agent: AgentAuditContext,
     ) -> Self {
         let meta = ChallengeMeta {
             op_kind: op_kind.to_string(),
@@ -85,6 +116,7 @@ impl AgentAuditEntry {
             ts_ms: now_ms(),
             token_id: mint_token_id(agent_id),
             meta,
+            agent,
         }
     }
 }
@@ -251,13 +283,40 @@ mod tests {
             ssh_client: "1.2.3.4".into(),
         };
         let entry = AgentAuditEntry::build(
-            "decrypt", "approved", "host1", &meta, "cmd", "why", Some(4242), 3, 120, "AGENTID",
+            "decrypt",
+            "approved",
+            "host1",
+            &meta,
+            "cmd",
+            "why",
+            Some(4242),
+            3,
+            120,
+            "AGENTID",
+            AgentAuditContext {
+                peer_exe: "git".into(),
+                scope_family: "workspace".into(),
+                scope_label: "workspace /repo".into(),
+                grant_ttl_s: 3600,
+                ..AgentAuditContext::default()
+            },
         );
         let v = serde_json::to_value(&entry).unwrap();
 
         for k in ["op_kind", "outcome", "salts", "latency_ms", "ts_ms", "token_id", "meta"] {
             assert!(v.get(k).is_some(), "missing sibling field {k}");
         }
+        // The agent-authoritative context must flatten to TOP-LEVEL siblings —
+        // the Worker's opAuditIngest reads them beside `meta`, never inside it.
+        for k in [
+            "peer_exe", "key_fp", "dest", "scope_family", "scope_label", "grant_ttl_s", "relayed",
+        ] {
+            assert!(v.get(k).is_some(), "missing flattened agent field {k}");
+        }
+        assert_eq!(v["peer_exe"].as_str().unwrap(), "git");
+        assert_eq!(v["scope_family"].as_str().unwrap(), "workspace");
+        assert_eq!(v["grant_ttl_s"].as_u64().unwrap(), 3600);
+        assert_eq!(v["relayed"].as_bool().unwrap(), false);
         let m = v.get("meta").unwrap();
         for k in [
             "op_kind", "command", "host", "user", "pwd", "tty", "ppid_cmd", "ppid", "ssh_client",
@@ -288,6 +347,7 @@ mod tests {
             0,
             0,
             "X",
+            AgentAuditContext::default(),
         );
         let v = serde_json::to_value(&entry).unwrap();
         assert_eq!(v["meta"]["ppid"].as_u64().unwrap(), 0);
@@ -316,7 +376,17 @@ mod tests {
     fn token_id_caps_long_hostname() {
         let long = "h".repeat(200);
         let entry = AgentAuditEntry::build(
-            "auth", "approved", "h", &crate::core::ClientMeta::default(), "", "", None, 0, 0, &long,
+            "auth",
+            "approved",
+            "h",
+            &crate::core::ClientMeta::default(),
+            "",
+            "",
+            None,
+            0,
+            0,
+            &long,
+            AgentAuditContext::default(),
         );
         // "a_" + 60 + "_" + 11 = 74, comfortably under the Worker's 80-char cap.
         assert!(entry.token_id.len() <= 74, "token_id too long: {}", entry.token_id.len());

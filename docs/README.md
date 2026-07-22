@@ -19,8 +19,12 @@ and update the relevant document in the same change.
 | Understand DEK caching | [`dek-cache.md`](dek-cache.md) | `cf-worker/src/do_account.ts`, `src/cf.rs` |
 | Use SSH identities | [`README.md` — portable identity](../README.md#portable-ssh-identity-for-git-vt) | `src/ssh_sign.rs`, `src/client.rs` |
 | Understand extension errors | [`structured-errors.md`](structured-errors.md) | `src/core/wire.rs`, `src/client.rs` |
+| Understand SSH-agent authorization and caching | [`unified-authorization-engine.md`](unified-authorization-engine.md) | `src/core/authorization.rs`, `src/server_macos/authorization.rs`, `src/server_macos/ssh_agent.rs` |
+| Understand grant scopes (destination / workspace / relay) | [`authorization-scopes-v2.md`](authorization-scopes-v2.md) | `src/core/authorization.rs` (`GrantScope`), `src/server_macos/ssh_agent.rs` (`BindState`, `resolve_workspace`) |
 | Enable agent audit push | [`agent-audit.md`](agent-audit.md) | `src/audit.rs`, `src/server_macos/audit.rs` |
+| Understand prompt/notification fields and audit context | [`approval-transparency.md`](approval-transparency.md) | `src/server_macos/ssh_agent.rs` (prompt lines), `cf-worker/src/notify.ts`, `cf-worker/pwa/approve.js` |
 | Diagnose config/routing/caching (`vt doctor`) | [`diag-design.md`](diag-design.md) | `src/client.rs` (`doctor`), `src/server_macos/ssh_agent.rs` (`handle_diag`) |
+| Build/install VT.app, menu bar UI, native notifications, key-wrap rebind | [`app-bundle.md`](app-bundle.md) | `app/VTShell.swift`, `src/server_macos/security.rs` (`notify_macos`), `src/core/crypto.rs` (`derive_passphrase_secret`) |
 | Configure Slack App notifications | [`slack-app.md`](slack-app.md) | `cf-worker/src/slack_app.ts` |
 | Configure Feishu/Lark notifications | [`feishu.md`](feishu.md) | `cf-worker/src/feishu.ts` |
 

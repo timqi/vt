@@ -200,20 +200,32 @@ If `detail` is present and on the allow-list, append it as `(<detail>)`.
 
 Failure responses must not leave caches partially populated:
 
-1. **Sign auth cache**: granted only when `AuthOutcome::Success(method)` and `method.is_cacheable()`. Returning a structured error never enters `cache.grant(...)`. No change required — existing code already returns before granting.
+1. **Sign grants**: a successful engine decision returns a non-cloneable
+   permit with a pending grant. Raw signing or `sign@vt` failure drops the
+   permit; only a successful signature (and, for extensions, encrypted
+   response) consumes it with `commit()`.
 
-2. **Decrypt auth cache**: same. The `missing` set is only granted after `AuthOutcome::Success`. Verify that "partial hit → user rejects" leaves the previously-cached entries untouched (it does: we never call `cache.revoke`).
+2. **Decrypt grants**: pure-v2 batches use all-of lookup. A partial hit followed
+   by rejection leaves existing entries untouched and adds none; successful
+   response encryption commits the complete deduplicated scope set. Any legacy
+   member makes the entire request fresh.
 
-3. **`AuthCache::grant` idempotency**: structured errors must never extend a still-valid grant — already guaranteed by `AuthCache::grant` skipping when the entry is still in-window. No change.
+3. **Strict TTL**: committing an equal or wider policy never extends a
+   still-valid grant. A shorter policy cannot reuse a wider grant and replaces
+   it only after a fresh successful approval.
 
-4. **Lock state**: `AgentLocked` is checked before any auth prompt. The structured envelope still goes out auth-cipher-encrypted, so the lock check itself doesn't bypass the lock semantics.
+4. **Lock state**: agent lock is checked before deriving the auth cipher or
+   showing a prompt, so it remains an unstructured SSH-agent failure and can
+   neither consume nor create a grant.
 
 ## What can break
 
 - **Cross-version mismatch**: someone runs an old `vt` client against a new agent (or vice versa). Mitigation: hard-fail on `v` mismatch with `ErrKind::ProtocolVersion`. We do **not** silently degrade. Document in CHANGELOG that the client/agent binaries must match.
 - **`detail` accidentally containing user data**: easy to regress. Mitigation: `detail` field type is `&'static str` at the construction site; we use an `enum WireFail { kind, detail: Option<&'static str> }` internally and the JSON serializer turns the static into an owned `String` only at the JSON layer. Anything dynamic forces a compile error.
 - **Forwarded-socket leak**: see § "auth@vt and forwarded sockets". No regression vs today's logs.
-- **Cache poisoning via error path**: ruled out by review of `check_or_prompt_*` — both helpers `return false` before any `cache.grant` on the failure path.
+- **Cache poisoning via error path**: ruled out by the engine's pending-grant
+  permit. Rejection, unavailable state, operation failure, serialization
+  failure, and response-encryption failure all drop without commit.
 - **Test surface bloat**: every kind needs a pure unit test. The current suite
   covers wire round-trips, `AuthOutcome` mapping, exit-code mapping, unknown
   future kinds, version mismatches, and malformed envelopes without requiring a

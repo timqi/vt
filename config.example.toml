@@ -55,3 +55,15 @@
 #     ~/.config/vt/agent.toml          (override with $VT_AGENT_CONFIG)
 #
 # See agent.example.toml for the template and docs/hook.md for the design.
+
+# --- SSH agent defaults ([agent] section, optional) --------------------------
+# Startup defaults for `vt ssh agent`, so a supervisor (the VT.app menu-bar
+# shell) can spawn the agent without hardcoding your flags. Explicit CLI flags
+# always override these; none of these keys is an environment variable.
+# See docs/app-bundle.md §4.
+# [agent]
+# timeout = 300                      # idle seconds before keys are cleared
+# ssh_auth_cache_duration = 0        # sign approval reuse seconds; 0 = always prompt
+# decrypt_auth_cache_duration = 0    # decrypt approval reuse seconds; 0 = always prompt
+# cache_hit_notify = true            # notify when a cached grant skips Touch ID
+# run_allow = "/opt/homebrew/bin/zed"  # run@vt allowlist (comma-separated); unset disables run@vt

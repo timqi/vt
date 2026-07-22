@@ -69,9 +69,11 @@ Keychain copy" idea does not apply here.
   agent's existing multi-algorithm signing core (Ed25519 / RSA-SHA2 / ECDSA
   P-256/P-384), so it is not pinned to Ed25519 even though the git identity from
   `vt ssh keygen` is Ed25519.
-- `sign@vt` shares the sign auth cache with the standard `SIGN_REQUEST` path
-  (opt-in via `--ssh-auth-cache-mode`; default `none` = always prompts). v1
-  shipped cache-free; see §6 for the revised decision.
+- `sign@vt` shares the sign grant store with the standard `SIGN_REQUEST` path
+  (opt-in via `--ssh-auth-cache-duration`; default `0` = always prompts). v1
+  shipped cache-free; see §6 for the revised decision and
+  [`authorization-scopes-v2.md`](authorization-scopes-v2.md) for the current
+  activity scopes.
 
 ## 3. Wire additions (`src/core.rs`, cross-platform)
 
@@ -140,9 +142,9 @@ fn sign_data_with_privkey(
 }
 ```
 
-`Session::sign` (standard path) becomes: lookup + `check_or_prompt_auth` +
-`sign_data_with_privkey(...)`. Behaviour is byte-identical (guarded by a test
-that signs the same data via the old inline path vs the helper).
+`Session::sign` (standard path) performs lookup, requests an
+`Operation::Sign` permit from the unified authorization engine, then calls
+`sign_data_with_privkey(...)`. The permit commits only after signing succeeds.
 
 ## 5. Agent: `sign@vt` handler + dispatcher wiring (current)
 
@@ -201,11 +203,10 @@ async fn handle_sign_vt(
     if !body.is_empty() { auth_message.push('\n'); auth_message.push_str(&body); }
     append_meta_lines(&mut auth_message, &req.meta);
 
-    // Cache-aware (shared sign auth cache, see §6). Distinguish reject vs
-    // unavailable so the client gets the right ErrKind (AuthRejected => no
-    // fallback). (v1 always prompted here.)
-    let decision = self.check_or_prompt_auth(&fp_str, &auth_message).await;
-    /* … audit + map CacheHit/Approved → proceed, Rejected/Unavailable → ErrKind … */
+    // Shared Operation::Sign grant scope; distinguish reject vs unavailable
+    // so the client gets the right ErrKind (AuthRejected => no fallback).
+    let permit = self.authorization.authorize(sign_request).await?;
+    /* … sign + serialize; the dispatcher commits after response encryption … */
 
     let sig = sign_data_with_privkey(&privkey, &req.data, req.flags)
         .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_FAILED)))?;
@@ -224,7 +225,7 @@ verification BEFORE dispatch, so `sign@vt` is VT_AUTH-gated for free, and the
 `handle_sign_vt` errors flow back through the same `ExtResponse` envelope as the
 other extensions.
 
-## 6. AuthCache decision — shared with the standard sign cache (v1 was NO cache)
+## 6. Grant decision — shared with standard SSH signing (v1 was NO cache)
 
 v1 always prompted, on the theory that git pushes are infrequent and a
 per-sign Touch ID is cheap. In practice `vt ssh connect` is also the transport
@@ -232,18 +233,17 @@ for multi-host fan-outs (`tssh h1 h2 …`), where a single command produced one
 Touch ID **per host** — exactly the prompt storm the sign cache exists to
 prevent.
 
-`sign@vt` therefore now goes through `check_or_prompt_auth`, sharing the
-standard sign cache (keyed `(context, fingerprint)`; opt-in via
-`--ssh-auth-cache-mode`, default `none` = v1 behaviour). The
-originally-feared "cache-context escalation" (a standard-sign grant silently
-authorizing `sign@vt` for the same key, and vice versa) is now accepted
-deliberately: both operations are "sign an arbitrary challenge with this key",
-so a cached grant on either path already concedes the same capability for the
-TTL — a dedicated `(context, fingerprint, host, op)` namespace would re-add
-one prompt per host on a fan-out (defeating the point) without denying a
-cache holder any real power. The shared cache carries all the standard
-protections: strict TTL, dual-clock expiry, lock/wake/idle flush, and the
-prompt-queue re-check that collapses concurrent bursts to one dialog.
+`sign@vt` and standard signing therefore both use `Operation::Sign` in the
+unified grant store (opt-in via `--ssh-auth-cache-duration`, default `0` = v1
+behaviour). Under activity scopes V2
+([`authorization-scopes-v2.md`](authorization-scopes-v2.md)) a local
+`sign@vt` caller is scoped to its kernel-derived git workspace, so a
+multi-host fan-out from one project shares one grant and avoids one prompt
+per host; raw ssh signs are scoped to their session-bind-verified destination
+instead, and relay callers stay confined per connection.
+The shared store carries all the standard protections:
+strict TTL, dual-clock expiry, lock/wake/idle flush, and the prompt-queue
+re-check that collapses concurrent bursts to one dialog.
 
 ## 7. Client: `VTClient::sign_vt` (`src/client.rs`, `#[cfg(unix)]`)
 
@@ -367,9 +367,9 @@ async fn sign(&mut self, request: SignRequest) -> Result<ssh_key::Signature, Age
   by the agent itself). It never signs with caller-supplied key material. This
   is strictly weaker capability than the standard `sign` path already grants
   for the same key.
-- **G2 — cache.** Shares the standard sign auth cache (opt-in, default `none`
-  = always prompt) — see §6 for why the dedicated-namespace requirement was
-  dropped.
+- **G2 — cache.** Shares the standard sign operation/store (opt-in, default
+  duration `0` = always prompt), while the workspace / destination / relay
+  scopes still partition individual grants; see §6.
 - **G3 — fallback only on pre-prompt failure.** Enforced by reusing
   `should_fallback_to_cf`. All `handle_sign_vt` rejections that occur before the
   prompt are `BadRequest`/`Generic`; `Generic` ("key not here") falls back,

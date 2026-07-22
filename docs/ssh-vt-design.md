@@ -378,18 +378,18 @@ injection preserved).
 
 ### Cache-context narrowing IS preserved for the relay
 
-The macOS `vt ssh agent`'s "forwarded-agent narrowing" anchors the auth cache
-to a per-connection `(peer_pid, peer_start_time)` context when the connecting
-peer is a forwarding agent. That check keys on the peer's executable basename
-being `ssh` — but under `--forward-real-agent` the peer reaching the real agent
-is the **`vt` relay process** (basename `vt`), which would otherwise fall into
-the ordinary local-caller context (per-session / per-app / global) and lose the
-per-connection scoping. `resolve_cache_context` therefore ALSO recognises the
+The macOS `vt ssh agent` confines relay grants to a per-connection
+`(peer_pid, peer_start_time)` subject. Under `--forward-real-agent` the peer
+reaching the real agent is the **`vt` relay process** (basename `vt`), which
+would otherwise be classified as an ordinary local caller (workspace scope
+under activity scopes V2 — see
+[`authorization-scopes-v2.md`](authorization-scopes-v2.md)) and lose the
+per-connection scoping. The session classifier therefore recognises the
 relay peer — by its kernel-derived argv (`KERN_PROCARGS2`, parsed by the pure
 `parse_procargs2`; predicate `is_vt_relay_invocation`: basename `vt` +
-`ssh connect` + `--forward-real-agent`) — and gives it the **identical**
-`(pid, start)` per-connection context `ssh` gets, in every cache mode (incl.
-`global`) and with no TTY requirement (the relay may be scripted). So a relayed
+`ssh connect` + `--forward-real-agent`) — and confines it to its own
+`(pid, start)` subject, with no TTY requirement (the relay may be scripted).
+So a relayed
 `decrypt@vt` grant is scoped to that one `vt ssh connect` process and dies with
 it — matching a plain `ssh -A` of the real agent, not widening it. Argv is
 process-controlled, but a spoofed match only *narrows* a caller to its own

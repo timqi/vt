@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -9,29 +9,35 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use ssh_agent_lib::agent::{listen, Agent, Session};
 use ssh_agent_lib::error::AgentError;
+use ssh_agent_lib::proto::extension::SessionBind;
 use ssh_agent_lib::proto::{
     AddIdentity, Credential, Extension, Identity, RemoveIdentity, SignRequest, Unparsed,
 };
 use ssh_key::private::{KeypairData, PrivateKey};
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock};
 
+use crate::core::authorization::{
+    AuthorizationEngine, AuthorizationFailure, AuthorizationPermit, AuthorizationRequest,
+    CommitError, Decision, GrantScope, Operation, ReusePolicy, ScopeFamily, SubjectId,
+};
 use crate::core::crypto::{derive_dek, AesGcmCrypto};
-use crate::core::session::{AuthOutcome, UnavailableReason};
+use crate::core::session::AuthOutcome;
 use crate::core::wire::{
     outcome_to_err_strict, wrap_ok_envelope, ErrKind, WIRE_VERSION,
 };
 use crate::core::{
     legacy_decrypt, AuthReq, AuthRes, ContextBasis, DecryptInput, DecryptReq, DecryptResItem,
     DiagCacheReport, DiagPeerReport, DiagReq, DiagRes, EncryptReq, EncryptResItem, RunReq,
-    RunRes, SignReq, SignRes, SALT_LEN,
+    RunRes, SignReq, SignRes, UiStatusReq, UiStatusRes, SALT_LEN,
 };
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
-use super::security::{authenticate, derive_passcode_ciphers, load_mac_cipher};
+use super::authorization::{new_engine, sleep_diverged};
+use super::security::{derive_passcode_ciphers, load_mac_cipher, validate_mac_key_material};
 use super::store::KeychainStore;
-use super::audit::{self, AgentAuditEntry, AuditPushConfig};
+use super::audit::{self, AgentAuditContext, AgentAuditEntry, AuditPushConfig};
 
 /// SSH agent extension names used by vt.
 pub const EXT_ENCRYPT: &str = "encrypt@vt";
@@ -40,6 +46,10 @@ pub const EXT_AUTH: &str = "auth@vt";
 pub const EXT_RUN: &str = "run@vt";
 pub const EXT_SIGN: &str = "sign@vt";
 pub const EXT_DIAG: &str = "diag@vt";
+/// Token-gated shell status/revoke channel (docs/app-bundle.md §5).
+/// Plaintext (pre-cipher) like `session-bind@openssh.com`; NOT in the vt
+/// cipher-path match below and NOT permitted by the relay filter.
+pub const EXT_UI_STATUS: &str = "ui-status@vt";
 
 fn agent_err(e: anyhow::Error) -> AgentError {
     AgentError::Other(Box::new(std::io::Error::new(
@@ -86,189 +96,22 @@ pub fn encode_ssh_keys_into(
     Ok(())
 }
 
-// --- Auth Cache ---
+// --- Reuse policy -----------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthCacheMode {
-    None,
-    PerSession,
-    PerApp,
-    /// One shared context for the whole agent process — no TTY or session
-    /// requirement. The only mode that serves orchestrated callers (AI
-    /// agents, CI, make) whose spawned commands have no controlling terminal
-    /// and a fresh session per call, so per-session/per-app can never hit.
-    /// Coarsest blast radius: within the TTL, ANY caller that can reach the
-    /// socket (including every session of a forwarded agent) rides one grant.
-    Global,
-}
-
-impl FromStr for AuthCacheMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "none" => Ok(AuthCacheMode::None),
-            "per-session" | "per_session" | "session" => Ok(AuthCacheMode::PerSession),
-            "per-app" | "per_app" | "app" => Ok(AuthCacheMode::PerApp),
-            "global" => Ok(AuthCacheMode::Global),
-            _ => Err(format!(
-                "invalid auth cache mode '{}': expected none, per-session, per-app, or global",
-                s
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for AuthCacheMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AuthCacheMode::None => write!(f, "none"),
-            AuthCacheMode::PerSession => write!(f, "per-session"),
-            AuthCacheMode::PerApp => write!(f, "per-app"),
-            AuthCacheMode::Global => write!(f, "global"),
-        }
-    }
-}
-
-/// Auth cache context: `(context_id, context_start_tvsec)`.
-///
-/// Including the process start time defeats PID/TTY-device reuse: if the
-/// original context process (app or TTY owner) exits and its PID or tdev is
-/// recycled, the new process has a different start time and won't match a
-/// cached grant.
-pub type CacheContext = (u64, u64);
-
-/// A cache entry's expiry, tracked on two clocks.
-///
-/// `std::time::Instant` on macOS reads `CLOCK_UPTIME_RAW`, which does NOT
-/// advance while the system is asleep — an expiry tracked only on `Instant`
-/// pauses its countdown when the lid closes, so a grant issued just before
-/// sleep would still be live on wake hours (or days) later. The wall clock
-/// keeps counting through sleep but can be stepped backwards (NTP), which
-/// would stretch a wall-only expiry. An entry is therefore valid only while
-/// BOTH clocks agree: `mono` caps total awake time at the TTL, `wall` caps
-/// total real time at the TTL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CacheExpiry {
-    mono: Instant,
-    wall: SystemTime,
-}
-
-impl CacheExpiry {
-    fn is_valid_at(&self, now_mono: Instant, now_wall: SystemTime) -> bool {
-        now_mono < self.mono && now_wall < self.wall
-    }
-}
-
-pub struct AuthCache {
-    /// Each entry stores when it expires (computed at grant time).
-    entries: HashMap<(CacheContext, String), CacheExpiry>,
-    /// Lifetime of a fresh grant.
-    ttl: Duration,
-}
-
-impl AuthCache {
-    pub fn new(ttl_secs: u64) -> Self {
-        Self {
-            entries: HashMap::new(),
-            ttl: Duration::from_secs(ttl_secs),
-        }
-    }
-
-    /// `key` is a composed lookup digest ([`sign_cache_key`] /
-    /// [`decrypt_cache_key`]), not a raw fingerprint.
-    pub fn is_authorized(&self, context: CacheContext, key: &str) -> bool {
-        self.is_authorized_at(context, key, Instant::now(), SystemTime::now())
-    }
-
-    /// Clock-injectable core of [`is_authorized`], unit-testable for the
-    /// sleep scenario (mono frozen, wall advanced) without real sleeping.
-    fn is_authorized_at(
-        &self,
-        context: CacheContext,
-        key: &str,
-        now_mono: Instant,
-        now_wall: SystemTime,
-    ) -> bool {
-        self.entries
-            .get(&(context, key.to_string()))
-            .is_some_and(|e| e.is_valid_at(now_mono, now_wall))
-    }
-
-    /// Strict-TTL grant: a still-valid entry's expiry is left untouched.
-    /// Concurrent grants for the same key cannot extend the original TTL.
-    /// Expired entries (or absent ones) are replaced with a fresh expiry.
-    pub fn grant(&mut self, context: CacheContext, key: &str) {
-        self.grant_at(context, key, Instant::now(), SystemTime::now());
-    }
-
-    fn grant_at(
-        &mut self,
-        context: CacheContext,
-        key: &str,
-        now_mono: Instant,
-        now_wall: SystemTime,
-    ) {
-        let fresh = CacheExpiry {
-            mono: now_mono + self.ttl,
-            wall: now_wall + self.ttl,
-        };
-        self.entries
-            .entry((context, key.to_string()))
-            .and_modify(|e| {
-                if !e.is_valid_at(now_mono, now_wall) {
-                    *e = fresh;
-                }
-            })
-            .or_insert(fresh);
-    }
-
-    /// Drop every entry; returns how many were dropped (for flush logging).
-    pub fn clear(&mut self) -> usize {
-        let n = self.entries.len();
-        self.entries.clear();
-        n
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn sweep_expired(&mut self) {
-        let now_mono = Instant::now();
-        let now_wall = SystemTime::now();
-        self.entries.retain(|_, e| e.is_valid_at(now_mono, now_wall));
-    }
-
-    pub fn ttl_secs(&self) -> u64 {
-        self.ttl.as_secs()
-    }
-
-    /// Diagnostics (`diag@vt`): currently-valid entries for `context` ONLY —
-    /// same dual-clock predicate as [`is_authorized`]. Deliberately scoped to
-    /// one context so a caller (possibly a relayed remote) never learns how
-    /// many grants other sessions/tabs hold.
-    pub fn live_len(&self, context: CacheContext) -> usize {
-        self.live_len_at(context, Instant::now(), SystemTime::now())
-    }
-
-    /// Clock-injectable core of [`live_len`] (see [`is_authorized_at`]).
-    fn live_len_at(
-        &self,
-        context: CacheContext,
-        now_mono: Instant,
-        now_wall: SystemTime,
-    ) -> usize {
-        self.entries
-            .iter()
-            .filter(|((c, _), e)| *c == context && e.is_valid_at(now_mono, now_wall))
-            .count()
+/// Human-readable duration for the prompt reuse line ("8h", "90m", "45s").
+fn reuse_ttl_label(secs: u64) -> String {
+    if secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
     }
 }
 
 /// True when `timeout` has elapsed since the last activity on EITHER clock —
-/// the same dual-clock rule as [`CacheExpiry`] (which documents why), applied
-/// to the idle timeout: without the wall clock a laptop that naps often could
+/// the same dual-clock rule as authorization grants, applied to the idle
+/// timeout: without the wall clock a laptop that naps often could
 /// stay "active" for days and never drop its keys.
 fn idle_exceeded(
     last_mono: Instant,
@@ -277,22 +120,18 @@ fn idle_exceeded(
     now_wall: SystemTime,
     timeout: Duration,
 ) -> bool {
-    let deadline = CacheExpiry {
-        mono: last_mono + timeout,
-        wall: last_wall + timeout,
-    };
-    !deadline.is_valid_at(now_mono, now_wall)
+    last_mono
+        .checked_add(timeout)
+        .is_some_and(|deadline| now_mono >= deadline)
+        || last_wall
+            .checked_add(timeout)
+            .is_some_and(|deadline| now_wall >= deadline)
 }
 
 // --- Cache watcher (screen lock + sleep/wake invalidation) ---
 
 /// How often the cache watcher samples screen-lock state and clock skew.
 const WATCHER_TICK: Duration = Duration::from_secs(5);
-/// Wall clock advancing this much further than the monotonic clock between
-/// two watcher ticks means the system slept (mono pauses during sleep).
-/// Large enough to also absorb small NTP steps without spurious clears.
-const WATCHER_SLEEP_DIVERGENCE: Duration = Duration::from_secs(30);
-
 /// Decide whether the auth caches must be flushed for this watcher tick.
 ///
 /// Two triggers, both "the human walked away" signals that must revoke
@@ -301,10 +140,11 @@ const WATCHER_SLEEP_DIVERGENCE: Duration = Duration::from_secs(30);
 ///      -switched, or logged out). Only the *transition* clears, so a grant
 ///      issued after unlock isn't immediately eaten by the steady locked
 ///      state of some other display.
-///   2. Sleep detected: wall time advanced ≥ [`WATCHER_SLEEP_DIVERGENCE`]
+///   2. Sleep detected: wall time advanced by the shared sleep-divergence
+///      threshold
 ///      more than monotonic time since the previous tick. `wall_delta` is
 ///      `None` when the wall clock stepped backwards — not a sleep signal;
-///      the dual-clock TTL ([`CacheExpiry`]) still bounds those entries.
+///      the authorization engine's dual-clock TTL still bounds those entries.
 fn watcher_should_clear(
     was_interactive: bool,
     is_interactive: bool,
@@ -314,10 +154,29 @@ fn watcher_should_clear(
     if was_interactive && !is_interactive {
         return true;
     }
-    match wall_delta {
-        Some(wall) => wall.saturating_sub(mono_delta) >= WATCHER_SLEEP_DIVERGENCE,
-        None => false,
+    sleep_diverged(mono_delta, wall_delta)
+}
+
+/// Wipe the decrypted-key map from RAM and mark `idle_cleared` so the next
+/// interactive request silently reloads (docs/app-bundle.md §10). The single
+/// source of the "wipe → later silent reload" handshake, shared by the idle
+/// sweeper and the screen-lock/wake watcher so the flag can't be forgotten in
+/// one of them. Returns the number of keys cleared. NOTE: the `ssh-add -x`
+/// lock finalizer clears keys WITHOUT this flag on purpose — it relies on the
+/// `locked` gate (not `idle_cleared`) to refuse reload — so it does not use
+/// this helper.
+async fn clear_keys_for_reload(
+    keys: &Arc<RwLock<HashMap<String, PrivateKey>>>,
+    idle_cleared: &Arc<RwLock<bool>>,
+) -> usize {
+    let mut guard = keys.write().await;
+    let count = guard.len();
+    if count > 0 {
+        guard.clear();
+        drop(guard);
+        *idle_cleared.write().await = true;
     }
+    count
 }
 
 // --- macOS process introspection ---
@@ -401,9 +260,8 @@ mod proc_info {
     }
 
     /// Get the controlling TTY device number for a process. Returns None
-    /// for processes with no controlling terminal (`tdev == 0`) so the
-    /// caller can treat them as uncacheable — otherwise every daemon
-    /// without a TTY would share a single cache slot keyed on 0.
+    /// for processes with no controlling terminal (`tdev == 0`). Diag-only
+    /// since scopes V2; behavior must never depend on it.
     pub fn get_tty_dev(pid: i32) -> Option<u32> {
         let (_, tdev, _) = get_proc_bsdinfo(pid)?;
         if tdev == 0 {
@@ -411,6 +269,58 @@ mod proc_info {
         } else {
             Some(tdev)
         }
+    }
+
+    const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
+
+    /// Layout mirror of `struct vnode_info_path` from `<sys/proc_info.h>`:
+    /// `struct vnode_info` (a 136-byte `vinfo_stat` + type/pad/fsid = 152
+    /// bytes, opaque here) followed by a MAXPATHLEN path buffer.
+    #[repr(C)]
+    struct VnodeInfoPath {
+        vip_vi: [u8; 152],
+        vip_path: [u8; MAXPATHLEN as usize],
+    }
+
+    #[repr(C)]
+    struct ProcVnodePathInfo {
+        pvi_cdir: VnodeInfoPath,
+        pvi_rdir: VnodeInfoPath,
+    }
+
+    /// NUL-terminated kernel path buffer → PathBuf. `None` on a missing
+    /// NUL, an empty path, or non-UTF-8 bytes (callers degrade to Fresh).
+    pub fn nul_terminated_path(buf: &[u8]) -> Option<std::path::PathBuf> {
+        let len = buf.iter().position(|&b| b == 0)?;
+        if len == 0 {
+            return None;
+        }
+        let s = std::str::from_utf8(&buf[..len]).ok()?;
+        Some(std::path::PathBuf::from(s))
+    }
+
+    /// Kernel-derived current working directory of `pid`
+    /// (`proc_pidinfo(PROC_PIDVNODEPATHINFO)` → `pvi_cdir.vip_path`). Same
+    /// trust level as `get_proc_path`; `None` on any failure. The strict
+    /// `ret == size` check makes a layout mismatch fail closed instead of
+    /// reading a truncated struct.
+    pub fn get_cwd(pid: i32) -> Option<std::path::PathBuf> {
+        const _: () = assert!(std::mem::size_of::<ProcVnodePathInfo>() == 2 * (152 + 1024));
+        let mut info: ProcVnodePathInfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<ProcVnodePathInfo>() as libc::c_int;
+        let ret = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDVNODEPATHINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if ret != size {
+            return None;
+        }
+        nul_terminated_path(&info.pvi_cdir.vip_path)
     }
 
     /// Get the process start time (seconds since epoch).
@@ -462,53 +372,6 @@ mod proc_info {
         crate::ssh_sign::parse_procargs2(&buf)
     }
 
-    /// Get the session leader PID (POSIX sid) for `pid`.
-    ///
-    /// Under macOS terminal stacks `forkpty()` calls `setsid()` in the child
-    /// before exec, so the resulting shell IS the session leader of its own
-    /// session. `getsid()` therefore returns:
-    ///   - Terminal.app/iTerm direct shell  → that shell's PID
-    ///   - tmux/screen pane shell           → the pane's shell PID (the
-    ///                                          multiplexer server has its own
-    ///                                          separate session)
-    ///   - ssh-spawned remote shell         → that shell's PID
-    ///   - nested shells (no setsid)        → the outer shell's PID
-    pub fn get_sid(pid: i32) -> Option<i32> {
-        let sid = unsafe { libc::getsid(pid) };
-        if sid > 0 {
-            Some(sid)
-        } else {
-            None
-        }
-    }
-
-    /// Walk the process tree upward to find a `.app/Contents/` ancestor.
-    /// Returns `None` when there is no app ancestor (tmux panes — the tmux
-    /// server re-parents to launchd — ssh logins, bare console sessions).
-    /// The caller must treat that as uncacheable: the previous fallback of
-    /// keying on the short-lived `peer_pid` itself produced a context that
-    /// could never hit again but still inserted a dead entry per call.
-    pub fn find_app_pid(peer_pid: i32) -> Option<i32> {
-        let mut current_pid = peer_pid;
-        // Limit traversal to prevent infinite loops
-        for _ in 0..64 {
-            if current_pid <= 1 {
-                break;
-            }
-            if let Some(path) = get_proc_path(current_pid) {
-                if path.contains(".app/Contents/") {
-                    return Some(current_pid);
-                }
-            }
-            match get_proc_bsdinfo(current_pid) {
-                Some((ppid, _, _)) if ppid > 0 && ppid as i32 != current_pid => {
-                    current_pid = ppid as i32;
-                }
-                _ => break,
-            }
-        }
-        None
-    }
 }
 
 // --- SSH Agent ---
@@ -519,9 +382,10 @@ use crate::core::sanitize_for_display as sanitize_prompt;
 use crate::core::sanitize_for_display_multiline as sanitize_prompt_multiline;
 
 /// Per-line cap and total-line cap for the multi-line `command` body the CLI
-/// sends. The CLI builds something like `op: inject\nfile: …\ncmd: …\nreason: …`
-/// so 6 lines is enough headroom; further lines from a hostile peer are
-/// silently dropped so the dialog can't be pushed off-screen.
+/// sends. The CLI builds something like `file: …\ncmd: …\nreason: …` (older
+/// clients prepend `op: inject`), so 6 lines is enough headroom; further
+/// lines from a hostile peer are silently dropped so the dialog can't be
+/// pushed off-screen.
 const PROMPT_COMMAND_MAX_LINES: usize = 6;
 const PROMPT_COMMAND_MAX_LINE_LEN: usize = 120;
 
@@ -747,79 +611,26 @@ const RUN_ENV_PASSTHROUGH: &[&str] = &[
     "LC_ALL", "LC_CTYPE", "DISPLAY",
 ];
 
-/// Default idle timeout: 30 minutes.
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
-/// Default auth cache duration for sign: 2 minutes.
-pub const DEFAULT_AUTH_CACHE_DURATION_SECS: u64 = 120;
-/// Default auth cache duration for decrypt@vt: 30 seconds.
-/// Shorter than sign because a cached decrypt grant releases per-record DEK
-/// material, whose blast radius is wider than a single-challenge signature.
-pub const DEFAULT_DECRYPT_AUTH_CACHE_DURATION_SECS: u64 = 30;
+/// Default idle timeout: 2 hours.
+///
+/// Idle timeout overlaps in purpose with screen-lock / sleep invalidation —
+/// both are "the human walked away" backstops — and lock/sleep fire far
+/// faster (seconds, via the cache watcher). On a Mac with prompt auto-lock
+/// the idle timeout is largely redundant, so a longer default favors fewer
+/// surprise re-prompts after a quiet spell while lock/sleep remain the fast
+/// guard. It is still a real backstop for the unlocked-but-unattended
+/// window; hosts without reliable auto-lock should lower it via
+/// `--timeout` / `[agent].timeout`.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 2 * 60 * 60;
 
-/// Configuration for one of the agent's auth caches. Carries (mode, ttl)
-/// together so the sign and decrypt caches can't have their fields
-/// accidentally swapped at any of the call layers.
+/// Cache durations for the two reusable operations, carried together with
+/// named fields so sign and decrypt cannot be transposed at any call layer —
+/// they carry deliberately different blast radii (a cached decrypt grant
+/// releases per-record DEK material). `0` = the engine's `Fresh` policy.
 #[derive(Debug, Clone, Copy)]
-pub struct AuthCacheConfig {
-    pub mode: AuthCacheMode,
-    pub ttl_secs: u64,
-}
-
-/// Derive the decrypt-cache lookup string for a single v2 item.
-///
-/// Domain-tagged so a digest from this hash can never collide with a digest
-/// from any other use of SHA-256 in the codebase. `host` and `pwd` are
-/// length-prefixed so the boundaries between fields are unambiguous.
-///
-/// `host` and `pwd` come from the client-supplied request and are NOT
-/// trusted for security — they only partition the cache, so different
-/// hostnames / working directories don't share entries. This mirrors the
-/// advisory `pwd` component of the Worker-side DEK cache: a compromised peer
-/// can lie to force a miss (DoS) or to reuse another directory's still-cached
-/// grant on the same host, but it never widens the hard context boundary
-/// (the peer process tree). The pwd component is what scopes `global`-mode
-/// grants to one project tree for orchestrated callers.
-fn decrypt_cache_key(
-    t: crate::core::SecretType,
-    salt: &[u8; SALT_LEN],
-    host: &str,
-    pwd: &str,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"vt-decrypt-cache-v2");
-    h.update([t.as_byte()]);
-    h.update(salt);
-    h.update((host.len() as u32).to_le_bytes());
-    h.update(host.as_bytes());
-    h.update((pwd.len() as u32).to_le_bytes());
-    h.update(pwd.as_bytes());
-    hex_string(&h.finalize())
-}
-
-/// Derive the sign-cache lookup string: key fingerprint + client-reported
-/// working directory. Same advisory-`pwd` rationale as [`decrypt_cache_key`].
-/// Plain SSH `sign` requests (agent protocol, no `ClientMeta`) pass an empty
-/// pwd and so share one slot per fingerprint, unchanged from before; `sign@vt`
-/// requests carry `meta.pwd` and are partitioned by it.
-fn sign_cache_key(fingerprint: &str, pwd: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"vt-sign-cache-v1");
-    h.update((fingerprint.len() as u32).to_le_bytes());
-    h.update(fingerprint.as_bytes());
-    h.update((pwd.len() as u32).to_le_bytes());
-    h.update(pwd.as_bytes());
-    hex_string(&h.finalize())
-}
-
-fn hex_string(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
+pub struct AuthCacheTtls {
+    pub sign_secs: u64,
+    pub decrypt_secs: u64,
 }
 
 /// Load all SSH keys from the keychain store into a HashMap. The store and
@@ -983,13 +794,16 @@ pub struct VtSshAgentFactory {
     /// Last request time on both clocks — see [`idle_exceeded`] for why the
     /// monotonic clock alone can't drive the idle timeout.
     last_activity: Arc<RwLock<(Instant, SystemTime)>>,
-    locked: Arc<RwLock<bool>>,
+    locked: Arc<AtomicBool>,
+    /// Serializes SSH-agent lock/unlock state transitions. The synchronous
+    /// atomic remains the live authorization validator's fast state source.
+    lock_transition: Arc<Mutex<()>>,
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
     idle_cleared: Arc<RwLock<bool>>,
-    sign_auth_cache: Arc<RwLock<AuthCache>>,
-    decrypt_auth_cache: Arc<RwLock<AuthCache>>,
-    sign_cache_mode: AuthCacheMode,
-    decrypt_cache_mode: AuthCacheMode,
+    authorization: Arc<AuthorizationEngine>,
+    /// 0 = Fresh (always prompt); named fields prevent sign/decrypt
+    /// transposition (see [`AuthCacheTtls`]).
+    cache_ttls: AuthCacheTtls,
     /// When true, `decrypt@vt` rejects `Legacy` items (v0/v1 URLs). v2 envelope
     /// items continue to work. Lets users who have fully migrated harden the
     /// agent so the "agent emits plaintext over wire" path can never be
@@ -997,201 +811,545 @@ pub struct VtSshAgentFactory {
     disable_legacy_decrypt: bool,
     /// run@vt allowlist. Empty = feature disabled.
     run_allow: Arc<RunAllowlist>,
-    /// Global serializer for ALL human auth prompts; see
-    /// [`VtSshSession::authenticate_serialized`] for the rationale.
-    prompt_sem: Arc<Semaphore>,
     /// Fire-and-forget audit push config. Cloned per session like `run_allow`.
     /// Disabled config = audit push is a no-op.
     audit_push: Arc<AuditPushConfig>,
+    /// Fire a system notification when a grant reuse satisfies sign/decrypt
+    /// without a prompt (docs/app-bundle.md §3). Default on.
+    notify_cache_hits: bool,
+    /// 32-byte spawn token read from `--ui-token-fd` at startup; gates
+    /// `ui-status@vt`. `None` (CLI-started agent) refuses every request.
+    ui_token: Option<[u8; 32]>,
+    /// Configured idle timeout (seconds) — reported over `ui-status@vt` so
+    /// the shell can display it (docs/app-bundle.md §10).
+    idle_timeout_secs: u64,
 }
 
 impl VtSshAgentFactory {
     fn new(
         keys: HashMap<String, PrivateKey>,
-        sign_cache: AuthCacheConfig,
-        decrypt_cache: AuthCacheConfig,
+        cache_ttls: AuthCacheTtls,
         disable_legacy_decrypt: bool,
         run_allow: RunAllowlist,
         audit_push: Arc<AuditPushConfig>,
+        notify_cache_hits: bool,
+        ui_token: Option<[u8; 32]>,
+        idle_timeout_secs: u64,
     ) -> Self {
+        let locked = Arc::new(AtomicBool::new(false));
+        let authorization = new_engine(Arc::clone(&locked));
         Self {
             keys: Arc::new(RwLock::new(keys)),
             last_activity: Arc::new(RwLock::new((Instant::now(), SystemTime::now()))),
-            locked: Arc::new(RwLock::new(false)),
+            locked,
+            lock_transition: Arc::new(Mutex::new(())),
             lock_passphrase: Arc::new(RwLock::new(None)),
             idle_cleared: Arc::new(RwLock::new(false)),
-            sign_auth_cache: Arc::new(RwLock::new(AuthCache::new(sign_cache.ttl_secs))),
-            decrypt_auth_cache: Arc::new(RwLock::new(AuthCache::new(decrypt_cache.ttl_secs))),
-            sign_cache_mode: sign_cache.mode,
-            decrypt_cache_mode: decrypt_cache.mode,
+            authorization,
+            cache_ttls,
             disable_legacy_decrypt,
             run_allow: Arc::new(run_allow),
-            prompt_sem: Arc::new(Semaphore::new(1)),
             audit_push,
+            notify_cache_hits,
+            ui_token,
+            idle_timeout_secs,
         }
     }
 }
 
-/// Resolve the auth-cache context for this session.
-///
-/// Returns `None` when the session must not be cached (no peer PID,
-/// `tdev == 0` for per-session, or missing proc info). The context is
-/// captured once at session creation — not recomputed per request — so a
-/// cache lookup can never race proc-tree state between connection and the
-/// actual `sign` call.
-///
-/// `PerSession` keys on the **session leader's** PID and start time, not the
-/// peer process's. The peer process (e.g. `gh`, `vt read`) is short-lived and
-/// has a unique start_tvsec per invocation, so anchoring on it would prevent
-/// the cache from ever hitting across separate CLI calls. The session leader
-/// (the shell at the head of the pty — see `proc_info::get_sid`) lives for the
-/// full terminal session, giving the cache a stable anchor. `tdev != 0` is
-/// still required so daemons without a controlling terminal stay uncacheable.
-///
-/// `Global` is the escape hatch for orchestrated callers (AI agents / CI /
-/// make) whose spawned commands have **no controlling terminal and a fresh
-/// session per call** — under per-session/per-app they resolve to `None` and
-/// can never hit. It maps every peer to one fixed context; the only remaining
-/// boundary is the TTL (plus the lock/wake/idle flushes).
-///
-/// **Forwarded-agent narrowing:** when the peer is the local OpenSSH client
-/// (`ssh -A`, incl. a ControlMaster master carrying forwarded agent channels),
-/// every mode — including `Global` — anchors the context on that ssh process
-/// itself (`(pid, start)`), not on its terminal session or app ancestor.
-/// Grants made over one ssh connection stay confined to that connection: the
-/// remote host can reuse its own approvals within the TTL (the point of
-/// caching while forwarded), but it can never ride grants issued by other
-/// local tabs or other remote hosts, and the context dies with the ssh
-/// process. An ssh process can coincide with a session leader only for its
-/// own session, so the `(pid, start)` tuple can't collide with an unrelated
-/// per-session context.
-///
-/// Accepted consequence: the narrowing keys on the peer *process*, so it also
-/// applies to plain outbound `ssh host` signs (the agent cannot distinguish
-/// ssh authenticating itself from ssh relaying a forwarded request — both
-/// arrive from the same process). Repeated one-shot ssh invocations therefore
-/// no longer share a grant within the TTL; connections multiplexed through a
-/// ControlMaster master do (one long-lived process).
-fn resolve_cache_context(
-    peer_pid: Option<i32>,
-    mode: AuthCacheMode,
-    peer_is_vt_relay: bool,
-) -> Option<CacheContext> {
-    classify_cache_context(peer_pid, mode, peer_is_vt_relay).context
+// --- Peer classification (activity scopes V2) --------------------------------
+//
+// The caller-topology cache modes are gone. Grants are keyed by activity:
+// raw SSH signs by session-bind-verified destination (BindState, below),
+// local vt peers by kernel-derived workspace, relay peers per connection.
+// See docs/authorization-scopes-v2.md.
+
+/// A workspace the peer is operating in: the nearest `.git`-containing
+/// ancestor of its kernel-derived cwd. `subject` is the root directory's
+/// `(st_dev, st_ino)`; `root` is the canonical path captured from the SAME
+/// file descriptor (fstat + F_GETPATH), so the pair cannot be split by a
+/// rename between two lookups. The digest binds both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Workspace {
+    subject: SubjectId,
+    /// Stored as `String` because it is only ever built from validated UTF-8
+    /// and feeds the grant digest — a lossy conversion fallback here would
+    /// silently bind an empty root path.
+    root: String,
 }
 
-/// A resolved cache context together with the mode it was resolved under and
-/// WHY it resolved that way — the `basis` feeds `diag@vt` so an operator can
-/// see which rule classified their connection without reading this file.
-/// [`resolve_cache_context`] is the `.context` projection; behavior must
-/// never depend on `basis` or `mode`. Carrying `mode` here (rather than as
-/// parallel session fields) makes a sign/decrypt pairing mix-up in diag
-/// reporting unrepresentable.
-///
-/// [`ContextBasis`] lives in `crate::core` so the agent's wire tags and the
-/// CLI's human explanations are one compile-checked mapping.
+impl Workspace {
+    fn root_str(&self) -> &str {
+        &self.root
+    }
+
+    /// Client-reported `pwd` is display metadata, but if it is present and
+    /// does not lie inside this workspace the request degrades to Fresh — a
+    /// consistency check against confused callers, not a security boundary.
+    fn contains_claimed_pwd(&self, pwd: &str) -> bool {
+        pwd.is_empty() || std::path::Path::new(pwd).starts_with(std::path::Path::new(&self.root))
+    }
+}
+
+/// The caller's kernel-derived parent process, used as the activity identity
+/// when the caller's cwd is a broad shared directory: "this application
+/// instance keeps making the same request" (e.g. an app probing `gh` through
+/// the hook from cwd `/`). `subject` is the parent's `(pid, start_tvsec)`,
+/// so grants die when the app exits; `exe` is the parent's kernel-verified
+/// executable path (`proc_pidpath`), bound into the digest — never the
+/// client-claimed `ppid_cmd` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppIdentity {
+    subject: SubjectId,
+    exe: String,
+}
+
+impl AppIdentity {
+    /// Display name: executable basename (the digest uses the full path).
+    fn name(&self) -> &str {
+        self.exe.rsplit('/').next().unwrap_or(&self.exe)
+    }
+}
+
+/// The scope basis a resolved connection routes to. The three arms use
+/// distinct digest domains, so a directory that gains or loses a `.git`
+/// entry — or an app that later runs from a repository — starts a new grant
+/// family instead of silently continuing the old grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContextResolution {
-    pub mode: AuthCacheMode,
-    pub context: Option<CacheContext>,
-    pub basis: ContextBasis,
+enum ScopedBasis<'a> {
+    Git(&'a Workspace),
+    Cwd(&'a Workspace),
+    App(&'a AppIdentity),
 }
 
-/// Core of [`resolve_cache_context`], returning the basis alongside the
-/// context. No `?` early-returns: each fallible lookup assigns its basis
-/// explicitly so diag can report which branch failed. The precedence order
-/// (mode-none → peer pid → vt-relay → TTY gate → ssh narrowing → mode arm)
-/// is load-bearing and documented on [`resolve_cache_context`]; preserve it.
-fn classify_cache_context(
-    peer_pid: Option<i32>,
-    mode: AuthCacheMode,
-    peer_is_vt_relay: bool,
-) -> ContextResolution {
-    let resolved = |context: Option<CacheContext>, basis: ContextBasis| ContextResolution {
-        mode,
-        context,
-        basis,
-    };
-    // The `(pid, start_time)` anchor shared by every process-keyed branch;
-    // a failed start-time lookup is uniformly ProcLookupFailed → uncacheable.
-    let anchored = |pid: i32, basis: ContextBasis| match proc_info::get_start_tvsec(pid) {
-        Some(start) => resolved(Some((pid as u64, start)), basis),
-        None => resolved(None, ContextBasis::ProcLookupFailed),
-    };
-    if mode == AuthCacheMode::None {
-        return resolved(None, ContextBasis::ModeNone);
+/// How the connection's workspace resolution ended, kept for diag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspaceResolution {
+    /// Nearest `.git` ancestor of the kernel cwd.
+    Resolved(Workspace),
+    /// No usable `.git` ancestor: the kernel cwd directory itself, provided
+    /// it is not a broad shared bucket (see `cwd_fallback_acceptable`).
+    CwdFallback(Workspace),
+    /// Cwd is a broad shared bucket ($HOME, `/`, temp roots): the caller's
+    /// kernel-derived parent application.
+    AppFallback(AppIdentity),
+    /// Cwd too broad to scope AND no usable parent process (parent is
+    /// launchd / lookup failed): Fresh.
+    NoRoot,
+    /// No peer pid or proc/cwd lookup failed (also used for relay peers,
+    /// which never use workspace scopes).
+    Unavailable,
+}
+
+impl WorkspaceResolution {
+    fn scoped(&self) -> Option<ScopedBasis<'_>> {
+        match self {
+            WorkspaceResolution::Resolved(ws) => Some(ScopedBasis::Git(ws)),
+            WorkspaceResolution::CwdFallback(ws) => Some(ScopedBasis::Cwd(ws)),
+            WorkspaceResolution::AppFallback(app) => Some(ScopedBasis::App(app)),
+            _ => None,
+        }
     }
+}
+
+/// Ascend from `start` to the nearest directory containing a `.git` entry
+/// (dir or file — worktrees use a file). Depth-capped as a syscall bound on
+/// pathological trees.
+fn find_git_root(start: &std::path::Path) -> Option<PathBuf> {
+    let mut dir = start;
+    for _ in 0..64 {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// A `.git` root is an acceptable workspace boundary only when it does not
+/// pool unrelated work into one bucket:
+///
+/// - a dotfiles repository AT `$HOME` (`git init ~`, yadm) would make every
+///   caller anywhere under the home directory share one grant scope — the
+///   exact broad bucket the `cwd_fallback_acceptable` exclusions exist to
+///   prevent;
+/// - symmetrically, when the cwd lives under `$HOME`, a root found ABOVE
+///   `$HOME` (e.g. a stray `/Users/.git`) is rejected rather than pooling
+///   every user directory.
+///
+/// Both degrade to the narrower cwd fallback (or Fresh), never to a wider
+/// scope.
+fn workspace_root_acceptable(
+    root: &std::path::Path,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> bool {
+    let Some(home) = home else { return true };
+    if root == home {
+        return false;
+    }
+    if cwd.starts_with(home) && !root.starts_with(home) {
+        return false;
+    }
+    true
+}
+
+/// Capture the workspace identity through one file descriptor:
+/// `open(O_RDONLY|O_DIRECTORY)` → `fstat` → `fcntl(F_GETPATH)`. Deriving the
+/// `(dev, ino)` subject and the canonical path from the same fd removes the
+/// rename race between two separate path lookups.
+fn workspace_identity(root: &std::path::Path) -> Option<Workspace> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_root = std::ffi::CString::new(root.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe { libc::open(c_root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if fd < 0 {
+        return None;
+    }
+    // Everything below must close `fd` on every path.
+    let result = (|| {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return None;
+        }
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+            return None;
+        }
+        let path = proc_info::nul_terminated_path(&buf)?;
+        Some(Workspace {
+            subject: (st.st_dev as u64, st.st_ino),
+            root: path.to_str()?.to_string(),
+        })
+    })();
+    unsafe { libc::close(fd) };
+    result
+}
+
+/// The per-user Darwin temp root (`confstr(_CS_DARWIN_USER_TEMP_DIR)`),
+/// canonicalized and cached. Queried from the OS, never from a peer's
+/// `$TMPDIR`. `None` when the query fails.
+fn darwin_user_temp_dir() -> Option<&'static PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        let len = unsafe {
+            libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len())
+        };
+        if len == 0 || len > buf.len() {
+            return None;
+        }
+        let path = proc_info::nul_terminated_path(&buf)?;
+        // Canonicalize so it compares against F_GETPATH-derived paths.
+        std::fs::canonicalize(path).ok()
+    })
+    .as_ref()
+}
+
+/// A cwd with no `.git` ancestor may serve as its own grant scope, but only
+/// when it is not a directory that many unrelated activities share: `$HOME`
+/// and its ancestors (`/`, `/Users`) are the launch cwd of practically every
+/// interactive process, and the shared temp roots pool ephemeral work.
+/// Subdirectories of these (e.g. `/private/tmp/scratch`) remain acceptable —
+/// they name one activity. `cwd` must already be canonical (F_GETPATH), so
+/// `/tmp` arrives as `/private/tmp`.
+fn cwd_fallback_acceptable(cwd: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    if let Some(home) = home {
+        if cwd == home || home.starts_with(cwd) {
+            return false;
+        }
+    }
+    const SHARED_ROOTS: &[&str] = &[
+        "/tmp",
+        "/private/tmp",
+        "/var/tmp",
+        "/private/var/tmp",
+        "/Volumes",
+    ];
+    if SHARED_ROOTS.iter().any(|r| cwd == std::path::Path::new(r)) {
+        return false;
+    }
+    if darwin_user_temp_dir().is_some_and(|t| cwd == t) {
+        return false;
+    }
+    true
+}
+
+/// The peer's parent process as an activity identity. `None` when the parent
+/// is launchd/init (`ppid <= 1` — a daemon orphan or a peer whose parent
+/// already exited; scoping to launchd would pool every daemon on the box)
+/// or when a kernel lookup fails.
+fn parent_app_identity(peer_pid: i32) -> Option<AppIdentity> {
+    let (ppid, _, _) = proc_info::get_proc_bsdinfo(peer_pid)?;
+    let ppid = i32::try_from(ppid).ok()?;
+    if ppid <= 1 {
+        return None;
+    }
+    let start = proc_info::get_start_tvsec(ppid)?;
+    let exe = proc_info::get_proc_path(ppid)?;
+    Some(AppIdentity {
+        subject: (ppid as u64, start),
+        exe,
+    })
+}
+
+/// Resolve the peer's workspace once per connection (vt CLI connections are
+/// per-command; a process cwd does not change mid-connection in practice).
+/// Preference order: nearest acceptable `.git` root, else the cwd directory
+/// itself, else the parent application (each a distinct grant family), else
+/// Fresh.
+fn resolve_workspace(peer_pid: Option<i32>) -> WorkspaceResolution {
     let Some(pid) = peer_pid else {
-        return resolved(None, ContextBasis::NoPeerPid);
+        return WorkspaceResolution::Unavailable;
     };
-    // vt-relay narrowing (`vt ssh connect --forward-real-agent`): when the peer
-    // is the vt relay forwarding vt extensions from a remote host, give it the
-    // SAME per-connection `(pid, start)` context a forwarded `ssh` gets — in
-    // EVERY mode (incl. Global) and with NO TTY requirement (the relay may be
-    // scripted/TTY-less; the remote side always is). Deliberately AHEAD of the
-    // TTY gate so a relay without a controlling terminal still narrows to its
-    // own connection rather than falling through to a coarse shared context.
-    // `peer_is_vt_relay` is resolved once by the caller (kernel argv →
-    // `is_vt_relay_invocation`) and shared with the prompt origin marker, so
-    // the two can never disagree; a spoofed argv only narrows the caller to
-    // its own context, never widens it.
-    if peer_is_vt_relay {
-        return anchored(pid, ContextBasis::VtRelay);
+    let Some(cwd) = proc_info::get_cwd(pid) else {
+        return WorkspaceResolution::Unavailable;
+    };
+    let home = dirs::home_dir();
+    if let Some(root) = find_git_root(&cwd) {
+        if workspace_root_acceptable(&root, &cwd, home.as_deref()) {
+            return match workspace_identity(&root) {
+                Some(ws) => WorkspaceResolution::Resolved(ws),
+                None => WorkspaceResolution::Unavailable,
+            };
+        }
     }
-    // Per-session / per-app require the peer to have a controlling terminal.
-    // launchd-managed daemons and other non-interactive peers always prompt
-    // and never enter the cache — for these modes caching only makes sense
-    // for explicit human-driven terminal sessions. Deliberately ahead of the
-    // ssh narrowing below, so a TTY-less process running a binary named `ssh`
-    // (cron/launchd, or a renamed tool) can't use that branch to bypass the
-    // gate under these modes.
-    if matches!(mode, AuthCacheMode::PerSession | AuthCacheMode::PerApp)
-        && proc_info::get_tty_dev(pid).is_none()
-    {
-        return resolved(None, ContextBasis::NoTty);
+    // No usable git root: fall back to the cwd itself. Acceptability is
+    // checked on the fd-derived canonical path, so /tmp aliases and symlinked
+    // cwds cannot dodge the shared-root exclusions.
+    let Some(ws) = workspace_identity(&cwd) else {
+        return WorkspaceResolution::Unavailable;
+    };
+    if cwd_fallback_acceptable(std::path::Path::new(ws.root_str()), home.as_deref()) {
+        return WorkspaceResolution::CwdFallback(ws);
     }
-    if proc_info::get_proc_path(pid)
-        .as_deref()
-        .is_some_and(is_ssh_client_path)
-    {
-        return anchored(pid, ContextBasis::SshClient);
-    }
-    match mode {
-        // Handled above; kept so the match stays total without a wildcard.
-        AuthCacheMode::None => resolved(None, ContextBasis::ModeNone),
-        AuthCacheMode::PerSession => match proc_info::get_sid(pid) {
-            Some(sid) => anchored(sid, ContextBasis::SessionLeader),
-            None => resolved(None, ContextBasis::ProcLookupFailed),
-        },
-        AuthCacheMode::PerApp => match proc_info::find_app_pid(pid) {
-            Some(app_pid) => anchored(app_pid, ContextBasis::AppAncestor),
-            None => resolved(None, ContextBasis::NoAppAncestor),
-        },
-        // (0, 0) can never collide with a real context: sid/app_pid are
-        // always > 0.
-        AuthCacheMode::Global => resolved(Some((0, 0)), ContextBasis::Global),
+    // Broad shared cwd (daemons launch from `/`, terminals from `$HOME`):
+    // identify the activity by the calling application instead.
+    match parent_app_identity(pid) {
+        Some(app) => WorkspaceResolution::AppFallback(app),
+        None => WorkspaceResolution::NoRoot,
     }
 }
 
 /// True when `path` (the peer's canonical executable path from
 /// `proc_pidpath`) is an OpenSSH client binary, matched by basename so any
 /// install location (system, homebrew, nix) qualifies. A renamed copy evades
-/// the match — acceptable: the goal is correct grant scoping for honest
-/// forwarding setups, not containing local malware, which already reaches
-/// the socket directly.
+/// the match — acceptable: it lands in the unbound-non-ssh workspace arm,
+/// which stays within the documented same-UID concession
+/// (docs/authorization-scopes-v2.md §3.3).
 fn is_ssh_client_path(path: &str) -> bool {
     path.rsplit('/').next() == Some("ssh")
 }
 
-/// Assemble one cache's `diag@vt` report. `live_entries` counts only the
-/// caller's own context (0 when uncacheable) — never the whole cache.
-fn diag_cache_report(cache: &AuthCache, resolution: ContextResolution) -> DiagCacheReport {
-    DiagCacheReport {
-        mode: resolution.mode.to_string(),
-        ttl_secs: cache.ttl_secs(),
-        live_entries: resolution.context.map_or(0, |c| cache.live_len(c)),
-        context_basis: resolution.basis.as_wire().to_string(),
+// --- session-bind@openssh.com state machine -----------------------------------
+
+/// Local cap on recorded session ids per connection — a DoS defense (bounded
+/// memory), not a claimed protocol contract.
+const MAX_SESSION_BINDS: usize = 16;
+
+/// Destination binding state of one agent connection, driven by verified
+/// `session-bind@openssh.com` messages (OpenSSH ≥ 8.9 sends one per hop).
+/// See docs/authorization-scopes-v2.md §3.2.
+#[derive(Debug)]
+enum BindState {
+    Unbound,
+    Bound {
+        /// Exact wire-encoded `KeyData` bytes of the FIRST bound host key —
+        /// the destination digest input.
+        hostkey_wire: Vec<u8>,
+        /// Parsed copy of the same key, display-only (fingerprint /
+        /// known_hosts lookup for the prompt).
+        hostkey: KeyData,
+        /// Once true the connection may carry traffic from beyond the first
+        /// hop (agent forwarding) and is never destination-cacheable again.
+        forwarding: bool,
+        session_ids: Vec<Vec<u8>>,
+    },
+    /// A bind failed verification or consistency checks; sticky for the
+    /// connection lifetime. All raw signs degrade to Fresh.
+    Tainted,
+}
+
+impl BindState {
+    /// Destination host key wire bytes when — and only when — the connection
+    /// is bound to exactly one destination and has never been marked
+    /// forwarding.
+    fn destination(&self) -> Option<(&[u8], &KeyData)> {
+        match self {
+            BindState::Bound {
+                hostkey_wire,
+                hostkey,
+                forwarding: false,
+                ..
+            } => Some((hostkey_wire, hostkey)),
+            _ => None,
+        }
     }
+
+    /// Apply one `session-bind` message. `Err(())` means the bind was
+    /// refused; the caller replies with an agent failure. Refusal mirrors
+    /// OpenSSH: an **unverifiable** bind (bad signature, or a host key this
+    /// build cannot decode/verify — certificates, curves without an enabled
+    /// feature) is refused WITHOUT poisoning the recorded state, so benign
+    /// cert/p521 infrastructure merely gets no destination caching instead of
+    /// an attack-flavored sticky Tainted. Only **consistency violations**
+    /// (duplicate session id under a different key, forwarding→auth
+    /// downgrade) taint, because they indicate the peer is playing games with
+    /// state we must remember.
+    fn apply(&mut self, bind: &SessionBind) -> std::result::Result<(), ()> {
+        use ssh_agent_lib::ssh_encoding::Encode;
+
+        if bind.verify_signature().is_err() {
+            return Err(());
+        }
+        let mut wire = Vec::new();
+        if bind.host_key.encode(&mut wire).is_err() {
+            return Err(());
+        }
+        match self {
+            BindState::Tainted => Err(()),
+            BindState::Unbound => {
+                *self = BindState::Bound {
+                    hostkey_wire: wire,
+                    hostkey: bind.host_key.clone(),
+                    forwarding: bind.is_forwarding,
+                    session_ids: vec![bind.session_id.clone()],
+                };
+                Ok(())
+            }
+            BindState::Bound {
+                hostkey_wire,
+                forwarding,
+                session_ids,
+                ..
+            } => {
+                let same_key = *hostkey_wire == wire;
+                if session_ids.iter().any(|id| id == &bind.session_id) {
+                    // Re-binding a recorded session id: refuse a different
+                    // host key and a forwarding→auth downgrade.
+                    if !same_key || (*forwarding && !bind.is_forwarding) {
+                        *self = BindState::Tainted;
+                        return Err(());
+                    }
+                    *forwarding = *forwarding || bind.is_forwarding;
+                    return Ok(());
+                }
+                if session_ids.len() >= MAX_SESSION_BINDS {
+                    // Local DoS cap: refuse the excess bind but keep the
+                    // recorded state intact (OpenSSH behavior).
+                    return Err(());
+                }
+                session_ids.push(bind.session_id.clone());
+                // A second destination or an explicit forwarding bind means
+                // requests can originate beyond the first hop. Sticky.
+                if !same_key || bind.is_forwarding {
+                    *forwarding = true;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Best-effort display name for a bound destination: scan plain-name
+/// `~/.ssh/known_hosts` entries (via ssh-key's parser) for `hostkey` and
+/// return the first host name. Cosmetic only — the grant is keyed on the
+/// host key bytes, never on this name.
+fn known_hosts_name(hostkey: &KeyData) -> Option<String> {
+    let path = dirs::home_dir()?.join(".ssh").join("known_hosts");
+    let content = std::fs::read_to_string(path).ok()?;
+    known_hosts_name_in(&content, hostkey)
+}
+
+/// Human label for a destination-bound sign grant: known_hosts name when
+/// resolvable, always the host key fingerprint. Display-only.
+fn destination_label(hostkey: &KeyData) -> String {
+    match known_hosts_name(hostkey) {
+        Some(name) => format!("{} ({})", name, fingerprint_str(hostkey)),
+        None => fingerprint_str(hostkey),
+    }
+}
+
+/// Sign scope for a resolved basis — one place holds the basis→family
+/// mapping shared by the raw-sign and `sign@vt` arms.
+fn sign_scope_for_basis(basis: ScopedBasis<'_>, fingerprint: &str) -> GrantScope {
+    match basis {
+        ScopedBasis::Git(ws) => GrantScope::sign_workspace(ws.subject, ws.root_str(), fingerprint),
+        ScopedBasis::Cwd(ws) => GrantScope::sign_cwd(ws.subject, ws.root_str(), fingerprint),
+        ScopedBasis::App(app) => GrantScope::sign_app(app.subject, &app.exe, fingerprint),
+    }
+}
+
+/// Decrypt scope for a resolved basis, per `(type, salt)` record.
+fn decrypt_scope_for_basis(basis: ScopedBasis<'_>, secret_type: u8, salt: &[u8]) -> GrantScope {
+    match basis {
+        ScopedBasis::Git(ws) => {
+            GrantScope::decrypt_workspace(ws.subject, ws.root_str(), secret_type, salt)
+        }
+        ScopedBasis::Cwd(ws) => {
+            GrantScope::decrypt_cwd(ws.subject, ws.root_str(), secret_type, salt)
+        }
+        ScopedBasis::App(app) => {
+            GrantScope::decrypt_app(app.subject, &app.exe, secret_type, salt)
+        }
+    }
+}
+
+/// Contract a `$HOME` prefix to `~` for prompt display. Display-only —
+/// grants and digests always bind the canonical absolute path.
+fn contract_home(path: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        if let Some(rest) = path.strip_prefix(home.as_ref()) {
+            if rest.is_empty() {
+                return "~".to_string();
+            }
+            if rest.starts_with('/') {
+                return format!("~{}", rest);
+            }
+        }
+    }
+    path.to_string()
+}
+
+/// Human label for a reuse line. The wording distinguishes the scope
+/// families so the prompt states exactly what the approval covers: the
+/// workspace root is the common case and stays unmarked (a bare,
+/// home-contracted path always means "the whole repository"), while the
+/// narrower fallback families keep an explicit prefix so "this exact
+/// directory" / "this app" can never read as a repository scope.
+fn scoped_label(basis: ScopedBasis<'_>) -> String {
+    match basis {
+        ScopedBasis::Git(ws) => contract_home(ws.root_str()),
+        ScopedBasis::Cwd(ws) => format!("directory {}", contract_home(ws.root_str())),
+        ScopedBasis::App(app) => format!("app {}", app.name()),
+    }
+}
+
+/// Append the §6 prompt transparency line: present exactly when an approval
+/// can create a reusable grant. The label is agent-derived (kernel workspace
+/// path / verified host key) but sanitized like every other prompt field.
+fn append_reuse_line(message: &mut String, label: &Option<String>, ttl_secs: u64) {
+    if let Some(label) = label {
+        message.push_str("\nreuse: ");
+        message.push_str(&sanitize_prompt(label, 160));
+        message.push_str(" · ");
+        message.push_str(&reuse_ttl_label(ttl_secs));
+    }
+}
+
+fn known_hosts_name_in(content: &str, hostkey: &KeyData) -> Option<String> {
+    use ssh_key::known_hosts::{HostPatterns, KnownHosts};
+    KnownHosts::new(content)
+        .filter_map(std::result::Result::ok)
+        // @revoked / @cert-authority entries do not name a host's own key.
+        .filter(|entry| entry.marker().is_none())
+        .filter(|entry| entry.public_key().key_data() == hostkey)
+        // Hashed (`|1|…`) entries are irreversible: skip them and keep
+        // looking for a plain-name entry of the same key.
+        .find_map(|entry| match entry.host_patterns() {
+            HostPatterns::Patterns(patterns) => patterns.first().cloned(),
+            HostPatterns::HashedName { .. } => None,
+        })
 }
 
 impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
@@ -1200,33 +1358,55 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
         if let Some(pid) = peer_pid {
             tracing::debug!("New session from PID {}", pid);
         }
-        // One kernel-argv fetch per connection, shared by the cache narrowing
-        // and the prompt origin marker so they can never classify the peer
-        // differently.
+        // One kernel-argv fetch per connection, shared by the scope
+        // classification and the prompt origin marker so they can never
+        // classify the peer differently.
         let peer_is_vt_relay = peer_pid
             .and_then(proc_info::get_proc_argv)
             .map(|argv| crate::ssh_sign::is_vt_relay_invocation(&argv))
             .unwrap_or(false);
-        let sign_cache_resolution =
-            classify_cache_context(peer_pid, self.sign_cache_mode, peer_is_vt_relay);
-        let decrypt_cache_resolution =
-            classify_cache_context(peer_pid, self.decrypt_cache_mode, peer_is_vt_relay);
+        let peer_path = peer_pid.and_then(proc_info::get_proc_path);
+        let peer_is_ssh_client = peer_path.as_deref().is_some_and(is_ssh_client_path);
+        let peer_exe = peer_path
+            .as_deref()
+            .map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
+        // Relay AND plain-ssh peers are confined to a `(pid, start_tvsec)`
+        // connection subject: both can carry traffic that originated on a
+        // remote host (forwarded agent socket), so neither may ever reach the
+        // workspace arm. Local vt peers get a workspace resolution instead.
+        // All resolved once per connection so a scope lookup can never race
+        // proc-tree state against the request.
+        let confined_to_connection = peer_is_vt_relay || peer_is_ssh_client;
+        let connection_subject = if confined_to_connection {
+            peer_pid.and_then(|pid| {
+                proc_info::get_start_tvsec(pid).map(|start| (pid as u64, start))
+            })
+        } else {
+            None
+        };
         VtSshSession {
             keys: Arc::clone(&self.keys),
             last_activity: Arc::clone(&self.last_activity),
             locked: Arc::clone(&self.locked),
+            lock_transition: Arc::clone(&self.lock_transition),
             lock_passphrase: Arc::clone(&self.lock_passphrase),
             idle_cleared: Arc::clone(&self.idle_cleared),
-            sign_auth_cache: Arc::clone(&self.sign_auth_cache),
-            decrypt_auth_cache: Arc::clone(&self.decrypt_auth_cache),
+            authorization: Arc::clone(&self.authorization),
+            cache_ttls: self.cache_ttls,
             run_allow: Arc::clone(&self.run_allow),
-            prompt_sem: Arc::clone(&self.prompt_sem),
             audit_push: Arc::clone(&self.audit_push),
             peer_pid,
+            peer_exe,
             peer_is_vt_relay,
-            sign_cache_resolution,
-            decrypt_cache_resolution,
+            peer_is_ssh_client,
+            connection_subject,
+            workspace: std::sync::OnceLock::new(),
+            bind_state: BindState::Unbound,
+            destination_label: None,
             disable_legacy_decrypt: self.disable_legacy_decrypt,
+            notify_cache_hits: self.notify_cache_hits,
+            ui_token: self.ui_token,
+            idle_timeout_secs: self.idle_timeout_secs,
         }
     }
 }
@@ -1236,107 +1416,53 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
 struct VtSshSession {
     keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
     last_activity: Arc<RwLock<(Instant, SystemTime)>>,
-    locked: Arc<RwLock<bool>>,
+    locked: Arc<AtomicBool>,
+    lock_transition: Arc<Mutex<()>>,
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
     idle_cleared: Arc<RwLock<bool>>,
-    sign_auth_cache: Arc<RwLock<AuthCache>>,
-    decrypt_auth_cache: Arc<RwLock<AuthCache>>,
+    authorization: Arc<AuthorizationEngine>,
+    cache_ttls: AuthCacheTtls,
     /// Cloned per session for cheap reads; the underlying allowlist is
     /// constant for the lifetime of the agent process.
     run_allow: Arc<RunAllowlist>,
-    /// Shared across all sessions; see [`VtSshSession::authenticate_serialized`].
-    prompt_sem: Arc<Semaphore>,
     /// Shared fire-and-forget audit push config (disabled = no-op).
     audit_push: Arc<AuditPushConfig>,
     peer_pid: Option<i32>,
+    /// Peer executable basename (kernel `proc_pidpath`), captured once for
+    /// prompts and diag.
+    peer_exe: Option<String>,
     /// Peer is a `vt ssh connect --forward-real-agent` relay (kernel-argv
     /// check, resolved once at session creation): its requests originated on
     /// a remote host and every prompt carries the relay-origin marker.
     peer_is_vt_relay: bool,
-    /// Resolved once at session creation. `.context == None` = always prompt
-    /// for sign; `.mode`/`.basis` are diag-only.
-    sign_cache_resolution: ContextResolution,
-    /// Resolved once at session creation. `.context == None` = always prompt
-    /// for decrypt; `.mode`/`.basis` are diag-only.
-    decrypt_cache_resolution: ContextResolution,
+    /// Peer executable basename is `ssh` (kernel `proc_pidpath`). An ssh
+    /// peer can carry forwarded remote traffic, so it is confined per
+    /// connection for vt extensions and its raw signs are cacheable only via
+    /// a non-forwarding session-bind.
+    peer_is_ssh_client: bool,
+    /// `(pid, start_tvsec)` confinement subject for relay and ssh peers;
+    /// `None` for local vt peers or when the proc lookup failed (the
+    /// connection then degrades to Fresh via the scope constructors).
+    connection_subject: Option<SubjectId>,
+    /// Workspace resolution for local peers (Unavailable for relay/ssh).
+    /// Resolved lazily on first use — `resolve_workspace` does filesystem
+    /// I/O on a peer-controlled cwd, and `new_session` runs on the accept
+    /// loop, where a hung network mount would stall every client. Still
+    /// once per connection (never re-resolved per request).
+    workspace: std::sync::OnceLock<WorkspaceResolution>,
+    /// Destination binding driven by `session-bind@openssh.com` (§3.2 of
+    /// docs/authorization-scopes-v2.md). Mutated by `extension()`.
+    bind_state: BindState,
+    /// Display label for the bound destination, computed once per bind so a
+    /// sign burst does not re-read known_hosts.
+    destination_label: Option<String>,
     disable_legacy_decrypt: bool,
-}
-
-/// Outcome of a `sign` authorization, carrying enough to audit it. Replaces
-/// the old `bool` so the emit point in `Session::sign` can distinguish a
-/// silent cache hit from a fresh approval and from a denial. `Unavailable`
-/// keeps the [`UnavailableReason`] so `sign@vt` can surface the structured
-/// ErrKind (SessionLocked/NoGuiSession) instead of flattening to Generic.
-enum AuthDecision {
-    CacheHit,
-    Approved,
-    Rejected,
-    Unavailable(UnavailableReason),
-}
-
-impl AuthDecision {
-    /// True when signing should proceed.
-    fn is_ok(&self) -> bool {
-        matches!(self, AuthDecision::CacheHit | AuthDecision::Approved)
-    }
-    fn outcome(&self) -> &'static str {
-        match self {
-            AuthDecision::CacheHit => "cache_hit",
-            AuthDecision::Approved => "approved",
-            AuthDecision::Rejected => "rejected",
-            AuthDecision::Unavailable(_) => "unavailable",
-        }
-    }
-}
-
-/// Outcome of a `decrypt@vt` batch authorization. Carries the structured
-/// `ErrKind` on the failure arm so the existing client-facing error mapping
-/// (`SessionLocked`/`NoGuiSession` → the right `DETAIL_*`) is preserved
-/// (NEW-1): a bare `Unavailable` would collapse that distinction.
-enum DecryptDecision {
-    CacheHit,
-    Approved,
-    Rejected,
-    Err(ErrKind),
-}
-
-impl DecryptDecision {
-    fn outcome(&self) -> &'static str {
-        match self {
-            DecryptDecision::CacheHit => "cache_hit",
-            DecryptDecision::Approved => "approved",
-            DecryptDecision::Rejected => "rejected",
-            DecryptDecision::Err(_) => "unavailable",
-        }
-    }
-}
-
-/// Run the blocking auth chain on the blocking pool. No serialization —
-/// callers must already hold the prompt permit (or deliberately not need
-/// one). Join error means the auth chain panicked; fail closed.
-async fn authenticate_on_blocking_pool(reason: &str) -> AuthOutcome {
-    let msg = reason.to_string();
-    match tokio::task::spawn_blocking(move || authenticate(&msg)).await {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            tracing::error!("auth prompt task failed: {}", e);
-            AuthOutcome::Unavailable(UnavailableReason::NotInteractive)
-        }
-    }
-}
-
-/// Map a single `authenticate()` outcome (the always-prompt, no-cache path)
-/// onto a `DecryptDecision`, preserving the structured `ErrKind` for the
-/// failure arms. `Rejected` is its own variant; a `None` from
-/// `outcome_to_err_strict` (future enum variant) fails closed to `Generic`.
-fn decrypt_decision_from_authenticate(outcome: AuthOutcome) -> DecryptDecision {
-    match outcome {
-        AuthOutcome::Success(_) => DecryptDecision::Approved,
-        AuthOutcome::Rejected => DecryptDecision::Rejected,
-        AuthOutcome::Unavailable(reason) => DecryptDecision::Err(
-            outcome_to_err_strict(AuthOutcome::Unavailable(reason)).unwrap_or(ErrKind::Generic),
-        ),
-    }
+    /// Cache-hit transparency notifications (docs/app-bundle.md §3).
+    notify_cache_hits: bool,
+    /// Spawn token gating `ui-status@vt`; `None` refuses every request.
+    ui_token: Option<[u8; 32]>,
+    /// Configured idle timeout (seconds), reported over `ui-status@vt`.
+    idle_timeout_secs: u64,
 }
 
 impl VtSshSession {
@@ -1356,6 +1482,363 @@ impl VtSshSession {
         }
     }
 
+    /// Append the kernel-verified caller line. Unlike the client-reported
+    /// `via:` (`meta.ppid_cmd`), `peer_exe` comes from `proc_pidpath` on the
+    /// socket peer and cannot be forged by the request body — but the
+    /// basename is still attacker-chosen (a local process names its own
+    /// binary), so it is sanitized like every other prompt field. Placed with
+    /// the agent-derived truth lines, before the client-reported body/meta.
+    ///
+    /// Exception display: the overwhelmingly common caller is the vt CLI
+    /// itself, so `caller: vt` carries no information and is suppressed —
+    /// the line appears only for other basenames (`ssh -A` forwarded
+    /// traffic, `ssh-keygen`, renamed binaries). Suppressing on the name
+    /// hides nothing a rename could not already hide: the line is display
+    /// signal, not a boundary. Audit rows keep `peer_exe` unconditionally.
+    fn append_caller_line(&self, message: &mut String) {
+        if let Some(exe) = self.peer_exe.as_deref() {
+            if !exe.is_empty() && exe != "vt" {
+                message.push_str("\ncaller: ");
+                message.push_str(&sanitize_prompt(exe, 80));
+            }
+        }
+    }
+
+    /// Append the raw-sign destination truth line from the session-bind
+    /// state (docs/approval-transparency.md §A1). `reuse_names_destination`
+    /// is true when the reuse line already carries the destination label (a
+    /// destination-reusable scope — the only reusable arm a bound non-relay
+    /// peer can reach), in which case the plain line would be a duplicate. A
+    /// forwarding-capable bind is always flagged: the signed request may
+    /// originate beyond hop one. A tainted bind failed verification outright.
+    fn append_destination_line(&self, message: &mut String, reuse_names_destination: bool) {
+        match &self.bind_state {
+            BindState::Bound {
+                forwarding: false,
+                hostkey,
+                ..
+            } => {
+                if !reuse_names_destination {
+                    let label = self
+                        .destination_label
+                        .clone()
+                        .unwrap_or_else(|| destination_label(hostkey));
+                    message.push_str("\ndest: ");
+                    message.push_str(&sanitize_prompt(&label, 160));
+                }
+            }
+            BindState::Bound {
+                forwarding: true,
+                hostkey,
+                ..
+            } => {
+                let label = self
+                    .destination_label
+                    .clone()
+                    .unwrap_or_else(|| destination_label(hostkey));
+                message.push_str("\ndest: ");
+                message.push_str(&sanitize_prompt(&label, 160));
+                message.push_str(" (forwarding — may serve a relayed request)");
+            }
+            BindState::Tainted => {
+                message.push_str("\nwarning: session-bind verification failed");
+            }
+            BindState::Unbound => {}
+        }
+    }
+
+    /// The verified destination for audit rows: the bound, non-forwarding
+    /// session-bind label; empty otherwise. Mirrors `append_destination_line`
+    /// but never reports a forwarding-capable or tainted bind as a
+    /// destination.
+    fn audit_destination(&self) -> String {
+        match &self.bind_state {
+            BindState::Bound {
+                forwarding: false,
+                hostkey,
+                ..
+            } => self
+                .destination_label
+                .clone()
+                .unwrap_or_else(|| destination_label(hostkey)),
+            _ => String::new(),
+        }
+    }
+
+    // ---- Activity-scope construction (docs/authorization-scopes-v2.md) ----
+    //
+    // Each helper returns the scope(s) plus a human reuse label. The label is
+    // `Some` exactly when an approval can create a reusable grant, and is
+    // built from the same data the scope digest binds — the prompt must state
+    // what is being granted (§6 transparency invariant).
+
+    /// The per-connection confinement arm shared by relay and plain-ssh
+    /// peers: `Some(label)` exactly when the connection subject resolved.
+    fn connection_label(&self) -> Option<String> {
+        self.connection_subject.map(|_| {
+            if self.peer_is_vt_relay {
+                "this relay connection".to_string()
+            } else {
+                "this forwarded ssh connection".to_string()
+            }
+        })
+    }
+
+    /// True when this connection may carry traffic that originated on a
+    /// remote host (vt relay or plain `ssh -A`): vt extensions must then be
+    /// confined per connection and must never reach the workspace arm.
+    fn confined_to_connection(&self) -> bool {
+        self.peer_is_vt_relay || self.peer_is_ssh_client
+    }
+
+    /// Lazy once-per-connection workspace resolution (see the field doc).
+    /// Confined connections never resolve one.
+    fn workspace_resolution(&self) -> &WorkspaceResolution {
+        self.workspace.get_or_init(|| {
+            if self.confined_to_connection() {
+                WorkspaceResolution::Unavailable
+            } else {
+                resolve_workspace(self.peer_pid)
+            }
+        })
+    }
+
+    /// The scope basis, with the §4 consistency check applied to the
+    /// directory-shaped arms: a claimed `pwd` outside the git/cwd root
+    /// degrades to Fresh. The app arm carries no root to check against —
+    /// its claimed pwd stays display-only, like the connection arms.
+    fn reusable_scope(&self, claimed_pwd: &str) -> Option<ScopedBasis<'_>> {
+        self.workspace_resolution().scoped().filter(|basis| match basis {
+            ScopedBasis::Git(ws) | ScopedBasis::Cwd(ws) => {
+                ws.contains_claimed_pwd(claimed_pwd)
+            }
+            ScopedBasis::App(_) => true,
+        })
+    }
+
+    /// Scope for a raw `SIGN_REQUEST`.
+    fn raw_sign_scope(&self, fingerprint: &str) -> (GrantScope, Option<String>) {
+        if self.cache_ttls.sign_secs == 0 {
+            return (GrantScope::fresh(Operation::Sign), None);
+        }
+        if self.peer_is_vt_relay {
+            return (
+                GrantScope::sign(self.connection_subject, fingerprint, ""),
+                self.connection_label(),
+            );
+        }
+        match &self.bind_state {
+            BindState::Bound {
+                hostkey_wire,
+                hostkey,
+                forwarding: false,
+                ..
+            } => (
+                GrantScope::sign_destination(hostkey_wire, fingerprint),
+                // Precomputed at bind time; the on-demand fallback is
+                // unreachable in production (extension() sets the label on
+                // every successful bind) but keeps the reuse line
+                // self-contained for direct-construction tests.
+                self.destination_label
+                    .clone()
+                    .or_else(|| Some(destination_label(hostkey))),
+            ),
+            // Forwarding-capable: traffic may originate beyond hop one.
+            BindState::Bound { .. } | BindState::Tainted => {
+                (GrantScope::fresh(Operation::Sign), None)
+            }
+            // No bind and the peer is ssh: authentication and forwarding are
+            // indistinguishable — Fresh.
+            BindState::Unbound if self.peer_is_ssh_client => {
+                (GrantScope::fresh(Operation::Sign), None)
+            }
+            // No bind, non-ssh local caller (ssh-keygen -Y sign etc.):
+            // workspace / cwd / parent-app scope.
+            BindState::Unbound => match self.workspace_resolution().scoped() {
+                Some(basis) => (
+                    sign_scope_for_basis(basis, fingerprint),
+                    Some(scoped_label(basis)),
+                ),
+                None => (GrantScope::fresh(Operation::Sign), None),
+            },
+        }
+    }
+
+    /// Scope for `sign@vt` (local vt ⇒ workspace, relay/ssh ⇒ per-connection).
+    fn sign_vt_scope(&self, fingerprint: &str, claimed_pwd: &str) -> (GrantScope, Option<String>) {
+        if self.cache_ttls.sign_secs == 0 {
+            return (GrantScope::fresh(Operation::Sign), None);
+        }
+        if self.confined_to_connection() {
+            return (
+                GrantScope::sign(self.connection_subject, fingerprint, claimed_pwd),
+                self.connection_label(),
+            );
+        }
+        match self.reusable_scope(claimed_pwd) {
+            Some(basis) => (
+                sign_scope_for_basis(basis, fingerprint),
+                Some(scoped_label(basis)),
+            ),
+            None => (GrantScope::fresh(Operation::Sign), None),
+        }
+    }
+
+    fn connection_basis(&self) -> ContextBasis {
+        match self.connection_subject {
+            Some(_) if self.peer_is_vt_relay => ContextBasis::RelayConnection,
+            Some(_) => ContextBasis::SshConnection,
+            None => ContextBasis::ProcLookupFailed,
+        }
+    }
+
+    /// diag basis for the sign scope classification of THIS connection.
+    fn sign_basis(&self) -> ContextBasis {
+        if self.cache_ttls.sign_secs == 0 {
+            return ContextBasis::Disabled;
+        }
+        if self.peer_is_vt_relay {
+            return self.connection_basis();
+        }
+        match &self.bind_state {
+            BindState::Bound {
+                forwarding: false, ..
+            } => ContextBasis::SessionBind,
+            BindState::Bound { .. } => ContextBasis::Forwarding,
+            BindState::Tainted => ContextBasis::Tainted,
+            BindState::Unbound if self.peer_is_ssh_client => ContextBasis::UnboundSsh,
+            BindState::Unbound => self.workspace_basis(),
+        }
+    }
+
+    /// diag basis for the vt-extension (sign@vt / decrypt) classification of
+    /// THIS connection.
+    fn decrypt_basis(&self) -> ContextBasis {
+        if self.cache_ttls.decrypt_secs == 0 {
+            return ContextBasis::Disabled;
+        }
+        if self.confined_to_connection() {
+            return self.connection_basis();
+        }
+        self.workspace_basis()
+    }
+
+    fn workspace_basis(&self) -> ContextBasis {
+        match self.workspace_resolution() {
+            WorkspaceResolution::Resolved(_) => ContextBasis::Workspace,
+            WorkspaceResolution::CwdFallback(_) => ContextBasis::CwdWorkspace,
+            WorkspaceResolution::AppFallback(_) => ContextBasis::ParentApp,
+            WorkspaceResolution::NoRoot => ContextBasis::NoWorkspaceRoot,
+            WorkspaceResolution::Unavailable => match self.peer_pid {
+                None => ContextBasis::NoPeerPid,
+                Some(_) => ContextBasis::ProcLookupFailed,
+            },
+        }
+    }
+
+    /// Grants this connection's own classification could reuse — the single
+    /// basis→(family, subject) mapping behind both diag counts. The family
+    /// filter matters when a directory gains or loses a `.git` entry: the
+    /// workspace and cwd families then share a `(dev, ino)` subject, and a
+    /// caller must not count the other family's grants. `decrypt_basis`
+    /// never yields `SessionBind`, so one shared mapping is safe.
+    async fn live_grants(&self, basis: ContextBasis, operation: Operation) -> usize {
+        let scoped = match basis {
+            ContextBasis::SessionBind => Some((
+                ScopeFamily::Destination,
+                crate::core::authorization::DESTINATION_SUBJECT,
+            )),
+            ContextBasis::Workspace | ContextBasis::CwdWorkspace | ContextBasis::ParentApp => {
+                self.workspace_resolution().scoped().map(|basis| match basis {
+                    ScopedBasis::Git(ws) => (ScopeFamily::Workspace, ws.subject),
+                    ScopedBasis::Cwd(ws) => (ScopeFamily::CwdFallback, ws.subject),
+                    ScopedBasis::App(app) => (ScopeFamily::ParentApp, app.subject),
+                })
+            }
+            ContextBasis::RelayConnection | ContextBasis::SshConnection => self
+                .connection_subject
+                .map(|subject| (ScopeFamily::Connection, subject)),
+            _ => None,
+        };
+        match scoped {
+            Some((family, subject)) => {
+                self.authorization.live_len(operation, family, subject).await
+            }
+            None => 0,
+        }
+    }
+
+    /// Scopes for a pure-v2 decrypt batch (one per `(type, salt)` record).
+    fn decrypt_scopes(
+        &self,
+        v2_inputs: &[(crate::core::SecretType, [u8; SALT_LEN])],
+        claimed_host: &str,
+        claimed_pwd: &str,
+    ) -> (Vec<GrantScope>, Option<String>) {
+        let fresh = || vec![GrantScope::fresh(Operation::Decrypt)];
+        if self.cache_ttls.decrypt_secs == 0 {
+            return (fresh(), None);
+        }
+        if self.confined_to_connection() {
+            return (
+                v2_inputs
+                    .iter()
+                    .map(|(t, salt)| {
+                        GrantScope::decrypt_v2(
+                            self.connection_subject,
+                            t.as_byte(),
+                            salt,
+                            claimed_host,
+                            claimed_pwd,
+                        )
+                    })
+                    .collect(),
+                self.connection_label(),
+            );
+        }
+        match self.reusable_scope(claimed_pwd) {
+            Some(basis) => (
+                v2_inputs
+                    .iter()
+                    .map(|(t, salt)| decrypt_scope_for_basis(basis, t.as_byte(), salt))
+                    .collect(),
+                Some(scoped_label(basis)),
+            ),
+            None => (fresh(), None),
+        }
+    }
+
+    /// Agent-derived audit context shared by every row: kernel peer identity
+    /// and relay provenance. Operation-specific fields (key, destination,
+    /// scope) start empty — see `audit_ctx_scoped` and the sign handlers.
+    fn audit_ctx(&self) -> AgentAuditContext {
+        AgentAuditContext {
+            peer_exe: self.peer_exe.clone().unwrap_or_default(),
+            relayed: self.peer_is_vt_relay,
+            ..AgentAuditContext::default()
+        }
+    }
+
+    /// Audit context for an operation that can mint (or hit) a reusable
+    /// grant: records the scope family, the exact label the prompt's reuse
+    /// line displayed, and the effective TTL. `family` and `label` are `Some`
+    /// together by construction (both derive from the same scope helper); a
+    /// Fresh request leaves all three fields empty/zero.
+    fn audit_ctx_scoped(
+        &self,
+        family: Option<ScopeFamily>,
+        label: &Option<String>,
+        ttl_secs: u64,
+    ) -> AgentAuditContext {
+        let mut ctx = self.audit_ctx();
+        if let (Some(family), Some(label)) = (family, label.as_deref()) {
+            ctx.scope_family = family.as_wire().to_string();
+            ctx.scope_label = label.to_string();
+            ctx.grant_ttl_s = ttl_secs;
+        }
+        ctx
+    }
+
     /// Build an `AgentAuditEntry` from the post-decision context and hand it to
     /// the fire-and-forget pusher. No-op when audit push is disabled. Holds NO
     /// cache lock; never blocks (spawn_push returns immediately).
@@ -1370,6 +1853,7 @@ impl VtSshSession {
         reason: &str,
         salts: usize,
         latency_ms: u64,
+        agent_ctx: AgentAuditContext,
     ) {
         if !self.audit_push.enabled {
             return;
@@ -1385,13 +1869,15 @@ impl VtSshSession {
             salts,
             latency_ms,
             self.audit_push.agent_id(),
+            agent_ctx,
         );
         audit::spawn_push(Arc::clone(&self.audit_push), entry);
     }
 
-    /// Ensure keys are loaded. If they were cleared by the idle sweeper,
-    /// silently reload from keychain. Touch ID is enforced per sign/extension
-    /// request via `check_or_prompt_auth()` using the normal cache rules.
+    /// Ensure keys are loaded. If they were cleared by the idle sweeper or by
+    /// the screen-lock/sleep watcher (docs/app-bundle.md §10), silently reload
+    /// from keychain. The unified authorization engine still gates every
+    /// operation before a loaded key can be used.
     async fn ensure_keys_loaded(&self) -> Result<(), AgentError> {
         let keys = self.keys.read().await;
         if !keys.is_empty() {
@@ -1399,16 +1885,33 @@ impl VtSshSession {
         }
         drop(keys);
 
-        // Check if keys were cleared by idle timeout (vs just being empty)
+        // Check if keys were cleared by idle timeout / lock (vs just empty).
         let idle = *self.idle_cleared.read().await;
         if !idle {
             return Ok(());
         }
 
-        tracing::info!("Keys cleared by idle timeout, reloading from keychain");
+        // Do NOT repopulate RAM while the screen is locked (§10, C). A sign
+        // here is rejected by the validator anyway; reloading would undo the
+        // lock-wipe. Checked before the keychain I/O to skip a pointless read,
+        // and RE-checked after it (below) because the screen can lock during
+        // the read. `idle_cleared` is left set so a later interactive call
+        // reloads.
+        if !super::security::session_interactive_now() {
+            return Ok(());
+        }
+
+        tracing::info!("Keys cleared (idle/lock), reloading from keychain");
         let loaded = load_all_keys().map_err(agent_err)?;
         tracing::info!("Reloaded {} SSH keys", loaded.len());
         let mut keys = self.keys.write().await;
+        // A lock transition (agent lock OR screen lock) may have started while
+        // Keychain I/O was in progress. Re-check both while holding the same
+        // key-map guard used by lock() so loaded private keys can never be
+        // installed after a clear.
+        if self.locked.load(Ordering::Acquire) || !super::security::session_interactive_now() {
+            return Ok(());
+        }
         *keys = loaded;
 
         // Reset idle_cleared flag
@@ -1423,247 +1926,24 @@ impl VtSshSession {
         *last = (Instant::now(), SystemTime::now());
     }
 
-    /// Run the blocking auth chain (`authenticate`) for `reason`, serialized
-    /// through the global one-permit prompt semaphore and moved off the async
-    /// workers via `spawn_blocking`.
-    ///
-    /// Serialization: every accepted socket runs in its own tokio task, so
-    /// without the permit a peer holding VT_AUTH (or any process reaching a
-    /// forwarded socket) could stack N concurrent dialogs at the user —
-    /// prompt-fatigue that trains reflexive approval. `spawn_blocking`:
-    /// `authenticate` blocks on a human for up to ~30s; run inline it would
-    /// pin one runtime worker per concurrent prompt and, at worker-count
-    /// prompts, stall the whole agent including unrelated sessions.
-    ///
-    /// The cached paths (`check_or_prompt_auth`,
-    /// `check_or_prompt_decrypt_batch`) don't use this wrapper: they acquire
-    /// the permit themselves so they can re-check the cache after the queue
-    /// wait. Use this only where no cache is involved.
-    async fn authenticate_serialized(&self, reason: &str) -> AuthOutcome {
-        // The semaphore is never closed, so acquire only fails if that ever
-        // changes; fail closed as "cannot prompt" rather than a user reject.
-        let Ok(_permit) = self.prompt_sem.acquire().await else {
-            return AuthOutcome::Unavailable(UnavailableReason::NotInteractive);
-        };
-        authenticate_on_blocking_pool(reason).await
-    }
-
-    /// Check auth cache or prompt the user. Returns an [`AuthDecision`]
-    /// distinguishing a silent cache hit from a fresh approval / denial so the
-    /// `Session::sign` call site can audit the outcome.
-    ///
-    /// Used for `sign` (SSH authentication) and `sign@vt` (`vt ssh connect`),
-    /// which share one cache — both authorize "sign with this key". `auth@vt`
-    /// always prompts because forwarded agents share one local process.
-    /// `decrypt@vt` has its own cache (see `check_or_prompt_decrypt_batch`).
-    ///
-    /// All three success methods (Biometric, FIDO2, Password) are cached:
-    /// FIDO2 (YubiKey touch) is treated as equivalent to Touch ID for
-    /// authorization purposes — a deliberate policy choice.
-    async fn check_or_prompt_auth(
+    /// Fire the cache-hit transparency notification for a committed permit,
+    /// if enabled. MUST be called only AFTER `permit.commit()` (or
+    /// `commit_authorization`) has returned — while a permit is live its
+    /// security read guard blocks revocation, and this must not add
+    /// unbounded-latency work there. The notify itself is fire-and-forget
+    /// (docs/app-bundle.md §3). Single-sourced so both sign paths keep the
+    /// ordering invariant identical.
+    fn fire_cache_hit_note(
         &self,
-        fingerprint: &str,
-        pwd: &str,
-        auth_message: &str,
-    ) -> AuthDecision {
-        // If we couldn't resolve a cache context at session creation (no
-        // peer PID, no TTY, missing proc info), always prompt.
-        let Some(context) = self.sign_cache_resolution.context else {
-            return match self.authenticate_serialized(auth_message).await {
-                AuthOutcome::Success(_) => AuthDecision::Approved,
-                AuthOutcome::Rejected => AuthDecision::Rejected,
-                AuthOutcome::Unavailable(r) => AuthDecision::Unavailable(r),
-            };
-        };
-        let key = sign_cache_key(fingerprint, pwd);
-
-        // Fast path: cache hit without touching the prompt queue.
-        if self.sign_cache_hit(context, &key, fingerprint, "").await {
-            return AuthDecision::CacheHit;
+        note: Option<(&'static str, String)>,
+        reuse_remaining: Option<Duration>,
+    ) {
+        if !self.notify_cache_hits {
+            return;
         }
-
-        // Queue for the prompt, then RE-CHECK the cache: a racing request for
-        // the same key may have been approved (and granted — grants happen
-        // while the permit is still held) during the wait, so an N-request
-        // burst costs one dialog instead of N.
-        let Ok(_permit) = self.prompt_sem.acquire().await else {
-            return AuthDecision::Unavailable(UnavailableReason::NotInteractive);
-        };
-        if self.sign_cache_hit(context, &key, fingerprint, " after prompt-queue wait").await {
-            return AuthDecision::CacheHit;
+        if let Some((operation, label)) = note {
+            super::security::notify_cache_hit(operation, &label, reuse_remaining);
         }
-
-        // Prompt (permit held, no cache locks held)
-        let method = match authenticate_on_blocking_pool(auth_message).await {
-            AuthOutcome::Success(m) => m,
-            AuthOutcome::Rejected => return AuthDecision::Rejected,
-            AuthOutcome::Unavailable(reason) => {
-                tracing::warn!(
-                    "Auth unavailable for fingerprint={} reason={:?}",
-                    fingerprint,
-                    reason
-                );
-                return AuthDecision::Unavailable(reason);
-            }
-        };
-
-        if method.is_cacheable() {
-            // Granted while the permit is still held, so queued waiters are
-            // guaranteed to observe this entry on their re-check.
-            let mut cache = self.sign_auth_cache.write().await;
-            cache.grant(context, &key);
-            tracing::debug!(
-                "Sign auth cache grant for context={:?} fingerprint={} method={:?}",
-                context,
-                fingerprint,
-                method
-            );
-        }
-
-        AuthDecision::Approved
-    }
-
-    /// Cache-aware authorization for a `decrypt@vt` batch.
-    ///
-    /// Any legacy item in the batch disables caching for the whole batch —
-    /// legacy items release plaintext, and the invariant "legacy-containing
-    /// batch always prompts" is load-bearing for that decision. Otherwise:
-    /// full hit skips Touch ID; partial hit prompts once and then grants the
-    /// whole batch (strict-TTL — see the grant loop below).
-    ///
-    /// Returns a [`DecryptDecision`]: `CacheHit`/`Approved` allow the decrypt,
-    /// `Rejected`/`Err(kind)` block it (the caller maps those to the structured
-    /// `ExtResponse::Err` envelope). Both failure arms `return` before any
-    /// `cache.grant` call, preserving the invariant that failure paths never
-    /// extend or create cache entries.
-    async fn check_or_prompt_decrypt_batch(
-        &self,
-        v2_items: &[(crate::core::SecretType, [u8; SALT_LEN])],
-        has_legacy: bool,
-        host: &str,
-        pwd: &str,
-        auth_message: &str,
-    ) -> DecryptDecision {
-        // Cacheable iff there's a resolved context AND the batch is non-empty
-        // pure-v2; everything else falls through to the always-prompt path.
-        let context = match self.decrypt_cache_resolution.context {
-            Some(c) if !has_legacy && !v2_items.is_empty() => c,
-            // No cache eligibility: prompt once. Preserve the structured
-            // ErrKind via `outcome_to_err_strict` so the client-facing error
-            // (SessionLocked/NoGuiSession) is not flattened (NEW-1). Fail
-            // closed: a `None` for a non-Success outcome (future enum variant)
-            // becomes an Err rather than a silent allow.
-            _ => {
-                return decrypt_decision_from_authenticate(
-                    self.authenticate_serialized(auth_message).await,
-                )
-            }
-        };
-
-        let keys: Vec<String> = v2_items
-            .iter()
-            .map(|(t, salt)| decrypt_cache_key(*t, salt, host, pwd))
-            .collect();
-
-        // Fast path: full hit without touching the prompt queue.
-        if self.decrypt_miss_count(context, &keys).await == 0 {
-            tracing::debug!(
-                "Decrypt auth cache hit for context={:?} ({} v2 items)",
-                context,
-                v2_items.len()
-            );
-            return DecryptDecision::CacheHit;
-        }
-
-        // Queue for the prompt, then RE-CHECK: a racing request covering the
-        // same records may have been approved (and granted — grants happen
-        // while the permit is still held) during the wait, so an N-request
-        // burst costs one dialog instead of N.
-        let Ok(_permit) = self.prompt_sem.acquire().await else {
-            return decrypt_decision_from_authenticate(AuthOutcome::Unavailable(
-                UnavailableReason::NotInteractive,
-            ));
-        };
-        let miss_count = self.decrypt_miss_count(context, &keys).await;
-        if miss_count == 0 {
-            tracing::debug!(
-                "Decrypt auth cache hit after prompt-queue wait for context={:?} ({} v2 items)",
-                context,
-                v2_items.len()
-            );
-            return DecryptDecision::CacheHit;
-        }
-
-        let method = match authenticate_on_blocking_pool(auth_message).await {
-            AuthOutcome::Success(m) => m,
-            AuthOutcome::Rejected => return DecryptDecision::Rejected,
-            AuthOutcome::Unavailable(reason) => {
-                tracing::warn!("decrypt@vt unavailable: {:?}", reason);
-                return DecryptDecision::Err(
-                    outcome_to_err_strict(AuthOutcome::Unavailable(reason))
-                        .unwrap_or(ErrKind::Generic),
-                );
-            }
-        };
-
-        if method.is_cacheable() {
-            // The user just approved the ENTIRE batch, so grant every key in
-            // it, not just the previously-missing ones — an entry that was
-            // valid at the check above but expired while the prompt sat on
-            // screen would otherwise stay expired despite the fresh approval.
-            // `grant_at` is strict-TTL: keys still valid at this instant keep
-            // their original expiry (no sliding refresh). Granted while the
-            // permit is still held, so queued waiters observe the entries on
-            // their re-check.
-            let now_mono = Instant::now();
-            let now_wall = SystemTime::now();
-            let mut cache = self.decrypt_auth_cache.write().await;
-            for k in &keys {
-                cache.grant_at(context, k, now_mono, now_wall);
-            }
-            tracing::debug!(
-                "Decrypt auth cache grant for context={:?} method={:?} cache_misses={}",
-                context,
-                method,
-                miss_count
-            );
-        }
-
-        DecryptDecision::Approved
-    }
-
-    /// Sign-cache lookup with a hit-path debug log; `phase` distinguishes the
-    /// fast-path check from the post-queue re-check in the log line. `key` is
-    /// the [`sign_cache_key`] digest; `fingerprint` is passed alongside only
-    /// so the log line stays human-readable.
-    async fn sign_cache_hit(
-        &self,
-        context: CacheContext,
-        key: &str,
-        fingerprint: &str,
-        phase: &str,
-    ) -> bool {
-        let hit = self.sign_auth_cache.read().await.is_authorized(context, key);
-        if hit {
-            tracing::debug!(
-                "Sign auth cache hit{} for context={:?} fingerprint={}",
-                phase,
-                context,
-                fingerprint
-            );
-        }
-        hit
-    }
-
-    /// Count how many of `keys` are NOT currently authorized for `context` —
-    /// 0 means a full cache hit. One clock capture per call.
-    async fn decrypt_miss_count(&self, context: CacheContext, keys: &[String]) -> usize {
-        let now_mono = Instant::now();
-        let now_wall = SystemTime::now();
-        let cache = self.decrypt_auth_cache.read().await;
-        keys.iter()
-            .filter(|k| !cache.is_authorized_at(context, k, now_mono, now_wall))
-            .count()
     }
 
     // ---- Structured-envelope dispatch helpers --------------------------------
@@ -1680,7 +1960,7 @@ impl VtSshSession {
         decrypted: &[u8],
         store: &KeychainStore,
         passphrase_cipher: &AesGcmCrypto,
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         // v2 envelope: agent allocates a fresh per-record (salt, DEK) pair
         // for each requested SecretType. The agent NEVER receives plaintext
         // on this path. The salt is generated server-side (never accepted
@@ -1726,8 +2006,9 @@ impl VtSshSession {
             "",
             req.types.len(),
             0,
+            self.audit_ctx(),
         );
-        Ok(Zeroizing::new(bytes))
+        Ok(HandlerSuccess::without_authorization(Zeroizing::new(bytes)))
     }
 
     async fn handle_decrypt(
@@ -1735,7 +2016,7 @@ impl VtSshSession {
         decrypted: &[u8],
         store: &KeychainStore,
         passphrase_cipher: &AesGcmCrypto,
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         let req: DecryptReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
@@ -1781,6 +2062,16 @@ impl VtSshSession {
             return Err((ErrKind::LegacyDisabled, Some(DETAIL_LEGACY_DISABLED)));
         }
 
+        // Verify that the stored master key is present and decryptable before
+        // consulting reusable authorization state or prompting. Drop this
+        // short-lived copy immediately; the operation reloads it only after a
+        // permit is obtained, so raw key material is not held across a human
+        // prompt. Validation is deterministic over the already-loaded store
+        // and passphrase cipher, making the later load a non-fallible
+        // precondition in normal operation while retaining defensive mapping.
+        validate_mac_key_material(store, passphrase_cipher)
+            .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
+
         let who = who_at_host(&req.meta.user, &req.host);
         let n = req.items.len();
         let mut local_auth_message = header_with_who(
@@ -1789,6 +2080,43 @@ impl VtSshSession {
             &who,
         );
         self.append_relay_origin(&mut local_auth_message);
+        self.append_caller_line(&mut local_auth_message);
+        // Pure-v2 batches use one atomic scope per record and require an all-of
+        // hit. Any legacy member makes the entire request explicitly Fresh.
+        // The reuse line is agent-derived truth and is appended BEFORE the
+        // client-reported body/meta below, for the same reason as the relay
+        // origin marker: a hostile caller must not be able to pad the one
+        // line that says the tap creates a standing grant off-screen.
+        let (scopes, reuse, reuse_label) = if legacy_count > 0 {
+            (
+                vec![GrantScope::fresh(Operation::Decrypt)],
+                ReusePolicy::Fresh,
+                None,
+            )
+        } else {
+            let (scopes, reuse_label) =
+                self.decrypt_scopes(&v2_inputs, &req.host, &req.meta.pwd);
+            let display = reuse_label.clone().unwrap_or_default();
+            let scopes: Vec<GrantScope> = scopes
+                .into_iter()
+                .map(|scope| scope.with_display(display.clone()))
+                .collect();
+            append_reuse_line(
+                &mut local_auth_message,
+                &reuse_label,
+                self.cache_ttls.decrypt_secs,
+            );
+            (
+                scopes,
+                ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs),
+                reuse_label,
+            )
+        };
+        let audit_ctx = self.audit_ctx_scoped(
+            scopes.first().and_then(GrantScope::family),
+            &reuse_label,
+            self.cache_ttls.decrypt_secs,
+        );
         let body = sanitize_prompt_multiline(
             &req.command,
             PROMPT_COMMAND_MAX_LINE_LEN,
@@ -1799,43 +2127,40 @@ impl VtSshSession {
             local_auth_message.push_str(&body);
         }
         append_meta_lines(&mut local_auth_message, &req.meta);
-        // Cache-aware authorization. Pure v2 batches may skip the prompt on
-        // a full hit; any legacy item disables caching for the entire batch.
-        // Failure paths inside `check_or_prompt_decrypt_batch` never grant
-        // cache entries (verified by inspection of the helper).
-        let t0 = Instant::now();
-        let decision = self
-            .check_or_prompt_decrypt_batch(
-                &v2_inputs,
-                legacy_count > 0,
-                &req.host,
-                &req.meta.pwd,
-                &local_auth_message,
-            )
-            .await;
-        // Cache hits never prompted → 0 latency; otherwise prompt→decision.
-        let latency_ms = if matches!(decision, DecryptDecision::CacheHit) {
-            0
-        } else {
-            t0.elapsed().as_millis() as u64
-        };
-        self.emit_audit(
-            "decrypt",
-            decision.outcome(),
-            &req.host,
-            &req.meta,
-            &req.command,
-            "",
-            req.items.len(),
-            latency_ms,
-        );
-        match decision {
-            DecryptDecision::CacheHit | DecryptDecision::Approved => {}
-            DecryptDecision::Rejected => {
-                return Err((ErrKind::AuthRejected, auth_outcome_detail(ErrKind::AuthRejected)))
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::new(scopes, reuse, local_auth_message))
+            .await
+        {
+            Ok(permit) => {
+                self.emit_audit(
+                    "decrypt",
+                    permit.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    &req.command,
+                    "",
+                    req.items.len(),
+                    permit.latency_ms(),
+                    audit_ctx,
+                );
+                permit
             }
-            DecryptDecision::Err(kind) => return Err((kind, auth_outcome_detail(kind))),
-        }
+            Err(failure) => {
+                self.emit_audit(
+                    "decrypt",
+                    failure.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    &req.command,
+                    "",
+                    req.items.len(),
+                    failure.latency_ms(),
+                    audit_ctx,
+                );
+                return Err(authorization_failure_wire(&failure));
+            }
+        };
         let (mac_cipher, mac_key) = load_mac_cipher(store, passphrase_cipher)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
         let mut result: Vec<DecryptResItem> = Vec::with_capacity(req.items.len());
@@ -1868,8 +2193,10 @@ impl VtSshSession {
             }
         }
         drop(mac_key);
-        let bytes = serde_json::to_vec(&result)
-            .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?;
+        let bytes = Zeroizing::new(
+            serde_json::to_vec(&result)
+                .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?,
+        );
         // Scrub DEKs inside the response Vec before drop. `bytes` already
         // carries them (still wiped via `Zeroizing` below).
         for item in result.iter_mut() {
@@ -1877,13 +2204,14 @@ impl VtSshSession {
                 dek.zeroize();
             }
         }
-        Ok(Zeroizing::new(bytes))
+        let note = cache_hit_note_for(&permit, "decrypt", &reuse_label);
+        Ok(HandlerSuccess::authorized(bytes, permit).with_cache_hit_note(note))
     }
 
     async fn handle_auth(
         &self,
         decrypted: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         let req: AuthReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
@@ -1894,6 +2222,7 @@ impl VtSshSession {
         let who = who_at_host(&req.meta.user, &req.host);
         let mut auth_message = header_with_who("auth", "on", &who);
         self.append_relay_origin(&mut auth_message);
+        self.append_caller_line(&mut auth_message);
         let reason = sanitize_prompt(&req.reason, 100);
         if !reason.is_empty() {
             auth_message.push_str("\nreason: ");
@@ -1901,45 +2230,49 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
-        // Always prompt Touch ID — no auth caching for auth@vt. Over
-        // forwarded agents, all remote sessions share the same local
-        // process, so caching would approve all sudo from any session.
-        let t0 = Instant::now();
-        let outcome = self.authenticate_serialized(&auth_message).await;
-        let latency_ms = t0.elapsed().as_millis() as u64;
-        let outcome_str = match &outcome {
-            AuthOutcome::Success(_) => "approved",
-            AuthOutcome::Rejected => "rejected",
-            AuthOutcome::Unavailable(_) => "unavailable",
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::fresh(
+                GrantScope::fresh(Operation::Auth),
+                auth_message,
+            ))
+            .await
+        {
+            Ok(permit) => {
+                self.emit_audit(
+                    "auth",
+                    permit.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    "",
+                    &req.reason,
+                    0,
+                    permit.latency_ms(),
+                    self.audit_ctx(),
+                );
+                permit
+            }
+            Err(failure) => {
+                self.emit_audit(
+                    "auth",
+                    failure.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    "",
+                    &req.reason,
+                    0,
+                    failure.latency_ms(),
+                    self.audit_ctx(),
+                );
+                return Err(authorization_failure_wire(&failure));
+            }
         };
-        self.emit_audit(
-            "auth",
-            outcome_str,
-            &req.host,
-            &req.meta,
-            "",
-            &req.reason,
-            0,
-            latency_ms,
-        );
-        match outcome {
-            AuthOutcome::Success(_) => {}
-            AuthOutcome::Rejected => {
-                return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
-            }
-            AuthOutcome::Unavailable(reason) => {
-                tracing::warn!("auth@vt unavailable: {:?}", reason);
-                // Fail closed on a future-variant miss in `outcome_to_err`.
-                let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
-                    .unwrap_or(ErrKind::Generic);
-                return Err((kind, auth_outcome_detail(kind)));
-            }
-        }
 
         let result = AuthRes { approved: true };
-        Ok(Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
+        let bytes = Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
             (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
-        })?))
+        })?);
+        Ok(HandlerSuccess::authorized(bytes, permit))
     }
 
     /// `diag@vt`: read-only diagnostics for `vt doctor`. No Touch ID (it
@@ -1951,29 +2284,36 @@ impl VtSshSession {
     async fn handle_diag(
         &self,
         decrypted: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         let _req: DiagReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
-        let peer_path = self.peer_pid.and_then(proc_info::get_proc_path);
         let peer = DiagPeerReport {
             pid: self.peer_pid,
-            exe: peer_path
-                .as_deref()
-                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string()),
+            exe: self.peer_exe.clone(),
             has_tty: self
                 .peer_pid
                 .is_some_and(|pid| proc_info::get_tty_dev(pid).is_some()),
-            is_ssh_client: peer_path.as_deref().is_some_and(is_ssh_client_path),
+            is_ssh_client: self.peer_is_ssh_client,
             is_vt_relay: self.peer_is_vt_relay,
         };
-        let sign_cache = {
-            let cache = self.sign_auth_cache.read().await;
-            diag_cache_report(&cache, self.sign_cache_resolution)
+        // live_entries counts only grants THIS connection's own scope
+        // classification could reuse — never a whole-store count, and never
+        // grants a differently-classified caller would need. A caller whose
+        // basis says "never cached" therefore always reports 0.
+        let sign_basis = self.sign_basis();
+        let sign_live = self.live_grants(sign_basis, Operation::Sign).await;
+        let decrypt_basis = self.decrypt_basis();
+        let decrypt_live = self.live_grants(decrypt_basis, Operation::Decrypt).await;
+        let sign_cache = DiagCacheReport {
+            ttl_secs: self.cache_ttls.sign_secs,
+            live_entries: sign_live,
+            context_basis: sign_basis.as_wire().to_string(),
         };
-        let decrypt_cache = {
-            let cache = self.decrypt_auth_cache.read().await;
-            diag_cache_report(&cache, self.decrypt_cache_resolution)
+        let decrypt_cache = DiagCacheReport {
+            ttl_secs: self.cache_ttls.decrypt_secs,
+            live_entries: decrypt_live,
+            context_basis: decrypt_basis.as_wire().to_string(),
         };
         let result = DiagRes {
             agent_version: env!("VT_VERSION").to_string(),
@@ -1983,9 +2323,71 @@ impl VtSshSession {
             run_allow_len: self.run_allow.len(),
             audit_push: self.audit_push.enabled,
         };
-        Ok(Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
-            (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
-        })?))
+        Ok(HandlerSuccess::without_authorization(Zeroizing::new(
+            serde_json::to_vec(&result)
+                .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?,
+        )))
+    }
+
+    /// `ui-status@vt` (docs/app-bundle.md §5): plaintext, token-gated
+    /// status/revoke channel for the VT.app shell. Runs BEFORE the lock
+    /// check and the VT_AUTH cipher path, never touches the idle clock, is
+    /// never cached and never audit-pushed. The only whole-store grant
+    /// visibility in the agent — every failure mode is an unstructured
+    /// `AgentError::Failure` so a prober without the token cannot even
+    /// distinguish "agent without token" from "unknown extension".
+    async fn handle_ui_status(
+        &self,
+        extension: &Extension,
+    ) -> Result<Option<Extension>, AgentError> {
+        use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
+        use subtle::ConstantTimeEq;
+
+        let req: UiStatusReq =
+            serde_json::from_slice(extension.details.as_ref()).map_err(|_| AgentError::Failure)?;
+        // Constant-time token compare, same idiom as `unlock()`. A
+        // CLI-started agent has no token and refuses every request.
+        let authorized = match (
+            &self.ui_token,
+            BASE64_URL_SAFE_NO_PAD.decode(&req.token),
+        ) {
+            (Some(expected), Ok(candidate)) if candidate.len() == 32 => {
+                expected.ct_eq(candidate.as_slice()).into()
+            }
+            _ => false,
+        };
+        if !authorized {
+            return Err(AgentError::Failure);
+        }
+
+        let revoked = match req.action.as_str() {
+            crate::core::UI_STATUS_ACTION_STATUS => None,
+            // Authority-reducing only: reuses the linearized revoker, so the
+            // epoch advances even when the store is empty and an in-flight
+            // prompt cannot recreate a revoked grant. May wait while a live
+            // permit holds the security gate — the shell shows "waiting for
+            // the in-flight approval".
+            crate::core::UI_STATUS_ACTION_REVOKE_ALL => {
+                Some(self.authorization.invalidate_all().await)
+            }
+            _ => return Err(AgentError::Failure),
+        };
+        let res = UiStatusRes {
+            agent_version: env!("VT_VERSION").to_string(),
+            locked: self.locked.load(Ordering::Acquire),
+            sign_ttl_secs: self.cache_ttls.sign_secs,
+            decrypt_ttl_secs: self.cache_ttls.decrypt_secs,
+            idle_timeout_secs: self.idle_timeout_secs,
+            run_allow_len: self.run_allow.len(),
+            audit_push: self.audit_push.enabled,
+            revoked,
+            grants: self.authorization.snapshot().await,
+        };
+        let bytes = serde_json::to_vec(&res).map_err(|e| agent_err(e.into()))?;
+        Ok(Some(Extension {
+            name: extension.name.clone(),
+            details: Unparsed::from(bytes),
+        }))
     }
 
     /// Touch-ID-gated local command launcher. Every call prompts — no auth
@@ -1999,7 +2401,7 @@ impl VtSshSession {
     async fn handle_run(
         &self,
         decrypted: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         let req: RunReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
@@ -2039,6 +2441,11 @@ impl VtSshSession {
         let argv_for_prompt = sanitize_prompt(&argv_joined, RUN_PROMPT_ARGV_MAX);
         let exe_display = sanitize_prompt(&resolved.display().to_string(), 160);
         let mut auth_message = header_with_who("run on this Mac", "from", &who);
+        // The vt relay refuses run@vt, so the relay marker is a dead path
+        // today — kept for uniformity with the other extension prompts as
+        // cheap insurance against a future relay-filter change.
+        self.append_relay_origin(&mut auth_message);
+        self.append_caller_line(&mut auth_message);
         auth_message.push_str("\nexe: ");
         auth_message.push_str(&exe_display);
         auth_message.push_str("\nargv: ");
@@ -2051,43 +2458,47 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
-        // NEVER cache. run@vt is treated like auth@vt — every call prompts
-        // because a forwarded agent socket is shared across all remote
-        // sessions, and any cache here would let one session's approval
-        // be reused by another to run arbitrary allowlisted programs.
-        // Prompt serialization (one dialog at a time) is inside
-        // `authenticate_serialized`, shared with every other prompting path.
-        // run@vt: exe + argv joined as the audit `command` (reuses the prompt
-        // builders above). All emit points carry it.
+        // Validation, allowlist resolution, and canonicalization above all run
+        // before authorization. run@vt uses the shared engine but an explicit
+        // Fresh policy, so every invocation still requires a human approval.
         let run_command = format!("exe: {}\nargv: {}", exe_display, argv_for_prompt);
         let run_reason = req.reason.as_deref().unwrap_or("");
-        let t0 = Instant::now();
-        let outcome = self.authenticate_serialized(&auth_message).await;
-        let latency_ms = t0.elapsed().as_millis() as u64;
-        match outcome {
-            AuthOutcome::Success(_) => {}
-            AuthOutcome::Rejected => {
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::fresh(
+                GrantScope::fresh(Operation::Run),
+                auth_message,
+            ))
+            .await
+        {
+            Ok(permit) => permit,
+            Err(failure) => {
                 self.emit_audit(
-                    "run", "rejected", &req.host, &req.meta, &run_command, run_reason, 0,
-                    latency_ms,
+                    "run",
+                    failure.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    &run_command,
+                    run_reason,
+                    0,
+                    failure.latency_ms(),
+                    self.audit_ctx(),
                 );
-                return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
+                return Err(authorization_failure_wire(&failure));
             }
-            AuthOutcome::Unavailable(reason) => {
-                tracing::warn!("run@vt unavailable: {:?}", reason);
-                let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
-                    .unwrap_or(ErrKind::Generic);
-                self.emit_audit(
-                    "run", "unavailable", &req.host, &req.meta, &run_command, run_reason, 0,
-                    latency_ms,
-                );
-                return Err((kind, auth_outcome_detail(kind)));
-            }
-        }
+        };
         // Q5: emit `approved` at the human tap, BEFORE the spawn attempt, so a
         // denied launch (below) is distinguishable from a failed one (two rows).
         self.emit_audit(
-            "run", "approved", &req.host, &req.meta, &run_command, run_reason, 0, latency_ms,
+            "run",
+            permit.decision().audit_outcome(),
+            &req.host,
+            &req.meta,
+            &run_command,
+            run_reason,
+            0,
+            permit.latency_ms(),
+            self.audit_ctx(),
         );
 
         // Spawn detached. `setsid` makes the child a new session leader so it
@@ -2103,7 +2514,15 @@ impl VtSshSession {
                 tracing::warn!("run@vt spawn failed: {}", e);
                 // Second row: the launch was approved but failed to spawn.
                 self.emit_audit(
-                    "run", "spawn_failed", &req.host, &req.meta, &run_command, run_reason, 0, 0,
+                    "run",
+                    "spawn_failed",
+                    &req.host,
+                    &req.meta,
+                    &run_command,
+                    run_reason,
+                    0,
+                    0,
+                    self.audit_ctx(),
                 );
                 return Err((ErrKind::Generic, Some(DETAIL_RUN_SPAWN_FAILED)));
             }
@@ -2116,9 +2535,10 @@ impl VtSshSession {
         );
 
         let result = RunRes { pid };
-        Ok(Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
+        let bytes = Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
             (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
-        })?))
+        })?);
+        Ok(HandlerSuccess::authorized(bytes, permit))
     }
 
     /// `sign@vt`: VT_AUTH-gated signing with a Keychain-held key, displaying vt
@@ -2127,15 +2547,15 @@ impl VtSshSession {
     /// auth-cipher envelope and carries human context. The private key never
     /// leaves the agent.
     ///
-    /// Shares the sign auth cache with the standard `SIGN_REQUEST` path (same
-    /// (context, fingerprint) key — both authorize "sign with this key"), so a
-    /// multi-host `vt ssh connect` fan-out costs one Touch ID within the TTL
-    /// instead of one per host. v1 always prompted; superseded by the cache
-    /// opt-in — mode `none` (default) restores per-request prompts.
+    /// Uses the same `Operation::Sign` grant store as standard `SIGN_REQUEST`.
+    /// Local callers get a kernel-verified workspace scope (one approval
+    /// covers a same-project multi-host fan-out); relay callers stay confined
+    /// to their connection. Duration `0` (the default) keeps per-request
+    /// prompts. See docs/authorization-scopes-v2.md §3.4.
     async fn handle_sign_vt(
         &self,
         decrypted: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> {
+    ) -> Result<HandlerSuccess, WireFailure> {
         use ssh_agent_lib::ssh_encoding::Decode;
 
         let req: SignReq = serde_json::from_slice(decrypted)
@@ -2170,6 +2590,7 @@ impl VtSshSession {
         let who = who_at_host(&req.meta.user, &req.host);
         let mut auth_message = header_with_who("ssh-sign", "for", &who);
         self.append_relay_origin(&mut auth_message);
+        self.append_caller_line(&mut auth_message);
         // sign@vt can name ANY agent key, so the prompt must say which one
         // (comment, else SHA256 fingerprint — same label rule as
         // `Session::sign`). This line is agent-derived truth (the requested
@@ -2183,6 +2604,17 @@ impl VtSshSession {
         } else {
             auth_message.push_str(&sanitize_prompt(privkey.comment(), 80));
         }
+        // Reuse line before the client-reported body/meta — same padding
+        // rationale as the relay origin marker.
+        let (scope, reuse_label) = self.sign_vt_scope(&fp_str, &req.meta.pwd);
+        let scope = scope.with_display(reuse_label.clone().unwrap_or_default());
+        append_reuse_line(&mut auth_message, &reuse_label, self.cache_ttls.sign_secs);
+        let audit_ctx = {
+            let mut ctx =
+                self.audit_ctx_scoped(scope.family(), &reuse_label, self.cache_ttls.sign_secs);
+            ctx.key_fp = fp_str.clone();
+            ctx
+        };
         let body = sanitize_prompt_multiline(
             &req.command,
             PROMPT_COMMAND_MAX_LINE_LEN,
@@ -2194,42 +2626,44 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
-        // Cache-aware authorization (same cache + double-check semantics as
-        // `Session::sign`). Distinguish reject vs unavailable so the client
-        // gets the right ErrKind (AuthRejected => no fallback, G3).
-        let t0 = Instant::now();
-        let decision = self
-            .check_or_prompt_auth(&fp_str, &req.meta.pwd, &auth_message)
-            .await;
-        let latency_ms = if matches!(decision, AuthDecision::CacheHit) {
-            0
-        } else {
-            t0.elapsed().as_millis() as u64
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::new(
+                vec![scope],
+                ReusePolicy::from_ttl_secs(self.cache_ttls.sign_secs),
+                auth_message,
+            ))
+            .await
+        {
+            Ok(permit) => {
+                self.emit_audit(
+                    "ssh-sign",
+                    permit.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    &req.command,
+                    "",
+                    0,
+                    permit.latency_ms(),
+                    audit_ctx,
+                );
+                permit
+            }
+            Err(failure) => {
+                self.emit_audit(
+                    "ssh-sign",
+                    failure.decision().audit_outcome(),
+                    &req.host,
+                    &req.meta,
+                    &req.command,
+                    "",
+                    0,
+                    failure.latency_ms(),
+                    audit_ctx,
+                );
+                return Err(authorization_failure_wire(&failure));
+            }
         };
-        // Audit the decision (op_kind="ssh-sign", same as the CF ceremony sign
-        // path) — without this, agent-side `vt ssh connect` signing left no
-        // audit row, a visibility gap vs every other handler.
-        self.emit_audit(
-            "ssh-sign",
-            decision.outcome(),
-            &req.host,
-            &req.meta,
-            &req.command,
-            "",
-            0,
-            latency_ms,
-        );
-        match decision {
-            AuthDecision::CacheHit | AuthDecision::Approved => {}
-            AuthDecision::Rejected => {
-                return Err((ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)));
-            }
-            AuthDecision::Unavailable(reason) => {
-                let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
-                    .unwrap_or(ErrKind::Generic);
-                return Err((kind, auth_outcome_detail(kind)));
-            }
-        }
 
         let sig = sign_data_with_privkey(&privkey, &req.data, req.flags)
             .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_FAILED)))?;
@@ -2237,10 +2671,31 @@ impl VtSshSession {
             algorithm: sig.algorithm().to_string(),
             signature: sig.as_bytes().to_vec(),
         };
-        serde_json::to_vec(&res)
+        let bytes = serde_json::to_vec(&res)
             .map(Zeroizing::new)
-            .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))
+            .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?;
+        let note = cache_hit_note_for(&permit, "sign", &reuse_label);
+        Ok(HandlerSuccess::authorized(bytes, permit).with_cache_hit_note(note))
     }
+}
+
+/// Finish an agent lock transition independently of the requesting
+/// connection. Dropping the returned JoinHandle detaches rather than cancels
+/// the task, and the owned transition guard prevents a concurrent unlock from
+/// publishing `locked = false` before keys and grants are cleared.
+fn spawn_lock_finalizer(
+    transition: tokio::sync::OwnedMutexGuard<()>,
+    keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
+    authorization: Arc<AuthorizationEngine>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut keys = keys.write().await;
+        keys.clear();
+        drop(keys);
+
+        authorization.invalidate_all().await;
+        drop(transition);
+    })
 }
 
 /// Spawn `exe` with `args` as a detached background process. Returns the
@@ -2328,6 +2783,8 @@ const DETAIL_LEGACY_DISABLED: &str = "legacy decryption disabled (--no-legacy-de
 const DETAIL_AUTH_REJECTED: &str = "authentication was declined";
 const DETAIL_SCREEN_LOCKED: &str = "screen is locked";
 const DETAIL_NO_GUI: &str = "no active GUI session";
+const DETAIL_AUTH_INVALIDATED: &str = "authorization state changed; retry";
+const DETAIL_AUTH_INVALID_TTL: &str = "authorization cache duration is too large";
 const DETAIL_INTERNAL_SERIALIZE: &str = "agent failed to serialize response";
 // run@vt-specific failure reasons. All strings are static program info
 // (no host/argv/user data) and therefore safe to surface to a remote peer.
@@ -2374,6 +2831,79 @@ fn auth_outcome_detail(kind: ErrKind) -> Option<&'static str> {
     }
 }
 
+type WireFailure = (ErrKind, Option<&'static str>);
+
+struct HandlerSuccess {
+    bytes: Zeroizing<Vec<u8>>,
+    authorization: Option<AuthorizationPermit>,
+    /// `(operation, scope display)` when the permit's decision was a cache
+    /// hit. The dispatcher fires the transparency notification from this
+    /// AFTER `commit()` — never while the permit (and its security read
+    /// guard) is live (docs/app-bundle.md §3).
+    cache_hit_note: Option<(&'static str, String)>,
+}
+
+impl HandlerSuccess {
+    fn authorized(bytes: Zeroizing<Vec<u8>>, authorization: AuthorizationPermit) -> Self {
+        Self {
+            bytes,
+            authorization: Some(authorization),
+            cache_hit_note: None,
+        }
+    }
+
+    fn without_authorization(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self {
+            bytes,
+            authorization: None,
+            cache_hit_note: None,
+        }
+    }
+
+    fn with_cache_hit_note(mut self, note: Option<(&'static str, String)>) -> Self {
+        self.cache_hit_note = note;
+        self
+    }
+}
+
+/// Build the dispatcher's post-commit notification note for a permit whose
+/// decision was `CacheHit`. `None` label (a fresh basis can't hit — defensive)
+/// degrades to the family-free "cached scope".
+fn cache_hit_note_for(
+    permit: &AuthorizationPermit,
+    operation: &'static str,
+    reuse_label: &Option<String>,
+) -> Option<(&'static str, String)> {
+    (permit.decision() == Decision::CacheHit).then(|| {
+        (
+            operation,
+            reuse_label.clone().unwrap_or_else(|| "cached scope".to_string()),
+        )
+    })
+}
+
+fn authorization_failure_wire(failure: &AuthorizationFailure) -> WireFailure {
+    match failure.decision() {
+        Decision::Rejected => (ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)),
+        Decision::Unavailable(reason) => {
+            let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
+                .unwrap_or(ErrKind::Generic);
+            (kind, auth_outcome_detail(kind))
+        }
+        Decision::Invalidated => (ErrKind::Transient, Some(DETAIL_AUTH_INVALIDATED)),
+        Decision::CacheHit | Decision::Approved(_) => {
+            (ErrKind::Generic, Some(DETAIL_AUTH_INVALIDATED))
+        }
+    }
+}
+
+async fn commit_authorization(permit: AuthorizationPermit) -> Result<(), WireFailure> {
+    permit.commit().await.map_err(|error| match error {
+        CommitError::Invalidated => (ErrKind::Transient, Some(DETAIL_AUTH_INVALIDATED)),
+        CommitError::InvalidTtl => (ErrKind::Generic, Some(DETAIL_AUTH_INVALID_TTL)),
+    })
+}
+
 // ---- Envelope serialization helpers -----------------------------------------
 
 /// Concrete shape used to serialize an `err` envelope. Mirrors the JSON
@@ -2390,16 +2920,17 @@ struct ErrEnvelope {
 #[async_trait]
 impl Session for VtSshSession {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        let locked = self.locked.read().await;
-        if *locked {
+        if self.locked.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
-        drop(locked);
 
         // Reload keys from keychain if cleared by idle timeout.
         // Listing public keys is not security-sensitive; Touch ID is
         // enforced on sign/extension requests.
         self.ensure_keys_loaded().await?;
+        if self.locked.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
 
         let keys = self.keys.read().await;
         let identities = keys
@@ -2413,11 +2944,9 @@ impl Session for VtSshSession {
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        let locked = self.locked.read().await;
-        if *locked {
+        if self.locked.load(Ordering::Acquire) {
             return Err(AgentError::Failure);
         }
-        drop(locked);
 
         self.ensure_keys_loaded().await?;
         self.touch_activity().await;
@@ -2425,7 +2954,7 @@ impl Session for VtSshSession {
         let fp_str = fingerprint_str(&request.pubkey);
 
         // Clone the key out and drop the read-lock BEFORE the Touch ID prompt.
-        // Holding the `keys` read-guard across check_or_prompt_auth (which can
+        // Holding the `keys` read-guard across authorization (which can
         // block on a human for up to ~30s) would starve every writer
         // (add/remove/unlock) for the prompt's duration — a non-VT_AUTH peer can
         // trigger SIGN_REQUESTs to weaponize this. (Mirrors handle_sign_vt.)
@@ -2434,54 +2963,131 @@ impl Session for VtSshSession {
             keys.get(&fp_str).ok_or(AgentError::Failure)?.clone()
         };
         let comment = privkey.comment();
-        let proc_name = self
-            .peer_pid
-            .and_then(proc_info::get_proc_path)
-            .and_then(|p| p.rsplit('/').next().map(String::from))
-            .unwrap_or_default();
+        // Sanitized like the sign@vt key line: the comment is user-set at add
+        // time, so it may not inject fake prompt lines.
         let key_label = if comment.is_empty() {
             fp_str.clone()
         } else {
-            comment.to_string()
+            sanitize_prompt(comment, 80)
         };
-        let auth_message = if proc_name.is_empty() {
-            format!("sign: {}", key_label)
-        } else {
-            format!("sign: {} ({})", key_label, proc_name)
+        // Same layout as the sign@vt prompt (header, then key/caller/dest/
+        // reuse truth lines) so the two sign paths read as one UI — raw signs
+        // just carry no client meta. The caller line replaces the old
+        // `sign: key (proc)` parenthetical.
+        let mut auth_message = format!("ssh-sign\nkey: {}", key_label);
+        self.append_caller_line(&mut auth_message);
+        let (scope, reuse_label) = self.raw_sign_scope(&fp_str);
+        // The reuse-line label doubles as the grant's display string
+        // (ui-status snapshots, cache-hit notifications).
+        let scope = scope.with_display(reuse_label.clone().unwrap_or_default());
+        // Destination truth line BEFORE the reuse line: with the default
+        // TTL of 0 the reuse line never appears, and the verified
+        // session-bind destination must still be shown (a non-relay bound
+        // peer's reuse label IS the destination label, so `reuse_label`
+        // being present means the line below would be a duplicate).
+        self.append_destination_line(&mut auth_message, reuse_label.is_some());
+        append_reuse_line(&mut auth_message, &reuse_label, self.cache_ttls.sign_secs);
+        let audit_ctx = {
+            let mut ctx =
+                self.audit_ctx_scoped(scope.family(), &reuse_label, self.cache_ttls.sign_secs);
+            ctx.key_fp = fp_str.clone();
+            ctx.dest = self.audit_destination();
+            ctx
         };
 
-        // Check auth cache or prompt Touch ID. Plain agent-protocol signs
-        // carry no ClientMeta, so the pwd key component is empty.
-        let t0 = Instant::now();
-        let decision = self.check_or_prompt_auth(&fp_str, "", &auth_message).await;
-        let latency_ms = if matches!(decision, AuthDecision::CacheHit) {
-            0
-        } else {
-            t0.elapsed().as_millis() as u64
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::new(
+                vec![scope],
+                ReusePolicy::from_ttl_secs(self.cache_ttls.sign_secs),
+                auth_message.clone(),
+            ))
+            .await
+        {
+            Ok(permit) => {
+                self.emit_audit(
+                    "sign",
+                    permit.decision().audit_outcome(),
+                    "",
+                    &crate::core::ClientMeta::default(),
+                    &auth_message,
+                    "",
+                    0,
+                    permit.latency_ms(),
+                    audit_ctx,
+                );
+                permit
+            }
+            Err(failure) => {
+                self.emit_audit(
+                    "sign",
+                    failure.decision().audit_outcome(),
+                    "",
+                    &crate::core::ClientMeta::default(),
+                    &auth_message,
+                    "",
+                    0,
+                    failure.latency_ms(),
+                    audit_ctx,
+                );
+                return Err(AgentError::Failure);
+            }
         };
-        // Session::sign is the raw SSH auth path (op_kind='sign', distinct from
-        // auth@vt) — it carries no vt ClientMeta, so use the prompt label as the
-        // audit `command` and leave meta empty.
-        self.emit_audit(
-            "sign",
-            decision.outcome(),
-            "",
-            &crate::core::ClientMeta::default(),
-            &auth_message,
-            "",
-            0,
-            latency_ms,
-        );
-        if !decision.is_ok() {
-            return Err(AgentError::Failure);
-        }
 
-        sign_data_with_privkey(&privkey, &request.data, request.flags)
+        let signature = sign_data_with_privkey(&privkey, &request.data, request.flags)?;
+        let cache_hit_note = cache_hit_note_for(&permit, "sign", &reuse_label);
+        let reuse_remaining = permit.reuse_remaining();
+        permit
+            .commit()
+            .await
+            .map_err(|_| AgentError::Failure)?;
+        self.fire_cache_hit_note(cache_hit_note, reuse_remaining);
+        Ok(signature)
     }
 
     async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
-        let locked = self.locked.read().await;
-        if *locked {
+        // `session-bind@openssh.com` is a standard OpenSSH extension: plain
+        // SSH-wire bytes, never VT_AUTH-encrypted. It MUST be intercepted
+        // before the lock check and the keychain/auth-cipher path below —
+        // binding grants nothing by itself, must work on connections opened
+        // while the agent is locked, and would otherwise fail to decrypt so
+        // destination caching would silently never engage. It also must not
+        // touch the idle clock — it precedes any human-gated operation. A
+        // bind that fails to decode (host certificate, unsupported curve) is
+        // refused without changing state, mirroring `BindState::apply`. See
+        // docs/authorization-scopes-v2.md §3.1.
+        if extension.name.as_str() == "session-bind@openssh.com" {
+            let outcome = match extension.parse_message::<SessionBind>() {
+                Ok(Some(bind)) => {
+                    let applied = self.bind_state.apply(&bind);
+                    // The label is display-only; compute it once per bind
+                    // (≤ MAX_SESSION_BINDS per connection) instead of
+                    // re-reading known_hosts on every sign request.
+                    self.destination_label = self
+                        .bind_state
+                        .destination()
+                        .map(|(_, hostkey)| destination_label(hostkey));
+                    applied
+                }
+                _ => Err(()),
+            };
+            return match outcome {
+                Ok(()) => Ok(None), // plain SSH_AGENT_SUCCESS
+                Err(()) => Err(AgentError::Failure),
+            };
+        }
+        // `ui-status@vt` is the shell's token-gated plaintext channel
+        // (docs/app-bundle.md §5). Like session-bind it precedes the lock
+        // check (a locked agent must still report `locked: true`), the
+        // keychain/auth-cipher path (the shell holds no VT_AUTH), and the
+        // idle-clock touch (it is meant to be polled; keeping the agent
+        // "active" would defeat the idle revocation). A missing or wrong
+        // token fails unstructured — indistinguishable from an unknown
+        // extension.
+        if extension.name.as_str() == EXT_UI_STATUS {
+            return self.handle_ui_status(&extension).await;
+        }
+        if self.locked.load(Ordering::Acquire) {
             // The lock check fires before keychain ciphers are derived, so
             // we have no `auth_cipher` to encrypt a structured envelope
             // with. Surface as an unstructured SSH-wire failure — clients
@@ -2489,7 +3095,6 @@ impl Session for VtSshSession {
             // run `ssh-add -X`. See docs/structured-errors.md.
             return Err(AgentError::Failure);
         }
-        drop(locked);
 
         // Only handle vt custom protocol extensions; ignore standard SSH extensions
         if !matches!(
@@ -2538,7 +3143,7 @@ impl Session for VtSshSession {
         // never returns `AgentError` for vt-level failures; only true
         // transport-layer failures (e.g. an internal serialize call) bubble
         // up as unstructured.
-        let dispatch: Result<Zeroizing<Vec<u8>>, (ErrKind, Option<&'static str>)> =
+        let dispatch: Result<HandlerSuccess, WireFailure> =
             match extension.name.as_str() {
                 EXT_ENCRYPT => {
                     self.handle_encrypt(&decrypted, &store, &passphrase_cipher)
@@ -2559,21 +3164,63 @@ impl Session for VtSshSession {
         // serialized inner body (which carries DEKs for encrypt/decrypt) is
         // only ever held in `Zeroizing` buffers — no intermediate
         // `serde_json::Value` allocation that wouldn't be wiped on drop.
-        let envelope_bytes: Zeroizing<Vec<u8>> = match dispatch {
-            Ok(inner_bytes) => Zeroizing::new(wrap_ok_envelope(&inner_bytes)),
-            Err((kind, detail)) => Zeroizing::new(
-                serde_json::to_vec(&ErrEnvelope {
-                    v: WIRE_VERSION,
-                    status: "err",
-                    kind,
-                    detail,
-                })
-                .map_err(|e| agent_err(e.into()))?,
+        let (envelope_bytes, authorization, cache_hit_note): (
+            Zeroizing<Vec<u8>>,
+            Option<AuthorizationPermit>,
+            Option<(&'static str, String)>,
+        ) = match dispatch {
+            Ok(success) => (
+                Zeroizing::new(wrap_ok_envelope(&success.bytes)),
+                success.authorization,
+                success.cache_hit_note,
+            ),
+            Err((kind, detail)) => (
+                Zeroizing::new(
+                    serde_json::to_vec(&ErrEnvelope {
+                        v: WIRE_VERSION,
+                        status: "err",
+                        kind,
+                        detail,
+                    })
+                    .map_err(|e| agent_err(e.into()))?,
+                ),
+                None,
+                None,
             ),
         };
 
-        // Encrypt envelope with auth cipher.
-        let encrypted_response = auth_cipher.encrypt(&envelope_bytes).map_err(agent_err)?;
+        // Encrypt the successful response before committing a pending grant.
+        // If envelope encryption fails, HandlerSuccess drops its non-cloneable
+        // permit and no approval becomes reusable.
+        //
+        // The commit-failure arm below is defensive: while this permit is
+        // alive its security read guard blocks epoch advancement, so
+        // `CommitError::Invalidated` cannot fire today. If a future change
+        // releases the guard before this point, note that the operation has
+        // already executed — a client retrying the resulting Transient error
+        // would re-run a non-idempotent handler (run@vt spawns twice).
+        let mut encrypted_response = auth_cipher.encrypt(&envelope_bytes).map_err(agent_err)?;
+        if let Some(permit) = authorization {
+            // Captured before commit consumes the permit; used only after the
+            // guard is released — a blocking notify while the permit is live
+            // would stall revocation (docs/app-bundle.md §3).
+            let reuse_remaining = permit.reuse_remaining();
+            if let Err((kind, detail)) = commit_authorization(permit).await {
+                tracing::warn!("authorization commit invalidated after operation success");
+                let error_envelope = Zeroizing::new(
+                    serde_json::to_vec(&ErrEnvelope {
+                        v: WIRE_VERSION,
+                        status: "err",
+                        kind,
+                        detail,
+                    })
+                    .map_err(|e| agent_err(e.into()))?,
+                );
+                encrypted_response = auth_cipher.encrypt(&error_envelope).map_err(agent_err)?;
+            } else {
+                self.fire_cache_hit_note(cache_hit_note, reuse_remaining);
+            }
+        }
 
         Ok(Some(Extension {
             name: extension.name,
@@ -2582,11 +3229,9 @@ impl Session for VtSshSession {
     }
 
     async fn add_identity(&mut self, identity: AddIdentity) -> Result<(), AgentError> {
-        let locked = self.locked.read().await;
-        if *locked {
+        if self.locked.load(Ordering::Acquire) {
             return Err(AgentError::Failure);
         }
-        drop(locked);
 
         match identity.credential {
             Credential::Key { privkey, comment } => {
@@ -2687,21 +3332,28 @@ impl Session for VtSshSession {
     }
 
     async fn lock(&mut self, passphrase: String) -> Result<(), AgentError> {
-        let mut locked = self.locked.write().await;
-        if *locked {
+        let transition = Arc::clone(&self.lock_transition).lock_owned().await;
+        if self.locked.load(Ordering::Acquire) {
             return Err(AgentError::Failure);
         }
-        *locked = true;
         let mut lp = self.lock_passphrase.write().await;
         *lp = Some(hash_lock_passphrase(&passphrase));
+        // No await between publishing the locked state and spawning the
+        // finalizer: cancellation can only happen once the finalizer owns the
+        // transition guard and is guaranteed to keep running.
+        self.locked.store(true, Ordering::Release);
+        drop(lp);
 
-        // Clear keys from memory on lock
-        let mut keys = self.keys.write().await;
-        keys.clear();
-
-        // Clear both auth caches on lock.
-        self.sign_auth_cache.write().await.clear();
-        self.decrypt_auth_cache.write().await.clear();
+        // Wait for outstanding permits, then advance the epoch even if no
+        // grant exists. The finalizer keeps running if this connection drops.
+        let finalizer = spawn_lock_finalizer(
+            transition,
+            Arc::clone(&self.keys),
+            Arc::clone(&self.authorization),
+        );
+        finalizer
+            .await
+            .map_err(|error| agent_err(anyhow::anyhow!("lock finalizer failed: {error}")))?;
 
         tracing::info!("Agent locked");
         Ok(())
@@ -2711,8 +3363,8 @@ impl Session for VtSshSession {
         use subtle::ConstantTimeEq;
         use zeroize::Zeroize;
 
-        let mut locked = self.locked.write().await;
-        if !*locked {
+        let _transition = self.lock_transition.lock().await;
+        if !self.locked.load(Ordering::Acquire) {
             return Err(AgentError::Failure);
         }
         let candidate = hash_lock_passphrase(&passphrase);
@@ -2725,13 +3377,6 @@ impl Session for VtSshSession {
         if !matches {
             return Err(AgentError::Failure);
         }
-        *locked = false;
-        let mut lp = self.lock_passphrase.write().await;
-        if let Some(ref mut hash) = *lp {
-            hash.zeroize();
-        }
-        *lp = None;
-
         // Reload keys after unlock
         match load_all_keys() {
             Ok(loaded) => {
@@ -2742,6 +3387,20 @@ impl Session for VtSshSession {
                 tracing::warn!("Failed to reload keys after unlock: {}", e);
             }
         }
+
+        // A cancelled lock request may have published the locked bit before
+        // its caller disappeared. Revoke again before unlocking so no grant
+        // from before that transition can ever become live again.
+        self.authorization.invalidate_all().await;
+
+        // Keep the passphrase intact across every await above. If this future
+        // is cancelled, the agent remains locked and a later unlock can retry.
+        let mut lp = self.lock_passphrase.write().await;
+        if let Some(ref mut hash) = *lp {
+            hash.zeroize();
+        }
+        *lp = None;
+        self.locked.store(false, Ordering::Release);
 
         tracing::info!("Agent unlocked");
         Ok(())
@@ -2756,13 +3415,27 @@ impl Session for VtSshSession {
 pub async fn run_ssh_agent(
     print_env: bool,
     idle_timeout_secs: u64,
-    sign_cache: AuthCacheConfig,
-    decrypt_cache: AuthCacheConfig,
+    cache_ttls: AuthCacheTtls,
     disable_legacy_decrypt: bool,
     run_allow: RunAllowlist,
     audit_push: Arc<AuditPushConfig>,
+    notify_cache_hits: bool,
+    ui_token: Option<[u8; 32]>,
 ) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
+
+    // Transparent wrap v1->v2 upgrade (docs/app-bundle.md §2): flock-guarded,
+    // touches only encrypted_passphrase + wrap_v. Failure is non-fatal here —
+    // a store bound to a moved binary path surfaces the same error with a
+    // clearer remedy below when keys are loaded.
+    match super::security::upgrade_wrap_v2_if_needed() {
+        Ok(true) => tracing::info!("master-key wrap upgraded to v2 (path-independent)"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            "master-key wrap v2 upgrade did not run: {e:#} — run `vt secret rebind` \
+             (with --old-bin-path if the binary moved)"
+        ),
+    }
 
     // Load keys (cipher is loaded and dropped inside load_all_keys)
     let keys = load_all_keys()?;
@@ -2791,11 +3464,13 @@ pub async fn run_ssh_agent(
     let audit_enabled = audit_push.enabled;
     let factory = VtSshAgentFactory::new(
         keys,
-        sign_cache,
-        decrypt_cache,
+        cache_ttls,
         disable_legacy_decrypt,
         run_allow,
         audit_push,
+        notify_cache_hits,
+        ui_token,
+        idle_timeout_secs,
     );
     if audit_enabled {
         tracing::info!("Agent audit push enabled");
@@ -2811,14 +3486,13 @@ pub async fn run_ssh_agent(
 
     // Spawn idle sweeper that clears keys from memory after inactivity.
     // Judged on both clocks (see `idle_exceeded`) so time asleep counts.
-    // Clearing keys also clears both auth caches: "idle long enough to drop
+    // Clearing keys also invalidates unified authorization grants: "idle long enough to drop
     // keys" implies the human is gone, so standing grants must not survive
     // the silent keychain reload that serves the next request.
     let sweeper_keys = Arc::clone(&factory.keys);
     let sweeper_last = Arc::clone(&factory.last_activity);
     let sweeper_idle_cleared = Arc::clone(&factory.idle_cleared);
-    let sweeper_sign_cache = Arc::clone(&factory.sign_auth_cache);
-    let sweeper_decrypt_cache = Arc::clone(&factory.decrypt_auth_cache);
+    let sweeper_authorization = Arc::clone(&factory.authorization);
     let sweeper_timeout = idle_timeout;
     tokio::spawn(async move {
         let check_interval = Duration::from_secs(60).min(sweeper_timeout);
@@ -2835,86 +3509,70 @@ pub async fn run_ssh_agent(
                 // Grants must not outlive the idle window even when no SSH
                 // keys are loaded (decrypt-only agents), so the cache flush
                 // is unconditional — not tied to the keys branch below.
-                let dropped = sweeper_sign_cache.write().await.clear()
-                    + sweeper_decrypt_cache.write().await.clear();
+                let dropped = sweeper_authorization.invalidate_all().await;
                 if dropped > 0 {
                     tracing::info!("Idle timeout, dropped {} auth cache grants", dropped);
                 }
-                let mut keys = sweeper_keys.write().await;
-                if !keys.is_empty() {
-                    let count = keys.len();
-                    keys.clear();
-                    let mut idle_cleared = sweeper_idle_cleared.write().await;
-                    *idle_cleared = true;
+                let cleared = clear_keys_for_reload(&sweeper_keys, &sweeper_idle_cleared).await;
+                if cleared > 0 {
                     tracing::info!(
                         "Idle timeout ({} min), cleared {} keys from memory",
                         sweeper_timeout.as_secs() / 60,
-                        count
+                        cleared
                     );
                 }
             }
         }
     });
 
-    // Spawn the cache watcher: flushes both auth caches when the screen
-    // locks or the system wakes from sleep (sudo-timestamp semantics), and
-    // sweeps expired entries periodically. See `watcher_should_clear`.
-    if sign_cache.mode != AuthCacheMode::None || decrypt_cache.mode != AuthCacheMode::None {
-        let watcher_sign = Arc::clone(&factory.sign_auth_cache);
-        let watcher_decrypt = Arc::clone(&factory.decrypt_auth_cache);
-        tokio::spawn(async move {
-            // `None` while there's nothing cached: the WindowServer poll is
-            // skipped, so no lock-state history exists. On the first tick
-            // with entries the unknown history defaults to "was interactive"
-            // — grants can only be created under an interactive screen
-            // (`authenticate` pre-checks session state), so finding the
-            // screen locked with live entries means it locked after the
-            // grant and the transition must fire.
-            let mut was_interactive: Option<bool> = None;
-            let mut prev_mono = Instant::now();
-            let mut prev_wall = SystemTime::now();
-            loop {
-                tokio::time::sleep(WATCHER_TICK).await;
-                let now_mono = Instant::now();
-                let now_wall = SystemTime::now();
-                let empty = watcher_sign.read().await.is_empty()
-                    && watcher_decrypt.read().await.is_empty();
-                if empty {
-                    // Nothing to flush — with 30-120s TTLs this is the common
-                    // case, so skip the CGSession poll entirely.
-                    was_interactive = None;
-                } else {
-                    let is_interactive = super::security::session_interactive_now();
-                    if watcher_should_clear(
-                        was_interactive.unwrap_or(true),
-                        is_interactive,
-                        now_mono.saturating_duration_since(prev_mono),
-                        now_wall.duration_since(prev_wall).ok(),
-                    ) {
-                        let dropped = watcher_sign.write().await.clear()
-                            + watcher_decrypt.write().await.clear();
-                        tracing::info!(
-                            "Auth caches cleared on screen lock / wake ({} grants dropped)",
-                            dropped
-                        );
-                    } else {
-                        watcher_sign.write().await.sweep_expired();
-                        watcher_decrypt.write().await.sweep_expired();
-                    }
-                    was_interactive = Some(is_interactive);
-                }
-                prev_mono = now_mono;
-                prev_wall = now_wall;
+    // Poll even while the grant store is empty. A human prompt deliberately
+    // creates no grant until its protected operation succeeds, so using store
+    // emptiness as a watcher shortcut would miss lock/wake invalidation while
+    // that prompt is in flight.
+    let watcher_authorization = Arc::clone(&factory.authorization);
+    let watcher_keys = Arc::clone(&factory.keys);
+    let watcher_idle_cleared = Arc::clone(&factory.idle_cleared);
+    tokio::spawn(async move {
+        let mut was_interactive = super::security::session_interactive_now();
+        let mut prev_mono = Instant::now();
+        let mut prev_wall = SystemTime::now();
+        loop {
+            tokio::time::sleep(WATCHER_TICK).await;
+            let now_mono = Instant::now();
+            let now_wall = SystemTime::now();
+            let is_interactive = super::security::session_interactive_now();
+            if watcher_should_clear(
+                was_interactive,
+                is_interactive,
+                now_mono.saturating_duration_since(prev_mono),
+                now_wall.duration_since(prev_wall).ok(),
+            ) {
+                let dropped = watcher_authorization.invalidate_all().await;
+                // §10 (C): lock/sleep must also wipe decrypted SSH keys from
+                // RAM, not just grants — screen lock does not otherwise clear
+                // them and (with a long idle timeout) they would linger.
+                // `ensure_keys_loaded` reloads silently on the next use once
+                // the screen is interactive again.
+                let cleared = clear_keys_for_reload(&watcher_keys, &watcher_idle_cleared).await;
+                tracing::info!(
+                    "Screen lock / wake: {} grants dropped, {} keys cleared from memory",
+                    dropped,
+                    cleared
+                );
+            } else {
+                watcher_authorization.sweep_expired().await;
             }
-        });
-        tracing::info!(
-            "Auth cache: sign(mode={}, ttl={}s) decrypt(mode={}, ttl={}s); auth@vt never cached",
-            sign_cache.mode,
-            sign_cache.ttl_secs,
-            decrypt_cache.mode,
-            decrypt_cache.ttl_secs,
-        );
-    }
+            was_interactive = is_interactive;
+            prev_mono = now_mono;
+            prev_wall = now_wall;
+        }
+    });
+    tracing::info!(
+        "Authorization: sign(ttl={}s) decrypt(ttl={}s) auth=fresh run=fresh (0 = always prompt; \
+         scopes: destination/workspace/connection — see docs/authorization-scopes-v2.md)",
+        cache_ttls.sign_secs,
+        cache_ttls.decrypt_secs,
+    );
 
     let listener = tokio::net::UnixListener::bind(&socket_path)?;
     tracing::info!(
@@ -2951,20 +3609,22 @@ pub async fn run_ssh_agent(
 /// Standalone entry point: runs the agent with env output.
 pub async fn start_ssh_agent(
     idle_timeout_secs: u64,
-    sign_cache: AuthCacheConfig,
-    decrypt_cache: AuthCacheConfig,
+    cache_ttls: AuthCacheTtls,
     disable_legacy_decrypt: bool,
     run_allow: RunAllowlist,
     audit_push: Arc<AuditPushConfig>,
+    notify_cache_hits: bool,
+    ui_token: Option<[u8; 32]>,
 ) -> Result<()> {
     run_ssh_agent(
         true,
         idle_timeout_secs,
-        sign_cache,
-        decrypt_cache,
+        cache_ttls,
         disable_legacy_decrypt,
         run_allow,
         audit_push,
+        notify_cache_hits,
+        ui_token,
     )
     .await
 }
@@ -2972,7 +3632,82 @@ pub async fn start_ssh_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::authorization::{
+        AuthorizationAuthenticator, AuthorizationValidator, ValidationError,
+    };
     use crate::core::session::AuthMethod;
+
+    struct TestAuthenticator;
+
+    #[async_trait]
+    impl AuthorizationAuthenticator for TestAuthenticator {
+        async fn authenticate(
+            &self,
+            _prompt: &str,
+            _revocation_pending: Arc<AtomicBool>,
+        ) -> AuthOutcome {
+            AuthOutcome::Success(AuthMethod::Biometric)
+        }
+    }
+
+    struct TestValidator;
+
+    impl AuthorizationValidator for TestValidator {
+        fn validate(
+            &self,
+            _revocation_pending: &AtomicBool,
+        ) -> std::result::Result<(), ValidationError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_lock_finalizer_holds_transition_and_clears_grants() {
+        let authorization =
+            AuthorizationEngine::new(Arc::new(TestAuthenticator), Arc::new(TestValidator));
+        let subject = (1, 2);
+        authorization
+            .authorize(AuthorizationRequest::new(
+                vec![GrantScope::sign(Some(subject), "cached", "")],
+                ReusePolicy::strict_ttl_secs(30),
+                "seed",
+            ))
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        let active = authorization
+            .authorize(AuthorizationRequest::new(
+                vec![GrantScope::sign(Some(subject), "active", "")],
+                ReusePolicy::strict_ttl_secs(30),
+                "active",
+            ))
+            .await
+            .unwrap();
+
+        let transition = Arc::new(Mutex::new(()));
+        let guard = Arc::clone(&transition).lock_owned().await;
+        let keys = Arc::new(RwLock::new(HashMap::<String, PrivateKey>::new()));
+        let finalizer =
+            spawn_lock_finalizer(guard, keys, Arc::clone(&authorization));
+        // Model cancellation of the connection waiting for lock() to finish.
+        // Tokio detaches the finalizer, which must retain the owned guard.
+        drop(finalizer);
+        assert!(transition.try_lock().is_err());
+
+        active.commit().await.unwrap();
+        let transition_guard = tokio::time::timeout(Duration::from_secs(1), transition.lock())
+            .await
+            .expect("detached lock finalizer did not complete");
+        drop(transition_guard);
+        assert_eq!(
+            authorization
+                .live_len(Operation::Sign, ScopeFamily::Connection, subject)
+                .await,
+            0
+        );
+    }
 
     // sign@vt's signing core: an Ed25519 PrivateKey signs `data` and the
     // signature verifies under its own public key, tagged `ssh-ed25519`. This is
@@ -3149,312 +3884,818 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         assert!(entries.is_empty());
     }
 
-    // --- AuthCacheMode tests ---
+    // --- Activity-scope classification tests (V2) ---
 
-    #[test]
-    fn test_auth_cache_mode_from_str() {
-        assert_eq!(
-            AuthCacheMode::from_str("none").unwrap(),
-            AuthCacheMode::None
-        );
-        assert_eq!(
-            AuthCacheMode::from_str("global").unwrap(),
-            AuthCacheMode::Global
-        );
-        assert_eq!(
-            AuthCacheMode::from_str("per-session").unwrap(),
-            AuthCacheMode::PerSession
-        );
-        assert_eq!(
-            AuthCacheMode::from_str("per_session").unwrap(),
-            AuthCacheMode::PerSession
-        );
-        assert_eq!(
-            AuthCacheMode::from_str("session").unwrap(),
-            AuthCacheMode::PerSession
-        );
-        assert_eq!(
-            AuthCacheMode::from_str("per-app").unwrap(),
-            AuthCacheMode::PerApp
-        );
-        assert_eq!(
-            AuthCacheMode::from_str("per_app").unwrap(),
-            AuthCacheMode::PerApp
-        );
-        assert_eq!(
-            AuthCacheMode::from_str("app").unwrap(),
-            AuthCacheMode::PerApp
-        );
+    fn test_session(sign_ttl: u64, decrypt_ttl: u64) -> VtSshSession {
+        let locked = Arc::new(AtomicBool::new(false));
+        VtSshSession {
+            keys: Arc::new(RwLock::new(HashMap::new())),
+            last_activity: Arc::new(RwLock::new((Instant::now(), SystemTime::now()))),
+            locked: Arc::clone(&locked),
+            lock_transition: Arc::new(Mutex::new(())),
+            lock_passphrase: Arc::new(RwLock::new(None)),
+            idle_cleared: Arc::new(RwLock::new(false)),
+            authorization: new_engine(locked),
+            cache_ttls: AuthCacheTtls {
+                sign_secs: sign_ttl,
+                decrypt_secs: decrypt_ttl,
+            },
+            run_allow: Arc::new(RunAllowlist::parse("").unwrap()),
+            audit_push: Arc::new(AuditPushConfig::disabled()),
+            peer_pid: Some(std::process::id() as i32),
+            peer_exe: Some("test".to_string()),
+            peer_is_vt_relay: false,
+            peer_is_ssh_client: false,
+            connection_subject: None,
+            // Pre-set: the lazy resolver would otherwise resolve the test
+            // process's real repo workspace.
+            workspace: std::sync::OnceLock::from(WorkspaceResolution::NoRoot),
+            bind_state: BindState::Unbound,
+            destination_label: None,
+            disable_legacy_decrypt: false,
+            notify_cache_hits: false,
+            ui_token: None,
+            idle_timeout_secs: 1800,
+        }
+    }
+
+    fn test_workspace() -> Workspace {
+        Workspace {
+            subject: (7, 42),
+            root: "/repo".to_string(),
+        }
+    }
+
+    fn test_bind(privkey: &PrivateKey, session_id: &[u8], forwarding: bool) -> SessionBind {
+        let signature = sign_data_with_privkey(privkey, session_id, 0).expect("sign session id");
+        SessionBind {
+            host_key: privkey.public_key().key_data().clone(),
+            session_id: session_id.to_vec(),
+            signature,
+            is_forwarding: forwarding,
+        }
+    }
+
+    fn test_hostkey() -> PrivateKey {
+        PrivateKey::random(&mut rand::rngs::OsRng, Algorithm::Ed25519).expect("gen key")
     }
 
     #[test]
-    fn test_auth_cache_mode_from_str_case_insensitive() {
+    fn bind_state_valid_bind_exposes_destination() {
+        let host = test_hostkey();
+        let mut state = BindState::Unbound;
+        assert!(state.apply(&test_bind(&host, b"sid-1", false)).is_ok());
+        let (wire, key) = state.destination().expect("destination-bound");
+        assert!(!wire.is_empty());
+        assert_eq!(fingerprint_str(key), fingerprint_str(host.public_key().key_data()));
+        // A second session id under the SAME key (re-KEX) keeps the binding.
+        assert!(state.apply(&test_bind(&host, b"sid-2", false)).is_ok());
+        assert!(state.destination().is_some());
+    }
+
+    #[test]
+    fn bind_state_bad_signature_refused_without_poisoning() {
+        let host = test_hostkey();
+        let mut bind = test_bind(&host, b"sid-1", false);
+        bind.session_id = b"sid-other".to_vec(); // signature no longer matches
+        let mut state = BindState::Unbound;
+        assert!(state.apply(&bind).is_err());
+        // Unverifiable binds (bad signature, cert/unsupported-curve host
+        // keys) are refused but do NOT poison the state: a later genuine
+        // bind still works (OpenSSH behavior).
+        assert!(matches!(state, BindState::Unbound));
+        assert!(state.apply(&test_bind(&host, b"sid-2", false)).is_ok());
+        assert!(state.destination().is_some());
+    }
+
+    #[test]
+    fn bind_state_forwarding_never_destination_cacheable() {
+        let host = test_hostkey();
+        // Forwarding on the first bind.
+        let mut state = BindState::Unbound;
+        assert!(state.apply(&test_bind(&host, b"sid-1", true)).is_ok());
+        assert!(state.destination().is_none());
+        // Forwarding after an auth bind: sticky.
+        let mut state = BindState::Unbound;
+        assert!(state.apply(&test_bind(&host, b"sid-1", false)).is_ok());
+        assert!(state.apply(&test_bind(&host, b"sid-2", true)).is_ok());
+        assert!(state.destination().is_none());
+    }
+
+    #[test]
+    fn bind_state_second_destination_marks_forwarding() {
+        let (h1, h2) = (test_hostkey(), test_hostkey());
+        let mut state = BindState::Unbound;
+        assert!(state.apply(&test_bind(&h1, b"sid-1", false)).is_ok());
+        assert!(state.apply(&test_bind(&h2, b"sid-2", false)).is_ok());
+        assert!(state.destination().is_none());
+    }
+
+    #[test]
+    fn bind_state_duplicate_session_id_conflicts_taint() {
+        let (h1, h2) = (test_hostkey(), test_hostkey());
+        // Same session id under a different key.
+        let mut state = BindState::Unbound;
+        assert!(state.apply(&test_bind(&h1, b"sid-1", false)).is_ok());
+        assert!(state.apply(&test_bind(&h2, b"sid-1", false)).is_err());
+        assert!(matches!(state, BindState::Tainted));
+        // Forwarding→auth downgrade for the same session id.
+        let mut state = BindState::Unbound;
+        assert!(state.apply(&test_bind(&h1, b"sid-1", true)).is_ok());
+        assert!(state.apply(&test_bind(&h1, b"sid-1", false)).is_err());
+        assert!(matches!(state, BindState::Tainted));
+    }
+
+    #[test]
+    fn bind_state_caps_recorded_session_ids_without_poisoning() {
+        let host = test_hostkey();
+        let mut state = BindState::Unbound;
+        for i in 0..MAX_SESSION_BINDS {
+            let sid = format!("sid-{i}");
+            assert!(state.apply(&test_bind(&host, sid.as_bytes(), false)).is_ok());
+        }
+        // The excess bind is refused but the established binding survives.
+        assert!(state.apply(&test_bind(&host, b"sid-overflow", false)).is_err());
+        assert!(state.destination().is_some());
+    }
+
+    #[test]
+    fn destination_line_shown_when_bound_and_fresh() {
+        // docs/approval-transparency.md §A1: with the default TTL of 0 the
+        // reuse line never appears, so the verified destination must get its
+        // own truth line.
+        let mut s = test_session(0, 0);
+        s.peer_is_ssh_client = true;
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", false))
+            .unwrap();
+        let mut msg = String::from("sign: k");
+        s.append_destination_line(&mut msg, false);
+        assert!(msg.contains("\ndest: SHA256:"), "missing dest line: {msg}");
+        assert!(!msg.contains("forwarding"), "non-forwarding bind flagged: {msg}");
+    }
+
+    #[test]
+    fn destination_line_skipped_when_reuse_line_names_it() {
+        let mut s = test_session(300, 0);
+        s.peer_is_ssh_client = true;
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", false))
+            .unwrap();
+        let (_, reuse_label) = s.raw_sign_scope("fp");
+        assert!(reuse_label.is_some(), "bound non-forwarding peer must be reusable");
+        let mut msg = String::from("sign: k");
+        s.append_destination_line(&mut msg, reuse_label.is_some());
+        assert_eq!(msg, "sign: k", "dest line must not duplicate the reuse label: {msg}");
+    }
+
+    #[test]
+    fn destination_line_flags_forwarding_and_taint() {
+        // Forwarding-capable bind: destination shown WITH the forwarding flag.
+        let mut s = test_session(0, 0);
+        s.peer_is_ssh_client = true;
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", true))
+            .unwrap();
+        let mut msg = String::new();
+        s.append_destination_line(&mut msg, false);
+        assert!(msg.contains("\ndest: SHA256:"), "forwarding bind must still name hop one: {msg}");
+        assert!(msg.contains("(forwarding"), "missing forwarding flag: {msg}");
+        // Tainted bind: explicit warning, no destination claim.
+        let mut s = test_session(0, 0);
+        s.bind_state = BindState::Tainted;
+        let mut msg = String::new();
+        s.append_destination_line(&mut msg, false);
+        assert_eq!(msg, "\nwarning: session-bind verification failed");
+        // Unbound: nothing.
+        let s = test_session(0, 0);
+        let mut msg = String::new();
+        s.append_destination_line(&mut msg, false);
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn caller_line_is_kernel_exe_and_sanitized() {
+        let mut s = test_session(0, 0);
+        s.peer_exe = Some("git\nremote".to_string());
+        let mut msg = String::from("h");
+        s.append_caller_line(&mut msg);
+        assert!(msg.starts_with("h\ncaller: "), "missing caller line: {msg}");
+        // The control character must not survive to inject a fake line.
+        assert_eq!(msg.matches('\n').count(), 1, "unsanitized caller exe: {msg}");
+        // Unknown peer exe → no line.
+        let mut s = test_session(0, 0);
+        s.peer_exe = None;
+        let mut msg = String::from("h");
+        s.append_caller_line(&mut msg);
+        assert_eq!(msg, "h");
+        // The vt CLI itself is the no-information common case → suppressed
+        // (exception display; audit still records peer_exe unconditionally).
+        let mut s = test_session(0, 0);
+        s.peer_exe = Some("vt".to_string());
+        let mut msg = String::from("h");
+        s.append_caller_line(&mut msg);
+        assert_eq!(msg, "h");
+    }
+
+    #[test]
+    fn contract_home_display_only() {
+        let home = dirs::home_dir().expect("home").to_string_lossy().into_owned();
+        assert_eq!(contract_home(&format!("{home}/code/vt")), "~/code/vt");
+        assert_eq!(contract_home(&home), "~");
+        // A sibling path sharing the prefix without a separator must NOT
+        // contract (e.g. /Users/qiqi2 vs /Users/qiqi).
+        assert_eq!(contract_home(&format!("{home}2/x")), format!("{home}2/x"));
+        assert_eq!(contract_home("/repo"), "/repo");
+    }
+
+    #[test]
+    fn audit_ctx_reports_scope_and_destination() {
+        // Workspace-scoped sign: family/label/ttl populated.
+        let mut s = test_session(300, 0);
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
+        let (scope, label) = s.sign_vt_scope("fp", "/repo/sub");
+        let ctx = s.audit_ctx_scoped(scope.family(), &label, 300);
+        assert_eq!(ctx.scope_family, "workspace");
+        assert_eq!(ctx.scope_label, "/repo");
+        assert_eq!(ctx.grant_ttl_s, 300);
+        assert_eq!(ctx.peer_exe, "test");
+        assert!(!ctx.relayed);
+        // Fresh (ttl 0): scope fields stay empty even though a basis exists.
+        let (scope, label) = test_session(0, 0).sign_vt_scope("fp", "");
+        let ctx = s.audit_ctx_scoped(scope.family(), &label, 0);
+        assert_eq!(ctx.scope_family, "");
+        assert_eq!(ctx.scope_label, "");
+        assert_eq!(ctx.grant_ttl_s, 0);
+        // audit_destination: only a bound, non-forwarding session-bind counts.
+        let mut s = test_session(0, 0);
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", false))
+            .unwrap();
+        assert!(s.audit_destination().starts_with("SHA256:"));
+        let mut s = test_session(0, 0);
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", true))
+            .unwrap();
+        assert_eq!(s.audit_destination(), "");
+        assert_eq!(test_session(0, 0).audit_destination(), "");
+    }
+
+    #[test]
+    fn reuse_label_present_iff_scope_reusable() {
+        // §6 transparency invariant: the prompt reuse line exists exactly
+        // when the approval can create a standing grant — across every
+        // classification arm.
+        let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
+        let mut sessions = Vec::new();
+        // workspace-resolved local caller
+        let mut s = test_session(300, 300);
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
+        sessions.push(s);
+        // destination-bound ssh caller
+        let mut s = test_session(300, 300);
+        s.peer_is_ssh_client = true;
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", false))
+            .unwrap();
+        sessions.push(s);
+        // confined relay caller
+        let mut s = test_session(300, 300);
+        s.peer_is_vt_relay = true;
+        s.connection_subject = Some((123, 456));
+        sessions.push(s);
+        // disabled + no-workspace-root callers
+        sessions.push(test_session(0, 0));
+        sessions.push(test_session(300, 300));
+
+        for s in &sessions {
+            for pwd in ["", "/repo/sub", "/elsewhere"] {
+                let (scope, label) = s.sign_vt_scope("fp", pwd);
+                assert_eq!(scope.is_reusable(), label.is_some());
+                let (scope, label) = s.raw_sign_scope("fp");
+                assert_eq!(scope.is_reusable(), label.is_some());
+                let (scopes, label) = s.decrypt_scopes(&inputs, "h", pwd);
+                assert_eq!(
+                    scopes.iter().all(GrantScope::is_reusable),
+                    label.is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_sign_scope_classification() {
+        // Duration 0: Fresh, no reuse line, regardless of state.
+        let mut s = test_session(0, 0);
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
+        assert!(s.raw_sign_scope("fp").1.is_none());
+        assert_eq!(s.sign_basis(), ContextBasis::Disabled);
+
+        // Unbound ssh peer: Fresh (auth vs forwarding indistinguishable).
+        let mut s = test_session(300, 0);
+        s.peer_is_ssh_client = true;
+        assert!(s.raw_sign_scope("fp").1.is_none());
+        assert_eq!(s.sign_basis(), ContextBasis::UnboundSsh);
+
+        // Unbound non-ssh with a workspace: workspace scope + label (bare
+        // path = workspace root; narrower families keep their prefix).
+        let mut s = test_session(300, 0);
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
+        let (_, label) = s.raw_sign_scope("fp");
+        assert_eq!(label.as_deref(), Some("/repo"));
+        assert_eq!(s.sign_basis(), ContextBasis::Workspace);
+
+        // No workspace root: Fresh.
+        let s = test_session(300, 0);
+        assert!(s.raw_sign_scope("fp").1.is_none());
+        assert_eq!(s.sign_basis(), ContextBasis::NoWorkspaceRoot);
+
+        // Destination-bound: destination label (fingerprint at minimum).
+        let mut s = test_session(300, 0);
+        s.peer_is_ssh_client = true;
+        let host = test_hostkey();
+        assert!(s.bind_state.apply(&test_bind(&host, b"sid", false)).is_ok());
+        let (_, label) = s.raw_sign_scope("fp");
+        assert!(label
+            .expect("destination-bound must offer reuse")
+            .contains(&fingerprint_str(host.public_key().key_data())));
+        assert_eq!(s.sign_basis(), ContextBasis::SessionBind);
+
+        // Tainted: Fresh.
+        let mut s = test_session(300, 0);
+        s.bind_state = BindState::Tainted;
+        assert!(s.raw_sign_scope("fp").1.is_none());
+        assert_eq!(s.sign_basis(), ContextBasis::Tainted);
+
+        // Relay: confined per connection.
+        let mut s = test_session(300, 0);
+        s.peer_is_vt_relay = true;
+        s.connection_subject = Some((123, 456));
         assert_eq!(
-            AuthCacheMode::from_str("None").unwrap(),
-            AuthCacheMode::None
+            s.raw_sign_scope("fp").1.as_deref(),
+            Some("this relay connection")
+        );
+        assert_eq!(s.sign_basis(), ContextBasis::RelayConnection);
+    }
+
+    #[test]
+    fn sign_vt_and_decrypt_scopes_respect_workspace_and_pwd() {
+        let mut s = test_session(300, 300);
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
+        // Claimed pwd inside the workspace: reusable.
+        assert!(s.sign_vt_scope("fp", "/repo/sub").1.is_some());
+        let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
+        assert!(s.decrypt_scopes(&inputs, "h", "/repo").1.is_some());
+        // Claimed pwd outside the workspace: consistency check → Fresh.
+        assert!(s.sign_vt_scope("fp", "/elsewhere").1.is_none());
+        assert!(s.decrypt_scopes(&inputs, "h", "/elsewhere").1.is_none());
+        // Empty pwd (raw-style caller): allowed.
+        assert!(s.sign_vt_scope("fp", "").1.is_some());
+        // Relay: per-connection scope, not workspace.
+        let mut s = test_session(300, 300);
+        s.peer_is_vt_relay = true;
+        s.connection_subject = Some((123, 456));
+        assert_eq!(
+            s.decrypt_scopes(&inputs, "h", "/x").1.as_deref(),
+            Some("this relay connection")
+        );
+        assert_eq!(s.decrypt_basis(), ContextBasis::RelayConnection);
+    }
+
+    #[test]
+    fn ssh_peer_vt_extensions_are_confined_per_connection_never_workspace() {
+        // An `ssh -A` peer can carry a REMOTE host's vt extensions; even if a
+        // workspace were somehow resolved it must never be used — otherwise
+        // the remote rides local workspace grants.
+        let mut s = test_session(300, 300);
+        s.peer_is_ssh_client = true;
+        s.connection_subject = Some((123, 456));
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
+        let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
+        assert_eq!(
+            s.sign_vt_scope("fp", "/repo").1.as_deref(),
+            Some("this forwarded ssh connection")
         );
         assert_eq!(
-            AuthCacheMode::from_str("NONE").unwrap(),
-            AuthCacheMode::None
+            s.decrypt_scopes(&inputs, "h", "/repo").1.as_deref(),
+            Some("this forwarded ssh connection")
         );
-        assert_eq!(
-            AuthCacheMode::from_str("Per-Session").unwrap(),
-            AuthCacheMode::PerSession
-        );
-        assert_eq!(
-            AuthCacheMode::from_str("PER-APP").unwrap(),
-            AuthCacheMode::PerApp
-        );
+        assert_eq!(s.decrypt_basis(), ContextBasis::SshConnection);
+        // With no resolvable connection subject the arm degrades to Fresh.
+        s.connection_subject = None;
+        assert!(s.sign_vt_scope("fp", "/repo").1.is_none());
+        assert!(s.decrypt_scopes(&inputs, "h", "/repo").1.is_none());
+        assert_eq!(s.decrypt_basis(), ContextBasis::ProcLookupFailed);
     }
 
     #[test]
-    fn test_auth_cache_mode_from_str_invalid() {
-        assert!(AuthCacheMode::from_str("invalid").is_err());
-        assert!(AuthCacheMode::from_str("").is_err());
-        assert!(AuthCacheMode::from_str("per").is_err());
-    }
-
-    #[test]
-    fn test_auth_cache_mode_display() {
-        assert_eq!(AuthCacheMode::None.to_string(), "none");
-        assert_eq!(AuthCacheMode::PerSession.to_string(), "per-session");
-        assert_eq!(AuthCacheMode::PerApp.to_string(), "per-app");
-    }
-
-    // --- AuthCache tests ---
-
-    #[test]
-    fn test_auth_cache_grant_and_hit() {
-        let mut cache = AuthCache::new(300);
-        let ctx = (1u64, 100u64);
-        assert!(!cache.is_authorized(ctx, "fp1"));
-
-        cache.grant(ctx, "fp1");
-        assert!(cache.is_authorized(ctx, "fp1"));
-    }
-
-    #[test]
-    fn test_resolve_cache_context_global_needs_no_tty() {
-        // Global must resolve for ANY identified peer — including TTY-less
-        // orchestrated callers (AI agents / CI) whose fresh-session spawns
-        // make per-session/per-app permanently miss. Our own test process
-        // works regardless of whether the runner has a controlling terminal.
-        let me = std::process::id() as i32;
-        assert_eq!(
-            resolve_cache_context(Some(me), AuthCacheMode::Global, false),
-            Some((0, 0))
-        );
-        // No peer PID → still uncacheable even in global mode.
-        assert_eq!(resolve_cache_context(None, AuthCacheMode::Global, false), None);
-        // None mode never caches.
-        assert_eq!(resolve_cache_context(Some(me), AuthCacheMode::None, false), None);
-    }
-
-    #[test]
-    fn test_classify_cache_context_basis() {
-        let me = std::process::id() as i32;
-        // Precedence: ModeNone wins even with no peer pid.
-        let r = classify_cache_context(None, AuthCacheMode::None, false);
-        assert_eq!((r.context, r.basis), (None, ContextBasis::ModeNone));
-        let r = classify_cache_context(None, AuthCacheMode::Global, false);
-        assert_eq!((r.context, r.basis), (None, ContextBasis::NoPeerPid));
-        // Our own test binary is not `ssh`, so global resolves via the
-        // Global arm — and resolve_cache_context must agree (thin wrapper).
-        let r = classify_cache_context(Some(me), AuthCacheMode::Global, false);
-        assert_eq!((r.context, r.basis), (Some((0, 0)), ContextBasis::Global));
-        assert_eq!(
-            resolve_cache_context(Some(me), AuthCacheMode::Global, false),
-            r.context
-        );
-        // vt-relay narrowing beats every mode, keyed on the peer process.
-        let r = classify_cache_context(Some(me), AuthCacheMode::Global, true);
-        assert_eq!(r.basis, ContextBasis::VtRelay);
-        assert_eq!(r.mode, AuthCacheMode::Global);
-        let ctx = r.context.expect("own pid must have a start time");
-        assert_eq!(ctx.0, me as u64);
-        // (Wire-tag stability is pinned in core.rs tests, next to the enum.)
-    }
-
-    #[test]
-    fn test_auth_cache_live_len_scoped_to_context() {
-        let mut cache = AuthCache::new(300);
-        let mine = (1u64, 100u64);
-        let other = (2u64, 100u64);
-        cache.grant(mine, "fp1");
-        cache.grant(mine, "fp2");
-        cache.grant(other, "fp3");
-        // Scoped: never counts another context's grants.
-        assert_eq!(cache.live_len(mine), 2);
-        assert_eq!(cache.live_len(other), 1);
-        assert_eq!(cache.live_len((3u64, 100u64)), 0);
-        // Dual-clock expiry: entries drop out when EITHER clock passes TTL,
-        // same predicate as is_authorized (wall advanced, mono frozen).
-        let now_mono = Instant::now();
-        let now_wall = SystemTime::now();
-        assert_eq!(cache.live_len_at(mine, now_mono, now_wall), 2);
-        let wall_late = now_wall + Duration::from_secs(301);
-        assert_eq!(cache.live_len_at(mine, now_mono, wall_late), 0);
-    }
-
-    // (Strict-TTL idempotence and expired-entry replacement are covered
-    // deterministically by the clock-injected `_at` tests below — no
-    // sleep-based duplicates.)
-
-    #[test]
-    fn test_auth_cache_different_context_misses() {
-        let mut cache = AuthCache::new(300);
-        let ctx1 = (1u64, 100u64);
-        let ctx2 = (2u64, 100u64);
-        cache.grant(ctx1, "fp1");
-
-        // Same fingerprint, different context
-        assert!(!cache.is_authorized(ctx2, "fp1"));
-        // Same context, different fingerprint
-        assert!(!cache.is_authorized(ctx1, "fp2"));
-    }
-
-    #[test]
-    fn test_auth_cache_start_time_distinguishes_reused_pid() {
-        // Same PID, different start time → different context (PID reuse)
-        let mut cache = AuthCache::new(300);
-        let orig = (1234u64, 1_700_000_000u64);
-        let reused = (1234u64, 1_700_000_500u64);
-        cache.grant(orig, "fp1");
-
-        assert!(cache.is_authorized(orig, "fp1"));
-        assert!(!cache.is_authorized(reused, "fp1"));
-    }
-
-    #[test]
-    fn test_auth_cache_clear() {
-        let mut cache = AuthCache::new(300);
-        let ctx1 = (1u64, 100u64);
-        let ctx2 = (2u64, 100u64);
-        cache.grant(ctx1, "fp1");
-        cache.grant(ctx2, "fp2");
-        assert!(cache.is_authorized(ctx1, "fp1"));
-
-        cache.clear();
-        assert!(!cache.is_authorized(ctx1, "fp1"));
-        assert!(!cache.is_authorized(ctx2, "fp2"));
-    }
-
-    #[test]
-    fn test_auth_cache_sweep_expired() {
-        let mut cache = AuthCache::new(0); // 0 second = immediately expired
-        cache.grant((1u64, 100u64), "fp1");
-        cache.grant((2u64, 100u64), "fp2");
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        cache.sweep_expired();
-        assert!(cache.entries.is_empty());
-    }
-
-    // --- Dual-clock expiry tests (sleep / clock-step scenarios) ---
-    //
-    // Clock-injected regression tests for the grant-survives-sleep bug;
-    // see [`CacheExpiry`] for the CLOCK_UPTIME_RAW rationale.
-
-    #[test]
-    fn test_auth_cache_wall_clock_expires_grant_across_sleep() {
-        let mut cache = AuthCache::new(120);
-        let ctx = (1u64, 100u64);
-        let m0 = Instant::now();
-        let w0 = SystemTime::now();
-        cache.grant_at(ctx, "fp1", m0, w0);
-
-        // 1s of awake time, but 10 minutes of wall time passed (slept).
-        let asleep_mono = m0 + Duration::from_secs(1);
-        let asleep_wall = w0 + Duration::from_secs(600);
-        assert!(
-            !cache.is_authorized_at(ctx, "fp1", asleep_mono, asleep_wall),
-            "grant must not survive a sleep longer than the TTL"
-        );
-    }
-
-    #[test]
-    fn test_auth_cache_mono_clock_bounds_stalled_wall_clock() {
-        // Wall clock stalled or stepped backwards (NTP): the monotonic bound
-        // still caps total awake time at the TTL.
-        let mut cache = AuthCache::new(120);
-        let ctx = (1u64, 100u64);
-        let m0 = Instant::now();
-        let w0 = SystemTime::now();
-        cache.grant_at(ctx, "fp1", m0, w0);
-
-        let late_mono = m0 + Duration::from_secs(121);
-        let early_wall = w0 + Duration::from_secs(1);
-        assert!(
-            !cache.is_authorized_at(ctx, "fp1", late_mono, early_wall),
-            "a backwards/stalled wall clock must not extend the grant"
-        );
-    }
-
-    #[test]
-    fn test_auth_cache_valid_while_both_clocks_within_ttl() {
-        let mut cache = AuthCache::new(120);
-        let ctx = (1u64, 100u64);
-        let m0 = Instant::now();
-        let w0 = SystemTime::now();
-        cache.grant_at(ctx, "fp1", m0, w0);
-
-        assert!(cache.is_authorized_at(
-            ctx,
-            "fp1",
-            m0 + Duration::from_secs(60),
-            w0 + Duration::from_secs(60),
+    fn workspace_root_acceptability_rejects_home_pooling() {
+        let home = std::path::Path::new("/Users/x");
+        // A dotfiles repo AT $HOME must not become a workspace.
+        assert!(!workspace_root_acceptable(
+            home,
+            std::path::Path::new("/Users/x/Downloads"),
+            Some(home)
+        ));
+        // A root above $HOME for a cwd inside $HOME is rejected too.
+        assert!(!workspace_root_acceptable(
+            std::path::Path::new("/Users"),
+            std::path::Path::new("/Users/x/proj"),
+            Some(home)
+        ));
+        // Ordinary project roots pass, inside or outside $HOME.
+        assert!(workspace_root_acceptable(
+            std::path::Path::new("/Users/x/code/vt"),
+            std::path::Path::new("/Users/x/code/vt/src"),
+            Some(home)
+        ));
+        assert!(workspace_root_acceptable(
+            std::path::Path::new("/opt/work/repo"),
+            std::path::Path::new("/opt/work/repo/a"),
+            Some(home)
         ));
     }
 
     #[test]
-    fn test_auth_cache_strict_ttl_not_extended_by_midway_regrant() {
-        // A re-grant at TTL/2 (e.g. racing prompt resolved late) must not
-        // move the original expiry.
-        let mut cache = AuthCache::new(120);
-        let ctx = (1u64, 100u64);
-        let m0 = Instant::now();
-        let w0 = SystemTime::now();
-        cache.grant_at(ctx, "fp1", m0, w0);
-        cache.grant_at(
-            ctx,
-            "fp1",
-            m0 + Duration::from_secs(60),
-            w0 + Duration::from_secs(60),
+    fn cwd_fallback_rejects_broad_shared_directories() {
+        let home = std::path::Path::new("/Users/x");
+        let p = std::path::Path::new;
+        // $HOME and its ancestors pool everything launched from them.
+        assert!(!cwd_fallback_acceptable(home, Some(home)));
+        assert!(!cwd_fallback_acceptable(p("/Users"), Some(home)));
+        assert!(!cwd_fallback_acceptable(p("/"), Some(home)));
+        // Shared temp roots (canonical forms — F_GETPATH resolves /tmp).
+        assert!(!cwd_fallback_acceptable(p("/private/tmp"), Some(home)));
+        assert!(!cwd_fallback_acceptable(p("/private/var/tmp"), Some(home)));
+        assert!(!cwd_fallback_acceptable(p("/Volumes"), Some(home)));
+        if let Some(t) = darwin_user_temp_dir() {
+            assert!(!cwd_fallback_acceptable(t, Some(home)));
+        }
+        // Subdirectories of the shared roots name one activity: acceptable.
+        assert!(cwd_fallback_acceptable(p("/private/tmp/scratch"), Some(home)));
+        assert!(cwd_fallback_acceptable(p("/Users/x/notes"), Some(home)));
+        assert!(cwd_fallback_acceptable(p("/opt/deploy"), Some(home)));
+    }
+
+    #[test]
+    fn resolve_workspace_falls_back_to_cwd_without_git_root() {
+        // End-to-end through the kernel-cwd path: a peer whose cwd has no
+        // `.git` ancestor lands in the cwd-fallback arm keyed on the
+        // canonical cwd; the same directory flips to the git family once a
+        // `.git` marker appears (grant separation between the two families
+        // is pinned at the digest level by scope_families_are_domain_separated).
+        let dir = temp_workspace("cwd-fallback");
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        if find_git_root(&canonical).is_some() {
+            // Defensive: a `.git` above the temp dir would invalidate the
+            // scenario; skip rather than assert a wrong arm.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .spawn()
+            .expect("spawn peer stand-in");
+        let pid = child.id() as i32;
+
+        match resolve_workspace(Some(pid)) {
+            WorkspaceResolution::CwdFallback(ws) => {
+                assert_eq!(PathBuf::from(ws.root_str()), canonical);
+            }
+            other => panic!("expected cwd fallback, got {other:?}"),
+        }
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        match resolve_workspace(Some(pid)) {
+            WorkspaceResolution::Resolved(ws) => {
+                assert_eq!(PathBuf::from(ws.root_str()), canonical);
+            }
+            other => panic!("expected git workspace after git init, got {other:?}"),
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cwd_fallback_scopes_use_directory_label_and_basis() {
+        // sign@vt / decrypt: cwd fallback behaves like a workspace but with
+        // the "directory" wording and the cwd-fallback basis.
+        let mut s = test_session(300, 300);
+        s.workspace = WorkspaceResolution::CwdFallback(test_workspace()).into();
+        let (scope, label) = s.sign_vt_scope("fp", "/repo/sub");
+        assert!(scope.is_reusable());
+        assert_eq!(label.as_deref(), Some("directory /repo"));
+        assert_eq!(s.decrypt_basis(), ContextBasis::CwdWorkspace);
+        // pwd consistency check still applies.
+        assert!(s.sign_vt_scope("fp", "/elsewhere").1.is_none());
+
+        let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
+        assert_eq!(
+            s.decrypt_scopes(&inputs, "h", "/repo").1.as_deref(),
+            Some("directory /repo")
         );
 
+        // Raw sign, unbound non-ssh peer: same fallback arm.
+        let (scope, label) = s.raw_sign_scope("fp");
+        assert!(scope.is_reusable());
+        assert_eq!(label.as_deref(), Some("directory /repo"));
+        assert_eq!(s.sign_basis(), ContextBasis::CwdWorkspace);
+
+        // The cwd-fallback scope must differ from the git-workspace scope of
+        // the same directory identity.
+        let mut git = test_session(300, 300);
+        git.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
+        assert_eq!(git.sign_vt_scope("fp", "/repo").1.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn parent_app_identity_resolves_kernel_parent() {
+        // A child we spawn has US as its kernel parent: identity must carry
+        // this process's (pid, start) subject and executable path.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn child");
+        let app = parent_app_identity(child.id() as i32).expect("parent identity");
+        let me = std::process::id() as u64;
+        assert_eq!(app.subject.0, me);
+        assert_eq!(
+            app.exe,
+            proc_info::get_proc_path(me as i32).expect("own exe")
+        );
+        assert!(!app.name().contains('/'));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn resolve_workspace_uses_parent_app_for_broad_cwd() {
+        // A peer whose cwd is an excluded shared root (the per-user Darwin
+        // temp dir) must resolve to its parent application, not NoRoot.
+        let dir = std::env::temp_dir();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        if find_git_root(&canonical).is_some()
+            || cwd_fallback_acceptable(&canonical, dirs::home_dir().as_deref())
+        {
+            // Defensive: scenario requires an excluded, non-git cwd.
+            return;
+        }
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .spawn()
+            .expect("spawn peer stand-in");
+        match resolve_workspace(Some(child.id() as i32)) {
+            WorkspaceResolution::AppFallback(app) => {
+                assert_eq!(app.subject.0, std::process::id() as u64);
+            }
+            other => panic!("expected parent-app fallback, got {other:?}"),
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn parent_app_scopes_use_app_label_and_basis() {
+        let app = AppIdentity {
+            subject: (77, 4242),
+            exe: "/Applications/Paseo.app/Contents/MacOS/Paseo Daemon".to_string(),
+        };
+        let mut s = test_session(300, 300);
+        s.workspace = WorkspaceResolution::AppFallback(app).into();
+        // sign@vt / decrypt: reusable, "app" wording, parent-app basis. The
+        // claimed pwd is display-only in this arm (no root to check against).
+        let (scope, label) = s.sign_vt_scope("fp", "/anywhere");
+        assert!(scope.is_reusable());
+        assert_eq!(label.as_deref(), Some("app Paseo Daemon"));
+        assert_eq!(s.decrypt_basis(), ContextBasis::ParentApp);
+        let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
+        assert_eq!(
+            s.decrypt_scopes(&inputs, "h", "/").1.as_deref(),
+            Some("app Paseo Daemon")
+        );
+        // Raw sign, unbound non-ssh peer: same fallback arm.
+        let (scope, label) = s.raw_sign_scope("fp");
+        assert!(scope.is_reusable());
+        assert_eq!(label.as_deref(), Some("app Paseo Daemon"));
+        assert_eq!(s.sign_basis(), ContextBasis::ParentApp);
+    }
+
+    #[tokio::test]
+    async fn extension_intercepts_plaintext_session_bind_before_auth_cipher() {
+        // The seam most likely to regress: session-bind is plain SSH wire
+        // bytes and must be handled before the keychain/auth-cipher path —
+        // this test passes precisely because no keychain access happens.
+        let mut session = test_session(300, 0);
+        session.peer_is_ssh_client = true;
+        let host = test_hostkey();
+        let ext = Extension::new_message(test_bind(&host, b"sid-1", false))
+            .expect("encode session-bind");
+        let reply = session
+            .extension(ext)
+            .await
+            .expect("bind must succeed without keychain");
+        assert!(reply.is_none(), "plain SSH_AGENT_SUCCESS, no envelope");
+        assert!(session.bind_state.destination().is_some());
         assert!(
-            !cache.is_authorized_at(
-                ctx,
-                "fp1",
-                m0 + Duration::from_secs(121),
-                w0 + Duration::from_secs(121),
+            session.destination_label.is_some(),
+            "label precomputed at bind time"
+        );
+        assert_eq!(session.sign_basis(), ContextBasis::SessionBind);
+
+        // Malformed bind: refused without poisoning state (an undecodable
+        // host key — certificates, unsupported curves — is not an attack).
+        let mut session = test_session(300, 0);
+        let malformed = Extension {
+            name: "session-bind@openssh.com".to_string(),
+            details: Unparsed::from(vec![1u8, 2, 3]),
+        };
+        assert!(session.extension(malformed).await.is_err());
+        assert!(matches!(session.bind_state, BindState::Unbound));
+    }
+
+    // --- ui-status@vt tests (docs/app-bundle.md §5) ---
+
+    fn ui_status_req(token_b64: &str, action: &str) -> Extension {
+        Extension {
+            name: EXT_UI_STATUS.to_string(),
+            details: Unparsed::from(
+                serde_json::to_vec(&UiStatusReq {
+                    token: token_b64.to_string(),
+                    action: action.to_string(),
+                })
+                .unwrap(),
             ),
-            "midway re-grant must not extend the original expiry"
-        );
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_status_token_gate_locked_report_and_revoke() {
+        use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
+        let token = [7u8; 32];
+        let token_b64 = BASE64_URL_SAFE_NO_PAD.encode(token);
+
+        // CLI-started agent (no token configured): a well-formed request is
+        // refused — indistinguishable from an unknown extension.
+        let mut session = test_session(300, 300);
+        assert!(session
+            .extension(ui_status_req(&token_b64, "status"))
+            .await
+            .is_err());
+
+        // Wrong token refused; correct token answers WITHOUT keychain access
+        // (this test has no keychain store — like the session-bind test, it
+        // passes precisely because the plaintext path never derives ciphers).
+        let mut session = test_session(300, 300);
+        session.ui_token = Some(token);
+        session.authorization =
+            AuthorizationEngine::new(Arc::new(TestAuthenticator), Arc::new(TestValidator));
+        let wrong = BASE64_URL_SAFE_NO_PAD.encode([8u8; 32]);
+        assert!(session.extension(ui_status_req(&wrong, "status")).await.is_err());
+        // Unknown action: token holder still cannot invoke anything but
+        // status/revoke_all.
+        assert!(session
+            .extension(ui_status_req(&token_b64, "approve_all"))
+            .await
+            .is_err());
+
+        let reply = session
+            .extension(ui_status_req(&token_b64, "status"))
+            .await
+            .unwrap()
+            .expect("status reply");
+        assert_eq!(reply.name.as_str(), EXT_UI_STATUS);
+        let res: UiStatusRes = serde_json::from_slice(reply.details.as_ref()).unwrap();
+        assert!(!res.locked);
+        assert_eq!(res.sign_ttl_secs, 300);
+        assert_eq!(res.idle_timeout_secs, 1800); // test_session default
+        assert!(res.grants.is_empty());
+        assert!(res.revoked.is_none());
+
+        // A locked agent still reports status (the UI must be able to show
+        // the lock) — this rides the pre-lock-check dispatch position.
+        session.locked.store(true, Ordering::Release);
+        let reply = session
+            .extension(ui_status_req(&token_b64, "status"))
+            .await
+            .unwrap()
+            .expect("locked status reply");
+        let res: UiStatusRes = serde_json::from_slice(reply.details.as_ref()).unwrap();
+        assert!(res.locked);
+        session.locked.store(false, Ordering::Release);
+
+        // Snapshot carries the scope display label and expiry; revoke_all
+        // drops the grant and advances the epoch (stale commits refused).
+        session
+            .authorization
+            .authorize(AuthorizationRequest::new(
+                vec![GrantScope::sign_destination(b"hostkey-wire", "SHA256:k")
+                    .with_display("github.com (ED25519 SHA256:hk)")],
+                ReusePolicy::strict_ttl_secs(300),
+                "seed",
+            ))
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        let reply = session
+            .extension(ui_status_req(&token_b64, "status"))
+            .await
+            .unwrap()
+            .unwrap();
+        let res: UiStatusRes = serde_json::from_slice(reply.details.as_ref()).unwrap();
+        assert_eq!(res.grants.len(), 1);
+        let grant = &res.grants[0];
+        assert_eq!(grant.operation, "sign");
+        assert_eq!(grant.family, "destination");
+        assert_eq!(grant.display, "github.com (ED25519 SHA256:hk)");
+        assert_eq!(grant.ttl_secs, 300);
+        assert!(grant.remaining_secs > 290 && grant.remaining_secs <= 300);
+
+        let reply = session
+            .extension(ui_status_req(&token_b64, "revoke_all"))
+            .await
+            .unwrap()
+            .unwrap();
+        let res: UiStatusRes = serde_json::from_slice(reply.details.as_ref()).unwrap();
+        assert_eq!(res.revoked, Some(1));
+        assert!(res.grants.is_empty());
+    }
+
+    // --- Workspace resolution tests ---
+
+    fn temp_workspace(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vt-authz-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
-    fn test_auth_cache_regrant_after_wall_expiry_refreshes() {
-        // Fresh approval after a sleep-induced expiry must produce a live
-        // entry (models the decrypt batch grant-all-keys path where an entry
-        // expired while the prompt sat on screen).
-        let mut cache = AuthCache::new(120);
-        let ctx = (1u64, 100u64);
-        let m0 = Instant::now();
-        let w0 = SystemTime::now();
-        cache.grant_at(ctx, "fp1", m0, w0);
+    fn find_git_root_prefers_nearest_marker_dir_or_file() {
+        let root = temp_workspace("git-root");
+        std::fs::create_dir_all(root.join(".git")).unwrap(); // dir marker
+        let inner = root.join("a");
+        let nested = inner.join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_git_root(&nested), Some(root.clone()));
+        // A nearer `.git` FILE (worktree layout) wins over the outer dir.
+        std::fs::write(inner.join(".git"), "gitdir: elsewhere").unwrap();
+        assert_eq!(find_git_root(&nested), Some(inner));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-        // Slept past the TTL, then the user re-approved.
-        let m1 = m0 + Duration::from_secs(1);
-        let w1 = w0 + Duration::from_secs(600);
-        assert!(!cache.is_authorized_at(ctx, "fp1", m1, w1));
-        cache.grant_at(ctx, "fp1", m1, w1);
-        assert!(cache.is_authorized_at(
-            ctx,
-            "fp1",
-            m1 + Duration::from_secs(1),
-            w1 + Duration::from_secs(1),
-        ));
+    #[test]
+    fn workspace_identity_binds_dev_ino_and_canonical_path() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp_workspace("identity");
+        let ws = workspace_identity(&root).expect("identity");
+        let meta = std::fs::metadata(&root).unwrap();
+        assert_eq!(ws.subject, (meta.dev(), meta.ino()));
+        // F_GETPATH returns the resolved path (e.g. /tmp → /private/tmp).
+        assert_eq!(
+            PathBuf::from(&ws.root),
+            std::fs::canonicalize(&root).unwrap()
+        );
+        assert!(ws.contains_claimed_pwd(""));
+        assert!(ws.contains_claimed_pwd(&format!("{}/sub", ws.root)));
+        assert!(!ws.contains_claimed_pwd("/somewhere/else"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_cwd_matches_own_process_cwd() {
+        let pid = std::process::id() as i32;
+        let kernel = proc_info::get_cwd(pid).expect("own cwd");
+        let expected = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(kernel, expected);
+    }
+
+    // --- known_hosts display resolution ---
+
+    #[test]
+    fn known_hosts_lookup_matches_key_and_skips_hashed_and_marked() {
+        use base64::Engine as _;
+        use ssh_agent_lib::ssh_encoding::Encode;
+        let host = test_hostkey();
+        let hostkey = host.public_key().key_data().clone();
+        let mut wire = Vec::new();
+        hostkey.encode(&mut wire).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&wire);
+        let content = format!(
+            "# comment line\n\
+             |1|hashhash|morehash ssh-ed25519 {b64}\n\
+             @revoked revoked.example ssh-ed25519 {b64}\n\
+             github.com,gh.alias ssh-ed25519 {b64}\n"
+        );
+        assert_eq!(
+            known_hosts_name_in(&content, &hostkey).as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(known_hosts_name_in("", &hostkey), None);
     }
 
     // --- idle_exceeded tests ---
@@ -3541,84 +4782,6 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         assert!(!watcher_should_clear(true, true, mono, None));
     }
 
-    // --- decrypt_cache_key tests ---
-
-    #[test]
-    fn test_decrypt_cache_key_deterministic() {
-        let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
-        assert_eq!(k1, k2);
-        assert_eq!(k1.len(), 64); // SHA-256 hex
-    }
-
-    #[test]
-    fn test_decrypt_cache_key_changes_with_type() {
-        let salt = [0x42u8; SALT_LEN];
-        let k_raw = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
-        let k_totp = decrypt_cache_key(crate::core::SecretType::TOTP, &salt, "host1", "/p");
-        assert_ne!(k_raw, k_totp);
-    }
-
-    #[test]
-    fn test_decrypt_cache_key_changes_with_salt() {
-        let s1 = [0x42u8; SALT_LEN];
-        let s2 = [0x43u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &s1, "host1", "/p");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &s2, "host1", "/p");
-        assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn test_decrypt_cache_key_changes_with_host() {
-        let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/p");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host2", "/p");
-        assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn test_decrypt_cache_key_changes_with_pwd() {
-        // The pwd component is what scopes global-mode grants to one project
-        // tree; same record + host from a different directory must miss.
-        let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/proj/a");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "host1", "/proj/b");
-        assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn test_decrypt_cache_key_length_prefix_prevents_collision() {
-        // Length-prefix means "ab"+"c" must hash differently from "a"+"bc"
-        // even though concatenation matches — there's no way for the host
-        // string to absorb adjacent context bytes.
-        let salt = [0x42u8; SALT_LEN];
-        let k1 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "ab", "");
-        let k2 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "abc", "");
-        assert_ne!(k1, k2);
-        // Field-shift between host and pwd must also be unambiguous.
-        let k3 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "ab", "c");
-        let k4 = decrypt_cache_key(crate::core::SecretType::RAW, &salt, "a", "bc");
-        assert_ne!(k3, k4);
-    }
-
-    // --- sign_cache_key tests ---
-
-    #[test]
-    fn test_sign_cache_key_partitions_by_pwd_and_fingerprint() {
-        let k = sign_cache_key("SHA256:abc", "/proj/a");
-        assert_eq!(k, sign_cache_key("SHA256:abc", "/proj/a"));
-        assert_eq!(k.len(), 64);
-        assert_ne!(k, sign_cache_key("SHA256:abc", "/proj/b"));
-        assert_ne!(k, sign_cache_key("SHA256:xyz", "/proj/a"));
-        // Plain agent-protocol signs key on an empty pwd — distinct from any
-        // real directory, stable across calls.
-        assert_eq!(sign_cache_key("SHA256:abc", ""), sign_cache_key("SHA256:abc", ""));
-        assert_ne!(sign_cache_key("SHA256:abc", ""), k);
-        // Field-shift between fingerprint and pwd must be unambiguous.
-        assert_ne!(sign_cache_key("ab", "c"), sign_cache_key("a", "bc"));
-    }
-
     // --- is_ssh_client_path tests ---
 
     #[test]
@@ -3667,20 +4830,6 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         assert!(!path.is_empty(), "Path should not be empty");
     }
 
-    #[test]
-    #[ignore]
-    fn test_get_sid_self_returns_session_leader() {
-        // The current test process inherits its session from `cargo test`,
-        // so getsid(self) should return a positive PID — typically the
-        // shell that ran cargo, or cargo's own PID if it called setsid.
-        let pid = std::process::id() as i32;
-        let sid = proc_info::get_sid(pid).expect("getsid should succeed");
-        assert!(sid > 0, "Session leader PID should be positive");
-        // The session leader's start time must be queryable.
-        let start = proc_info::get_start_tvsec(sid)
-            .expect("Session leader's start_tvsec should be queryable");
-        assert!(start > 0, "Session leader start_tvsec should be positive");
-    }
 
     // ── Touch-ID prompt helpers ────────────────────────────────────────────
 

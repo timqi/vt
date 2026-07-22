@@ -66,6 +66,23 @@ export interface AuditRow {
    *  or 'agent' (SSH-agent Touch ID decision pushed by the Mac). The column is
    *  NOT NULL DEFAULT 'ceremony', so a read always has a value. */
   source: string;
+  // Agent-authoritative context, source='agent' rows only
+  // (docs/approval-transparency.md §B). NULL = pre-field agent or non-agent
+  // row; '' / 0 = a new agent said "not applicable" (fresh scope, non-sign op).
+  /** Kernel-verified peer executable basename. */
+  peer_exe: string | null;
+  /** Sign operations: `SHA256:…` of the signing key. */
+  key_fp: string | null;
+  /** Verified non-forwarding session-bind destination label. */
+  dest: string | null;
+  /** connection | destination | workspace | cwd-fallback | parent-app. */
+  scope_family: string | null;
+  /** The exact label the Touch ID reuse line displayed. */
+  scope_label: string | null;
+  /** Effective TTL of the reusable scope (seconds); 0 = fresh. */
+  grant_ttl_s: number | null;
+  /** Peer is the vt relay: 0 | 1. */
+  relayed: number | null;
   /** Monotonic change counter, bumped on EVERY write to the row (create +
    *  each in-place lifecycle update). Unlike `id` (assigned once at INSERT), a
    *  later approve/reject/expire/verify-fail UPDATE advances `seq`, so the
@@ -311,7 +328,7 @@ export interface CacheEntry {
  *  Worker always overwrites it from CF-Connecting-IP. `meta.op_kind` duplicates
  *  the sibling `op_kind`. */
 export interface AgentAuditEntry {
-  /** encrypt | decrypt | auth | run | sign */
+  /** encrypt | decrypt | auth | run | ssh-sign | sign */
   op_kind: string;
   /** approved | rejected | unavailable | cache_hit | spawn_failed */
   outcome: string;
@@ -324,6 +341,24 @@ export interface AgentAuditEntry {
   /** `a_<agent_id>_<8 random bytes b64u>` — UNIQUE retry-dedup key. */
   token_id: string;
   meta?: Partial<ChallengeMeta>;
+  // Agent-authoritative context (docs/approval-transparency.md §B). Unlike
+  // `meta` these are kernel/agent-derived, never client-claimed. All ABSENT
+  // from an old agent — the ingest preserves absence as SQL NULL, while a
+  // new agent sends ''/0/false for "not applicable".
+  /** Kernel-verified peer executable basename; '' unknown. */
+  peer_exe?: string;
+  /** Sign operations: `SHA256:…` of the signing key; '' otherwise. */
+  key_fp?: string;
+  /** Verified non-forwarding session-bind destination label; '' otherwise. */
+  dest?: string;
+  /** connection | destination | workspace | cwd-fallback | parent-app; '' = fresh. */
+  scope_family?: string;
+  /** The exact label the Touch ID reuse line displayed; '' = fresh. */
+  scope_label?: string;
+  /** Effective TTL of the reusable scope (seconds); 0 = fresh. */
+  grant_ttl_s?: number;
+  /** Peer is the `vt ssh connect --forward-real-agent` relay. */
+  relayed?: boolean;
 }
 
 /** Inbound to POST /api/audit-ingest. Signed with `VT-HMAC` over the raw body
@@ -346,6 +381,18 @@ export interface DoAuditIngestOp {
   latency_ms: number;
   ts_ms: number;
   meta: ChallengeMeta;
+  // Agent-authoritative context. `null` = the (old) agent never sent the
+  // field; ''/0/false = a new agent said "not applicable". The DO stores the
+  // null as SQL NULL so the two stay distinguishable (see the ingest caps in
+  // index.ts, which must NOT coerce absent to ''/0).
+  peer_exe: string | null;
+  key_fp: string | null;
+  dest: string | null;
+  scope_family: string | null;
+  scope_label: string | null;
+  grant_ttl_s: number | null;
+  /** SQLite has no bool: 0 | 1 | null. */
+  relayed: number | null;
 }
 
 // ── Internal DO op bodies ──────────────────────────────────────────────────
