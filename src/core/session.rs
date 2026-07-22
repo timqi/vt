@@ -67,6 +67,9 @@ impl AuthOutcome {
 pub enum NotifyKind {
     TouchIdRejected,
     Locked,
+    /// A grant reuse satisfied sign/decrypt without a Touch ID prompt
+    /// (docs/app-bundle.md §3) — transparency for otherwise-silent reuse.
+    CacheHit,
 }
 
 /// Classification of session state. Pure type, no FFI — produced by

@@ -25,9 +25,25 @@ const STORE_NAME: &str = "store";
 const LOCK_FILE_NAME: &str = "vt-keychain.lock";
 pub const STORE_SCHEMA_VERSION: u32 = 1;
 
+/// Wrap-derivation versions for `encrypted_passphrase` (docs/app-bundle.md §2).
+/// v1 mixes the binary path into the wrap key; v2 uses a fixed label so the
+/// binary can move (VT.app migration). `STORE_SCHEMA_VERSION` intentionally
+/// stays 1: old binaries can still parse a v2 store (they fail the unwrap,
+/// not the parse), preserving the export/import escape hatch.
+pub const WRAP_V1: u32 = 1;
+pub const WRAP_V2: u32 = 2;
+
+fn default_wrap_v() -> u32 {
+    WRAP_V1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeychainStore {
     pub v: u32,
+    /// Which derivation wraps `encrypted_passphrase`. Serde default 1 so
+    /// stores written before this field existed read as wrap v1.
+    #[serde(default = "default_wrap_v")]
+    pub wrap_v: u32,
     /// base64 of 64 bytes: passcode (32B) + auth_token (32B).
     pub passcode_and_auth_token: String,
     /// base64 of AES-GCM ciphertext (nonce || ct) wrapping the 32-byte master passphrase.
@@ -43,14 +59,22 @@ pub struct KeychainStore {
 }
 
 impl KeychainStore {
+    /// New stores are always wrap v2 (fixed-label derivation); only
+    /// `vt secret rebind --to-v1` produces a v1 wrap after this version.
     pub fn new(passcode_and_auth_token: &[u8], encrypted_passphrase: &[u8]) -> Self {
         Self {
             v: STORE_SCHEMA_VERSION,
+            wrap_v: WRAP_V2,
             passcode_and_auth_token: BASE64_URL_SAFE_NO_PAD.encode(passcode_and_auth_token),
             encrypted_passphrase: BASE64_URL_SAFE_NO_PAD.encode(encrypted_passphrase),
             encrypted_ssh_keys: None,
             encrypted_fido2: None,
         }
+    }
+
+    pub fn set_encrypted_passphrase(&mut self, bytes: &[u8], wrap_v: u32) {
+        self.encrypted_passphrase = BASE64_URL_SAFE_NO_PAD.encode(bytes);
+        self.wrap_v = wrap_v;
     }
 
     /// Read the store from the keychain. Returns an error if the item does

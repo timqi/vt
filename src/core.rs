@@ -488,6 +488,45 @@ pub struct DiagPeerReport {
     pub is_vt_relay: bool,
 }
 
+// ---- ui-status@vt (docs/app-bundle.md §5) -----------------------------------
+
+pub const UI_STATUS_ACTION_STATUS: &str = "status";
+pub const UI_STATUS_ACTION_REVOKE_ALL: &str = "revoke_all";
+
+/// Request: shell → agent for `ui-status@vt`. Plaintext JSON (the shell
+/// holds no VT_AUTH), gated by the 32-byte spawn token the shell passed the
+/// agent over an inherited pipe at startup. Like `diag@vt` it never resets
+/// the idle clock; unlike `diag@vt` a valid token sees the WHOLE grant
+/// store — the one deliberate exception to caller-scoped visibility.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct UiStatusReq {
+    /// base64-url-no-pad of the 32-byte spawn token.
+    pub token: String,
+    /// [`UI_STATUS_ACTION_STATUS`] or [`UI_STATUS_ACTION_REVOKE_ALL`]
+    /// (authority-reducing only — there is deliberately no action that
+    /// grants, extends, or approves anything).
+    pub action: String,
+}
+
+/// Response for `ui-status@vt`. No secrets, digests, or key material;
+/// grant `display` strings are the same text the Touch ID prompts showed.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct UiStatusRes {
+    pub agent_version: String,
+    pub locked: bool,
+    pub sign_ttl_secs: u64,
+    pub decrypt_ttl_secs: u64,
+    /// Idle timeout in seconds — surfaced so the shell can show *why* grants
+    /// clear after a quiet spell (docs/app-bundle.md §10). Policy, not secret.
+    pub idle_timeout_secs: u64,
+    pub run_allow_len: usize,
+    pub audit_push: bool,
+    /// Grants dropped, present only in a `revoke_all` reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<usize>,
+    pub grants: Vec<crate::core::authorization::GrantSnapshot>,
+}
+
 // ---- v2 URL parsing ---------------------------------------------------------
 
 /// Parsed `vt://...` URL. Strict parser (no `url::Url`, no normalization).

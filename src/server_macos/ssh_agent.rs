@@ -30,7 +30,7 @@ use crate::core::wire::{
 use crate::core::{
     legacy_decrypt, AuthReq, AuthRes, ContextBasis, DecryptInput, DecryptReq, DecryptResItem,
     DiagCacheReport, DiagPeerReport, DiagReq, DiagRes, EncryptReq, EncryptResItem, RunReq,
-    RunRes, SignReq, SignRes, SALT_LEN,
+    RunRes, SignReq, SignRes, UiStatusReq, UiStatusRes, SALT_LEN,
 };
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
@@ -46,6 +46,10 @@ pub const EXT_AUTH: &str = "auth@vt";
 pub const EXT_RUN: &str = "run@vt";
 pub const EXT_SIGN: &str = "sign@vt";
 pub const EXT_DIAG: &str = "diag@vt";
+/// Token-gated shell status/revoke channel (docs/app-bundle.md §5).
+/// Plaintext (pre-cipher) like `session-bind@openssh.com`; NOT in the vt
+/// cipher-path match below and NOT permitted by the relay filter.
+pub const EXT_UI_STATUS: &str = "ui-status@vt";
 
 fn agent_err(e: anyhow::Error) -> AgentError {
     AgentError::Other(Box::new(std::io::Error::new(
@@ -151,6 +155,28 @@ fn watcher_should_clear(
         return true;
     }
     sleep_diverged(mono_delta, wall_delta)
+}
+
+/// Wipe the decrypted-key map from RAM and mark `idle_cleared` so the next
+/// interactive request silently reloads (docs/app-bundle.md §10). The single
+/// source of the "wipe → later silent reload" handshake, shared by the idle
+/// sweeper and the screen-lock/wake watcher so the flag can't be forgotten in
+/// one of them. Returns the number of keys cleared. NOTE: the `ssh-add -x`
+/// lock finalizer clears keys WITHOUT this flag on purpose — it relies on the
+/// `locked` gate (not `idle_cleared`) to refuse reload — so it does not use
+/// this helper.
+async fn clear_keys_for_reload(
+    keys: &Arc<RwLock<HashMap<String, PrivateKey>>>,
+    idle_cleared: &Arc<RwLock<bool>>,
+) -> usize {
+    let mut guard = keys.write().await;
+    let count = guard.len();
+    if count > 0 {
+        guard.clear();
+        drop(guard);
+        *idle_cleared.write().await = true;
+    }
+    count
 }
 
 // --- macOS process introspection ---
@@ -585,8 +611,17 @@ const RUN_ENV_PASSTHROUGH: &[&str] = &[
     "LC_ALL", "LC_CTYPE", "DISPLAY",
 ];
 
-/// Default idle timeout: 30 minutes.
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
+/// Default idle timeout: 2 hours.
+///
+/// Idle timeout overlaps in purpose with screen-lock / sleep invalidation —
+/// both are "the human walked away" backstops — and lock/sleep fire far
+/// faster (seconds, via the cache watcher). On a Mac with prompt auto-lock
+/// the idle timeout is largely redundant, so a longer default favors fewer
+/// surprise re-prompts after a quiet spell while lock/sleep remain the fast
+/// guard. It is still a real backstop for the unlocked-but-unattended
+/// window; hosts without reliable auto-lock should lower it via
+/// `--timeout` / `[agent].timeout`.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 2 * 60 * 60;
 
 /// Cache durations for the two reusable operations, carried together with
 /// named fields so sign and decrypt cannot be transposed at any call layer —
@@ -779,6 +814,15 @@ pub struct VtSshAgentFactory {
     /// Fire-and-forget audit push config. Cloned per session like `run_allow`.
     /// Disabled config = audit push is a no-op.
     audit_push: Arc<AuditPushConfig>,
+    /// Fire a system notification when a grant reuse satisfies sign/decrypt
+    /// without a prompt (docs/app-bundle.md §3). Default on.
+    notify_cache_hits: bool,
+    /// 32-byte spawn token read from `--ui-token-fd` at startup; gates
+    /// `ui-status@vt`. `None` (CLI-started agent) refuses every request.
+    ui_token: Option<[u8; 32]>,
+    /// Configured idle timeout (seconds) — reported over `ui-status@vt` so
+    /// the shell can display it (docs/app-bundle.md §10).
+    idle_timeout_secs: u64,
 }
 
 impl VtSshAgentFactory {
@@ -788,6 +832,9 @@ impl VtSshAgentFactory {
         disable_legacy_decrypt: bool,
         run_allow: RunAllowlist,
         audit_push: Arc<AuditPushConfig>,
+        notify_cache_hits: bool,
+        ui_token: Option<[u8; 32]>,
+        idle_timeout_secs: u64,
     ) -> Self {
         let locked = Arc::new(AtomicBool::new(false));
         let authorization = new_engine(Arc::clone(&locked));
@@ -803,6 +850,9 @@ impl VtSshAgentFactory {
             disable_legacy_decrypt,
             run_allow: Arc::new(run_allow),
             audit_push,
+            notify_cache_hits,
+            ui_token,
+            idle_timeout_secs,
         }
     }
 }
@@ -1354,6 +1404,9 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             bind_state: BindState::Unbound,
             destination_label: None,
             disable_legacy_decrypt: self.disable_legacy_decrypt,
+            notify_cache_hits: self.notify_cache_hits,
+            ui_token: self.ui_token,
+            idle_timeout_secs: self.idle_timeout_secs,
         }
     }
 }
@@ -1404,6 +1457,12 @@ struct VtSshSession {
     /// sign burst does not re-read known_hosts.
     destination_label: Option<String>,
     disable_legacy_decrypt: bool,
+    /// Cache-hit transparency notifications (docs/app-bundle.md §3).
+    notify_cache_hits: bool,
+    /// Spawn token gating `ui-status@vt`; `None` refuses every request.
+    ui_token: Option<[u8; 32]>,
+    /// Configured idle timeout (seconds), reported over `ui-status@vt`.
+    idle_timeout_secs: u64,
 }
 
 impl VtSshSession {
@@ -1815,9 +1874,10 @@ impl VtSshSession {
         audit::spawn_push(Arc::clone(&self.audit_push), entry);
     }
 
-    /// Ensure keys are loaded. If they were cleared by the idle sweeper,
-    /// silently reload from keychain. The unified authorization engine still
-    /// gates every operation before a loaded key can be used.
+    /// Ensure keys are loaded. If they were cleared by the idle sweeper or by
+    /// the screen-lock/sleep watcher (docs/app-bundle.md §10), silently reload
+    /// from keychain. The unified authorization engine still gates every
+    /// operation before a loaded key can be used.
     async fn ensure_keys_loaded(&self) -> Result<(), AgentError> {
         let keys = self.keys.read().await;
         if !keys.is_empty() {
@@ -1825,20 +1885,31 @@ impl VtSshSession {
         }
         drop(keys);
 
-        // Check if keys were cleared by idle timeout (vs just being empty)
+        // Check if keys were cleared by idle timeout / lock (vs just empty).
         let idle = *self.idle_cleared.read().await;
         if !idle {
             return Ok(());
         }
 
-        tracing::info!("Keys cleared by idle timeout, reloading from keychain");
+        // Do NOT repopulate RAM while the screen is locked (§10, C). A sign
+        // here is rejected by the validator anyway; reloading would undo the
+        // lock-wipe. Checked before the keychain I/O to skip a pointless read,
+        // and RE-checked after it (below) because the screen can lock during
+        // the read. `idle_cleared` is left set so a later interactive call
+        // reloads.
+        if !super::security::session_interactive_now() {
+            return Ok(());
+        }
+
+        tracing::info!("Keys cleared (idle/lock), reloading from keychain");
         let loaded = load_all_keys().map_err(agent_err)?;
         tracing::info!("Reloaded {} SSH keys", loaded.len());
         let mut keys = self.keys.write().await;
-        // A lock transition may have started while Keychain I/O was in
-        // progress. Check while holding the same key-map guard used by lock()
-        // so loaded private keys can never be installed after its clear.
-        if self.locked.load(Ordering::Acquire) {
+        // A lock transition (agent lock OR screen lock) may have started while
+        // Keychain I/O was in progress. Re-check both while holding the same
+        // key-map guard used by lock() so loaded private keys can never be
+        // installed after a clear.
+        if self.locked.load(Ordering::Acquire) || !super::security::session_interactive_now() {
             return Ok(());
         }
         *keys = loaded;
@@ -1853,6 +1924,26 @@ impl VtSshSession {
     async fn touch_activity(&self) {
         let mut last = self.last_activity.write().await;
         *last = (Instant::now(), SystemTime::now());
+    }
+
+    /// Fire the cache-hit transparency notification for a committed permit,
+    /// if enabled. MUST be called only AFTER `permit.commit()` (or
+    /// `commit_authorization`) has returned — while a permit is live its
+    /// security read guard blocks revocation, and this must not add
+    /// unbounded-latency work there. The notify itself is fire-and-forget
+    /// (docs/app-bundle.md §3). Single-sourced so both sign paths keep the
+    /// ordering invariant identical.
+    fn fire_cache_hit_note(
+        &self,
+        note: Option<(&'static str, String)>,
+        reuse_remaining: Option<Duration>,
+    ) {
+        if !self.notify_cache_hits {
+            return;
+        }
+        if let Some((operation, label)) = note {
+            super::security::notify_cache_hit(operation, &label, reuse_remaining);
+        }
     }
 
     // ---- Structured-envelope dispatch helpers --------------------------------
@@ -2005,6 +2096,11 @@ impl VtSshSession {
         } else {
             let (scopes, reuse_label) =
                 self.decrypt_scopes(&v2_inputs, &req.host, &req.meta.pwd);
+            let display = reuse_label.clone().unwrap_or_default();
+            let scopes: Vec<GrantScope> = scopes
+                .into_iter()
+                .map(|scope| scope.with_display(display.clone()))
+                .collect();
             append_reuse_line(
                 &mut local_auth_message,
                 &reuse_label,
@@ -2108,7 +2204,8 @@ impl VtSshSession {
                 dek.zeroize();
             }
         }
-        Ok(HandlerSuccess::authorized(bytes, permit))
+        let note = cache_hit_note_for(&permit, "decrypt", &reuse_label);
+        Ok(HandlerSuccess::authorized(bytes, permit).with_cache_hit_note(note))
     }
 
     async fn handle_auth(
@@ -2230,6 +2327,67 @@ impl VtSshSession {
             serde_json::to_vec(&result)
                 .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?,
         )))
+    }
+
+    /// `ui-status@vt` (docs/app-bundle.md §5): plaintext, token-gated
+    /// status/revoke channel for the VT.app shell. Runs BEFORE the lock
+    /// check and the VT_AUTH cipher path, never touches the idle clock, is
+    /// never cached and never audit-pushed. The only whole-store grant
+    /// visibility in the agent — every failure mode is an unstructured
+    /// `AgentError::Failure` so a prober without the token cannot even
+    /// distinguish "agent without token" from "unknown extension".
+    async fn handle_ui_status(
+        &self,
+        extension: &Extension,
+    ) -> Result<Option<Extension>, AgentError> {
+        use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
+        use subtle::ConstantTimeEq;
+
+        let req: UiStatusReq =
+            serde_json::from_slice(extension.details.as_ref()).map_err(|_| AgentError::Failure)?;
+        // Constant-time token compare, same idiom as `unlock()`. A
+        // CLI-started agent has no token and refuses every request.
+        let authorized = match (
+            &self.ui_token,
+            BASE64_URL_SAFE_NO_PAD.decode(&req.token),
+        ) {
+            (Some(expected), Ok(candidate)) if candidate.len() == 32 => {
+                expected.ct_eq(candidate.as_slice()).into()
+            }
+            _ => false,
+        };
+        if !authorized {
+            return Err(AgentError::Failure);
+        }
+
+        let revoked = match req.action.as_str() {
+            crate::core::UI_STATUS_ACTION_STATUS => None,
+            // Authority-reducing only: reuses the linearized revoker, so the
+            // epoch advances even when the store is empty and an in-flight
+            // prompt cannot recreate a revoked grant. May wait while a live
+            // permit holds the security gate — the shell shows "waiting for
+            // the in-flight approval".
+            crate::core::UI_STATUS_ACTION_REVOKE_ALL => {
+                Some(self.authorization.invalidate_all().await)
+            }
+            _ => return Err(AgentError::Failure),
+        };
+        let res = UiStatusRes {
+            agent_version: env!("VT_VERSION").to_string(),
+            locked: self.locked.load(Ordering::Acquire),
+            sign_ttl_secs: self.cache_ttls.sign_secs,
+            decrypt_ttl_secs: self.cache_ttls.decrypt_secs,
+            idle_timeout_secs: self.idle_timeout_secs,
+            run_allow_len: self.run_allow.len(),
+            audit_push: self.audit_push.enabled,
+            revoked,
+            grants: self.authorization.snapshot().await,
+        };
+        let bytes = serde_json::to_vec(&res).map_err(|e| agent_err(e.into()))?;
+        Ok(Some(Extension {
+            name: extension.name.clone(),
+            details: Unparsed::from(bytes),
+        }))
     }
 
     /// Touch-ID-gated local command launcher. Every call prompts — no auth
@@ -2449,6 +2607,7 @@ impl VtSshSession {
         // Reuse line before the client-reported body/meta — same padding
         // rationale as the relay origin marker.
         let (scope, reuse_label) = self.sign_vt_scope(&fp_str, &req.meta.pwd);
+        let scope = scope.with_display(reuse_label.clone().unwrap_or_default());
         append_reuse_line(&mut auth_message, &reuse_label, self.cache_ttls.sign_secs);
         let audit_ctx = {
             let mut ctx =
@@ -2515,7 +2674,8 @@ impl VtSshSession {
         let bytes = serde_json::to_vec(&res)
             .map(Zeroizing::new)
             .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?;
-        Ok(HandlerSuccess::authorized(bytes, permit))
+        let note = cache_hit_note_for(&permit, "sign", &reuse_label);
+        Ok(HandlerSuccess::authorized(bytes, permit).with_cache_hit_note(note))
     }
 }
 
@@ -2676,6 +2836,11 @@ type WireFailure = (ErrKind, Option<&'static str>);
 struct HandlerSuccess {
     bytes: Zeroizing<Vec<u8>>,
     authorization: Option<AuthorizationPermit>,
+    /// `(operation, scope display)` when the permit's decision was a cache
+    /// hit. The dispatcher fires the transparency notification from this
+    /// AFTER `commit()` — never while the permit (and its security read
+    /// guard) is live (docs/app-bundle.md §3).
+    cache_hit_note: Option<(&'static str, String)>,
 }
 
 impl HandlerSuccess {
@@ -2683,6 +2848,7 @@ impl HandlerSuccess {
         Self {
             bytes,
             authorization: Some(authorization),
+            cache_hit_note: None,
         }
     }
 
@@ -2690,8 +2856,30 @@ impl HandlerSuccess {
         Self {
             bytes,
             authorization: None,
+            cache_hit_note: None,
         }
     }
+
+    fn with_cache_hit_note(mut self, note: Option<(&'static str, String)>) -> Self {
+        self.cache_hit_note = note;
+        self
+    }
+}
+
+/// Build the dispatcher's post-commit notification note for a permit whose
+/// decision was `CacheHit`. `None` label (a fresh basis can't hit — defensive)
+/// degrades to the family-free "cached scope".
+fn cache_hit_note_for(
+    permit: &AuthorizationPermit,
+    operation: &'static str,
+    reuse_label: &Option<String>,
+) -> Option<(&'static str, String)> {
+    (permit.decision() == Decision::CacheHit).then(|| {
+        (
+            operation,
+            reuse_label.clone().unwrap_or_else(|| "cached scope".to_string()),
+        )
+    })
 }
 
 fn authorization_failure_wire(failure: &AuthorizationFailure) -> WireFailure {
@@ -2789,6 +2977,9 @@ impl Session for VtSshSession {
         let mut auth_message = format!("ssh-sign\nkey: {}", key_label);
         self.append_caller_line(&mut auth_message);
         let (scope, reuse_label) = self.raw_sign_scope(&fp_str);
+        // The reuse-line label doubles as the grant's display string
+        // (ui-status snapshots, cache-hit notifications).
+        let scope = scope.with_display(reuse_label.clone().unwrap_or_default());
         // Destination truth line BEFORE the reuse line: with the default
         // TTL of 0 the reuse line never appears, and the verified
         // session-bind destination must still be shown (a non-relay bound
@@ -2844,10 +3035,13 @@ impl Session for VtSshSession {
         };
 
         let signature = sign_data_with_privkey(&privkey, &request.data, request.flags)?;
+        let cache_hit_note = cache_hit_note_for(&permit, "sign", &reuse_label);
+        let reuse_remaining = permit.reuse_remaining();
         permit
             .commit()
             .await
             .map_err(|_| AgentError::Failure)?;
+        self.fire_cache_hit_note(cache_hit_note, reuse_remaining);
         Ok(signature)
     }
 
@@ -2881,6 +3075,17 @@ impl Session for VtSshSession {
                 Ok(()) => Ok(None), // plain SSH_AGENT_SUCCESS
                 Err(()) => Err(AgentError::Failure),
             };
+        }
+        // `ui-status@vt` is the shell's token-gated plaintext channel
+        // (docs/app-bundle.md §5). Like session-bind it precedes the lock
+        // check (a locked agent must still report `locked: true`), the
+        // keychain/auth-cipher path (the shell holds no VT_AUTH), and the
+        // idle-clock touch (it is meant to be polled; keeping the agent
+        // "active" would defeat the idle revocation). A missing or wrong
+        // token fails unstructured — indistinguishable from an unknown
+        // extension.
+        if extension.name.as_str() == EXT_UI_STATUS {
+            return self.handle_ui_status(&extension).await;
         }
         if self.locked.load(Ordering::Acquire) {
             // The lock check fires before keychain ciphers are derived, so
@@ -2959,13 +3164,15 @@ impl Session for VtSshSession {
         // serialized inner body (which carries DEKs for encrypt/decrypt) is
         // only ever held in `Zeroizing` buffers — no intermediate
         // `serde_json::Value` allocation that wouldn't be wiped on drop.
-        let (envelope_bytes, authorization): (
+        let (envelope_bytes, authorization, cache_hit_note): (
             Zeroizing<Vec<u8>>,
             Option<AuthorizationPermit>,
+            Option<(&'static str, String)>,
         ) = match dispatch {
             Ok(success) => (
                 Zeroizing::new(wrap_ok_envelope(&success.bytes)),
                 success.authorization,
+                success.cache_hit_note,
             ),
             Err((kind, detail)) => (
                 Zeroizing::new(
@@ -2977,6 +3184,7 @@ impl Session for VtSshSession {
                     })
                     .map_err(|e| agent_err(e.into()))?,
                 ),
+                None,
                 None,
             ),
         };
@@ -2993,6 +3201,10 @@ impl Session for VtSshSession {
         // would re-run a non-idempotent handler (run@vt spawns twice).
         let mut encrypted_response = auth_cipher.encrypt(&envelope_bytes).map_err(agent_err)?;
         if let Some(permit) = authorization {
+            // Captured before commit consumes the permit; used only after the
+            // guard is released — a blocking notify while the permit is live
+            // would stall revocation (docs/app-bundle.md §3).
+            let reuse_remaining = permit.reuse_remaining();
             if let Err((kind, detail)) = commit_authorization(permit).await {
                 tracing::warn!("authorization commit invalidated after operation success");
                 let error_envelope = Zeroizing::new(
@@ -3005,6 +3217,8 @@ impl Session for VtSshSession {
                     .map_err(|e| agent_err(e.into()))?,
                 );
                 encrypted_response = auth_cipher.encrypt(&error_envelope).map_err(agent_err)?;
+            } else {
+                self.fire_cache_hit_note(cache_hit_note, reuse_remaining);
             }
         }
 
@@ -3205,8 +3419,23 @@ pub async fn run_ssh_agent(
     disable_legacy_decrypt: bool,
     run_allow: RunAllowlist,
     audit_push: Arc<AuditPushConfig>,
+    notify_cache_hits: bool,
+    ui_token: Option<[u8; 32]>,
 ) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
+
+    // Transparent wrap v1->v2 upgrade (docs/app-bundle.md §2): flock-guarded,
+    // touches only encrypted_passphrase + wrap_v. Failure is non-fatal here —
+    // a store bound to a moved binary path surfaces the same error with a
+    // clearer remedy below when keys are loaded.
+    match super::security::upgrade_wrap_v2_if_needed() {
+        Ok(true) => tracing::info!("master-key wrap upgraded to v2 (path-independent)"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            "master-key wrap v2 upgrade did not run: {e:#} — run `vt secret rebind` \
+             (with --old-bin-path if the binary moved)"
+        ),
+    }
 
     // Load keys (cipher is loaded and dropped inside load_all_keys)
     let keys = load_all_keys()?;
@@ -3239,6 +3468,9 @@ pub async fn run_ssh_agent(
         disable_legacy_decrypt,
         run_allow,
         audit_push,
+        notify_cache_hits,
+        ui_token,
+        idle_timeout_secs,
     );
     if audit_enabled {
         tracing::info!("Agent audit push enabled");
@@ -3281,16 +3513,12 @@ pub async fn run_ssh_agent(
                 if dropped > 0 {
                     tracing::info!("Idle timeout, dropped {} auth cache grants", dropped);
                 }
-                let mut keys = sweeper_keys.write().await;
-                if !keys.is_empty() {
-                    let count = keys.len();
-                    keys.clear();
-                    let mut idle_cleared = sweeper_idle_cleared.write().await;
-                    *idle_cleared = true;
+                let cleared = clear_keys_for_reload(&sweeper_keys, &sweeper_idle_cleared).await;
+                if cleared > 0 {
                     tracing::info!(
                         "Idle timeout ({} min), cleared {} keys from memory",
                         sweeper_timeout.as_secs() / 60,
-                        count
+                        cleared
                     );
                 }
             }
@@ -3302,6 +3530,8 @@ pub async fn run_ssh_agent(
     // emptiness as a watcher shortcut would miss lock/wake invalidation while
     // that prompt is in flight.
     let watcher_authorization = Arc::clone(&factory.authorization);
+    let watcher_keys = Arc::clone(&factory.keys);
+    let watcher_idle_cleared = Arc::clone(&factory.idle_cleared);
     tokio::spawn(async move {
         let mut was_interactive = super::security::session_interactive_now();
         let mut prev_mono = Instant::now();
@@ -3318,9 +3548,16 @@ pub async fn run_ssh_agent(
                 now_wall.duration_since(prev_wall).ok(),
             ) {
                 let dropped = watcher_authorization.invalidate_all().await;
+                // §10 (C): lock/sleep must also wipe decrypted SSH keys from
+                // RAM, not just grants — screen lock does not otherwise clear
+                // them and (with a long idle timeout) they would linger.
+                // `ensure_keys_loaded` reloads silently on the next use once
+                // the screen is interactive again.
+                let cleared = clear_keys_for_reload(&watcher_keys, &watcher_idle_cleared).await;
                 tracing::info!(
-                    "Authorization grants invalidated on screen lock / wake ({} grants dropped)",
-                    dropped
+                    "Screen lock / wake: {} grants dropped, {} keys cleared from memory",
+                    dropped,
+                    cleared
                 );
             } else {
                 watcher_authorization.sweep_expired().await;
@@ -3376,6 +3613,8 @@ pub async fn start_ssh_agent(
     disable_legacy_decrypt: bool,
     run_allow: RunAllowlist,
     audit_push: Arc<AuditPushConfig>,
+    notify_cache_hits: bool,
+    ui_token: Option<[u8; 32]>,
 ) -> Result<()> {
     run_ssh_agent(
         true,
@@ -3384,6 +3623,8 @@ pub async fn start_ssh_agent(
         disable_legacy_decrypt,
         run_allow,
         audit_push,
+        notify_cache_hits,
+        ui_token,
     )
     .await
 }
@@ -3672,6 +3913,9 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             bind_state: BindState::Unbound,
             destination_label: None,
             disable_legacy_decrypt: false,
+            notify_cache_hits: false,
+            ui_token: None,
+            idle_timeout_secs: 1800,
         }
     }
 
@@ -4270,6 +4514,115 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         };
         assert!(session.extension(malformed).await.is_err());
         assert!(matches!(session.bind_state, BindState::Unbound));
+    }
+
+    // --- ui-status@vt tests (docs/app-bundle.md §5) ---
+
+    fn ui_status_req(token_b64: &str, action: &str) -> Extension {
+        Extension {
+            name: EXT_UI_STATUS.to_string(),
+            details: Unparsed::from(
+                serde_json::to_vec(&UiStatusReq {
+                    token: token_b64.to_string(),
+                    action: action.to_string(),
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_status_token_gate_locked_report_and_revoke() {
+        use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
+        let token = [7u8; 32];
+        let token_b64 = BASE64_URL_SAFE_NO_PAD.encode(token);
+
+        // CLI-started agent (no token configured): a well-formed request is
+        // refused — indistinguishable from an unknown extension.
+        let mut session = test_session(300, 300);
+        assert!(session
+            .extension(ui_status_req(&token_b64, "status"))
+            .await
+            .is_err());
+
+        // Wrong token refused; correct token answers WITHOUT keychain access
+        // (this test has no keychain store — like the session-bind test, it
+        // passes precisely because the plaintext path never derives ciphers).
+        let mut session = test_session(300, 300);
+        session.ui_token = Some(token);
+        session.authorization =
+            AuthorizationEngine::new(Arc::new(TestAuthenticator), Arc::new(TestValidator));
+        let wrong = BASE64_URL_SAFE_NO_PAD.encode([8u8; 32]);
+        assert!(session.extension(ui_status_req(&wrong, "status")).await.is_err());
+        // Unknown action: token holder still cannot invoke anything but
+        // status/revoke_all.
+        assert!(session
+            .extension(ui_status_req(&token_b64, "approve_all"))
+            .await
+            .is_err());
+
+        let reply = session
+            .extension(ui_status_req(&token_b64, "status"))
+            .await
+            .unwrap()
+            .expect("status reply");
+        assert_eq!(reply.name.as_str(), EXT_UI_STATUS);
+        let res: UiStatusRes = serde_json::from_slice(reply.details.as_ref()).unwrap();
+        assert!(!res.locked);
+        assert_eq!(res.sign_ttl_secs, 300);
+        assert_eq!(res.idle_timeout_secs, 1800); // test_session default
+        assert!(res.grants.is_empty());
+        assert!(res.revoked.is_none());
+
+        // A locked agent still reports status (the UI must be able to show
+        // the lock) — this rides the pre-lock-check dispatch position.
+        session.locked.store(true, Ordering::Release);
+        let reply = session
+            .extension(ui_status_req(&token_b64, "status"))
+            .await
+            .unwrap()
+            .expect("locked status reply");
+        let res: UiStatusRes = serde_json::from_slice(reply.details.as_ref()).unwrap();
+        assert!(res.locked);
+        session.locked.store(false, Ordering::Release);
+
+        // Snapshot carries the scope display label and expiry; revoke_all
+        // drops the grant and advances the epoch (stale commits refused).
+        session
+            .authorization
+            .authorize(AuthorizationRequest::new(
+                vec![GrantScope::sign_destination(b"hostkey-wire", "SHA256:k")
+                    .with_display("github.com (ED25519 SHA256:hk)")],
+                ReusePolicy::strict_ttl_secs(300),
+                "seed",
+            ))
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        let reply = session
+            .extension(ui_status_req(&token_b64, "status"))
+            .await
+            .unwrap()
+            .unwrap();
+        let res: UiStatusRes = serde_json::from_slice(reply.details.as_ref()).unwrap();
+        assert_eq!(res.grants.len(), 1);
+        let grant = &res.grants[0];
+        assert_eq!(grant.operation, "sign");
+        assert_eq!(grant.family, "destination");
+        assert_eq!(grant.display, "github.com (ED25519 SHA256:hk)");
+        assert_eq!(grant.ttl_secs, 300);
+        assert!(grant.remaining_secs > 290 && grant.remaining_secs <= 300);
+
+        let reply = session
+            .extension(ui_status_req(&token_b64, "revoke_all"))
+            .await
+            .unwrap()
+            .unwrap();
+        let res: UiStatusRes = serde_json::from_slice(reply.details.as_ref()).unwrap();
+        assert_eq!(res.revoked, Some(1));
+        assert!(res.grants.is_empty());
     }
 
     // --- Workspace resolution tests ---

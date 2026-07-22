@@ -29,6 +29,18 @@ pub enum Operation {
     Decrypt,
 }
 
+impl Operation {
+    /// Stable tag for `ui-status@vt` snapshots. One-way, never parsed back.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Operation::Auth => "auth",
+            Operation::Run => "run",
+            Operation::Sign => "sign",
+            Operation::Decrypt => "decrypt",
+        }
+    }
+}
+
 /// Which scope family a grant belongs to. Redundant with the digest's domain
 /// label for matching (the digest already separates families), but carried
 /// explicitly so diag counting can filter by family: workspace and
@@ -79,6 +91,11 @@ struct GrantKey {
 pub struct GrantScope {
     operation: Operation,
     key: Option<GrantKey>,
+    /// Human label of the scoped resource (destination host, workspace root,
+    /// parent app) — the same string the Touch ID reuse line shows. Never
+    /// hashed; carried into the grant store for `ui-status@vt` snapshots and
+    /// cache-hit notifications (docs/app-bundle.md §5). Memory-only.
+    display: String,
 }
 
 /// Subject for destination-bound sign grants. They are deliberately
@@ -96,7 +113,15 @@ impl GrantScope {
         Self {
             operation,
             key: None,
+            display: String::new(),
         }
+    }
+
+    /// Attach the human scope label (the reuse-line string). Display-only:
+    /// never part of the digest or the lookup key.
+    pub fn with_display(mut self, display: impl Into<String>) -> Self {
+        self.display = display.into();
+        self
     }
 
     /// Relay sign scope: fingerprint + claimed working directory, bounded by
@@ -293,6 +318,7 @@ impl GrantScope {
                 subject,
                 digest,
             }),
+            display: String::new(),
         }
     }
 
@@ -443,11 +469,53 @@ impl CacheExpiry {
     fn is_valid_at(self, now_mono: Instant, now_wall: SystemTime) -> bool {
         now_mono < self.mono && now_wall < self.wall
     }
+
+    /// Time left before the earlier of the two deadlines; zero once either
+    /// clock has passed. Display-only companion to [`Self::is_valid_at`].
+    fn remaining_at(self, now_mono: Instant, now_wall: SystemTime) -> Duration {
+        let mono_left = self.mono.saturating_duration_since(now_mono);
+        let wall_left = self
+            .wall
+            .duration_since(now_wall)
+            .unwrap_or(Duration::ZERO);
+        mono_left.min(wall_left)
+    }
+}
+
+/// Stored value per live grant: the dual-clock expiry plus the human scope
+/// label (display-only; feeds `ui-status@vt` snapshots).
+#[derive(Clone, Debug)]
+struct GrantEntry {
+    expiry: CacheExpiry,
+    display: String,
+}
+
+/// A reusable key paired with its scope's display label — what `authorize`
+/// carries from request scopes into lookups and pending commits.
+#[derive(Clone, Debug)]
+struct KeyedScope {
+    key: GrantKey,
+    display: String,
+}
+
+/// One live grant as reported to the token-gated `ui-status@vt` channel
+/// (docs/app-bundle.md §5) — the deliberate whole-store exception to
+/// diag@vt's caller-scoped counts. No digests, subjects, or key material;
+/// `display` is the same string the approval prompt showed.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GrantSnapshot {
+    /// Stable operation tag: "sign" | "decrypt" | "auth" | "run".
+    pub operation: String,
+    /// `ScopeFamily::as_wire` tag.
+    pub family: String,
+    pub display: String,
+    pub remaining_secs: u64,
+    pub ttl_secs: u64,
 }
 
 #[derive(Debug)]
 struct GrantStore {
-    entries: HashMap<GrantKey, CacheExpiry>,
+    entries: HashMap<GrantKey, GrantEntry>,
     epoch: u64,
 }
 
@@ -461,25 +529,37 @@ impl GrantStore {
 
     fn lookup_at(
         &self,
-        keys: &[GrantKey],
+        keys: &[KeyedScope],
         requested_ttl: Duration,
         now_mono: Instant,
         now_wall: SystemTime,
     ) -> Lookup {
+        let all_hit = keys.iter().all(|scoped| {
+            self.entries.get(&scoped.key).is_some_and(|entry| {
+                entry.expiry.is_valid_at(now_mono, now_wall) && entry.expiry.ttl <= requested_ttl
+            })
+        });
+        // Tightest remaining lifetime across the hit set — informational only
+        // (cache-hit notifications / ui-status); never feeds a reuse decision.
+        let remaining = if all_hit {
+            keys.iter()
+                .filter_map(|scoped| self.entries.get(&scoped.key))
+                .map(|entry| entry.expiry.remaining_at(now_mono, now_wall))
+                .min()
+        } else {
+            None
+        };
         Lookup {
             epoch: self.epoch,
-            all_hit: keys.iter().all(|key| {
-                self.entries.get(key).is_some_and(|expiry| {
-                    expiry.is_valid_at(now_mono, now_wall) && expiry.ttl <= requested_ttl
-                })
-            }),
+            all_hit,
+            remaining,
         }
     }
 
     fn commit_at(
         &mut self,
         expected_epoch: u64,
-        keys: &[GrantKey],
+        keys: &[KeyedScope],
         ttl: Duration,
         approved_mono: Instant,
         approved_wall: SystemTime,
@@ -489,18 +569,24 @@ impl GrantStore {
         }
         let fresh = CacheExpiry::checked(ttl, approved_mono, approved_wall)?;
         let mut inserted = 0;
-        for key in keys {
+        for scoped in keys {
             self.entries
-                .entry(key.clone())
-                .and_modify(|expiry| {
-                    if !expiry.is_valid_at(approved_mono, approved_wall) || expiry.ttl > ttl {
-                        *expiry = fresh;
+                .entry(scoped.key.clone())
+                .and_modify(|entry| {
+                    if !entry.expiry.is_valid_at(approved_mono, approved_wall)
+                        || entry.expiry.ttl > ttl
+                    {
+                        entry.expiry = fresh;
+                        entry.display = scoped.display.clone();
                         inserted += 1;
                     }
                 })
                 .or_insert_with(|| {
                     inserted += 1;
-                    fresh
+                    GrantEntry {
+                        expiry: fresh,
+                        display: scoped.display.clone(),
+                    }
                 });
         }
         Ok(inserted)
@@ -518,7 +604,7 @@ impl GrantStore {
 
     fn sweep_expired_at(&mut self, now_mono: Instant, now_wall: SystemTime) {
         self.entries
-            .retain(|_, expiry| expiry.is_valid_at(now_mono, now_wall));
+            .retain(|_, entry| entry.expiry.is_valid_at(now_mono, now_wall));
     }
 
     fn live_len_at(
@@ -531,13 +617,34 @@ impl GrantStore {
     ) -> usize {
         self.entries
             .iter()
-            .filter(|(key, expiry)| {
+            .filter(|(key, entry)| {
                 key.operation == operation
                     && key.family == family
                     && key.subject == subject
-                    && expiry.is_valid_at(now_mono, now_wall)
+                    && entry.expiry.is_valid_at(now_mono, now_wall)
             })
             .count()
+    }
+
+    /// Whole-store enumeration for the token-gated `ui-status@vt` channel
+    /// ONLY (docs/app-bundle.md §5). Sorted for stable UI ordering.
+    fn snapshot_at(&self, now_mono: Instant, now_wall: SystemTime) -> Vec<GrantSnapshot> {
+        let mut grants: Vec<GrantSnapshot> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.expiry.is_valid_at(now_mono, now_wall))
+            .map(|(key, entry)| GrantSnapshot {
+                operation: key.operation.as_wire().to_string(),
+                family: key.family.as_wire().to_string(),
+                display: entry.display.clone(),
+                remaining_secs: entry.expiry.remaining_at(now_mono, now_wall).as_secs(),
+                ttl_secs: entry.expiry.ttl.as_secs(),
+            })
+            .collect();
+        grants.sort_by(|a, b| {
+            (&a.operation, &a.family, &a.display).cmp(&(&b.operation, &b.family, &b.display))
+        });
+        grants
     }
 }
 
@@ -545,6 +652,8 @@ impl GrantStore {
 struct Lookup {
     epoch: u64,
     all_hit: bool,
+    /// Tightest remaining lifetime across the hit set when `all_hit`.
+    remaining: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,7 +664,7 @@ pub enum CommitError {
 
 struct PendingGrant {
     expected_epoch: u64,
-    keys: Vec<GrantKey>,
+    keys: Vec<KeyedScope>,
     ttl: Duration,
     approved_mono: Instant,
     approved_wall: SystemTime,
@@ -567,6 +676,9 @@ struct PendingGrant {
 pub struct AuthorizationPermit {
     decision: Decision,
     latency_ms: u64,
+    /// Tightest remaining grant lifetime when `decision` is `CacheHit`.
+    /// Informational only (cache-hit notifications); never a reuse input.
+    reuse_remaining: Option<Duration>,
     pending: Option<PendingGrant>,
     store: Arc<RwLock<GrantStore>>,
     _security: OwnedRwLockReadGuard<()>,
@@ -576,6 +688,10 @@ pub struct AuthorizationPermit {
 impl AuthorizationPermit {
     pub fn decision(&self) -> Decision {
         self.decision
+    }
+
+    pub fn reuse_remaining(&self) -> Option<Duration> {
+        self.reuse_remaining
     }
 
     pub fn latency_ms(&self) -> u64 {
@@ -696,6 +812,7 @@ impl AuthorizationEngine {
                 return Ok(AuthorizationPermit {
                     decision: Decision::CacheHit,
                     latency_ms: 0,
+                    reuse_remaining: lookup.remaining,
                     pending: None,
                     store: Arc::clone(&self.store),
                     _security: security,
@@ -736,6 +853,7 @@ impl AuthorizationEngine {
                     return Ok(AuthorizationPermit {
                         decision: Decision::CacheHit,
                         latency_ms: 0,
+                        reuse_remaining: lookup.remaining,
                         pending: None,
                         store: Arc::clone(&self.store),
                         _security: security,
@@ -822,6 +940,7 @@ impl AuthorizationEngine {
         Ok(AuthorizationPermit {
             decision: Decision::Approved(method),
             latency_ms: started.elapsed().as_millis() as u64,
+            reuse_remaining: None,
             pending,
             store: Arc::clone(&self.store),
             _security: security,
@@ -890,7 +1009,17 @@ impl AuthorizationEngine {
         )
     }
 
-    async fn lookup(&self, keys: &[GrantKey], requested_ttl: Duration) -> Lookup {
+    /// Whole-store grant enumeration. ONLY for the token-gated `ui-status@vt`
+    /// handler (docs/app-bundle.md §5) — every other read surface stays
+    /// caller-scoped (`live_len`). Read-lock only; never sweeps or mutates.
+    pub async fn snapshot(&self) -> Vec<GrantSnapshot> {
+        self.store
+            .read()
+            .await
+            .snapshot_at(Instant::now(), SystemTime::now())
+    }
+
+    async fn lookup(&self, keys: &[KeyedScope], requested_ttl: Duration) -> Lookup {
         self.store
             .read()
             .await
@@ -957,7 +1086,7 @@ impl AuthorizationEngine {
     }
 }
 
-fn reusable_keys(scopes: &[GrantScope], policy: ReusePolicy) -> Option<Vec<GrantKey>> {
+fn reusable_keys(scopes: &[GrantScope], policy: ReusePolicy) -> Option<Vec<KeyedScope>> {
     if !matches!(policy, ReusePolicy::StrictTtl(_)) {
         return None;
     }
@@ -966,7 +1095,10 @@ fn reusable_keys(scopes: &[GrantScope], policy: ReusePolicy) -> Option<Vec<Grant
     for scope in scopes {
         let key = scope.key.as_ref()?;
         if unique.insert(key.clone()) {
-            keys.push(key.clone());
+            keys.push(KeyedScope {
+                key: key.clone(),
+                display: scope.display.clone(),
+            });
         }
     }
     (!keys.is_empty()).then_some(keys)
@@ -1072,9 +1204,18 @@ mod tests {
         )
     }
 
+    /// Direct-store tests address entries as `KeyedScope` (key + display),
+    /// mirroring what `reusable_keys` hands the store.
+    fn keyed(scope: GrantScope) -> KeyedScope {
+        KeyedScope {
+            key: scope.key.unwrap(),
+            display: scope.display,
+        }
+    }
+
     #[test]
     fn strict_ttl_requires_both_clocks() {
-        let key = sign_scope((1, 2), "fp").key.unwrap();
+        let key = keyed(sign_scope((1, 2), "fp"));
         let mut store = GrantStore::new();
         let m0 = Instant::now();
         let w0 = SystemTime::now();
@@ -1121,7 +1262,7 @@ mod tests {
 
     #[test]
     fn strict_ttl_does_not_slide() {
-        let key = sign_scope((1, 2), "fp").key.unwrap();
+        let key = keyed(sign_scope((1, 2), "fp"));
         let mut store = GrantStore::new();
         let m0 = Instant::now();
         let w0 = SystemTime::now();
@@ -1157,7 +1298,7 @@ mod tests {
 
     #[test]
     fn shorter_policy_replaces_a_live_wider_ttl_without_sliding() {
-        let key = sign_scope((1, 2), "fp").key.unwrap();
+        let key = keyed(sign_scope((1, 2), "fp"));
         let mut store = GrantStore::new();
         let m0 = Instant::now();
         let w0 = SystemTime::now();
@@ -1331,7 +1472,7 @@ mod tests {
 
     #[test]
     fn invalidation_bumps_empty_store_epoch_and_blocks_stale_commit() {
-        let key = sign_scope((1, 2), "fp").key.unwrap();
+        let key = keyed(sign_scope((1, 2), "fp"));
         let mut store = GrantStore::new();
         assert_eq!(store.invalidate_all(), 0);
         assert_eq!(store.epoch, 1);
@@ -1349,7 +1490,7 @@ mod tests {
 
     #[test]
     fn oversized_ttl_fails_without_panicking() {
-        let key = sign_scope((1, 2), "fp").key.unwrap();
+        let key = keyed(sign_scope((1, 2), "fp"));
         let mut store = GrantStore::new();
         assert_eq!(
             store.commit_at(
