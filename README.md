@@ -29,26 +29,35 @@ common paths are:
 
 ## Installation
 
-Download prebuilt binaries from [GitHub Releases](https://github.com/timqi/vt/releases) (macOS arm64, Linux amd64).
+Download prebuilt artifacts from [GitHub Releases](https://github.com/timqi/vt/releases):
+the bare `vt` binary (macOS arm64, Linux amd64) and, for macOS, **VT.app** — a
+menu-bar app bundling the same `vt` CLI plus native VT-branded notifications
+(including cache-hit transparency), live grant status with one-click
+revoke-all, and agent supervision.
 
 Or build from source (recipes live in the `justfile`, run `just` to list them):
 
 ```bash
-# Builds (musl-static on Linux, native on macOS) and installs to ~/.local/bin
+# CLI only: builds (musl-static on Linux, native on macOS) and installs to ~/.local/bin
 just install
-```
 
-On macOS you can instead install **VT.app** — a menu-bar app bundling the
-same `vt` CLI, adding native VT-branded notifications (including cache-hit
-transparency), live grant status with one-click revoke-all, and agent
-supervision:
-
-```bash
-# Assembles VT.app, installs to /Applications, symlinks ~/.local/bin/vt
+# macOS menu-bar app: assembles VT.app, installs to /Applications, symlinks ~/.local/bin/vt
 just install-app
 ```
 
-See [docs/app-bundle.md](docs/app-bundle.md) — including the one-time
+Installing the **downloaded** VT.app tarball (vs `just install-app`):
+
+```bash
+tar xzf VT-app-darwin-arm64-*.tar.gz            # CLI extract avoids Gatekeeper quarantine
+mv VT.app /Applications/
+ln -sf /Applications/VT.app/Contents/MacOS/vt ~/.local/bin/vt   # put the CLI on PATH
+# If Gatekeeper still blocks it (e.g. extracted via Finder):
+#   xattr -dr com.apple.quarantine /Applications/VT.app
+```
+
+The release build is **ad-hoc signed**, so each release re-triggers the
+one-time Keychain authorization prompt on first launch. See
+[docs/app-bundle.md](docs/app-bundle.md) — including the one-time
 `vt secret rebind` migration if your keychain store was created by a `vt`
 binary at another path.
 

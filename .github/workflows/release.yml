@@ -54,6 +54,25 @@ jobs:
           name: ${{ matrix.artifact }}-${{ env.VERSION }}
           path: ${{ matrix.artifact }}-${{ env.VERSION }}.tar.gz
 
+      # macOS also ships the menu-bar VT.app (ad-hoc signed) alongside the
+      # bare `vt` binary. `just app` is the single source of the bundle
+      # layout; VT_APP_BIN reuses the binary just built (no second compile).
+      # tar.gz to match the binary artifacts; CLI extraction (`tar xzf`)
+      # avoids the Gatekeeper quarantine that Finder/zip would propagate.
+      - name: Package VT.app (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install just
+          VT_APP_BIN="target/${{ matrix.target }}/release/vt" just app
+          COPYFILE_DISABLE=1 tar czf VT-app-darwin-arm64-${{ env.VERSION }}.tar.gz -C build VT.app
+
+      - name: Upload VT.app artifact (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: VT-app-darwin-arm64-${{ env.VERSION }}
+          path: VT-app-darwin-arm64-${{ env.VERSION }}.tar.gz
+
   release:
     needs: build
     runs-on: ubuntu-latest

@@ -52,6 +52,17 @@ and notifications show `CFBundleDisplayName` (`VT`) regardless.
 - `just install-app` copies to `/Applications/VT.app` and symlinks
   `~/.local/bin/vt → /Applications/VT.app/Contents/MacOS/vt` (same target dir
   the existing `just install` uses).
+- **Release** (`.github/workflows/release.yml`): the macOS job builds VT.app
+  via `just app` (reusing the release binary through `VT_APP_BIN`, so no
+  second compile) and ships it as `VT-app-darwin-arm64-<tag>.tar.gz`
+  alongside the bare `vt` tarball. It is **ad-hoc signed** (no Developer ID
+  set up), so: each release re-triggers the one-time Keychain ACL prompt on
+  first launch (ad-hoc signatures differ per build), and Gatekeeper would
+  quarantine it — but `tar xzf` from the CLI does not propagate the download
+  quarantine the way Finder/zip does, so a terminal install usually opens
+  cleanly; `xattr -dr com.apple.quarantine` is the fallback. Moving to
+  Developer ID + notarization later removes both frictions and is a drop-in
+  `VT_CODESIGN_ID` + a notarize step.
 - Menu-bar icon: the hex-nut key shape from the SVG redrawn as an `NSImage`
   template (code-drawn paths in Swift; monochrome, so it adapts to
   light/dark and lets us render state variants).

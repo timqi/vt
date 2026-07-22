@@ -43,20 +43,27 @@ install:
 # Assemble VT.app (macOS): Rust binary + Swift menu-bar shell + icns.
 # Ad-hoc signed by default; export VT_CODESIGN_ID for a stable identity
 # (last keychain re-auth ever — see docs/app-bundle.md §7).
+# VT_APP_BIN: reuse a prebuilt `vt` instead of `just build` (CI passes the
+# target-specific release binary to avoid a second compile).
 app:
     #!/usr/bin/env bash
     set -euo pipefail
     [ "$(uname -s)" = "Darwin" ] || { echo "error: VT.app builds on macOS only" >&2; exit 1; }
-    just build
+    if [ -n "${VT_APP_BIN:-}" ]; then
+      BIN="$VT_APP_BIN"
+    else
+      just build
+      BIN=target/release/vt
+    fi
     APP=build/VT.app
     rm -rf "$APP"
     mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-    VERSION="$(target/release/vt version 2>/dev/null | awk 'NR==1{print $2}')"
+    VERSION="$("$BIN" version 2>/dev/null | awk 'NR==1{print $2}')"
     sed "s/VT_BUNDLE_VERSION/${VERSION:-0.0.0}/g" app/Info.plist > "$APP/Contents/Info.plist"
     # Shell binary is "VTApp" (NOT "VT"): APFS is case-insensitive by
     # default, so "VT" would collide with the "vt" CLI beside it.
     swiftc -O -o "$APP/Contents/MacOS/VTApp" app/VTShell.swift
-    cp target/release/vt "$APP/Contents/MacOS/vt"
+    cp "$BIN" "$APP/Contents/MacOS/vt"
     # AppIcon.icns from the Worker PWA icon (single source of truth).
     ICONSET=build/AppIcon.iconset
     rm -rf "$ICONSET" && mkdir -p "$ICONSET"
@@ -109,7 +116,8 @@ ci: check test check-worker
 deploy-worker:
     wrangler deploy
 
-# The GitHub `Release` workflow builds macOS arm64 + Linux amd64 and publishes.
+# The GitHub `Release` workflow builds the bare `vt` (macOS arm64 + Linux
+# amd64) plus an ad-hoc-signed VT.app tarball (macOS), and publishes.
 # The short hash makes same-day releases unique and matches `vt version` output.
 #
 # Cut a CalVer release: tag `vYYYYMMDD-<shorthash>` and push it
