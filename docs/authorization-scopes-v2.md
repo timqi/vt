@@ -298,6 +298,16 @@ agent lock, and idle timeout still revoke everything, so generous values
 (hours) are reasonable — the human leaving is the real expiry event.
 Suggested values in examples: `28800` (8 h) sign, `3600` decrypt.
 
+The idle timeout (`--timeout` / `[agent].timeout`) is the one backstop that
+overlaps with lock/sleep in purpose but fires only after *inactivity*, so a
+short idle timeout would prematurely cap an otherwise-generous cache TTL even
+while the human is present and the screen unlocked. Because lock/sleep
+invalidate far sooner (seconds, via the cache watcher) on any Mac with prompt
+auto-lock, the default idle timeout is **2 h** — long enough not to fight
+generous TTLs, while still bounding the unlocked-but-unattended window. Hosts
+without reliable auto-lock should lower it, since there the idle timeout is
+the only walked-away guard.
+
 ## 6. Prompt transparency invariant
 
 **The prompt must state the reuse scope whenever an approval can create a

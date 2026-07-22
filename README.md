@@ -38,6 +38,20 @@ Or build from source (recipes live in the `justfile`, run `just` to list them):
 just install
 ```
 
+On macOS you can instead install **VT.app** — a menu-bar app bundling the
+same `vt` CLI, adding native VT-branded notifications (including cache-hit
+transparency), live grant status with one-click revoke-all, and agent
+supervision:
+
+```bash
+# Assembles VT.app, installs to /Applications, symlinks ~/.local/bin/vt
+just install-app
+```
+
+See [docs/app-bundle.md](docs/app-bundle.md) — including the one-time
+`vt secret rebind` migration if your keychain store was created by a `vt`
+binary at another path.
+
 ## Quick Start
 
 > **Platform note.** Vault bootstrap and key storage (`init`, `secret *`,
