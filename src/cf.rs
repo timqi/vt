@@ -202,6 +202,20 @@ fn tty_name() -> String {
 #[cfg(not(unix))]
 fn tty_name() -> String { String::new() }
 
+/// Shorten a parent command line to `basename(argv[0]) + args`. A long
+/// absolute argv[0] (`/opt/homebrew/Cellar/…/bin/zsh -c …`) drowned the
+/// signal on every display surface (Touch ID `via:`, approval page 父进程,
+/// notifications); the field is client-claimed display data everywhere, so
+/// the shortening happens once at collection.
+#[cfg(unix)]
+fn basename_cmdline(first: &str, rest: &[String]) -> String {
+    let base = first.rsplit('/').next().unwrap_or(first);
+    std::iter::once(base)
+        .chain(rest.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(unix)]
 fn parent_cmd() -> String {
     let ppid = unsafe { libc::getppid() };
@@ -217,8 +231,8 @@ fn parent_cmd() -> String {
                 .filter(|p| !p.is_empty())
                 .map(|p| String::from_utf8_lossy(p).into_owned())
                 .collect();
-            if !parts.is_empty() {
-                return parts.join(" ");
+            if let Some(first) = parts.first() {
+                return basename_cmdline(first, &parts[1..]);
             }
         }
     }
@@ -228,7 +242,11 @@ fn parent_cmd() -> String {
         .output()
     {
         if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let mut it = full.split_whitespace().map(str::to_string);
+            if let Some(first) = it.next() {
+                return basename_cmdline(&first, &it.collect::<Vec<_>>());
+            }
         }
     }
     String::new()

@@ -323,6 +323,15 @@
     addRow(dl, '终端', r.tty);
     addRow(dl, '父进程', r.ppid_cmd);
     if (r.ppid != null) addRow(dl, '父进程PID', r.ppid);
+    // Agent-authoritative fields (source='agent' rows; addRow skips ''/null,
+    // so pre-migration and non-agent rows render unchanged).
+    addRow(dl, '调用进程', r.peer_exe);
+    addRow(dl, '密钥', r.key_fp);
+    addRow(dl, '目的主机', r.dest);
+    addRow(dl, '复用范围', r.scope_label);
+    addRow(dl, '范围类型', r.scope_family);
+    if (typeof r.grant_ttl_s === 'number' && r.grant_ttl_s > 0) addRow(dl, '授权时长', cacheTtlLabel(r.grant_ttl_s));
+    if (r.relayed === 1) addRow(dl, '经中继', '是');
     addRow(dl, 'SSH 来源', r.ssh_client);
     addRow(dl, 'IP', r.ip);
     addRow(dl, 'DEK 数', r.salts);

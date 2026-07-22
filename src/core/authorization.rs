@@ -29,9 +29,46 @@ pub enum Operation {
     Decrypt,
 }
 
+/// Which scope family a grant belongs to. Redundant with the digest's domain
+/// label for matching (the digest already separates families), but carried
+/// explicitly so diag counting can filter by family: workspace and
+/// cwd-fallback grants can share a `(dev, ino)` subject when a directory
+/// gains or loses a `.git` entry, and a caller must never count the other
+/// family's grants as reusable.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ScopeFamily {
+    /// Per-connection confinement (relay / plain-ssh peers).
+    Connection,
+    /// Session-bind-verified destination host key.
+    Destination,
+    /// Kernel-derived `.git` workspace root.
+    Workspace,
+    /// No `.git` root: the kernel-derived cwd itself.
+    CwdFallback,
+    /// Broad shared cwd ($HOME, `/`, temp roots): the kernel-derived parent
+    /// process (application) of the caller.
+    ParentApp,
+}
+
+impl ScopeFamily {
+    /// Stable tag for audit telemetry (docs/approval-transparency.md §B).
+    /// One-way: never parsed back, so — unlike `ContextBasis` — no
+    /// `from_wire` counterpart exists.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            ScopeFamily::Connection => "connection",
+            ScopeFamily::Destination => "destination",
+            ScopeFamily::Workspace => "workspace",
+            ScopeFamily::CwdFallback => "cwd-fallback",
+            ScopeFamily::ParentApp => "parent-app",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct GrantKey {
     operation: Operation,
+    family: ScopeFamily,
     subject: SubjectId,
     digest: [u8; 32],
 }
@@ -72,7 +109,12 @@ impl GrantScope {
         h.update(b"vt-authorization-sign-v1");
         hash_field(&mut h, fingerprint.as_bytes());
         hash_field(&mut h, pwd.as_bytes());
-        Self::reusable(Operation::Sign, subject, h.finalize().into())
+        Self::reusable(
+            Operation::Sign,
+            ScopeFamily::Connection,
+            subject,
+            h.finalize().into(),
+        )
     }
 
     /// Destination-bound sign scope: the connection proved its destination
@@ -84,7 +126,12 @@ impl GrantScope {
         h.update(b"vt-authz-sign-dest-v1");
         hash_field(&mut h, hostkey_wire);
         hash_field(&mut h, fingerprint.as_bytes());
-        Self::reusable(Operation::Sign, DESTINATION_SUBJECT, h.finalize().into())
+        Self::reusable(
+            Operation::Sign,
+            ScopeFamily::Destination,
+            DESTINATION_SUBJECT,
+            h.finalize().into(),
+        )
     }
 
     /// Workspace-bound sign scope (local `sign@vt` and unbound non-ssh raw
@@ -99,7 +146,30 @@ impl GrantScope {
         h.update(b"vt-authz-sign-ws-v1");
         hash_field(&mut h, root_path.as_bytes());
         hash_field(&mut h, fingerprint.as_bytes());
-        Self::reusable(Operation::Sign, subject, h.finalize().into())
+        Self::reusable(
+            Operation::Sign,
+            ScopeFamily::Workspace,
+            subject,
+            h.finalize().into(),
+        )
+    }
+
+    /// Cwd-fallback sign scope: the peer's kernel cwd has no `.git` ancestor,
+    /// so the cwd directory itself is the activity boundary. Same fd-derived
+    /// `(dev, ino)` + canonical-path binding as [`Self::sign_workspace`], but
+    /// a distinct digest domain: a directory that later gains a `.git` must
+    /// start a new grant family, never silently continue this one.
+    pub fn sign_cwd(subject: SubjectId, root_path: &str, fingerprint: &str) -> Self {
+        let mut h = Sha256::new();
+        h.update(b"vt-authz-sign-cwd-v1");
+        hash_field(&mut h, root_path.as_bytes());
+        hash_field(&mut h, fingerprint.as_bytes());
+        Self::reusable(
+            Operation::Sign,
+            ScopeFamily::CwdFallback,
+            subject,
+            h.finalize().into(),
+        )
     }
 
     /// Workspace-bound decrypt scope for local pure-v2 batches. Same subject
@@ -115,7 +185,72 @@ impl GrantScope {
         hash_field(&mut h, root_path.as_bytes());
         h.update([secret_type]);
         hash_field(&mut h, salt);
-        Self::reusable(Operation::Decrypt, subject, h.finalize().into())
+        Self::reusable(
+            Operation::Decrypt,
+            ScopeFamily::Workspace,
+            subject,
+            h.finalize().into(),
+        )
+    }
+
+    /// Parent-app sign scope: the caller's kernel cwd is a broad shared
+    /// directory ($HOME, `/`, a temp root), so the activity is identified by
+    /// the caller's kernel-derived parent process instead — "this application
+    /// instance keeps making the same request". `subject` is the parent's
+    /// `(pid, start_tvsec)` (grants die with the parent); the digest binds
+    /// the parent's kernel-verified executable path, never the
+    /// client-claimed `ppid_cmd`.
+    pub fn sign_app(subject: SubjectId, parent_exe: &str, fingerprint: &str) -> Self {
+        let mut h = Sha256::new();
+        h.update(b"vt-authz-sign-app-v1");
+        hash_field(&mut h, parent_exe.as_bytes());
+        hash_field(&mut h, fingerprint.as_bytes());
+        Self::reusable(
+            Operation::Sign,
+            ScopeFamily::ParentApp,
+            subject,
+            h.finalize().into(),
+        )
+    }
+
+    /// Parent-app decrypt scope. Same rules as [`Self::sign_app`].
+    pub fn decrypt_app(
+        subject: SubjectId,
+        parent_exe: &str,
+        secret_type: u8,
+        salt: &[u8],
+    ) -> Self {
+        let mut h = Sha256::new();
+        h.update(b"vt-authz-decrypt-app-v1");
+        hash_field(&mut h, parent_exe.as_bytes());
+        h.update([secret_type]);
+        hash_field(&mut h, salt);
+        Self::reusable(
+            Operation::Decrypt,
+            ScopeFamily::ParentApp,
+            subject,
+            h.finalize().into(),
+        )
+    }
+
+    /// Cwd-fallback decrypt scope. Same rules as [`Self::sign_cwd`].
+    pub fn decrypt_cwd(
+        subject: SubjectId,
+        root_path: &str,
+        secret_type: u8,
+        salt: &[u8],
+    ) -> Self {
+        let mut h = Sha256::new();
+        h.update(b"vt-authz-decrypt-cwd-v1");
+        hash_field(&mut h, root_path.as_bytes());
+        h.update([secret_type]);
+        hash_field(&mut h, salt);
+        Self::reusable(
+            Operation::Decrypt,
+            ScopeFamily::CwdFallback,
+            subject,
+            h.finalize().into(),
+        )
     }
 
     /// Relay decrypt scope: type + salt + claimed host/pwd, bounded by the
@@ -136,14 +271,25 @@ impl GrantScope {
         hash_field(&mut h, salt);
         hash_field(&mut h, host.as_bytes());
         hash_field(&mut h, pwd.as_bytes());
-        Self::reusable(Operation::Decrypt, subject, h.finalize().into())
+        Self::reusable(
+            Operation::Decrypt,
+            ScopeFamily::Connection,
+            subject,
+            h.finalize().into(),
+        )
     }
 
-    fn reusable(operation: Operation, subject: SubjectId, digest: [u8; 32]) -> Self {
+    fn reusable(
+        operation: Operation,
+        family: ScopeFamily,
+        subject: SubjectId,
+        digest: [u8; 32],
+    ) -> Self {
         Self {
             operation,
             key: Some(GrantKey {
                 operation,
+                family,
                 subject,
                 digest,
             }),
@@ -157,6 +303,12 @@ impl GrantScope {
     #[cfg(test)]
     pub fn is_reusable(&self) -> bool {
         self.key.is_some()
+    }
+
+    /// The scope family when this scope can mint a grant; `None` for fresh.
+    /// Feeds the audit rows' `scope_family` field.
+    pub fn family(&self) -> Option<ScopeFamily> {
+        self.key.as_ref().map(|k| k.family)
     }
 }
 
@@ -372,6 +524,7 @@ impl GrantStore {
     fn live_len_at(
         &self,
         operation: Operation,
+        family: ScopeFamily,
         subject: SubjectId,
         now_mono: Instant,
         now_wall: SystemTime,
@@ -380,6 +533,7 @@ impl GrantStore {
             .iter()
             .filter(|(key, expiry)| {
                 key.operation == operation
+                    && key.family == family
                     && key.subject == subject
                     && expiry.is_valid_at(now_mono, now_wall)
             })
@@ -721,11 +875,19 @@ impl AuthorizationEngine {
             .sweep_expired_at(Instant::now(), SystemTime::now());
     }
 
-    pub async fn live_len(&self, operation: Operation, subject: SubjectId) -> usize {
-        self.store
-            .read()
-            .await
-            .live_len_at(operation, subject, Instant::now(), SystemTime::now())
+    pub async fn live_len(
+        &self,
+        operation: Operation,
+        family: ScopeFamily,
+        subject: SubjectId,
+    ) -> usize {
+        self.store.read().await.live_len_at(
+            operation,
+            family,
+            subject,
+            Instant::now(),
+            SystemTime::now(),
+        )
     }
 
     async fn lookup(&self, keys: &[GrantKey], requested_ttl: Duration) -> Lookup {
@@ -1068,13 +1230,43 @@ mod tests {
         assert_ne!(relay_sign, dest_sign);
         assert_ne!(ws_sign, dest_sign);
 
+        // Cwd-fallback is its own family: the SAME directory (same subject,
+        // same canonical path) must never match a git-workspace grant, so a
+        // later `git init` (or `.git` removal) starts a new family instead
+        // of silently continuing the old grants.
+        let cwd_sign = GrantScope::sign_cwd(subject, "/repo", "fp").key.unwrap();
+        assert_ne!(cwd_sign, ws_sign);
+        assert_ne!(cwd_sign, relay_sign);
+        assert_ne!(cwd_sign, dest_sign);
+
+        // Parent-app is its own family too (and partitions on the exe path).
+        let app_sign = GrantScope::sign_app(subject, "/repo", "fp").key.unwrap();
+        assert_ne!(app_sign, ws_sign);
+        assert_ne!(app_sign, cwd_sign);
+        assert_ne!(app_sign, relay_sign);
+        assert_ne!(
+            GrantScope::sign_app(subject, "/App/A", "fp").key.unwrap(),
+            GrantScope::sign_app(subject, "/App/B", "fp").key.unwrap()
+        );
+
         let relay_dec = GrantScope::decrypt_v2(Some(subject), b'0', &[7; 16], "/repo", "/repo")
             .key
             .unwrap();
         let ws_dec = GrantScope::decrypt_workspace(subject, "/repo", b'0', &[7; 16])
             .key
             .unwrap();
+        let cwd_dec = GrantScope::decrypt_cwd(subject, "/repo", b'0', &[7; 16])
+            .key
+            .unwrap();
+        let app_dec = GrantScope::decrypt_app(subject, "/repo", b'0', &[7; 16])
+            .key
+            .unwrap();
         assert_ne!(relay_dec, ws_dec);
+        assert_ne!(cwd_dec, ws_dec);
+        assert_ne!(cwd_dec, relay_dec);
+        assert_ne!(app_dec, ws_dec);
+        assert_ne!(app_dec, cwd_dec);
+        assert_ne!(app_dec, relay_dec);
 
         // Destination scope partitions on host key and key fingerprint.
         assert_ne!(
@@ -1265,9 +1457,40 @@ mod tests {
             .await
             .unwrap();
         permit.commit().await.unwrap();
-        assert_eq!(engine.live_len(Operation::Sign, (1, 2)).await, 1);
-        assert_eq!(engine.live_len(Operation::Sign, (2, 2)).await, 0);
-        assert_eq!(engine.live_len(Operation::Decrypt, (1, 2)).await, 0);
+        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 1);
+        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (2, 2)).await, 0);
+        assert_eq!(engine.live_len(Operation::Decrypt, ScopeFamily::Connection, (1, 2)).await, 0);
+    }
+
+    #[tokio::test]
+    async fn live_len_filters_by_scope_family() {
+        // A workspace grant and a cwd-fallback grant can share a (dev, ino)
+        // subject (the same directory before/after `git init`); diag counts
+        // must not report the other family's grants as reusable.
+        let auth = SuccessAuthenticator::new();
+        let engine = AuthorizationEngine::new(auth, AllowValidator::allowed());
+        let subject = (7, 42);
+        let permit = engine
+            .authorize(AuthorizationRequest::new(
+                vec![GrantScope::sign_cwd(subject, "/dir", "fp")],
+                ReusePolicy::strict_ttl_secs(30),
+                "sign",
+            ))
+            .await
+            .unwrap();
+        permit.commit().await.unwrap();
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::CwdFallback, subject)
+                .await,
+            1
+        );
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::Workspace, subject)
+                .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1282,7 +1505,7 @@ mod tests {
             });
             let engine = AuthorizationEngine::new(auth, AllowValidator::allowed());
             assert!(engine.authorize(sign_request((1, 2), "fp")).await.is_err());
-            assert_eq!(engine.live_len(Operation::Sign, (1, 2)).await, 0);
+            assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
         }
     }
 
@@ -1330,7 +1553,7 @@ mod tests {
             failure.decision(),
             Decision::Unavailable(UnavailableReason::NotInteractive)
         );
-        assert_eq!(engine.live_len(Operation::Sign, (1, 2)).await, 0);
+        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
 
         let retry = engine
             .authorize(sign_request((1, 2), "cached"))
@@ -1394,7 +1617,7 @@ mod tests {
         auth.release.notify_one();
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while engine.live_len(Operation::Sign, (1, 2)).await != 0 {
+            while engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await != 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -1434,7 +1657,7 @@ mod tests {
             permit.commit().await.unwrap();
         }
         assert_eq!(auth.calls.load(Ordering::Acquire), 2);
-        assert_eq!(engine.live_len(Operation::Auth, (1, 2)).await, 0);
+        assert_eq!(engine.live_len(Operation::Auth, ScopeFamily::Connection, (1, 2)).await, 0);
     }
 
     #[tokio::test]
@@ -1455,7 +1678,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(auth.calls.load(Ordering::Acquire), 2);
-        assert_eq!(engine.live_len(Operation::Sign, (1, 2)).await, 0);
+        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
     }
 
     #[tokio::test]
@@ -1463,7 +1686,7 @@ mod tests {
         let auth = SuccessAuthenticator::new();
         let engine = AuthorizationEngine::new(auth.clone(), AllowValidator::allowed());
         let digest = [7; 32];
-        let base = GrantScope::reusable(Operation::Sign, (1, 2), digest);
+        let base = GrantScope::reusable(Operation::Sign, ScopeFamily::Connection, (1, 2), digest);
         engine
             .authorize(AuthorizationRequest::new(
                 vec![base.clone()],
@@ -1488,9 +1711,9 @@ mod tests {
         hit.commit().await.unwrap();
 
         for isolated in [
-            GrantScope::reusable(Operation::Decrypt, (1, 2), digest),
-            GrantScope::reusable(Operation::Sign, (2, 2), digest),
-            GrantScope::reusable(Operation::Sign, (1, 2), [8; 32]),
+            GrantScope::reusable(Operation::Decrypt, ScopeFamily::Connection, (1, 2), digest),
+            GrantScope::reusable(Operation::Sign, ScopeFamily::Connection, (2, 2), digest),
+            GrantScope::reusable(Operation::Sign, ScopeFamily::Connection, (1, 2), [8; 32]),
         ] {
             let permit = engine
                 .authorize(AuthorizationRequest::new(
@@ -1623,7 +1846,7 @@ mod tests {
         for request in requests {
             request.await.unwrap();
         }
-        assert_eq!(engine.live_len(Operation::Run, (1, 2)).await, 0);
+        assert_eq!(engine.live_len(Operation::Run, ScopeFamily::Connection, (1, 2)).await, 0);
     }
 
     #[tokio::test]
@@ -1647,7 +1870,7 @@ mod tests {
             .err()
             .expect("in-flight prompt must be revoked");
         assert_eq!(failure.decision(), Decision::Invalidated);
-        assert_eq!(engine.live_len(Operation::Sign, (1, 2)).await, 0);
+        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
     }
 
     #[tokio::test]
@@ -1701,7 +1924,7 @@ mod tests {
             .err()
             .expect("post-prompt live validation must fail");
         assert_eq!(failure.decision(), Decision::Invalidated);
-        assert_eq!(engine.live_len(Operation::Sign, (1, 2)).await, 0);
+        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
     }
 
     struct ConcurrentInvalidValidator {
@@ -1765,7 +1988,7 @@ mod tests {
         }
         assert_eq!(validator.calls.load(Ordering::Acquire), 2);
         assert_eq!(validator.completions.load(Ordering::Acquire), 1);
-        assert_eq!(engine.live_len(Operation::Sign, (1, 2)).await, 0);
+        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
 
         let retry = engine
             .authorize(sign_request((1, 2), "cached"))
@@ -1900,7 +2123,7 @@ mod tests {
         validator.allowed.store(true, Ordering::Release);
         active.commit().await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while engine.live_len(Operation::Sign, (1, 2)).await != 0 {
+            while engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await != 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -1966,7 +2189,7 @@ mod tests {
         assert!(!invalidate.is_finished());
         permit.commit().await.unwrap();
         assert_eq!(invalidate.await.unwrap(), 1);
-        assert_eq!(engine.live_len(Operation::Sign, (1, 2)).await, 0);
+        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
     }
 
     #[tokio::test]
@@ -2055,6 +2278,6 @@ mod tests {
             .err()
             .expect("second prompt is rejected");
         assert_eq!(failure.decision(), Decision::Rejected);
-        assert_eq!(engine.live_len(Operation::Decrypt, (1, 2)).await, 1);
+        assert_eq!(engine.live_len(Operation::Decrypt, ScopeFamily::Connection, (1, 2)).await, 1);
     }
 }

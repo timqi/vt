@@ -181,13 +181,13 @@ export interface EditExtra {
 function buildMessage(
   state: SlackAppState,
   opKind: string,
-  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
-  opts: { approveUrl?: string; mention?: string[]; extra?: EditExtra },
+  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ssh_client' | 'ip' | 'reason'>,
+  opts: { approveUrl?: string; mention?: string[]; extra?: EditExtra; salts?: number },
 ): { text: string; color: string; blocks: unknown[] } {
   const h = HEADER[state];
   const title = `${h.emoji} VT 审批${opKind ? `: ${opKind}` : ''} — ${h.label}`;
 
-  const context = metaLines(meta);
+  const context = metaLines(meta, opts.salts ?? 0);
   if (state === 'approved') {
     const bits: string[] = [];
     if (opts.extra?.approverLabel) bits.push(`批准人(Passkey): ${opts.extra.approverLabel}`);
@@ -239,8 +239,10 @@ export async function sendApprovalCard(
   opKind: string,
   meta: ChallengeMeta,
   approveUrl: string,
+  salts = 0,
 ): Promise<SlackAppMsgRef | null> {
-  const { text, color, blocks } = buildMessage('pending', opKind, meta, { approveUrl, mention: cfg.mention });
+  const { text, color, blocks } =
+    buildMessage('pending', opKind, meta, { approveUrl, mention: cfg.mention, salts });
   const res = await apiCall('chat.postMessage', {
     channel: cfg.channel,
     text,                                    // fallback (notifications / a11y)
@@ -263,8 +265,11 @@ export async function editCard(
   opKind: string,
   meta: ChallengeMeta,
   extra: EditExtra = {},
+  salts = 0,
 ): Promise<string> {
-  const { text, color, blocks } = buildMessage(state, opKind, meta, { extra });
+  // Terminal edits keep the batch-size segment: the context block must stay
+  // identical to the pending card apart from the state line (no drift).
+  const { text, color, blocks } = buildMessage(state, opKind, meta, { extra, salts });
   const res = await apiCall('chat.update', {
     channel: ref.channel,
     ts: ref.ts,

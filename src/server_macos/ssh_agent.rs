@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::core::authorization::{
     AuthorizationEngine, AuthorizationFailure, AuthorizationPermit, AuthorizationRequest,
-    CommitError, Decision, GrantScope, Operation, ReusePolicy, SubjectId,
+    CommitError, Decision, GrantScope, Operation, ReusePolicy, ScopeFamily, SubjectId,
 };
 use crate::core::crypto::{derive_dek, AesGcmCrypto};
 use crate::core::session::AuthOutcome;
@@ -37,7 +37,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::authorization::{new_engine, sleep_diverged};
 use super::security::{derive_passcode_ciphers, load_mac_cipher, validate_mac_key_material};
 use super::store::KeychainStore;
-use super::audit::{self, AgentAuditEntry, AuditPushConfig};
+use super::audit::{self, AgentAuditContext, AgentAuditEntry, AuditPushConfig};
 
 /// SSH agent extension names used by vt.
 pub const EXT_ENCRYPT: &str = "encrypt@vt";
@@ -356,9 +356,10 @@ use crate::core::sanitize_for_display as sanitize_prompt;
 use crate::core::sanitize_for_display_multiline as sanitize_prompt_multiline;
 
 /// Per-line cap and total-line cap for the multi-line `command` body the CLI
-/// sends. The CLI builds something like `op: inject\nfile: …\ncmd: …\nreason: …`
-/// so 6 lines is enough headroom; further lines from a hostile peer are
-/// silently dropped so the dialog can't be pushed off-screen.
+/// sends. The CLI builds something like `file: …\ncmd: …\nreason: …` (older
+/// clients prepend `op: inject`), so 6 lines is enough headroom; further
+/// lines from a hostile peer are silently dropped so the dialog can't be
+/// pushed off-screen.
 const PROMPT_COMMAND_MAX_LINES: usize = 6;
 const PROMPT_COMMAND_MAX_LINE_LEN: usize = 120;
 
@@ -840,13 +841,50 @@ impl Workspace {
     }
 }
 
+/// The caller's kernel-derived parent process, used as the activity identity
+/// when the caller's cwd is a broad shared directory: "this application
+/// instance keeps making the same request" (e.g. an app probing `gh` through
+/// the hook from cwd `/`). `subject` is the parent's `(pid, start_tvsec)`,
+/// so grants die when the app exits; `exe` is the parent's kernel-verified
+/// executable path (`proc_pidpath`), bound into the digest — never the
+/// client-claimed `ppid_cmd` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppIdentity {
+    subject: SubjectId,
+    exe: String,
+}
+
+impl AppIdentity {
+    /// Display name: executable basename (the digest uses the full path).
+    fn name(&self) -> &str {
+        self.exe.rsplit('/').next().unwrap_or(&self.exe)
+    }
+}
+
+/// The scope basis a resolved connection routes to. The three arms use
+/// distinct digest domains, so a directory that gains or loses a `.git`
+/// entry — or an app that later runs from a repository — starts a new grant
+/// family instead of silently continuing the old grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopedBasis<'a> {
+    Git(&'a Workspace),
+    Cwd(&'a Workspace),
+    App(&'a AppIdentity),
+}
+
 /// How the connection's workspace resolution ended, kept for diag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkspaceResolution {
+    /// Nearest `.git` ancestor of the kernel cwd.
     Resolved(Workspace),
-    /// Kernel cwd known but no `.git` ancestor: deliberately Fresh. A cwd
-    /// fallback would pool $HOME / /tmp / CI scratch dirs into one broad
-    /// unlabeled bucket.
+    /// No usable `.git` ancestor: the kernel cwd directory itself, provided
+    /// it is not a broad shared bucket (see `cwd_fallback_acceptable`).
+    CwdFallback(Workspace),
+    /// Cwd is a broad shared bucket ($HOME, `/`, temp roots): the caller's
+    /// kernel-derived parent application.
+    AppFallback(AppIdentity),
+    /// Cwd too broad to scope AND no usable parent process (parent is
+    /// launchd / lookup failed): Fresh.
     NoRoot,
     /// No peer pid or proc/cwd lookup failed (also used for relay peers,
     /// which never use workspace scopes).
@@ -854,9 +892,11 @@ enum WorkspaceResolution {
 }
 
 impl WorkspaceResolution {
-    fn workspace(&self) -> Option<&Workspace> {
+    fn scoped(&self) -> Option<ScopedBasis<'_>> {
         match self {
-            WorkspaceResolution::Resolved(ws) => Some(ws),
+            WorkspaceResolution::Resolved(ws) => Some(ScopedBasis::Git(ws)),
+            WorkspaceResolution::CwdFallback(ws) => Some(ScopedBasis::Cwd(ws)),
+            WorkspaceResolution::AppFallback(app) => Some(ScopedBasis::App(app)),
             _ => None,
         }
     }
@@ -881,12 +921,14 @@ fn find_git_root(start: &std::path::Path) -> Option<PathBuf> {
 ///
 /// - a dotfiles repository AT `$HOME` (`git init ~`, yadm) would make every
 ///   caller anywhere under the home directory share one grant scope — the
-///   exact broad bucket the `NoRoot ⇒ Fresh` rule exists to prevent;
+///   exact broad bucket the `cwd_fallback_acceptable` exclusions exist to
+///   prevent;
 /// - symmetrically, when the cwd lives under `$HOME`, a root found ABOVE
 ///   `$HOME` (e.g. a stray `/Users/.git`) is rejected rather than pooling
 ///   every user directory.
 ///
-/// Both degrade to Fresh, never to a wider scope.
+/// Both degrade to the narrower cwd fallback (or Fresh), never to a wider
+/// scope.
 fn workspace_root_acceptable(
     root: &std::path::Path,
     cwd: &std::path::Path,
@@ -933,8 +975,78 @@ fn workspace_identity(root: &std::path::Path) -> Option<Workspace> {
     result
 }
 
+/// The per-user Darwin temp root (`confstr(_CS_DARWIN_USER_TEMP_DIR)`),
+/// canonicalized and cached. Queried from the OS, never from a peer's
+/// `$TMPDIR`. `None` when the query fails.
+fn darwin_user_temp_dir() -> Option<&'static PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        let len = unsafe {
+            libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len())
+        };
+        if len == 0 || len > buf.len() {
+            return None;
+        }
+        let path = proc_info::nul_terminated_path(&buf)?;
+        // Canonicalize so it compares against F_GETPATH-derived paths.
+        std::fs::canonicalize(path).ok()
+    })
+    .as_ref()
+}
+
+/// A cwd with no `.git` ancestor may serve as its own grant scope, but only
+/// when it is not a directory that many unrelated activities share: `$HOME`
+/// and its ancestors (`/`, `/Users`) are the launch cwd of practically every
+/// interactive process, and the shared temp roots pool ephemeral work.
+/// Subdirectories of these (e.g. `/private/tmp/scratch`) remain acceptable —
+/// they name one activity. `cwd` must already be canonical (F_GETPATH), so
+/// `/tmp` arrives as `/private/tmp`.
+fn cwd_fallback_acceptable(cwd: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    if let Some(home) = home {
+        if cwd == home || home.starts_with(cwd) {
+            return false;
+        }
+    }
+    const SHARED_ROOTS: &[&str] = &[
+        "/tmp",
+        "/private/tmp",
+        "/var/tmp",
+        "/private/var/tmp",
+        "/Volumes",
+    ];
+    if SHARED_ROOTS.iter().any(|r| cwd == std::path::Path::new(r)) {
+        return false;
+    }
+    if darwin_user_temp_dir().is_some_and(|t| cwd == t) {
+        return false;
+    }
+    true
+}
+
+/// The peer's parent process as an activity identity. `None` when the parent
+/// is launchd/init (`ppid <= 1` — a daemon orphan or a peer whose parent
+/// already exited; scoping to launchd would pool every daemon on the box)
+/// or when a kernel lookup fails.
+fn parent_app_identity(peer_pid: i32) -> Option<AppIdentity> {
+    let (ppid, _, _) = proc_info::get_proc_bsdinfo(peer_pid)?;
+    let ppid = i32::try_from(ppid).ok()?;
+    if ppid <= 1 {
+        return None;
+    }
+    let start = proc_info::get_start_tvsec(ppid)?;
+    let exe = proc_info::get_proc_path(ppid)?;
+    Some(AppIdentity {
+        subject: (ppid as u64, start),
+        exe,
+    })
+}
+
 /// Resolve the peer's workspace once per connection (vt CLI connections are
 /// per-command; a process cwd does not change mid-connection in practice).
+/// Preference order: nearest acceptable `.git` root, else the cwd directory
+/// itself, else the parent application (each a distinct grant family), else
+/// Fresh.
 fn resolve_workspace(peer_pid: Option<i32>) -> WorkspaceResolution {
     let Some(pid) = peer_pid else {
         return WorkspaceResolution::Unavailable;
@@ -942,15 +1054,29 @@ fn resolve_workspace(peer_pid: Option<i32>) -> WorkspaceResolution {
     let Some(cwd) = proc_info::get_cwd(pid) else {
         return WorkspaceResolution::Unavailable;
     };
-    let Some(root) = find_git_root(&cwd) else {
-        return WorkspaceResolution::NoRoot;
-    };
-    if !workspace_root_acceptable(&root, &cwd, dirs::home_dir().as_deref()) {
-        return WorkspaceResolution::NoRoot;
+    let home = dirs::home_dir();
+    if let Some(root) = find_git_root(&cwd) {
+        if workspace_root_acceptable(&root, &cwd, home.as_deref()) {
+            return match workspace_identity(&root) {
+                Some(ws) => WorkspaceResolution::Resolved(ws),
+                None => WorkspaceResolution::Unavailable,
+            };
+        }
     }
-    match workspace_identity(&root) {
-        Some(ws) => WorkspaceResolution::Resolved(ws),
-        None => WorkspaceResolution::Unavailable,
+    // No usable git root: fall back to the cwd itself. Acceptability is
+    // checked on the fd-derived canonical path, so /tmp aliases and symlinked
+    // cwds cannot dodge the shared-root exclusions.
+    let Some(ws) = workspace_identity(&cwd) else {
+        return WorkspaceResolution::Unavailable;
+    };
+    if cwd_fallback_acceptable(std::path::Path::new(ws.root_str()), home.as_deref()) {
+        return WorkspaceResolution::CwdFallback(ws);
+    }
+    // Broad shared cwd (daemons launch from `/`, terminals from `$HOME`):
+    // identify the activity by the calling application instead.
+    match parent_app_identity(pid) {
+        Some(app) => WorkspaceResolution::AppFallback(app),
+        None => WorkspaceResolution::NoRoot,
     }
 }
 
@@ -1093,9 +1219,60 @@ fn destination_label(hostkey: &KeyData) -> String {
     }
 }
 
-/// Human label for a workspace-bound grant.
-fn workspace_label(ws: &Workspace) -> String {
-    format!("workspace {}", ws.root_str())
+/// Sign scope for a resolved basis — one place holds the basis→family
+/// mapping shared by the raw-sign and `sign@vt` arms.
+fn sign_scope_for_basis(basis: ScopedBasis<'_>, fingerprint: &str) -> GrantScope {
+    match basis {
+        ScopedBasis::Git(ws) => GrantScope::sign_workspace(ws.subject, ws.root_str(), fingerprint),
+        ScopedBasis::Cwd(ws) => GrantScope::sign_cwd(ws.subject, ws.root_str(), fingerprint),
+        ScopedBasis::App(app) => GrantScope::sign_app(app.subject, &app.exe, fingerprint),
+    }
+}
+
+/// Decrypt scope for a resolved basis, per `(type, salt)` record.
+fn decrypt_scope_for_basis(basis: ScopedBasis<'_>, secret_type: u8, salt: &[u8]) -> GrantScope {
+    match basis {
+        ScopedBasis::Git(ws) => {
+            GrantScope::decrypt_workspace(ws.subject, ws.root_str(), secret_type, salt)
+        }
+        ScopedBasis::Cwd(ws) => {
+            GrantScope::decrypt_cwd(ws.subject, ws.root_str(), secret_type, salt)
+        }
+        ScopedBasis::App(app) => {
+            GrantScope::decrypt_app(app.subject, &app.exe, secret_type, salt)
+        }
+    }
+}
+
+/// Contract a `$HOME` prefix to `~` for prompt display. Display-only —
+/// grants and digests always bind the canonical absolute path.
+fn contract_home(path: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        if let Some(rest) = path.strip_prefix(home.as_ref()) {
+            if rest.is_empty() {
+                return "~".to_string();
+            }
+            if rest.starts_with('/') {
+                return format!("~{}", rest);
+            }
+        }
+    }
+    path.to_string()
+}
+
+/// Human label for a reuse line. The wording distinguishes the scope
+/// families so the prompt states exactly what the approval covers: the
+/// workspace root is the common case and stays unmarked (a bare,
+/// home-contracted path always means "the whole repository"), while the
+/// narrower fallback families keep an explicit prefix so "this exact
+/// directory" / "this app" can never read as a repository scope.
+fn scoped_label(basis: ScopedBasis<'_>) -> String {
+    match basis {
+        ScopedBasis::Git(ws) => contract_home(ws.root_str()),
+        ScopedBasis::Cwd(ws) => format!("directory {}", contract_home(ws.root_str())),
+        ScopedBasis::App(app) => format!("app {}", app.name()),
+    }
 }
 
 /// Append the §6 prompt transparency line: present exactly when an approval
@@ -1246,6 +1423,89 @@ impl VtSshSession {
         }
     }
 
+    /// Append the kernel-verified caller line. Unlike the client-reported
+    /// `via:` (`meta.ppid_cmd`), `peer_exe` comes from `proc_pidpath` on the
+    /// socket peer and cannot be forged by the request body — but the
+    /// basename is still attacker-chosen (a local process names its own
+    /// binary), so it is sanitized like every other prompt field. Placed with
+    /// the agent-derived truth lines, before the client-reported body/meta.
+    ///
+    /// Exception display: the overwhelmingly common caller is the vt CLI
+    /// itself, so `caller: vt` carries no information and is suppressed —
+    /// the line appears only for other basenames (`ssh -A` forwarded
+    /// traffic, `ssh-keygen`, renamed binaries). Suppressing on the name
+    /// hides nothing a rename could not already hide: the line is display
+    /// signal, not a boundary. Audit rows keep `peer_exe` unconditionally.
+    fn append_caller_line(&self, message: &mut String) {
+        if let Some(exe) = self.peer_exe.as_deref() {
+            if !exe.is_empty() && exe != "vt" {
+                message.push_str("\ncaller: ");
+                message.push_str(&sanitize_prompt(exe, 80));
+            }
+        }
+    }
+
+    /// Append the raw-sign destination truth line from the session-bind
+    /// state (docs/approval-transparency.md §A1). `reuse_names_destination`
+    /// is true when the reuse line already carries the destination label (a
+    /// destination-reusable scope — the only reusable arm a bound non-relay
+    /// peer can reach), in which case the plain line would be a duplicate. A
+    /// forwarding-capable bind is always flagged: the signed request may
+    /// originate beyond hop one. A tainted bind failed verification outright.
+    fn append_destination_line(&self, message: &mut String, reuse_names_destination: bool) {
+        match &self.bind_state {
+            BindState::Bound {
+                forwarding: false,
+                hostkey,
+                ..
+            } => {
+                if !reuse_names_destination {
+                    let label = self
+                        .destination_label
+                        .clone()
+                        .unwrap_or_else(|| destination_label(hostkey));
+                    message.push_str("\ndest: ");
+                    message.push_str(&sanitize_prompt(&label, 160));
+                }
+            }
+            BindState::Bound {
+                forwarding: true,
+                hostkey,
+                ..
+            } => {
+                let label = self
+                    .destination_label
+                    .clone()
+                    .unwrap_or_else(|| destination_label(hostkey));
+                message.push_str("\ndest: ");
+                message.push_str(&sanitize_prompt(&label, 160));
+                message.push_str(" (forwarding — may serve a relayed request)");
+            }
+            BindState::Tainted => {
+                message.push_str("\nwarning: session-bind verification failed");
+            }
+            BindState::Unbound => {}
+        }
+    }
+
+    /// The verified destination for audit rows: the bound, non-forwarding
+    /// session-bind label; empty otherwise. Mirrors `append_destination_line`
+    /// but never reports a forwarding-capable or tainted bind as a
+    /// destination.
+    fn audit_destination(&self) -> String {
+        match &self.bind_state {
+            BindState::Bound {
+                forwarding: false,
+                hostkey,
+                ..
+            } => self
+                .destination_label
+                .clone()
+                .unwrap_or_else(|| destination_label(hostkey)),
+            _ => String::new(),
+        }
+    }
+
     // ---- Activity-scope construction (docs/authorization-scopes-v2.md) ----
     //
     // Each helper returns the scope(s) plus a human reuse label. The label is
@@ -1284,13 +1544,17 @@ impl VtSshSession {
         })
     }
 
-    /// The workspace, but only when the client-reported `pwd` is consistent
-    /// with it (§4 consistency check) — the shared guard of the `sign@vt`
-    /// and decrypt workspace arms.
-    fn reusable_workspace(&self, claimed_pwd: &str) -> Option<&Workspace> {
-        self.workspace_resolution()
-            .workspace()
-            .filter(|ws| ws.contains_claimed_pwd(claimed_pwd))
+    /// The scope basis, with the §4 consistency check applied to the
+    /// directory-shaped arms: a claimed `pwd` outside the git/cwd root
+    /// degrades to Fresh. The app arm carries no root to check against —
+    /// its claimed pwd stays display-only, like the connection arms.
+    fn reusable_scope(&self, claimed_pwd: &str) -> Option<ScopedBasis<'_>> {
+        self.workspace_resolution().scoped().filter(|basis| match basis {
+            ScopedBasis::Git(ws) | ScopedBasis::Cwd(ws) => {
+                ws.contains_claimed_pwd(claimed_pwd)
+            }
+            ScopedBasis::App(_) => true,
+        })
     }
 
     /// Scope for a raw `SIGN_REQUEST`.
@@ -1330,11 +1594,11 @@ impl VtSshSession {
                 (GrantScope::fresh(Operation::Sign), None)
             }
             // No bind, non-ssh local caller (ssh-keygen -Y sign etc.):
-            // workspace scope.
-            BindState::Unbound => match self.workspace_resolution().workspace() {
-                Some(ws) => (
-                    GrantScope::sign_workspace(ws.subject, ws.root_str(), fingerprint),
-                    Some(workspace_label(ws)),
+            // workspace / cwd / parent-app scope.
+            BindState::Unbound => match self.workspace_resolution().scoped() {
+                Some(basis) => (
+                    sign_scope_for_basis(basis, fingerprint),
+                    Some(scoped_label(basis)),
                 ),
                 None => (GrantScope::fresh(Operation::Sign), None),
             },
@@ -1352,10 +1616,10 @@ impl VtSshSession {
                 self.connection_label(),
             );
         }
-        match self.reusable_workspace(claimed_pwd) {
-            Some(ws) => (
-                GrantScope::sign_workspace(ws.subject, ws.root_str(), fingerprint),
-                Some(workspace_label(ws)),
+        match self.reusable_scope(claimed_pwd) {
+            Some(basis) => (
+                sign_scope_for_basis(basis, fingerprint),
+                Some(scoped_label(basis)),
             ),
             None => (GrantScope::fresh(Operation::Sign), None),
         }
@@ -1403,6 +1667,8 @@ impl VtSshSession {
     fn workspace_basis(&self) -> ContextBasis {
         match self.workspace_resolution() {
             WorkspaceResolution::Resolved(_) => ContextBasis::Workspace,
+            WorkspaceResolution::CwdFallback(_) => ContextBasis::CwdWorkspace,
+            WorkspaceResolution::AppFallback(_) => ContextBasis::ParentApp,
             WorkspaceResolution::NoRoot => ContextBasis::NoWorkspaceRoot,
             WorkspaceResolution::Unavailable => match self.peer_pid {
                 None => ContextBasis::NoPeerPid,
@@ -1412,23 +1678,33 @@ impl VtSshSession {
     }
 
     /// Grants this connection's own classification could reuse — the single
-    /// basis→subject mapping behind both diag counts. `decrypt_basis` never
-    /// yields `SessionBind`, so one shared mapping is safe.
+    /// basis→(family, subject) mapping behind both diag counts. The family
+    /// filter matters when a directory gains or loses a `.git` entry: the
+    /// workspace and cwd families then share a `(dev, ino)` subject, and a
+    /// caller must not count the other family's grants. `decrypt_basis`
+    /// never yields `SessionBind`, so one shared mapping is safe.
     async fn live_grants(&self, basis: ContextBasis, operation: Operation) -> usize {
-        let subject = match basis {
-            ContextBasis::SessionBind => {
-                Some(crate::core::authorization::DESTINATION_SUBJECT)
+        let scoped = match basis {
+            ContextBasis::SessionBind => Some((
+                ScopeFamily::Destination,
+                crate::core::authorization::DESTINATION_SUBJECT,
+            )),
+            ContextBasis::Workspace | ContextBasis::CwdWorkspace | ContextBasis::ParentApp => {
+                self.workspace_resolution().scoped().map(|basis| match basis {
+                    ScopedBasis::Git(ws) => (ScopeFamily::Workspace, ws.subject),
+                    ScopedBasis::Cwd(ws) => (ScopeFamily::CwdFallback, ws.subject),
+                    ScopedBasis::App(app) => (ScopeFamily::ParentApp, app.subject),
+                })
             }
-            ContextBasis::Workspace => {
-                self.workspace_resolution().workspace().map(|ws| ws.subject)
-            }
-            ContextBasis::RelayConnection | ContextBasis::SshConnection => {
-                self.connection_subject
-            }
+            ContextBasis::RelayConnection | ContextBasis::SshConnection => self
+                .connection_subject
+                .map(|subject| (ScopeFamily::Connection, subject)),
             _ => None,
         };
-        match subject {
-            Some(subject) => self.authorization.live_len(operation, subject).await,
+        match scoped {
+            Some((family, subject)) => {
+                self.authorization.live_len(operation, family, subject).await
+            }
             None => 0,
         }
     }
@@ -1461,23 +1737,47 @@ impl VtSshSession {
                 self.connection_label(),
             );
         }
-        match self.reusable_workspace(claimed_pwd) {
-            Some(ws) => (
+        match self.reusable_scope(claimed_pwd) {
+            Some(basis) => (
                 v2_inputs
                     .iter()
-                    .map(|(t, salt)| {
-                        GrantScope::decrypt_workspace(
-                            ws.subject,
-                            ws.root_str(),
-                            t.as_byte(),
-                            salt,
-                        )
-                    })
+                    .map(|(t, salt)| decrypt_scope_for_basis(basis, t.as_byte(), salt))
                     .collect(),
-                Some(workspace_label(ws)),
+                Some(scoped_label(basis)),
             ),
             None => (fresh(), None),
         }
+    }
+
+    /// Agent-derived audit context shared by every row: kernel peer identity
+    /// and relay provenance. Operation-specific fields (key, destination,
+    /// scope) start empty — see `audit_ctx_scoped` and the sign handlers.
+    fn audit_ctx(&self) -> AgentAuditContext {
+        AgentAuditContext {
+            peer_exe: self.peer_exe.clone().unwrap_or_default(),
+            relayed: self.peer_is_vt_relay,
+            ..AgentAuditContext::default()
+        }
+    }
+
+    /// Audit context for an operation that can mint (or hit) a reusable
+    /// grant: records the scope family, the exact label the prompt's reuse
+    /// line displayed, and the effective TTL. `family` and `label` are `Some`
+    /// together by construction (both derive from the same scope helper); a
+    /// Fresh request leaves all three fields empty/zero.
+    fn audit_ctx_scoped(
+        &self,
+        family: Option<ScopeFamily>,
+        label: &Option<String>,
+        ttl_secs: u64,
+    ) -> AgentAuditContext {
+        let mut ctx = self.audit_ctx();
+        if let (Some(family), Some(label)) = (family, label.as_deref()) {
+            ctx.scope_family = family.as_wire().to_string();
+            ctx.scope_label = label.to_string();
+            ctx.grant_ttl_s = ttl_secs;
+        }
+        ctx
     }
 
     /// Build an `AgentAuditEntry` from the post-decision context and hand it to
@@ -1494,6 +1794,7 @@ impl VtSshSession {
         reason: &str,
         salts: usize,
         latency_ms: u64,
+        agent_ctx: AgentAuditContext,
     ) {
         if !self.audit_push.enabled {
             return;
@@ -1509,6 +1810,7 @@ impl VtSshSession {
             salts,
             latency_ms,
             self.audit_push.agent_id(),
+            agent_ctx,
         );
         audit::spawn_push(Arc::clone(&self.audit_push), entry);
     }
@@ -1613,6 +1915,7 @@ impl VtSshSession {
             "",
             req.types.len(),
             0,
+            self.audit_ctx(),
         );
         Ok(HandlerSuccess::without_authorization(Zeroizing::new(bytes)))
     }
@@ -1686,14 +1989,19 @@ impl VtSshSession {
             &who,
         );
         self.append_relay_origin(&mut local_auth_message);
+        self.append_caller_line(&mut local_auth_message);
         // Pure-v2 batches use one atomic scope per record and require an all-of
         // hit. Any legacy member makes the entire request explicitly Fresh.
         // The reuse line is agent-derived truth and is appended BEFORE the
         // client-reported body/meta below, for the same reason as the relay
         // origin marker: a hostile caller must not be able to pad the one
         // line that says the tap creates a standing grant off-screen.
-        let (scopes, reuse) = if legacy_count > 0 {
-            (vec![GrantScope::fresh(Operation::Decrypt)], ReusePolicy::Fresh)
+        let (scopes, reuse, reuse_label) = if legacy_count > 0 {
+            (
+                vec![GrantScope::fresh(Operation::Decrypt)],
+                ReusePolicy::Fresh,
+                None,
+            )
         } else {
             let (scopes, reuse_label) =
                 self.decrypt_scopes(&v2_inputs, &req.host, &req.meta.pwd);
@@ -1702,8 +2010,17 @@ impl VtSshSession {
                 &reuse_label,
                 self.cache_ttls.decrypt_secs,
             );
-            (scopes, ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs))
+            (
+                scopes,
+                ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs),
+                reuse_label,
+            )
         };
+        let audit_ctx = self.audit_ctx_scoped(
+            scopes.first().and_then(GrantScope::family),
+            &reuse_label,
+            self.cache_ttls.decrypt_secs,
+        );
         let body = sanitize_prompt_multiline(
             &req.command,
             PROMPT_COMMAND_MAX_LINE_LEN,
@@ -1729,6 +2046,7 @@ impl VtSshSession {
                     "",
                     req.items.len(),
                     permit.latency_ms(),
+                    audit_ctx,
                 );
                 permit
             }
@@ -1742,6 +2060,7 @@ impl VtSshSession {
                     "",
                     req.items.len(),
                     failure.latency_ms(),
+                    audit_ctx,
                 );
                 return Err(authorization_failure_wire(&failure));
             }
@@ -1806,6 +2125,7 @@ impl VtSshSession {
         let who = who_at_host(&req.meta.user, &req.host);
         let mut auth_message = header_with_who("auth", "on", &who);
         self.append_relay_origin(&mut auth_message);
+        self.append_caller_line(&mut auth_message);
         let reason = sanitize_prompt(&req.reason, 100);
         if !reason.is_empty() {
             auth_message.push_str("\nreason: ");
@@ -1831,6 +2151,7 @@ impl VtSshSession {
                     &req.reason,
                     0,
                     permit.latency_ms(),
+                    self.audit_ctx(),
                 );
                 permit
             }
@@ -1844,6 +2165,7 @@ impl VtSshSession {
                     &req.reason,
                     0,
                     failure.latency_ms(),
+                    self.audit_ctx(),
                 );
                 return Err(authorization_failure_wire(&failure));
             }
@@ -1961,6 +2283,11 @@ impl VtSshSession {
         let argv_for_prompt = sanitize_prompt(&argv_joined, RUN_PROMPT_ARGV_MAX);
         let exe_display = sanitize_prompt(&resolved.display().to_string(), 160);
         let mut auth_message = header_with_who("run on this Mac", "from", &who);
+        // The vt relay refuses run@vt, so the relay marker is a dead path
+        // today — kept for uniformity with the other extension prompts as
+        // cheap insurance against a future relay-filter change.
+        self.append_relay_origin(&mut auth_message);
+        self.append_caller_line(&mut auth_message);
         auth_message.push_str("\nexe: ");
         auth_message.push_str(&exe_display);
         auth_message.push_str("\nargv: ");
@@ -1997,6 +2324,7 @@ impl VtSshSession {
                     run_reason,
                     0,
                     failure.latency_ms(),
+                    self.audit_ctx(),
                 );
                 return Err(authorization_failure_wire(&failure));
             }
@@ -2012,6 +2340,7 @@ impl VtSshSession {
             run_reason,
             0,
             permit.latency_ms(),
+            self.audit_ctx(),
         );
 
         // Spawn detached. `setsid` makes the child a new session leader so it
@@ -2027,7 +2356,15 @@ impl VtSshSession {
                 tracing::warn!("run@vt spawn failed: {}", e);
                 // Second row: the launch was approved but failed to spawn.
                 self.emit_audit(
-                    "run", "spawn_failed", &req.host, &req.meta, &run_command, run_reason, 0, 0,
+                    "run",
+                    "spawn_failed",
+                    &req.host,
+                    &req.meta,
+                    &run_command,
+                    run_reason,
+                    0,
+                    0,
+                    self.audit_ctx(),
                 );
                 return Err((ErrKind::Generic, Some(DETAIL_RUN_SPAWN_FAILED)));
             }
@@ -2095,6 +2432,7 @@ impl VtSshSession {
         let who = who_at_host(&req.meta.user, &req.host);
         let mut auth_message = header_with_who("ssh-sign", "for", &who);
         self.append_relay_origin(&mut auth_message);
+        self.append_caller_line(&mut auth_message);
         // sign@vt can name ANY agent key, so the prompt must say which one
         // (comment, else SHA256 fingerprint — same label rule as
         // `Session::sign`). This line is agent-derived truth (the requested
@@ -2112,6 +2450,12 @@ impl VtSshSession {
         // rationale as the relay origin marker.
         let (scope, reuse_label) = self.sign_vt_scope(&fp_str, &req.meta.pwd);
         append_reuse_line(&mut auth_message, &reuse_label, self.cache_ttls.sign_secs);
+        let audit_ctx = {
+            let mut ctx =
+                self.audit_ctx_scoped(scope.family(), &reuse_label, self.cache_ttls.sign_secs);
+            ctx.key_fp = fp_str.clone();
+            ctx
+        };
         let body = sanitize_prompt_multiline(
             &req.command,
             PROMPT_COMMAND_MAX_LINE_LEN,
@@ -2142,6 +2486,7 @@ impl VtSshSession {
                     "",
                     0,
                     permit.latency_ms(),
+                    audit_ctx,
                 );
                 permit
             }
@@ -2155,6 +2500,7 @@ impl VtSshSession {
                     "",
                     0,
                     failure.latency_ms(),
+                    audit_ctx,
                 );
                 return Err(authorization_failure_wire(&failure));
             }
@@ -2429,19 +2775,34 @@ impl Session for VtSshSession {
             keys.get(&fp_str).ok_or(AgentError::Failure)?.clone()
         };
         let comment = privkey.comment();
-        let proc_name = self.peer_exe.as_deref().unwrap_or("");
+        // Sanitized like the sign@vt key line: the comment is user-set at add
+        // time, so it may not inject fake prompt lines.
         let key_label = if comment.is_empty() {
             fp_str.clone()
         } else {
-            comment.to_string()
+            sanitize_prompt(comment, 80)
         };
-        let mut auth_message = if proc_name.is_empty() {
-            format!("sign: {}", key_label)
-        } else {
-            format!("sign: {} ({})", key_label, proc_name)
-        };
+        // Same layout as the sign@vt prompt (header, then key/caller/dest/
+        // reuse truth lines) so the two sign paths read as one UI — raw signs
+        // just carry no client meta. The caller line replaces the old
+        // `sign: key (proc)` parenthetical.
+        let mut auth_message = format!("ssh-sign\nkey: {}", key_label);
+        self.append_caller_line(&mut auth_message);
         let (scope, reuse_label) = self.raw_sign_scope(&fp_str);
+        // Destination truth line BEFORE the reuse line: with the default
+        // TTL of 0 the reuse line never appears, and the verified
+        // session-bind destination must still be shown (a non-relay bound
+        // peer's reuse label IS the destination label, so `reuse_label`
+        // being present means the line below would be a duplicate).
+        self.append_destination_line(&mut auth_message, reuse_label.is_some());
         append_reuse_line(&mut auth_message, &reuse_label, self.cache_ttls.sign_secs);
+        let audit_ctx = {
+            let mut ctx =
+                self.audit_ctx_scoped(scope.family(), &reuse_label, self.cache_ttls.sign_secs);
+            ctx.key_fp = fp_str.clone();
+            ctx.dest = self.audit_destination();
+            ctx
+        };
 
         let permit = match self
             .authorization
@@ -2462,6 +2823,7 @@ impl Session for VtSshSession {
                     "",
                     0,
                     permit.latency_ms(),
+                    audit_ctx,
                 );
                 permit
             }
@@ -2475,6 +2837,7 @@ impl Session for VtSshSession {
                     "",
                     0,
                     failure.latency_ms(),
+                    audit_ctx,
                 );
                 return Err(AgentError::Failure);
             }
@@ -3097,7 +3460,12 @@ mod tests {
             .await
             .expect("detached lock finalizer did not complete");
         drop(transition_guard);
-        assert_eq!(authorization.live_len(Operation::Sign, subject).await, 0);
+        assert_eq!(
+            authorization
+                .live_len(Operation::Sign, ScopeFamily::Connection, subject)
+                .await,
+            0
+        );
     }
 
     // sign@vt's signing core: an Ed25519 PrivateKey signs `data` and the
@@ -3408,6 +3776,128 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     }
 
     #[test]
+    fn destination_line_shown_when_bound_and_fresh() {
+        // docs/approval-transparency.md §A1: with the default TTL of 0 the
+        // reuse line never appears, so the verified destination must get its
+        // own truth line.
+        let mut s = test_session(0, 0);
+        s.peer_is_ssh_client = true;
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", false))
+            .unwrap();
+        let mut msg = String::from("sign: k");
+        s.append_destination_line(&mut msg, false);
+        assert!(msg.contains("\ndest: SHA256:"), "missing dest line: {msg}");
+        assert!(!msg.contains("forwarding"), "non-forwarding bind flagged: {msg}");
+    }
+
+    #[test]
+    fn destination_line_skipped_when_reuse_line_names_it() {
+        let mut s = test_session(300, 0);
+        s.peer_is_ssh_client = true;
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", false))
+            .unwrap();
+        let (_, reuse_label) = s.raw_sign_scope("fp");
+        assert!(reuse_label.is_some(), "bound non-forwarding peer must be reusable");
+        let mut msg = String::from("sign: k");
+        s.append_destination_line(&mut msg, reuse_label.is_some());
+        assert_eq!(msg, "sign: k", "dest line must not duplicate the reuse label: {msg}");
+    }
+
+    #[test]
+    fn destination_line_flags_forwarding_and_taint() {
+        // Forwarding-capable bind: destination shown WITH the forwarding flag.
+        let mut s = test_session(0, 0);
+        s.peer_is_ssh_client = true;
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", true))
+            .unwrap();
+        let mut msg = String::new();
+        s.append_destination_line(&mut msg, false);
+        assert!(msg.contains("\ndest: SHA256:"), "forwarding bind must still name hop one: {msg}");
+        assert!(msg.contains("(forwarding"), "missing forwarding flag: {msg}");
+        // Tainted bind: explicit warning, no destination claim.
+        let mut s = test_session(0, 0);
+        s.bind_state = BindState::Tainted;
+        let mut msg = String::new();
+        s.append_destination_line(&mut msg, false);
+        assert_eq!(msg, "\nwarning: session-bind verification failed");
+        // Unbound: nothing.
+        let s = test_session(0, 0);
+        let mut msg = String::new();
+        s.append_destination_line(&mut msg, false);
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn caller_line_is_kernel_exe_and_sanitized() {
+        let mut s = test_session(0, 0);
+        s.peer_exe = Some("git\nremote".to_string());
+        let mut msg = String::from("h");
+        s.append_caller_line(&mut msg);
+        assert!(msg.starts_with("h\ncaller: "), "missing caller line: {msg}");
+        // The control character must not survive to inject a fake line.
+        assert_eq!(msg.matches('\n').count(), 1, "unsanitized caller exe: {msg}");
+        // Unknown peer exe → no line.
+        let mut s = test_session(0, 0);
+        s.peer_exe = None;
+        let mut msg = String::from("h");
+        s.append_caller_line(&mut msg);
+        assert_eq!(msg, "h");
+        // The vt CLI itself is the no-information common case → suppressed
+        // (exception display; audit still records peer_exe unconditionally).
+        let mut s = test_session(0, 0);
+        s.peer_exe = Some("vt".to_string());
+        let mut msg = String::from("h");
+        s.append_caller_line(&mut msg);
+        assert_eq!(msg, "h");
+    }
+
+    #[test]
+    fn contract_home_display_only() {
+        let home = dirs::home_dir().expect("home").to_string_lossy().into_owned();
+        assert_eq!(contract_home(&format!("{home}/code/vt")), "~/code/vt");
+        assert_eq!(contract_home(&home), "~");
+        // A sibling path sharing the prefix without a separator must NOT
+        // contract (e.g. /Users/qiqi2 vs /Users/qiqi).
+        assert_eq!(contract_home(&format!("{home}2/x")), format!("{home}2/x"));
+        assert_eq!(contract_home("/repo"), "/repo");
+    }
+
+    #[test]
+    fn audit_ctx_reports_scope_and_destination() {
+        // Workspace-scoped sign: family/label/ttl populated.
+        let mut s = test_session(300, 0);
+        s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
+        let (scope, label) = s.sign_vt_scope("fp", "/repo/sub");
+        let ctx = s.audit_ctx_scoped(scope.family(), &label, 300);
+        assert_eq!(ctx.scope_family, "workspace");
+        assert_eq!(ctx.scope_label, "/repo");
+        assert_eq!(ctx.grant_ttl_s, 300);
+        assert_eq!(ctx.peer_exe, "test");
+        assert!(!ctx.relayed);
+        // Fresh (ttl 0): scope fields stay empty even though a basis exists.
+        let (scope, label) = test_session(0, 0).sign_vt_scope("fp", "");
+        let ctx = s.audit_ctx_scoped(scope.family(), &label, 0);
+        assert_eq!(ctx.scope_family, "");
+        assert_eq!(ctx.scope_label, "");
+        assert_eq!(ctx.grant_ttl_s, 0);
+        // audit_destination: only a bound, non-forwarding session-bind counts.
+        let mut s = test_session(0, 0);
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", false))
+            .unwrap();
+        assert!(s.audit_destination().starts_with("SHA256:"));
+        let mut s = test_session(0, 0);
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"sid", true))
+            .unwrap();
+        assert_eq!(s.audit_destination(), "");
+        assert_eq!(test_session(0, 0).audit_destination(), "");
+    }
+
+    #[test]
     fn reuse_label_present_iff_scope_reusable() {
         // §6 transparency invariant: the prompt reuse line exists exactly
         // when the approval can create a standing grant — across every
@@ -3463,11 +3953,12 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         assert!(s.raw_sign_scope("fp").1.is_none());
         assert_eq!(s.sign_basis(), ContextBasis::UnboundSsh);
 
-        // Unbound non-ssh with a workspace: workspace scope + label.
+        // Unbound non-ssh with a workspace: workspace scope + label (bare
+        // path = workspace root; narrower families keep their prefix).
         let mut s = test_session(300, 0);
         s.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
         let (_, label) = s.raw_sign_scope("fp");
-        assert_eq!(label.as_deref(), Some("workspace /repo"));
+        assert_eq!(label.as_deref(), Some("/repo"));
         assert_eq!(s.sign_basis(), ContextBasis::Workspace);
 
         // No workspace root: Fresh.
@@ -3579,6 +4070,173 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             std::path::Path::new("/opt/work/repo/a"),
             Some(home)
         ));
+    }
+
+    #[test]
+    fn cwd_fallback_rejects_broad_shared_directories() {
+        let home = std::path::Path::new("/Users/x");
+        let p = std::path::Path::new;
+        // $HOME and its ancestors pool everything launched from them.
+        assert!(!cwd_fallback_acceptable(home, Some(home)));
+        assert!(!cwd_fallback_acceptable(p("/Users"), Some(home)));
+        assert!(!cwd_fallback_acceptable(p("/"), Some(home)));
+        // Shared temp roots (canonical forms — F_GETPATH resolves /tmp).
+        assert!(!cwd_fallback_acceptable(p("/private/tmp"), Some(home)));
+        assert!(!cwd_fallback_acceptable(p("/private/var/tmp"), Some(home)));
+        assert!(!cwd_fallback_acceptable(p("/Volumes"), Some(home)));
+        if let Some(t) = darwin_user_temp_dir() {
+            assert!(!cwd_fallback_acceptable(t, Some(home)));
+        }
+        // Subdirectories of the shared roots name one activity: acceptable.
+        assert!(cwd_fallback_acceptable(p("/private/tmp/scratch"), Some(home)));
+        assert!(cwd_fallback_acceptable(p("/Users/x/notes"), Some(home)));
+        assert!(cwd_fallback_acceptable(p("/opt/deploy"), Some(home)));
+    }
+
+    #[test]
+    fn resolve_workspace_falls_back_to_cwd_without_git_root() {
+        // End-to-end through the kernel-cwd path: a peer whose cwd has no
+        // `.git` ancestor lands in the cwd-fallback arm keyed on the
+        // canonical cwd; the same directory flips to the git family once a
+        // `.git` marker appears (grant separation between the two families
+        // is pinned at the digest level by scope_families_are_domain_separated).
+        let dir = temp_workspace("cwd-fallback");
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        if find_git_root(&canonical).is_some() {
+            // Defensive: a `.git` above the temp dir would invalidate the
+            // scenario; skip rather than assert a wrong arm.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .spawn()
+            .expect("spawn peer stand-in");
+        let pid = child.id() as i32;
+
+        match resolve_workspace(Some(pid)) {
+            WorkspaceResolution::CwdFallback(ws) => {
+                assert_eq!(PathBuf::from(ws.root_str()), canonical);
+            }
+            other => panic!("expected cwd fallback, got {other:?}"),
+        }
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        match resolve_workspace(Some(pid)) {
+            WorkspaceResolution::Resolved(ws) => {
+                assert_eq!(PathBuf::from(ws.root_str()), canonical);
+            }
+            other => panic!("expected git workspace after git init, got {other:?}"),
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cwd_fallback_scopes_use_directory_label_and_basis() {
+        // sign@vt / decrypt: cwd fallback behaves like a workspace but with
+        // the "directory" wording and the cwd-fallback basis.
+        let mut s = test_session(300, 300);
+        s.workspace = WorkspaceResolution::CwdFallback(test_workspace()).into();
+        let (scope, label) = s.sign_vt_scope("fp", "/repo/sub");
+        assert!(scope.is_reusable());
+        assert_eq!(label.as_deref(), Some("directory /repo"));
+        assert_eq!(s.decrypt_basis(), ContextBasis::CwdWorkspace);
+        // pwd consistency check still applies.
+        assert!(s.sign_vt_scope("fp", "/elsewhere").1.is_none());
+
+        let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
+        assert_eq!(
+            s.decrypt_scopes(&inputs, "h", "/repo").1.as_deref(),
+            Some("directory /repo")
+        );
+
+        // Raw sign, unbound non-ssh peer: same fallback arm.
+        let (scope, label) = s.raw_sign_scope("fp");
+        assert!(scope.is_reusable());
+        assert_eq!(label.as_deref(), Some("directory /repo"));
+        assert_eq!(s.sign_basis(), ContextBasis::CwdWorkspace);
+
+        // The cwd-fallback scope must differ from the git-workspace scope of
+        // the same directory identity.
+        let mut git = test_session(300, 300);
+        git.workspace = WorkspaceResolution::Resolved(test_workspace()).into();
+        assert_eq!(git.sign_vt_scope("fp", "/repo").1.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn parent_app_identity_resolves_kernel_parent() {
+        // A child we spawn has US as its kernel parent: identity must carry
+        // this process's (pid, start) subject and executable path.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn child");
+        let app = parent_app_identity(child.id() as i32).expect("parent identity");
+        let me = std::process::id() as u64;
+        assert_eq!(app.subject.0, me);
+        assert_eq!(
+            app.exe,
+            proc_info::get_proc_path(me as i32).expect("own exe")
+        );
+        assert!(!app.name().contains('/'));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn resolve_workspace_uses_parent_app_for_broad_cwd() {
+        // A peer whose cwd is an excluded shared root (the per-user Darwin
+        // temp dir) must resolve to its parent application, not NoRoot.
+        let dir = std::env::temp_dir();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        if find_git_root(&canonical).is_some()
+            || cwd_fallback_acceptable(&canonical, dirs::home_dir().as_deref())
+        {
+            // Defensive: scenario requires an excluded, non-git cwd.
+            return;
+        }
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .spawn()
+            .expect("spawn peer stand-in");
+        match resolve_workspace(Some(child.id() as i32)) {
+            WorkspaceResolution::AppFallback(app) => {
+                assert_eq!(app.subject.0, std::process::id() as u64);
+            }
+            other => panic!("expected parent-app fallback, got {other:?}"),
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn parent_app_scopes_use_app_label_and_basis() {
+        let app = AppIdentity {
+            subject: (77, 4242),
+            exe: "/Applications/Paseo.app/Contents/MacOS/Paseo Daemon".to_string(),
+        };
+        let mut s = test_session(300, 300);
+        s.workspace = WorkspaceResolution::AppFallback(app).into();
+        // sign@vt / decrypt: reusable, "app" wording, parent-app basis. The
+        // claimed pwd is display-only in this arm (no root to check against).
+        let (scope, label) = s.sign_vt_scope("fp", "/anywhere");
+        assert!(scope.is_reusable());
+        assert_eq!(label.as_deref(), Some("app Paseo Daemon"));
+        assert_eq!(s.decrypt_basis(), ContextBasis::ParentApp);
+        let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];
+        assert_eq!(
+            s.decrypt_scopes(&inputs, "h", "/").1.as_deref(),
+            Some("app Paseo Daemon")
+        );
+        // Raw sign, unbound non-ssh peer: same fallback arm.
+        let (scope, label) = s.raw_sign_scope("fp");
+        assert!(scope.is_reusable());
+        assert_eq!(label.as_deref(), Some("app Paseo Daemon"));
+        assert_eq!(s.sign_basis(), ContextBasis::ParentApp);
     }
 
     #[tokio::test]

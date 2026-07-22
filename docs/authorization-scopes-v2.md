@@ -1,6 +1,7 @@
 # Authorization scopes V2 — activity-scoped grants
 
-Status: **design, revised after expert review R1**
+Status: **implemented; revised after expert review R1, then extended with
+the cwd fallback (§4a)**
 
 V2 replaces the caller-topology cache modes (`none` / `per-session` /
 `per-app` / `global`) with per-operation activity scopes. The unified
@@ -18,6 +19,8 @@ that operation's risk actually lives:
 | raw SSH sign, session-bound | key fingerprint × **destination host key** | The risk of a signature is "authenticate as me to some server". Which directory or process asked is incidental. |
 | raw SSH sign, unbound non-ssh peer | key fingerprint × **workspace** | `ssh-keygen -Y sign` (git commit signing) never binds; the local kernel-verified caller's project is the activity. |
 | `sign@vt` from local vt | key fingerprint × **workspace** | The local vt client is kernel-verified; a multi-host fan-out from one project is one human activity. |
+| local caller with no `.git` root | key fingerprint / secret × **cwd directory** | Outside any repository the kernel-derived cwd itself is the activity — a distinct grant family from workspaces (§4a). |
+| local caller from a broad shared cwd ($HOME, `/`, temp roots) | key fingerprint / secret × **parent application** | Daemons and GUI helpers launch from shared directories; the kernel-derived parent process is the activity (§4a parent-app arm). |
 | `sign@vt` via relay **or plain-ssh** connection | key fingerprint × claimed pwd, bounded **per connection** | Unchanged from V1: a connection that can carry forwarded remote traffic reuses only its own approvals and never reaches the workspace arm. |
 | `decrypt@vt` local, pure v2 | secret `(type, salt)` × **workspace** | Secrets belong to projects. "I am working in this project" is the approval unit. |
 | `decrypt@vt` via relay or plain-ssh connection, pure v2 | secret `(type, salt)` × claimed host/pwd, bounded per connection | Unchanged from V1. |
@@ -190,13 +193,12 @@ For local vt peers (decrypt and sign@vt) and unbound non-ssh raw signers:
    (`pvi_cdir.vip_path`). Failure ⇒ Fresh.
 2. Ascend from cwd to the nearest ancestor containing a `.git` entry (dir
    **or** file — worktrees use a file), depth-capped as a syscall bound.
-   **None found ⇒ Fresh** (diag basis `no-workspace-root`). A cwd fallback
-   would silently pool `$HOME`, `/tmp`, and CI scratch directories into one
-   broad unlabeled bucket; V2 fails narrow instead. For the same reason a
-   root that IS `$HOME` (a dotfiles repository — `git init ~`, yadm) and a
-   root found above `$HOME` for a cwd inside `$HOME` are rejected ⇒ Fresh:
-   accepting them would make every caller under the home directory share one
-   grant bucket.
+   **None found ⇒ the cwd itself becomes the scope** (§4a) unless it is a
+   broad shared directory. A root that IS `$HOME` (a dotfiles repository —
+   `git init ~`, yadm) and a root found above `$HOME` for a cwd inside
+   `$HOME` are rejected the same way: accepting them would make every
+   caller under the home directory share one grant bucket, so they degrade
+   to the narrower cwd fallback instead.
 3. Capture the workspace identity through **one file descriptor**:
    `open(root, O_RDONLY | O_DIRECTORY)` → `fstat(fd)` for `(st_dev, st_ino)`
    → `fcntl(fd, F_GETPATH)` for the canonical path → close. The dev/ino pair
@@ -217,6 +219,55 @@ a hung network mount must stall only that connection, not the accept loop.
 Subject spaces overlap structurally (`(dev, ino)` vs relay `(pid, tvsec)`
 vs `(0, 0)`), but every scope family uses a distinct digest domain label,
 so a subject collision alone can never merge grants.
+
+## 4a. Cwd fallback (no `.git` root)
+
+When step 2 finds no usable `.git` root, the kernel-derived cwd directory
+itself becomes the scope, captured through the same one-fd identity as a
+workspace root, with two deliberate differences:
+
+- **Distinct grant family.** The digests use `vt-authz-sign-cwd-v1` /
+  `vt-authz-decrypt-cwd-v1`, and the engine tags grants with a
+  `ScopeFamily` so diag counting can also tell the families apart. The same
+  directory before and after `git init` shares its `(dev, ino)` subject and
+  canonical path; without domain separation, adding or removing a `.git`
+  entry would silently continue the other family's grants with no new
+  approval event.
+- **Broad shared directories are never a directory scope**
+  (`cwd_fallback_acceptable`, checked on the fd-derived canonical path so
+  `/tmp` aliases cannot dodge it): `$HOME`, any ancestor of `$HOME` (`/`,
+  `/Users`), the shared temp roots (`/tmp`, `/private/tmp`, `/var/tmp`,
+  `/private/var/tmp`), `/Volumes`, and the per-user Darwin temp root
+  (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, queried from the OS, never from a
+  peer's `$TMPDIR`). These are the launch cwd of many unrelated activities;
+  scoping them would pool that work into one bucket. They fall through to
+  the parent-app arm below. Subdirectories (`/tmp/scratch`, `~/notes`) name
+  one activity and are acceptable.
+
+### Parent-app arm (broad cwd)
+
+A caller whose cwd is one of the excluded broad directories is typically an
+application-spawned helper (a daemon probing `gh` through the hook from
+cwd `/`, a GUI app's git integration from `$HOME`). Its activity identity is
+the **kernel-derived parent process**:
+
+- `subject` = parent `(pid, start_tvsec)` — grants die when the app exits;
+- digest binds the parent's kernel-verified executable path
+  (`proc_pidpath(ppid)`, never the client-claimed `ppid_cmd` string):
+  `H("vt-authz-{sign,decrypt}-app-v1", parent_exe, …)`;
+- parent `pid <= 1` (launchd — daemon orphans) or a failed lookup ⇒ Fresh
+  (diag basis `no-workspace-root`): scoping to launchd would pool every
+  daemon on the box;
+- the claimed `pwd` is display-only in this arm (there is no root to check
+  it against), like the connection arms;
+- prompt label: `reuse: app <exe basename>`; diag basis `parent-app`.
+
+The fallback matches the honest-intent reading of §2: repeated operations
+from one non-repository directory (a deploy dir, a scratch checkout-free
+project) are one human activity. Remote containment is unaffected — confined
+connections (relay / ssh peers) never reach this arm, exactly as they never
+reach the workspace arm. The prompt states the scope as
+`reuse: directory <path>` (§6) and diag reports basis `cwd-fallback` (§7).
 
 ## 5. Configuration
 
@@ -255,23 +306,40 @@ line:
 
 ```text
 reuse: github.com (SHA256:…) · 8h        # destination sign
-reuse: workspace ~/code/vt · 8h          # workspace sign / decrypt
+reuse: ~/code/vt · 8h                    # workspace sign / decrypt (bare path
+                                         #   = the whole repository; $HOME
+                                         #   contracted to ~ for display)
+reuse: directory /opt/deploy · 8h        # cwd-fallback sign / decrypt
+reuse: app Paseo Daemon · 8h             # parent-app sign / decrypt
 ```
+
+The workspace label is deliberately unmarked — it is the overwhelmingly
+common case, and repeating a `workspace` keyword on every prompt added no
+information. The narrower fallback families keep their prefix so "this
+exact directory" / "this app" can never read as a repository scope.
 
 Fresh operations (`auth@vt`, `run@vt`, legacy decrypt, unbound-ssh sign)
 show no reuse line. The approved range and the displayed range must be the
 same sentence; handlers build the label from the same fd-derived data the
 scope digest uses (§4.3).
 
+Beyond the reuse line, prompts carry further agent-derived truth lines
+(docs/approval-transparency.md): a kernel-verified `caller:` line on the
+four vt extensions, and on raw signs a `dest:` line for a verified
+non-forwarding session-bind (when no reuse line already names it), a
+forwarding flag, or a taint warning. **Every agent-derived truth line
+precedes every client-reported line** (command body, `pwd:`/`via:`/`ssh:`),
+so a hostile caller can pad only its own region off-screen.
+
 ## 7. Diagnostics
 
 `diag@vt` replaces `mode` + V1 `ContextBasis` with the scope classification:
 
 - sign report: `basis ∈ {session-bind, forwarding, tainted, unbound-ssh,
-  workspace, no-workspace-root, relay-connection, ssh-connection,
-  disabled, …}`;
-- decrypt report: `basis ∈ {workspace, no-workspace-root, relay-connection,
-  ssh-connection, disabled, …}`.
+  workspace, cwd-fallback, parent-app, no-workspace-root, relay-connection,
+  ssh-connection, disabled, …}`;
+- decrypt report: `basis ∈ {workspace, cwd-fallback, parent-app,
+  no-workspace-root, relay-connection, ssh-connection, disabled, …}`.
 
 `live_entries` counts only grants the caller's **own** classification would
 hit: a `session-bind` caller counts the user-wide destination grants (those
@@ -337,8 +405,20 @@ remains read-only, prompt-free, and must still not reset the idle clock.
 - `sign@vt` via relay signs with the relay's configured `--host` label, not
   a verified downstream destination (unchanged V1 behavior); it is
   per-connection confined and must never be described as destination-bound.
-- Working outside any git repository never caches (§4.2). Deliberate
-  fail-narrow; revisit only with an explicit opt-in.
+- Working outside any git repository caches per exact cwd directory (§4a) —
+  the operator-requested revision of V2's original never-cache stance. The
+  activity unit is coarser than a git root ("same launch directory" rather
+  than "same project"): long-lived helpers that launch from a generic
+  directory and CI runners that reuse a checkout root share grants they
+  would not share under `.git` scoping. Bounded by the shared-directory
+  exclusions, the distinct grant family, TTL, and the revocation epoch.
+- The parent-app arm keys on the immediate kernel parent. Everything one
+  application instance does from a broad cwd shares per-record grants,
+  regardless of which of its windows/jobs asked; and a helper that
+  daemonizes (reparents to launchd) loses its scope and degrades to Fresh
+  rather than pooling under launchd. Both are the intended fail-narrow
+  reading. Within §2, a same-UID process claiming another app's identity
+  was never prevented by any scope.
 
 ## 11. Test plan
 

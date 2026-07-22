@@ -36,7 +36,7 @@ unavailable, cache_hit, spawn_failed}`:
 | `decrypt` | `handle_decrypt`                    | emits `cache_hit` on a decrypt-cache hit; `salts` = batch size |
 | `auth`    | `handle_auth` (auth@vt)             | always prompts |
 | `run`     | `handle_run` (run@vt)               | `approved` at the human tap, **plus** a second `spawn_failed` row if the launch fails (two events, two rows) |
-| `sign`    | `Session::sign` (standard SSH auth) | distinct from `auth@vt`; carries no vt ClientMeta, so the prompt label is the audit `command` |
+| `sign`    | `Session::sign` (standard SSH auth) | distinct from `auth@vt`; carries no vt ClientMeta, so the prompt label is the audit `command` — the structured `key_fp` / `dest` / `peer_exe` fields carry the key, verified destination, and caller |
 | `ssh-sign`| `handle_sign_vt` (`sign@vt`)         | context-carrying git signing; carries `ClientMeta` and shares the sign auth cache |
 
 `latency_ms` measures prompt-shown → decision; cache hits are `0`. `ppid` is the
@@ -105,11 +105,20 @@ never crowds out the random suffix (which would collapse dedup).
 POST {audit_url}/api/audit-ingest
   Authorization: VT-HMAC b64u(HMAC-SHA256(agent_audit_key, rawBody))
   body = { timestamp_ms, agent_id, hostname, entry }
-    entry = { op_kind, outcome, salts, latency_ms, ts_ms, token_id, meta }
+    entry = { op_kind, outcome, salts, latency_ms, ts_ms, token_id, meta,
+              peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s,
+              relayed }
       meta = ChallengeMeta wire shape (op_kind, command, host, user, pwd, tty,
              ppid_cmd, ppid, ssh_client, reason) — NO `ip` (the Worker forces it
              from CF-Connecting-IP).
 ```
+
+The seven trailing fields are agent-authoritative context
+(docs/approval-transparency.md §B): kernel-verified peer executable, sign key
+fingerprint, verified session-bind destination, and the reuse-scope
+family/label/TTL the Touch ID prompt displayed, plus the relay flag. The agent
+always sends them (`''`/`0`/`false` = not applicable); the Worker stores an
+*absent* field (old agent) as SQL NULL — the two stay distinguishable.
 
 Worker `/api/audit-ingest`:
 1. reject body > 64 KB (Content-Length + arrayBuffer length) → 413

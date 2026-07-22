@@ -22,6 +22,7 @@ and update the relevant document in the same change.
 | Understand SSH-agent authorization and caching | [`unified-authorization-engine.md`](unified-authorization-engine.md) | `src/core/authorization.rs`, `src/server_macos/authorization.rs`, `src/server_macos/ssh_agent.rs` |
 | Understand grant scopes (destination / workspace / relay) | [`authorization-scopes-v2.md`](authorization-scopes-v2.md) | `src/core/authorization.rs` (`GrantScope`), `src/server_macos/ssh_agent.rs` (`BindState`, `resolve_workspace`) |
 | Enable agent audit push | [`agent-audit.md`](agent-audit.md) | `src/audit.rs`, `src/server_macos/audit.rs` |
+| Understand prompt/notification fields and audit context | [`approval-transparency.md`](approval-transparency.md) | `src/server_macos/ssh_agent.rs` (prompt lines), `cf-worker/src/notify.ts`, `cf-worker/pwa/approve.js` |
 | Diagnose config/routing/caching (`vt doctor`) | [`diag-design.md`](diag-design.md) | `src/client.rs` (`doctor`), `src/server_macos/ssh_agent.rs` (`handle_diag`) |
 | Configure Slack App notifications | [`slack-app.md`](slack-app.md) | `cf-worker/src/slack_app.ts` |
 | Configure Feishu/Lark notifications | [`feishu.md`](feishu.md) | `cf-worker/src/feishu.ts` |

@@ -1246,31 +1246,39 @@ pub async fn inject(
     only_env: Option<Vec<String>>,
     mut args: Vec<String>,
 ) -> Result<()> {
-    let raw_command = args.join(" ");
-    debug!("Original command: {}", raw_command);
-    let mut original_command = String::from("op: inject");
+    debug!("Original command: {}", args.join(" "));
+    // Display body shown on the Touch ID prompt, the approval page, and the
+    // notifications. No `op:` header — the `cmd:`/`file:` lines themselves say
+    // "inject" (`vt read` keeps its explicit `op: read`), and the surrounding
+    // surface already names the operation (prompt header / 类型 field). The
+    // command is shortened to basename + args and capped: a long absolute
+    // argv[0] drowned the signal a human actually reads (operator feedback,
+    // docs/approval-transparency.md §C5); the executable path was
+    // client-claimed display data anyway, never a verified field.
+    let mut lines: Vec<String> = Vec::new();
     if let Some(p) = replace_file.as_ref() {
-        original_command.push_str("\nfile: ");
-        original_command.push_str(&sanitize_for_display(p, 100));
+        lines.push(format!("file: {}", sanitize_for_display(p, 100)));
     }
-    if raw_command.is_empty() {
-        original_command.push_str("\ncmd: [no shell command]");
+    let display_cmd = args
+        .first()
+        .map(|argv0| {
+            std::iter::once(argv0.rsplit('/').next().unwrap_or(argv0))
+                .chain(args[1..].iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let normalized = collapse_whitespace(&display_cmd);
+    if normalized.is_empty() {
+        lines.push("cmd: [no shell command]".to_string());
     } else {
-        let normalized = collapse_whitespace(&raw_command);
         let redacted = redact_vt_urls(&normalized, "vt://***");
-        original_command.push_str("\ncmd: ");
-        // Keep the full command in the audit/approval record (the detail dialog
-        // renders it verbatim). The Touch ID prompt re-caps per line
-        // (PROMPT_COMMAND_MAX_LINE_LEN) and the whole request body is bounded by
-        // PROMPT_DISPLAY_MAX_BYTES (8 KiB) / CEREMONY_POST_MAX_BYTES, so a
-        // generous cap here shows real commands in full without truncating to
-        // "gh api…".
-        original_command.push_str(&sanitize_for_display(&redacted, 1024));
+        lines.push(format!("cmd: {}", sanitize_for_display(&redacted, 160)));
     }
     if let Some(r) = reason {
-        original_command.push_str("\nreason: ");
-        original_command.push_str(&sanitize_for_display(r, 200));
+        lines.push(format!("reason: {}", sanitize_for_display(r, 200)));
     }
+    let original_command = lines.join("\n");
 
     // Open the target ONCE with O_NOFOLLOW, capture its mode, and read its
     // content. The same in-memory bytes are reused as both the decrypt source
