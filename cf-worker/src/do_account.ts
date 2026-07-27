@@ -44,7 +44,7 @@ const AGENT_CACHE_NOTIFY_MIN_INTERVAL_MS = 60 * 1000;
 // this set is rejected, so neither a tampered approve body nor a future UI typo
 // can mint an over-long window. 0 ("do not cache") is NOT a member — it is the
 // absence of a write. The PWA's radio options are [0, ...this] (see opPageData).
-const CACHE_TTL_WHITELIST = new Set([8 * 60, 20 * 60, 2 * 60 * 60]);
+const CACHE_TTL_WHITELIST = new Set([20 * 60, 2 * 60 * 60, 8 * 60 * 60]);
 
 // Cap concurrent admin audit-stream sockets (multiple browser tabs / stale
 // hibernated sockets). Bounds broadcast fan-out and DO memory; a new connect

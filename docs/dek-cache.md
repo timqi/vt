@@ -6,7 +6,7 @@ TTL, a caller can decrypt the approved records without another phone tap.
 
 ## Current contract
 
-- TTL choices are `0`, `8m`, `20m`, and `2h`. `0` is the default and means no
+- TTL choices are `0`, `20m`, `2h`, and `8h`. `0` is the default and means no
   cache write.
 - Caching is enabled only when the Worker secret `CACHE_SECKEY` is configured.
   There is no `VT_DEK_CACHE` environment variable and no separate client-side
@@ -52,7 +52,11 @@ credential; when a cache entry is live, possession of that token from the same
 egress IP and matching `pwd` is sufficient to obtain the cached DEK.
 
 Keep the default TTL at `0` for high-assurance or unattended workloads. Use
-short TTLs for automation that needs repeated decrypts, and rotate
+short TTLs for automation that needs repeated decrypts. `8h` is a
+workday-session choice for an attended desktop only: for its whole window,
+possession of `VT_PASSKEY_TOKEN` from the same egress IP and `pwd` decrypts the
+approved records with no phone tap, so do not select it on shared, unattended,
+or CI hosts. Rotate
 `CACHE_SECKEY` or use the admin clear-cache action for emergency invalidation.
 The cache does not re-key existing `vt://` records.
 
@@ -70,7 +74,7 @@ The cache does not re-key existing `vt://` records.
 ## Verification
 
 1. Deploy a Worker with `CACHE_SECKEY` configured.
-2. Read a `vt://` record and select `8m` on the approval page.
+2. Read a `vt://` record and select `20m` on the approval page.
 3. Read the same record again from the same egress IP and working directory;
    the second read should not open a phone ceremony.
 4. Check the admin audit page for the cache grant and hit.
