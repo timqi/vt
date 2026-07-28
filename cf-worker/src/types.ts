@@ -26,6 +26,12 @@ export interface Env {
    *  Feishu/Lark self-built-app bot channel: @-mentions approvers + edits the
    *  card in place on the decision. Empty/invalid → Feishu disabled. See feishu.ts. */
   FEISHU_JSON: string;
+  /** "1" | "true" | "on" | "yes" → push the 免审批 cache-hit notices (Pushover /
+   *  Slack / Slack App / Feishu). Anything else, including absent, keeps them
+   *  off: a cache hit can fire many times a minute and the stream buries the
+   *  approval messages that need a human. The audit row is written regardless,
+   *  so cache hits remain fully visible on the admin audit page. */
+  CACHE_HIT_NOTIFY?: string;
   WORKER_ORIGIN: string;
   RP_ID: string;
   /** Cloudflare Access team domain, e.g. "myteam.cloudflareaccess.com". Empty → admin surface fails closed. */

@@ -46,8 +46,10 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   supervisor. `vt inject --recover` must remain unauthenticated and only move
   the ciphertext backup back over the target.
 - DEK caching is opt-in, requires `CACHE_SECKEY`, and uses the Worker-selected
-  TTLs. A cache hit is not a phone approval; preserve its audit/notification
-  behavior and IP binding.
+  TTLs. A cache hit is not a phone approval; preserve its audit row and IP
+  binding. The real-time 免审批 push (Pushover / Slack / Slack App / Feishu)
+  is separately opt-in via the `CACHE_HIT_NOTIFY` var and off by default —
+  it is too noisy on busy hosts. Never make the audit row conditional on it.
 - `auth@vt` and `run@vt` always require a fresh approval. Do not add them to
   auth caches.
 - `auth@vt`, `run@vt`, SSH signing, and `decrypt@vt` all use the unified

@@ -55,6 +55,11 @@ RP_ID = "vt.example.com"
 # Both empty → the Worker fails closed (403) on every admin-surface request.
 ACCESS_TEAM_DOMAIN = "<your-team>.cloudflareaccess.com"
 ACCESS_AUD = "<YOUR_ACCESS_APPLICATION_AUD_TAG>"
+# Cache-hit (免审批) real-time notices. Off unless set to 1/true/on/yes — they
+# fire on every DEK-cache and agent Touch-ID-cache hit and bury the approval
+# messages that need a tap. Audit rows are written either way, so cache hits
+# stay visible on the admin audit page.
+CACHE_HIT_NOTIFY = "0"
 
 # Secrets (wrangler secret put — never inlined):
 #   VT_AUTH_CF        32-byte base64url token, daemon→Worker HMAC on /api/challenge

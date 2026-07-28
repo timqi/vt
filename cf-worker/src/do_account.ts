@@ -40,6 +40,15 @@ const AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 // audit table still records every hit — the notice is a heads-up, not a ledger.
 const AGENT_CACHE_NOTIFY_MIN_INTERVAL_MS = 60 * 1000;
 
+// Cache-hit 免审批 notices are opt-in and OFF by default — they fire on every
+// no-human-in-the-loop decrypt and bury the approval messages that do need a
+// tap. Set CACHE_HIT_NOTIFY = "1" | "true" | "on" | "yes" in wrangler.toml
+// [vars] to restore the push. The audit row is written either way.
+function cacheHitNotifyEnabled(env: Env): boolean {
+  const v = (env.CACHE_HIT_NOTIFY ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'on' || v === 'yes';
+}
+
 // Allowed positive DEK-cache TTLs (seconds). A write with any value outside
 // this set is rejected, so neither a tampered approve body nor a future UI typo
 // can mint an over-long window. 0 ("do not cache") is NOT a member — it is the
@@ -1234,12 +1243,19 @@ export class AccountDO extends DurableObject<Env> {
   // DEK-cache hit (opDekCache) and the agent Touch-ID-cache hit
   // (notifyAgentCacheHit); `note` names the skipped factor when it isn't the
   // default phone approval, `errTag` distinguishes the two sources in logs.
+  //
+  // Push is OPT-IN (CACHE_HIT_NOTIFY=1): a busy host hits the cache many times
+  // a minute and the resulting stream drowns the approval messages that
+  // actually need a human. Silence here only drops the real-time FYI — the
+  // audit row (auditCacheEvent / auditAgent) is written unconditionally and
+  // stays the durable record, visible on the admin audit page.
   private pushCacheHitNotices(
     meta: ChallengeMeta,
     salts: number,
     note: string | undefined,
     errTag: string,
   ): void {
+    if (!cacheHitNotifyEnabled(this.env)) return;
     this.ctx.waitUntil(
       notifyCacheHit(this.env, meta, salts, note)
         .then((w) => { if (w) logErr(`notify.${errTag}`, w); })
