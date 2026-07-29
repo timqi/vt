@@ -97,6 +97,27 @@
   // the picker says so instead of letting "1 周" read like just another option.
   function ttlIsLong(s) { return s >= 86400; }
 
+  // Would extending with `ttl` actually move this group's expiry? Extension is
+  // absolute (now + ttl), never additive, so a TTL shorter than the time already
+  // on the clock is a no-op — the server refuses it as `no_gain`. Deciding this
+  // client-side is what lets the UI say so BEFORE the click instead of firing a
+  // request that comes back 409 with nothing to show for it.
+  function wouldGain(g, ttl) { return now() + ttl * 1000 > g.max_expires_ms; }
+
+  // Smallest rung that would move every extendable group in `gs` forward, so the
+  // UI can name the fix ("请选择 ≥ 2 天") rather than just refusing.
+  function smallestUsefulTtl(gs) {
+    var opts = meta.ttl_options_s || [];
+    for (var i = 0; i < opts.length; i++) {
+      var ok = gs.length > 0;
+      for (var j = 0; j < gs.length; j++) {
+        if (!wouldGain(gs[j], opts[i])) { ok = false; break; }
+      }
+      if (ok) return opts[i];
+    }
+    return 0;
+  }
+
   // Why a group cannot be extended, in the operator's language. These mirror the
   // server's reason codes 1:1 (do_account.opCacheList) — the server decides, the
   // UI only translates, so the button state can never disagree with the policy.
@@ -315,9 +336,15 @@
     clr.addEventListener('click', function () { clearGroups([g.group_id], clr); });
     act.appendChild(clr);
     if (meta.extend_enabled && g.extendable) {
+      var ttlNow = selectedTtl();
+      var gains = wouldGain(g, ttlNow);
       var ext = el('button', 'small ghost', '延长');
       ext.type = 'button';
-      ext.title = '发起延长审批（需 Passkey 批准）';
+      ext.disabled = !gains;
+      ext.title = gains
+        ? '发起延长审批（需 Passkey 批准）：有效期将重设为「批准时刻 + ' + ttlLabel(ttlNow) + '」'
+        : '所选时长 ' + ttlLabel(ttlNow) + ' 短于现有剩余 '
+          + fmtRemaining(g.max_expires_ms - t) + '，不会生效；请在上方选更长的时长';
       ext.addEventListener('click', function () { requestExtend([g.group_id], ext); });
       act.appendChild(ext);
     }
@@ -360,6 +387,11 @@
   }
 
   function syncBulkBar() {
+    // Read the chosen duration FIRST: everything below (button state, per-row
+    // eligibility, the note) is a function of it. It used to be declared further
+    // down, so the `gainers` filter saw a hoisted `undefined` and disabled the
+    // button unconditionally.
+    var ttl = selectedTtl();
     var ids = selectedIds();
     var bar = document.getElementById('bulkbar');
     var countEl = document.getElementById('bulk-count');
@@ -368,10 +400,11 @@
     bar.hidden = ids.length === 0;
     if (ids.length === 0) return;
     var entries = 0, extendable = 0;
+    var extGroups = [];
     ids.forEach(function (id) {
       var g = byGroup[id];
       entries += g.live;
-      if (g.extendable) extendable++;
+      if (g.extendable) { extendable++; extGroups.push(g); }
     });
     countEl.textContent = '已选 ' + ids.length + ' 组 / ' + entries + ' 条';
     var ttlLabelEl = document.getElementById('extend-ttl-label');
@@ -385,11 +418,14 @@
     }
     ttlLabelEl.hidden = false;
     extendBtn.hidden = false;
-    extendBtn.disabled = extendable === 0;
+    var gainers = extGroups.filter(function (g) { return wouldGain(g, ttl); });
+    // Disabled when the request would provably change nothing — the server would
+    // refuse it as no_gain anyway, and a button that 409s is worse than one that
+    // explains itself.
+    extendBtn.disabled = gainers.length === 0;
     // Build the note additively: a partial selection and a long-window warning are
     // independent facts, and the earlier version let the former hide the latter —
-    // so picking 1 週 on a mixed selection showed no exposure warning at all.
-    var ttl = selectedTtl();
+    // so picking 1 周 on a mixed selection showed no exposure warning at all.
     var parts = [];
     var warn = false;
     if (extendable === 0) {
@@ -403,15 +439,32 @@
         return (REASON_TEXT[k] || k) + ' ×' + reasons[k];
       }).join('；'));
       warn = true;
+    } else if (gainers.length === 0) {
+      // The common trap: extension is absolute, so a rung shorter than the time
+      // already on the clock does nothing. Name the smallest rung that would work.
+      var longest = 0;
+      extGroups.forEach(function (g) {
+        var left = g.max_expires_ms - now();
+        if (left > longest) longest = left;
+      });
+      var need = smallestUsefulTtl(extGroups);
+      parts.push('所选时长 ' + ttlLabel(ttl) + ' 不会生效：现有剩余最长 '
+        + fmtRemaining(longest) + '（延长是重设为「批准时刻 + 时长」，不是叠加）'
+        + (need ? '，请选择 ' + ttlLabel(need) + ' 或更长' : ''));
+      warn = true;
     } else {
-      if (extendable < ids.length) {
+      if (gainers.length < extendable) {
+        parts.push('仅 ' + gainers.length + ' / ' + extendable
+          + ' 组会因此延长（其余现有剩余已更长）');
+        warn = true;
+      } else if (extendable < ids.length) {
         parts.push('仅 ' + extendable + ' / ' + ids.length + ' 组可延长，其余将被忽略');
         warn = true;
       }
       // A multi-day pick is a materially larger exposure than a workday one. The
       // approval page states it too, but say it before the request is even made.
       if (ttlIsLong(ttl)) {
-        parts.push('⚠ ' + ttlLabel(ttl) + '内这 ' + extendable
+        parts.push('⚠ ' + ttlLabel(ttl) + '内这 ' + gainers.length
           + ' 组记录的解密将持续免手机审批（同一来源 IP + 工作目录）');
         warn = true;
       }
@@ -518,8 +571,21 @@
   async function requestExtend(ids, btn) {
     var ttl = selectedTtl();
     if (!ttl) { setStatus('请选择延长时长', 'error'); return; }
-    var targets = ids.filter(function (id) { return byGroup[id] && byGroup[id].extendable; });
-    if (!targets.length) { setStatus('所选分组均不可延长', 'error'); return; }
+    // Filter on the SAME predicate the server enforces, so the client never fires a
+    // request it can already tell will be refused — and when it can't proceed, it
+    // names the fix instead of reporting a bare failure.
+    var eligible = ids.filter(function (id) { return byGroup[id] && byGroup[id].extendable; });
+    var targets = eligible.filter(function (id) { return wouldGain(byGroup[id], ttl); });
+    if (!targets.length) {
+      if (eligible.length) {
+        var need = smallestUsefulTtl(eligible.map(function (id) { return byGroup[id]; }));
+        setStatus('所选时长 ' + ttlLabel(ttl) + ' 短于现有剩余，不会生效'
+          + (need ? '；请选择 ' + ttlLabel(need) + ' 或更长' : ''), 'error');
+      } else {
+        setStatus('所选分组均不可延长', 'error');
+      }
+      return;
+    }
     if (btn) btn.disabled = true;
     setStatus('正在创建审批请求…');
     try {
@@ -532,9 +598,26 @@
         setStatus('延长功能未启用（CACHE_ADMIN_EXTEND）', 'error');
         return;
       }
+      if (resp.status === 403) {
+        setStatus('未授权（Cloudflare Access 会话可能已过期，请刷新登录）', 'error');
+        return;
+      }
       if (resp.status === 409) {
-        setStatus('没有可延长的目标（可能刚刚过期或已被清除）', 'error');
+        // Refresh FIRST, then report — load() re-renders and would otherwise
+        // overwrite the message, which is exactly how this failure managed to look
+        // like "the button does nothing".
+        var why = null;
+        try { why = (await resp.json()).rejected; } catch (e) { /* keep generic */ }
         await load();
+        var detail = '';
+        if (why && why.length) {
+          var counts = {};
+          why.forEach(function (r) { counts[r.reason] = (counts[r.reason] || 0) + 1; });
+          detail = '：' + Object.keys(counts).map(function (k) {
+            return (REASON_TEXT[k] || k) + ' ×' + counts[k];
+          }).join('；');
+        }
+        setStatus('没有可延长的目标' + detail, 'error');
         return;
       }
       if (!resp.ok) { setStatus('创建失败 HTTP ' + resp.status, 'error'); return; }
@@ -605,7 +688,7 @@
   document.getElementById('f-live').addEventListener('change', render);
   document.getElementById('f-host').addEventListener('input', render);
   // Re-run the note so the multi-day warning appears the moment 1d/2d/1w is picked.
-  document.getElementById('extend-ttl').addEventListener('change', syncBulkBar);
+  document.getElementById('extend-ttl').addEventListener('change', render);
 
   document.getElementById('pick-all').addEventListener('change', function () {
     var on = this.checked;

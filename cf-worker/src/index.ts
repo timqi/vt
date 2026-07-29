@@ -48,7 +48,7 @@ const ADMIN_SEG = 'kestrel';
 // stale far-future-cached copy. (Workers Assets serves static files with a
 // cacheable response; without a versioned URL a changed audit.js can refresh
 // while admin.css stays stale, which desyncs markup from styles.)
-const ASSET_VER = '20260729-3';
+const ASSET_VER = '20260729-4';
 
 // Escape a JSON string for safe embedding in a <script type="application/json"> block.
 function escapeJsonForHtml(obj: unknown): string {
