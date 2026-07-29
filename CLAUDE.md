@@ -44,7 +44,13 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   behavior when adding a new command.
 - `vt inject -r` restores ciphertext through its self-exec'd restore
   supervisor. `vt inject --recover` must remain unauthenticated and only move
-  the ciphertext backup back over the target.
+  the ciphertext backup back over the target. The ciphertext backup's
+  deterministic per-target name (`.{name}.vt-backup`) IS the exposure lock:
+  it is created O_EXCL before any plaintext hits disk, and every restore path
+  must consume it via rename() — never copy+delete — so an overlapping
+  `inject -r` of the same file fails EEXIST instead of snapshotting exposed
+  plaintext as its "ciphertext" backup. Do not reintroduce a randomized
+  backup name, and keep refusing `-r` files with zero `vt://` records.
 - DEK caching is opt-in, requires `CACHE_SECKEY`, and uses the Worker-selected
   TTLs. A cache hit is not a phone approval; preserve its audit row and IP
   binding. Every write mints an immutable `cache_group_id` (the handle the admin

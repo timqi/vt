@@ -1316,6 +1316,33 @@ pub async fn inject(
         }
         None => String::new(),
     };
+    // Exposure-overlap pre-checks, before the decrypt round trip spends a
+    // Touch ID / phone approval. The O_EXCL backup create below (step 2) is
+    // the authoritative, race-free gate; these two only fail earlier and
+    // louder:
+    //  - an existing backup means the target is mid-exposure (or a dead
+    //    supervisor left it plaintext) — arming again would snapshot that
+    //    plaintext as "ciphertext" and restore it permanently;
+    //  - zero vt:// records means there is nothing to decrypt: either the
+    //    wrong file, or plaintext left behind by a broken exposure.
+    if let Some(file) = replace_file.as_ref() {
+        let backup = exposure_backup_path(file)?;
+        if backup.symlink_metadata().is_ok() {
+            return Err(exposure_conflict_refusal(
+                file,
+                &backup,
+                inject_state_dir().as_deref(),
+            ));
+        }
+        if iter_vt_urls(&replace_file_content).next().is_none() {
+            return Err(anyhow::anyhow!(
+                "{} contains no vt:// records — nothing to decrypt. Was it \
+                 left decrypted by another process, or is this the wrong file?",
+                file
+            ));
+        }
+    }
+
     // Keep the original (ciphertext) bytes for the backup; the same bytes we
     // just read and are about to decrypt. Cheap clone (empty when no -r file).
     let orig_file_bytes = replace_file_content.clone().into_bytes();
@@ -1351,8 +1378,13 @@ pub async fn inject(
 
     // Plaintext exposure protocol when -r is set:
     //   1. Open target with O_NOFOLLOW, stat to capture mode + reject non-regular.
-    //   2. Write a backup file alongside the target (ciphertext copy, randomized
-    //      hidden name, O_CREAT|O_EXCL|O_NOFOLLOW, mode = orig).
+    //   2. Write a backup file alongside the target (ciphertext copy,
+    //      O_CREAT|O_EXCL|O_NOFOLLOW, mode = orig) at the DETERMINISTIC
+    //      per-target path `.{name}.vt-backup`. The backup doubles as the
+    //      exposure lock (see `exposure_backup_path`): a second inject of the
+    //      same target fails EEXIST here instead of snapshotting the exposed
+    //      plaintext as its "ciphertext" backup — which its supervisor would
+    //      later restore permanently.
     //   3. Spawn the detached supervisor before any plaintext can hit disk.
     //      Failure here deletes the backup and aborts — target stays ciphertext.
     //   4. Write the tmp file (plaintext, same hidden-name rules as backup).
@@ -1388,7 +1420,10 @@ pub async fn inject(
             rand::thread_rng().fill_bytes(&mut rnd);
         }
         let suffix: String = rnd.iter().map(|b| format!("{:02x}", b)).collect();
-        let backup_path = dir.join(format!(".{}.vt-backup-{}", file_name, suffix));
+        // Backup: deterministic per-target name (the exposure lock). Tmp and
+        // sidecar keep the random suffix — the tmp is consumed by rename()
+        // within this function and a leftover must not block the next inject.
+        let backup_path = exposure_backup_path(replace_file_path)?;
         let tmp_path = dir.join(format!(".{}.vt-tmp-{}", file_name, suffix));
         // Crash-recovery sidecar path in the state dir. Computed up front so
         // the supervisor gets it at spawn and can delete it after a normal
@@ -1405,15 +1440,30 @@ pub async fn inject(
         // the single O_NOFOLLOW open above) — NOT a fresh re-read of the target,
         // which would be a TOCTOU window for a directory-writable attacker.
         {
-            let mut backup_file = std::fs::OpenOptions::new()
+            let mut backup_file = match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .custom_flags(libc::O_NOFOLLOW)
                 .mode(orig_mode)
                 .open(&backup_path)
-                .with_context(|| {
-                    format!("Failed to create backup file: {}", backup_path.display())
-                })?;
+            {
+                Ok(f) => f,
+                // EEXIST: another exposure of this target is open (or a dead
+                // supervisor left one). The pre-decrypt check already refused
+                // the common case; this is the authoritative race-free gate.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(exposure_conflict_refusal(
+                        replace_file_path,
+                        &backup_path,
+                        inject_state_dir().as_deref(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("Failed to create backup file: {}", backup_path.display())
+                    });
+                }
+            };
             backup_file.write_all(&orig_file_bytes).with_context(|| {
                 format!(
                     "Failed to copy content to backup: {}",
@@ -1640,6 +1690,127 @@ fn write_inject_sidecar(path: &std::path::Path, sc: &InjectSidecar) -> Result<()
         .with_context(|| format!("writing inject sidecar {}", path.display()))?;
     f.sync_all().ok();
     Ok(())
+}
+
+// ── Per-target exposure lock ────────────────────────────────────────────────
+//
+// Overlapping `inject -r` runs on the same target are unsafe by construction:
+// the second run would read the first run's exposed plaintext, snapshot it as
+// its "ciphertext" backup, and its supervisor — firing last — would rename
+// that plaintext back over the target permanently, with no sidecar or backup
+// left for `--recover` to find. The lock that prevents this is the backup
+// file itself: its name is deterministic per target, it is created O_EXCL
+// before any plaintext hits disk, and it is consumed by rename() on every
+// restore path (supervisor, immediate_restore, --recover). Its existence
+// therefore means exactly "an exposure window is open, or a dead supervisor
+// left the target plaintext" — and a new inject must refuse.
+
+/// Deterministic ciphertext-backup path for `target`: `dir/.{name}.vt-backup`.
+/// Deliberately NOT randomized — see the module comment above. Restore paths
+/// must keep consuming it via rename(), never copy+delete (a copy would leave
+/// the lock behind or release it before the target is ciphertext again).
+fn exposure_backup_path(target: &str) -> Result<std::path::PathBuf> {
+    let orig_path = std::path::Path::new(target);
+    let dir = orig_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = orig_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Invalid replace file path: {}", target))?
+        .to_string_lossy()
+        .into_owned();
+    Ok(dir.join(format!(".{}.vt-backup", file_name)))
+}
+
+/// Why an inject over an existing backup was refused — picks the operator
+/// guidance in the refusal message.
+#[derive(Debug, PartialEq, Eq)]
+enum ExposureConflict {
+    /// A supervisor is presumed alive; the window ends in ~`remaining_s`.
+    Live { remaining_s: u64 },
+    /// Deadline + grace elapsed with the backup still present: the supervisor
+    /// died and the target may still be plaintext.
+    Orphaned,
+    /// No sidecar records this backup (its write failed, or it was cleaned);
+    /// manual restore is the only guidance left.
+    Untracked,
+}
+
+/// Pure classification of an exposure conflict from the sidecar (if one still
+/// records the colliding backup) and the clock. Mirrors [`plan_recovery`]'s
+/// liveness rule: within deadline + grace the supervisor is presumed alive.
+fn classify_exposure_conflict(sidecar: Option<&InjectSidecar>, now_ms: u64) -> ExposureConflict {
+    match sidecar {
+        Some(sc) if now_ms < sc.deadline_ms.saturating_add(RECOVER_GRACE_MS) => {
+            ExposureConflict::Live {
+                remaining_s: sc.deadline_ms.saturating_sub(now_ms).div_ceil(1000),
+            }
+        }
+        Some(_) => ExposureConflict::Orphaned,
+        None => ExposureConflict::Untracked,
+    }
+}
+
+/// Best-effort scan of `state_dir` for the sidecar recording `backup` as its
+/// ciphertext backup. Unreadable entries are skipped: this only upgrades the
+/// quality of a refusal message, never gates the refusal itself.
+fn find_sidecar_for_backup(
+    state_dir: &std::path::Path,
+    backup: &std::path::Path,
+) -> Option<InjectSidecar> {
+    let want = absolutize(backup);
+    for entry in std::fs::read_dir(state_dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let sc: Option<InjectSidecar> = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        if let Some(sc) = sc {
+            if std::path::Path::new(&sc.backup) == want.as_path() {
+                return Some(sc);
+            }
+        }
+    }
+    None
+}
+
+/// Build the refusal error for a colliding backup at `backup`. Consults the
+/// sidecar in `state_dir` — falling back to the target's own directory, where
+/// the no-home-dir fallback sidecar lives — purely to pick the guidance.
+fn exposure_conflict_refusal(
+    target: &str,
+    backup: &std::path::Path,
+    state_dir: Option<&std::path::Path>,
+) -> anyhow::Error {
+    let sidecar = [state_dir, backup.parent()]
+        .into_iter()
+        .flatten()
+        .find_map(|d| find_sidecar_for_backup(d, backup));
+    match classify_exposure_conflict(sidecar.as_ref(), now_ms()) {
+        ExposureConflict::Live { remaining_s } => anyhow::anyhow!(
+            "{} is mid-exposure by another vt inject (auto-restore in ~{}s); \
+             retry after the window closes",
+            target,
+            remaining_s
+        ),
+        ExposureConflict::Orphaned => anyhow::anyhow!(
+            "a previous exposure of {} was never restored (its supervisor is \
+             gone) and the file may still be plaintext; run `vt inject \
+             --recover` first",
+            target
+        ),
+        ExposureConflict::Untracked => anyhow::anyhow!(
+            "found leftover backup {} for {}; verify the file's state, then \
+             restore the ciphertext manually: mv '{}' '{}'",
+            backup.display(),
+            target,
+            backup.display(),
+            target
+        ),
+    }
 }
 
 /// Sweep the sidecar dir and restore any orphaned plaintext exposure. Invoked
@@ -2501,5 +2672,137 @@ mod tests {
         assert_eq!(absolutize(p), p);
         // A relative path becomes absolute (prefixed by some cwd).
         assert!(absolutize(std::path::Path::new("rel/x")).is_absolute());
+    }
+
+    #[test]
+    fn exposure_backup_path_is_deterministic_per_target() {
+        // Same target → same path: this determinism IS the exposure lock.
+        let a = exposure_backup_path("/etc/app/config.yaml").unwrap();
+        let b = exposure_backup_path("/etc/app/config.yaml").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            a,
+            std::path::PathBuf::from("/etc/app/.config.yaml.vt-backup")
+        );
+        // A bare file name resolves beside it in the cwd.
+        assert_eq!(
+            exposure_backup_path("config.yaml").unwrap(),
+            std::path::Path::new(".").join(".config.yaml.vt-backup")
+        );
+        // Same basename in different dirs must not collide.
+        assert_ne!(
+            exposure_backup_path("/a/config.yaml").unwrap(),
+            exposure_backup_path("/b/config.yaml").unwrap()
+        );
+        // A path with no file name is refused.
+        assert!(exposure_backup_path("/").is_err());
+    }
+
+    #[test]
+    fn classify_exposure_conflict_branches() {
+        let sc = InjectSidecar {
+            target: "/t/f".into(),
+            backup: "/t/.f.vt-backup".into(),
+            tmp: "/t/.f.vt-tmp-ab".into(),
+            deadline_ms: 100_000,
+        };
+        // Before the deadline: live, remaining seconds round up.
+        assert_eq!(
+            classify_exposure_conflict(Some(&sc), 98_500),
+            ExposureConflict::Live { remaining_s: 2 }
+        );
+        // Inside the grace window: still presumed live (about to fire).
+        assert_eq!(
+            classify_exposure_conflict(Some(&sc), 100_000 + RECOVER_GRACE_MS - 1),
+            ExposureConflict::Live { remaining_s: 0 }
+        );
+        // Past deadline + grace with the backup still present: dead supervisor.
+        assert_eq!(
+            classify_exposure_conflict(Some(&sc), 100_000 + RECOVER_GRACE_MS),
+            ExposureConflict::Orphaned
+        );
+        assert_eq!(
+            classify_exposure_conflict(None, 0),
+            ExposureConflict::Untracked
+        );
+    }
+
+    #[test]
+    fn find_sidecar_for_backup_matches_and_skips_garbage() {
+        let dir = std::env::temp_dir().join(format!("vt-inject-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backup = "/abs/.secret.env.vt-backup";
+        let sc = InjectSidecar {
+            target: "/abs/secret.env".into(),
+            backup: backup.into(),
+            tmp: "/abs/.secret.env.vt-tmp-ab".into(),
+            deadline_ms: 42,
+        };
+        std::fs::write(dir.join("aa.json"), serde_json::to_vec(&sc).unwrap()).unwrap();
+        std::fs::write(dir.join("bb.json"), b"not json").unwrap(); // skipped
+        std::fs::write(dir.join("cc.txt"), b"wrong extension").unwrap(); // ignored
+
+        assert_eq!(
+            find_sidecar_for_backup(&dir, std::path::Path::new(backup)),
+            Some(sc)
+        );
+        assert_eq!(
+            find_sidecar_for_backup(&dir, std::path::Path::new("/abs/.other.vt-backup")),
+            None
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn exposure_conflict_refusal_picks_the_right_guidance() {
+        let dir = std::env::temp_dir().join(format!("vt-inject-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("secret.env");
+        let target_str = target.to_str().unwrap();
+        let backup = exposure_backup_path(target_str).unwrap();
+        std::fs::write(&backup, b"ciphertext").unwrap();
+
+        // A sidecar whose deadline is long past → Orphaned → names --recover.
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let sc = InjectSidecar {
+            target: target_str.to_string(),
+            backup: backup.to_string_lossy().into_owned(),
+            tmp: "unused".into(),
+            deadline_ms: 0,
+        };
+        std::fs::write(state.join("aa.json"), serde_json::to_vec(&sc).unwrap()).unwrap();
+        let err = exposure_conflict_refusal(target_str, &backup, Some(&state));
+        assert!(err.to_string().contains("--recover"), "got: {err}");
+
+        // A live sidecar (far-future deadline) → retry guidance.
+        std::fs::write(
+            state.join("aa.json"),
+            serde_json::to_vec(&InjectSidecar {
+                deadline_ms: u64::MAX / 2,
+                ..sc.clone()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let err = exposure_conflict_refusal(target_str, &backup, Some(&state));
+        assert!(err.to_string().contains("mid-exposure"), "got: {err}");
+
+        // No sidecar anywhere → manual-restore guidance naming the backup.
+        std::fs::remove_file(state.join("aa.json")).unwrap();
+        let err = exposure_conflict_refusal(target_str, &backup, Some(&state));
+        assert!(
+            err.to_string().contains(&backup.display().to_string()),
+            "got: {err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_vt_records_means_nothing_to_decrypt() {
+        // The -r guard: zero vt:// records refuses the exposure protocol
+        // (either the wrong file, or plaintext left by a broken exposure).
+        assert!(iter_vt_urls("plain: text\nno records here").next().is_none());
+        assert!(iter_vt_urls("key: vt://0abc").next().is_some());
     }
 }
