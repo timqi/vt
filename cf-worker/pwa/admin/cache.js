@@ -25,7 +25,7 @@
   var byGroup = {};           // group_id -> summary
   var selected = {};          // group_id -> true
   var meta = {                // listing-level fields
-    extend_enabled: false, ttl_options_s: [], max_extend_ttl_ms: 0,
+    extend_enabled: false, ttl_options_s: [],
     truncated: false, scanned: 0,
   };
   // Server clock at listing time + the local monotonic reference we advance it
@@ -39,25 +39,6 @@
     if (cls) e.className = cls;
     if (text != null) e.textContent = text;
     return e;
-  }
-
-  function cell(tr, text, cls) {
-    var td = document.createElement('td');
-    if (cls) td.className = cls;
-    td.textContent = (text === null || text === undefined) ? '' : String(text);
-    tr.appendChild(td);
-    return td;
-  }
-
-  function cellClipped(tr, text, cls) {
-    var td = document.createElement('td');
-    var span = el('span', 'trunc ' + cls);
-    var s = (text === null || text === undefined) ? '' : String(text);
-    span.textContent = s;
-    if (s) span.title = s;
-    td.appendChild(span);
-    tr.appendChild(td);
-    return td;
   }
 
   function fmtTime(ms) {
@@ -317,8 +298,7 @@
     // used to live only in the far-right action cell, which scrolled off screen,
     // so the page never explained itself.
     var remTd = cell2(tr, live ? fmtRemaining(g.max_expires_ms - t) : '已过期', '',
-      { mainCls: live ? '' : 'cache-expired',
-        mainTitle: live ? '有效期至 ' + fmtTime(g.max_expires_ms) : '' });
+      { mainCls: live ? '' : 'cache-expired' });
     // Sub-line: the exact expiry while live, or WHY the row cannot be extended.
     var sub = null;
     if (meta.extend_enabled && !g.extendable && g.reason) {
@@ -495,7 +475,6 @@
       localRefMs = Date.now();
       meta.extend_enabled = !!json.extend_enabled;
       meta.ttl_options_s = json.ttl_options_s || [];
-      meta.max_extend_ttl_ms = json.max_extend_ttl_ms || 0;
       meta.truncated = !!json.truncated;
       meta.scanned = json.scanned || 0;
       renderTtlOptions();

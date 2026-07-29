@@ -214,15 +214,6 @@ export interface CacheExtendPreview {
   ip: string;
 }
 
-/** Outcome of committing an approved extension, per group. */
-export interface CacheExtendGroupResult {
-  group_id: string;
-  extended: number;
-  skipped: Record<string, number>;
-  /** New latest expiry across the group, or null if nothing moved. */
-  expires_ms: number | null;
-}
-
 // ── Admin cache listing ────────────────────────────────────────────────────
 
 /** One row of the admin cache tab: all entries written by ONE approval under one
@@ -235,8 +226,8 @@ export interface CacheGroupSummary {
   origin_token_id: string;
   entries: number;
   live: number;
-  /** Earliest / latest expiry across the group (epoch ms). */
-  min_expires_ms: number;
+  /** Latest expiry across the group (epoch ms) — what liveness and eligibility
+   *  are judged on. */
   max_expires_ms: number;
   /** Entry creation time (epoch ms); null for pre-migration entries. Forensic
    *  only — extension is measured from the approval, not from creation. */
@@ -253,11 +244,10 @@ export interface CacheGroupSummary {
   command: string | null;
   finalized_ms: number | null;
   cache_ttl_s: number | null;
-  /** False when entries in the group disagree on their origin/creation/IP — such
-   *  a group is clearable but never extendable (we refuse to guess which record
-   *  the human meant). */
-  consistent: boolean;
-  /** True when this group may be targeted by an extension request. */
+  /** True when this group may be targeted by an extension request. A group whose
+   *  entries disagree on origin/creation/IP is excluded here with
+   *  `reason='inconsistent'` — clearable, never extendable, since we refuse to
+   *  guess which record the human meant. */
   extendable: boolean;
   /** Why not, when extendable is false. */
   reason: string | null;
@@ -277,9 +267,6 @@ export interface CacheListResponse {
   extend_enabled: boolean;
   /** TTL options (seconds) an extension may request. */
   ttl_options_s: number[];
-  /** MAX_EXTEND_TTL_MS — the largest single hop one extension may grant. Total
-   *  lifetime is unbounded; each hop costs a fresh Passkey approval. */
-  max_extend_ttl_ms: number;
 }
 
 /** Handle to edit a sent Slack App message in place: `channel` is the resolved
@@ -447,10 +434,10 @@ export interface CacheEntry {
    *  own. ABSENT on pre-migration entries, which stay listable/clearable but are
    *  never extendable (see cache_policy.groupIdOf). */
   cache_group_id?: string;
-  /** When the phone approval created this entry (epoch ms). Immutable — an
-   *  extension moves expires_ms only, so created_ms remains the anchor for the
-   *  absolute lifetime ceiling. ABSENT on pre-migration entries, which therefore
-   *  cannot be extended (their total exposure could not be bounded). */
+  /** When the phone approval created this entry (epoch ms). Forensic only — an
+   *  extension is measured from the approval and moves expires_ms alone, so
+   *  nothing in the policy reads this. ABSENT on pre-migration entries, which are
+   *  extendable like any other. Immutable: never rewrite it. */
   created_ms?: number;
 }
 

@@ -109,7 +109,7 @@ until a Passkey approves it, and every one of these holds:
    request row (`op_kind='cache-extend'`) and the effect row (`status='extended'`)
    over its real-time stream, so the action is still visible to anyone with the
    console open, and permanently in the 90-day audit table afterwards.
-2. **Laddered TTLs only** (`20m` / `2h` / `8h` / `1d` / `2d` / `1w`). No arbitrary
+2. **Laddered TTLs only** (`20m` / `2h` / `8h` / `1d` / `2d` / `1w` / 100 years). No arbitrary
    deltas. The multi-day rungs are extension-only: `writeCache` validates against
    the shorter approve ladder, so a tampered approve body cannot arm a multi-day
    cache without going through this ceremony.
@@ -177,7 +177,7 @@ The cache does not re-key existing `vt://` records.
 
 | Concern | Source |
 |---|---|
-| TTL whitelist, lifetime ceiling, extension arithmetic | `cf-worker/src/cache_policy.ts` (+ `test/cache_policy.test.ts`) |
+| TTL ladders, per-hop cap, extension arithmetic | `cf-worker/src/cache_policy.ts` (+ `test/cache_policy.test.ts`) |
 | Cache writes/reads, listing, extension commit, audit, notifications | `cf-worker/src/do_account.ts` |
 | Sealed-box cache crypto | `cf-worker/src/cache_crypto.ts` |
 | PWA TTL selection and sealing | `cf-worker/pwa/approve.js` |
@@ -193,12 +193,14 @@ The cache does not re-key existing `vt://` records.
 3. Read the same record again from the same egress IP and working directory;
    the second read should not open a phone ceremony.
 4. Check the admin audit page for the cache grant and hit.
-5. Open the admin `DEK 缓存` tab: the entry group appears with its remaining time
-   and its extendable ceiling.
-6. With `CACHE_ADMIN_EXTEND = "1"`, select the group, press 延长, and approve on a
-   Passkey. Confirm the remaining time moves, the ceiling does not, and two audit
-   rows appear (`cache-extend` approved + `缓存已延长`). Repeat past the 8h mark
-   and confirm the request is refused rather than clamped silently.
+5. Open the admin `DEK 缓存` tab: the entry group appears with its remaining time.
+6. With `CACHE_ADMIN_EXTEND = "1"`, select the group and press 延长. First pick a
+   duration SHORTER than the time remaining and confirm the button is disabled and
+   the note names a usable rung — extension is absolute, so a shorter rung is a
+   no-op by definition. Then pick a longer one, approve on a Passkey, and confirm
+   the remaining time jumps to `批准时刻 + 时长` and two audit rows appear
+   (`cache-extend` approved + `缓存已延长`). Let a cache lapse and confirm it can no
+   longer be extended at all — only a fresh phone approval arms a new one.
 7. Rotate `CACHE_SECKEY` or clear the cache, then confirm the next read returns
    to the phone ceremony.
 

@@ -71,15 +71,22 @@ ACCESS_AUD = "<YOUR_ACCESS_APPLICATION_AUD_TAG>"
 # stay visible on the admin audit page.
 CACHE_HIT_NOTIFY = "0"
 # Admin-requested DEK-cache extension (the「延长」buttons on the admin DEK 缓存
-# tab). Off unless set to 1/true/on/yes. This is a KILL SWITCH, not an
-# authorization: even when on, extending requires a fresh phone Passkey approval,
-# may only request a laddered TTL (20m/2h/8h/1d/2d/1w), can never revive an entry
-# that already lapsed, and can never push one past 1 WEEK from its creation. Off
-# means the capability does not exist — the routes 404 and the UI hides the
-# controls. Listing and clearing cached DEKs are unaffected (they only reduce
-# authority). Note the ceiling: enabling this makes a one-week no-phone-approval
-# window reachable (always via an explicit request + a Passkey tap). Trim
-# EXTEND_TTL_WHITELIST in src/cache_policy.ts to lower it.
+# tab). Off unless set to 1/true/on/yes. A KILL SWITCH, not an authorization: even
+# when on, extending requires a fresh phone Passkey approval and may only request a
+# laddered TTL — 20m / 2h / 8h / 1d / 2d / 1w / 100 years (that last rung is
+# permanent in practice). Extension is measured from the approval (expiry becomes
+# "now + chosen TTL"), never additive, and can never revive an entry that already
+# lapsed.
+#
+# READ THIS BEFORE ENABLING. There is NO total-lifetime ceiling: an entry can be
+# renewed indefinitely, one approval at a time, and the permanent rung means an
+# entry need never expire at all. For as long as a window is open, possession of
+# VT_PASSKEY_TOKEN from the same egress IP and `pwd` decrypts those records with no
+# phone tap. What bounds this is liveness (a lapsed cache is gone for good) and the
+# fact that every hop costs a Passkey approval — not a time budget. To revoke:
+# 清除 on the tab, or rotate CACHE_SECKEY. Trim EXTEND_TTL_WHITELIST in
+# src/cache_policy.ts to remove rungs you do not want reachable, and consider
+# CACHE_HIT_NOTIFY=1 so no-tap decrypts stay visible.
 #
 # Set it HERE, not in the Cloudflare dashboard: `wrangler deploy` replaces the
 # Worker's vars with this file's [vars] block, so a dashboard-only value is

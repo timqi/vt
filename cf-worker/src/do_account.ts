@@ -15,13 +15,13 @@
 // same DO — no extra locking is needed.
 
 import { DurableObject } from 'cloudflare:workers';
-import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, AuditRow, AuditQueryResponse, CacheEntry, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheExtendGroupResult, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse } from './types';
+import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, AuditRow, AuditQueryResponse, CacheEntry, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse } from './types';
 import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, sha256, randomBytes, challengeHash } from './crypto';
 import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
 import { seal, openToCache, cachePublicKey, discardedBoxPublicKey } from './cache_crypto';
 import {
-  MAX_EXTEND_TTL_MS, planExtend,
+  planExtend,
   isAllowedApproveTtl, isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
   groupIdOf, isExtendableGroupId,
 } from './cache_policy';
@@ -156,7 +156,6 @@ interface CacheAgg {
   origin_token_id: string;
   entries: number;
   live: number;
-  min_expires_ms: number;
   max_expires_ms: number;
   created_ms: number | null;
   ip: string;
@@ -185,7 +184,7 @@ function fmtTimeZh(ms: number): string {
 // The text an approver actually reads before touching their Passkey (it lands in
 // ChallengeMeta.command, which the ceremony UI renders verbatim). It must name
 // every dimension of the authority being granted: how many entries, on which
-// hosts/IPs, for how long, and the ceiling that caps it.
+// hosts/IPs, and for how long.
 function extendSummary(intent: CacheExtendIntent): string {
   const entries = intent.preview.reduce((n, t) => n + t.live, 0);
   const lines = [
@@ -201,14 +200,10 @@ function extendSummary(intent: CacheExtendIntent): string {
 }
 
 // Outcome line for the audit row, so a partial commit is legible without digging
-// through Worker logs (e.g. "4 条已延长 / 2 条跳过: no_gain=2").
+// through Worker logs (e.g. "4 条已延长 · 跳过: no_gain=2").
 function extendOutcomeSummary(
-  results: CacheExtendGroupResult[], total: number, latest: number,
+  skips: Record<string, number>, total: number, latest: number,
 ): string {
-  const skips: Record<string, number> = {};
-  for (const r of results) {
-    for (const [k, v] of Object.entries(r.skipped)) skips[k] = (skips[k] ?? 0) + v;
-  }
   const parts = [`${total} 条已延长`];
   if (latest > 0) parts.push(`新有效期至 ${fmtTimeZh(latest)}`);
   const skipStr = Object.entries(skips).map(([k, v]) => `${k}=${v}`).join(' ');
@@ -1304,9 +1299,9 @@ export class AccountDO extends DurableObject<Env> {
     const createdMs = Date.now();
     const expires = createdMs + ttlS * 1000;
     // One group handle per write: unique, random, and independent of the
-    // truncated approve_token — an authority-GRANTING mutation (extend) must not
-    // hang off a selector that could ever be ambiguous. created_ms anchors the
-    // absolute lifetime ceiling and is never rewritten afterwards.
+    // approve_token — an authority-GRANTING mutation (extend) must not hang off a
+    // selector that could ever be ambiguous. created_ms is forensic only (extension
+    // measures from the approval) and is never rewritten afterwards.
     const groupId = 'g_' + b64uEnc(randomBytes(9));
     const writes: Record<string, CacheEntry> = {};
     for (let i = 0; i < salts.length; i++) {
@@ -1548,7 +1543,6 @@ export class AccountDO extends DurableObject<Env> {
       origin_token_id: e.origin_token_id ?? '',
       entries: 0,
       live: 0,
-      min_expires_ms: Number.POSITIVE_INFINITY,
       max_expires_ms: 0,
       created_ms: typeof e.created_ms === 'number' ? e.created_ms : null,
       ip: e.ip ?? '',
@@ -1592,7 +1586,6 @@ export class AccountDO extends DurableObject<Env> {
         agg.entries++;
         const exp = typeof e.expires_ms === 'number' ? e.expires_ms : 0;
         if (exp > now) agg.live++;
-        if (exp < agg.min_expires_ms) agg.min_expires_ms = exp;
         if (exp > agg.max_expires_ms) agg.max_expires_ms = exp;
         // Entries of one group are written by a single put batch, so they MUST
         // agree on origin/creation/IP. If they don't, something wrote across a
@@ -1602,12 +1595,6 @@ export class AccountDO extends DurableObject<Env> {
             || agg.created_ms !== created
             || agg.ip !== (e.ip ?? '')) {
           agg.consistent = false;
-          if (created !== null && (agg.created_ms === null || created < agg.created_ms)) {
-            // Anchor the lifetime ceiling on the EARLIEST creation seen, so an
-            // inconsistent group can never buy extra headroom (it is refused
-            // outright, but keep the arithmetic conservative regardless).
-            agg.created_ms = created;
-          }
         }
       }
       // Terminate ONLY on an empty page. A short-but-nonempty page does not mean
@@ -1675,7 +1662,6 @@ export class AccountDO extends DurableObject<Env> {
         origin_token_id: g.origin_token_id,
         entries: g.entries,
         live: g.live,
-        min_expires_ms: Number.isFinite(g.min_expires_ms) ? g.min_expires_ms : 0,
         max_expires_ms: g.max_expires_ms,
         created_ms: g.created_ms,
         ip: g.ip,
@@ -1687,7 +1673,6 @@ export class AccountDO extends DurableObject<Env> {
         command: row?.command ?? null,
         finalized_ms: row?.finalized_ms ?? null,
         cache_ttl_s: row?.cache_ttl_s ?? null,
-        consistent: g.consistent,
         extendable: reason === null,
         reason,
       });
@@ -1704,7 +1689,6 @@ export class AccountDO extends DurableObject<Env> {
       truncated: scan.truncated,
       extend_enabled: cacheAdminExtendEnabled(this.env),
       ttl_options_s: extendTtlOptions(),
-      max_extend_ttl_ms: MAX_EXTEND_TTL_MS,
     };
     return Response.json(resp);
   }
@@ -1881,19 +1865,19 @@ export class AccountDO extends DurableObject<Env> {
     const want = new Set(intent.group_ids.filter(isExtendableGroupId));
     if (want.size === 0) return;
     const scan = await this.scanCacheGroups(Date.now(), { want, collectKeys: true });
-    const results: CacheExtendGroupResult[] = [];
+    // One merged skip tally for the whole commit — the audit line reports totals,
+    // and nothing consumed the per-group breakdown.
+    const skipped: Record<string, number> = {};
     let totalExtended = 0;
     let latest = 0;
 
     for (const g of scan.groups.values()) {
-      const skipped: Record<string, number> = {};
       let extended = 0;
       let groupLatest = 0;
       // A group that drifted between request and commit is refused outright — we
       // will not guess which record the approver meant.
       if (!g.consistent) {
-        skipped.inconsistent = g.entries;
-        results.push({ group_id: g.group_id, extended: 0, skipped, expires_ms: null });
+        skipped.inconsistent = (skipped.inconsistent ?? 0) + g.entries;
         continue;
       }
       // Isolate each group: a storage failure on one must not abort the loop, or
@@ -1928,12 +1912,6 @@ export class AccountDO extends DurableObject<Env> {
         this.auditBumpCacheExpiry(g.origin_token_id, groupLatest);
         this.broadcastRow(g.origin_token_id, 'update');
       }
-      results.push({
-        group_id: g.group_id,
-        extended,
-        skipped,
-        expires_ms: extended > 0 ? groupLatest : null,
-      });
     }
 
     // Durable record of the EFFECT (the ceremony row records the authorization).
@@ -1943,7 +1921,7 @@ export class AccountDO extends DurableObject<Env> {
       {
         ...ch.meta,
         command: extendSummary(intent),
-        reason: extendOutcomeSummary(results, totalExtended, latest),
+        reason: extendOutcomeSummary(skipped, totalExtended, latest),
       },
       totalExtended,
       'extended',
@@ -1951,7 +1929,7 @@ export class AccountDO extends DurableObject<Env> {
     log('cache.extended', {
       at: tokenPrefix(ch.approve_token),
       ttl_s: intent.ttl_s,
-      groups: results.length,
+      groups: scan.groups.size,
       n: totalExtended,
       by: intent.requested_by,
     });

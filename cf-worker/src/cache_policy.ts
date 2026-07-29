@@ -40,8 +40,9 @@ export const EXTEND_TTL_WHITELIST = new Set([
 // cache_expires_ms, the admin countdown — and expiry logic is exactly where a
 // missed branch becomes a cache that outlives its revocation. A far-future
 // timestamp keeps all of those paths on their normal course: it simply never
-// arrives (year ~2126, and ~4.9e12 ms stays well inside both the safe-integer
-// range and SQLite INTEGER).
+// arrives. (The TTL itself is ~3.15e12 ms; the expiry it produces lands around
+// year 2126, ~4.9e12 ms — both far inside the safe-integer range and SQLite
+// INTEGER.)
 //
 // SECURITY NOTE: this rung opts a record OUT of the phone-approval premise for
 // practical purposes. Liveness is what bounds every other rung — stop approving and
@@ -73,8 +74,8 @@ export const EXTEND_TTL_WHITELIST = new Set([
 // Trim EXTEND_TTL_WHITELIST to shorten the longest single hop.
 export const MAX_EXTEND_TTL_MS = Math.max(...EXTEND_TTL_WHITELIST) * 1000;
 
-/** Why an entry was left untouched by an extension. Reported per group so the
- *  admin UI can explain a partial result instead of silently doing nothing. */
+/** Why an entry was left untouched by an extension. Tallied across the commit so
+ *  the audit row can explain a partial result instead of silently doing nothing. */
 export type ExtendSkip =
   /** Already past expires_ms — an extension must never resurrect a lapsed
    *  entry (that would be the Worker minting cache authority from nothing).

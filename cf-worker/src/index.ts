@@ -294,6 +294,7 @@ app.post(`/${ADMIN_SEG}/api/cache-extend-request`, async (c) => {
   return doResp;
 });
 
+// POST clear-cache — emergency revocation: drop ALL cached DEKs now. Access-gated.
 app.post(`/${ADMIN_SEG}/api/clear-cache`, async (c) => {
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   return stub.fetch('https://account.do/op/clear-cache', { method: 'POST' });
