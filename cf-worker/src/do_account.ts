@@ -1596,7 +1596,12 @@ export class AccountDO extends DurableObject<Env> {
           }
         }
       }
-      if (page.size < CACHE_LIST_PAGE) break;
+      // Terminate ONLY on an empty page. A short-but-nonempty page does not mean
+      // "end of prefix": DO storage may cut a page below the requested limit to
+      // stay under an internal response-size cap. Treating that as completion
+      // would silently drop the remaining groups while still reporting
+      // truncated=false — precisely the silent-partial-view failure this listing
+      // must never have. The cost is one extra empty list() per scan.
       if (scanned >= CACHE_LIST_SCAN_MAX) { truncated = true; break; }
     }
     return { groups, scanned, truncated };
@@ -1742,7 +1747,11 @@ export class AccountDO extends DurableObject<Env> {
     }
     const rejected: Array<{ group_id: string; reason: string }> = [];
     const requested: string[] = [];
-    for (const g of op.group_ids) {
+    // Dedupe FIRST: a duplicated id would otherwise appear twice in
+    // intent.preview and inflate the "N 组 / M 条" scope the approver reads on the
+    // ceremony page. The commit dedupes anyway, so the effect was already correct
+    // — but what the human is asked to approve must match it exactly.
+    for (const g of new Set(op.group_ids)) {
       if (isExtendableGroupId(g)) requested.push(g);
       else rejected.push({ group_id: String(g).slice(0, 80), reason: 'not_extendable' });
     }
@@ -1875,23 +1884,31 @@ export class AccountDO extends DurableObject<Env> {
         results.push({ group_id: g.group_id, extended: 0, skipped, expires_ms: null });
         continue;
       }
-      for (let i = 0; i < g.keys.length; i += STORAGE_BATCH) {
-        const chunk = g.keys.slice(i, i + STORAGE_BATCH);
-        const fresh = await this.ctx.storage.get<CacheEntry>(chunk);
-        // ── atomic section: no await until the put ──
-        const now = Date.now();
-        const writes: Record<string, CacheEntry> = {};
-        for (const key of chunk) {
-          const entry = fresh.get(key);
-          if (!entry) { skipped.gone = (skipped.gone ?? 0) + 1; continue; }
-          const plan = planExtend(entry, intent.ttl_s, now);
-          if (!plan.ok) { skipped[plan.skip] = (skipped[plan.skip] ?? 0) + 1; continue; }
-          writes[key] = { ...entry, expires_ms: plan.expires_ms };
-          if (plan.expires_ms > groupLatest) groupLatest = plan.expires_ms;
-          extended++;
+      // Isolate each group: a storage failure on one must not abort the loop, or
+      // groups that already mutated would go unrecorded by the trailing audit row
+      // (the mutation is durable, so its trail must be too).
+      try {
+        for (let i = 0; i < g.keys.length; i += STORAGE_BATCH) {
+          const chunk = g.keys.slice(i, i + STORAGE_BATCH);
+          const fresh = await this.ctx.storage.get<CacheEntry>(chunk);
+          // ── atomic section: no await until the put ──
+          const now = Date.now();
+          const writes: Record<string, CacheEntry> = {};
+          for (const key of chunk) {
+            const entry = fresh.get(key);
+            if (!entry) { skipped.gone = (skipped.gone ?? 0) + 1; continue; }
+            const plan = planExtend(entry, intent.ttl_s, now);
+            if (!plan.ok) { skipped[plan.skip] = (skipped[plan.skip] ?? 0) + 1; continue; }
+            writes[key] = { ...entry, expires_ms: plan.expires_ms };
+            if (plan.expires_ms > groupLatest) groupLatest = plan.expires_ms;
+            extended++;
+          }
+          if (Object.keys(writes).length > 0) await this.ctx.storage.put(writes);
+          // ── end atomic section ──
         }
-        if (Object.keys(writes).length > 0) await this.ctx.storage.put(writes);
-        // ── end atomic section ──
+      } catch (e) {
+        logErr('cache.extend_group_failed', e, { group: g.group_id });
+        skipped.error = (skipped.error ?? 0) + 1;
       }
       totalExtended += extended;
       if (groupLatest > latest) latest = groupLatest;
