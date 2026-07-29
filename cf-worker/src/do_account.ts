@@ -1040,6 +1040,14 @@ export class AccountDO extends DurableObject<Env> {
       this.broadcastRow(auditKey(challenge.approve_token), 'insert');
     }
 
+    // A cache-extension ceremony is NOT pushed to any channel. Its entire flow is
+    // console-resident: the operator picks the groups on the admin DEK 缓存 tab and
+    // the Passkey ceremony mounts inline on that same page, so a card would notify
+    // the person already watching the result. Observability is preserved where it
+    // belongs — the audit tab receives the request row (op_kind='cache-extend') and
+    // the effect row (status='extended') over its real-time stream.
+    if (challenge.extend) return;
+
     // Feishu approval card — fire-and-forget (waitUntil), NOT awaited: this keeps
     // a third-party API's latency out of the singleton DO's serialized op path.
     // Pushover/Slack are sent separately from index.ts (stateless). See feishu.ts.
@@ -1845,7 +1853,6 @@ export class AccountDO extends DurableObject<Env> {
       summary,
       targets,
       rejected,
-      meta,
     };
     return Response.json(resp);
   }

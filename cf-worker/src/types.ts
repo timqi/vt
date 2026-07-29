@@ -585,12 +585,6 @@ export interface CacheExtendCreateResponse {
   targets: CacheExtendPreview[];
   /** Requested group ids that were dropped, with the reason. */
   rejected: Array<{ group_id: string; reason: string }>;
-  /** The ceremony's display meta. Returned so the Worker edge can fan the request
-   *  out to the STATELESS push channels (Pushover / Slack webhook, which
-   *  index.ts owns) exactly like a decrypt request — an authority-granting
-   *  request should be at least as visible as a routine one. The DO already sent
-   *  the stateful, editable Feishu / Slack App cards itself. */
-  meta: ChallengeMeta;
 }
 
 export interface DoRejectOp {

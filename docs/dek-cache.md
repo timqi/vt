@@ -102,9 +102,13 @@ until a Passkey approves it, and every one of these holds:
 1. **Passkey required.** The intent (group ids, TTL, requester) is written onto
    the challenge at request time and never mutated, so the approval finalizes
    exactly what was proposed. The ceremony is single-use, expires in 5 minutes if
-   untouched, is pushed to every configured notification channel, and appears on
-   the audit tab as `cache-extend` — an unexpected extension request is visible
-   to the operator who did not initiate it.
+   untouched, and is **not pushed to any notification channel** — the flow is
+   console-resident (select groups on the DEK 缓存 tab, approve in the modal that
+   opens on the same page), so a card would only notify the person already watching
+   the result. Observability stays where it belongs: the audit tab receives the
+   request row (`op_kind='cache-extend'`) and the effect row (`status='extended'`)
+   over its real-time stream, so the action is still visible to anyone with the
+   console open, and permanently in the 90-day audit table afterwards.
 2. **Laddered TTLs only** (`20m` / `2h` / `8h` / `1d` / `2d` / `1w`). No arbitrary
    deltas. The multi-day rungs are extension-only: `writeCache` validates against
    the shorter approve ladder, so a tampered approve body cannot arm a multi-day

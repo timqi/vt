@@ -16,7 +16,7 @@ import { parsePushoverConfig } from './pushover';
 import { parseSlackConfig } from './slack';
 import { parseSlackAppConfig } from './slack_app';
 import { parseFeishuConfig } from './feishu';
-import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, CacheExtendCreateResponse } from './types';
+import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp } from './types';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess, type AccessVars } from './access';
 
@@ -285,29 +285,15 @@ app.post(`/${ADMIN_SEG}/api/cache-extend-request`, async (c) => {
       admin_ip: c.req.header('CF-Connecting-IP') ?? '',
     }),
   });
-  if (!doResp.ok) return doResp;
-  // Fan the pending request out to the STATELESS channels too (the DO already
-  // sent the editable Feishu / Slack App cards). An extension request is the one
-  // admin action that grants authority, so it should be at least as visible on
-  // the notification channels as a routine decrypt — including to an operator who
-  // did NOT initiate it. Never fatal: the ceremony already exists.
-  let created: CacheExtendCreateResponse;
-  try { created = await doResp.clone().json() as CacheExtendCreateResponse; }
-  catch { return doResp; }
-  const pushWarning = await notifyApproval(
-    c.env, created.meta.op_kind, created.meta, created.approve_url, 0);
-  if (pushWarning) {
-    logErr('notify.failed', pushWarning, { at: tokenPrefix(created.approve_token) });
-  }
-  log('cache.extend_request', {
-    at: tokenPrefix(created.approve_token),
-    by: created.meta.user,
-    groups: created.targets.length,
-  });
+  // Deliberately NO notification fan-out here. The whole extension flow lives in
+  // the admin console: the operator selects the groups, presses 延长, and the
+  // Passkey ceremony mounts inline on the same page. A pushed approval card would
+  // be noise for a request whose requester is already looking at the result — and
+  // the audit tab still records both the request (op_kind='cache-extend') and its
+  // effect (status='extended') in real time, so the action stays observable there.
   return doResp;
 });
 
-// POST clear-cache — emergency revocation: drop ALL cached DEKs now. Access-gated.
 app.post(`/${ADMIN_SEG}/api/clear-cache`, async (c) => {
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   return stub.fetch('https://account.do/op/clear-cache', { method: 'POST' });
