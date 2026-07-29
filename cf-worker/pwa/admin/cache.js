@@ -93,6 +93,9 @@
     inconsistent: '组内条目不一致，仅允许清除',
     expired: '已全部过期',
     capped: '已达创建后总时长上限',
+    no_gain: '已用满总时长，延长不会生效',
+    not_extendable: '不可延长',
+    gone: '已被清除',
   };
 
   function commandSummary(cmd, max) {

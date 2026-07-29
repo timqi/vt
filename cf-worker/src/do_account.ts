@@ -1657,6 +1657,12 @@ export class AccountDO extends DurableObject<Env> {
       else if (g.live === 0) reason = 'expired';
       else if (g.created_ms === null) reason = 'legacy';
       else if (ceiling !== null && now >= ceiling) reason = 'capped';
+      // Headroom already spent: the ceiling is at or before the current expiry, so
+      // EVERY whitelisted TTL clamps to a value that cannot move expiry forward
+      // (planExtend would return no_gain for all of them). Offering a button here
+      // would promise an extension that provably does nothing — surface the real
+      // state instead. Common in practice: an 8h grant is capped from birth.
+      else if (ceiling !== null && ceiling <= g.max_expires_ms) reason = 'no_gain';
       groups.push({
         group_id: g.group_id,
         origin_token_id: g.origin_token_id,
@@ -1767,8 +1773,12 @@ export class AccountDO extends DurableObject<Env> {
       if (!agg.consistent) { rejected.push({ group_id: gid, reason: 'inconsistent' }); continue; }
       if (agg.live === 0) { rejected.push({ group_id: gid, reason: 'expired' }); continue; }
       if (agg.created_ms === null) { rejected.push({ group_id: gid, reason: 'legacy' }); continue; }
-      if (now >= agg.created_ms + MAX_CACHE_LIFETIME_MS) {
-        rejected.push({ group_id: gid, reason: 'capped' }); continue;
+      const ceiling = agg.created_ms + MAX_CACHE_LIFETIME_MS;
+      if (now >= ceiling) { rejected.push({ group_id: gid, reason: 'capped' }); continue; }
+      // No headroom left ⇒ every whitelisted TTL clamps to no_gain. Refuse here
+      // rather than mint a ceremony that asks a human to approve a no-op.
+      if (ceiling <= agg.max_expires_ms) {
+        rejected.push({ group_id: gid, reason: 'no_gain' }); continue;
       }
       targets.push({
         group_id: gid,
