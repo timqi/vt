@@ -1401,7 +1401,7 @@ pub async fn inject(
         if let Some(replace_file_path) = &replace_file
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
         let orig_path = std::path::Path::new(replace_file_path);
         let dir = orig_path
@@ -1439,7 +1439,10 @@ pub async fn inject(
         // Step 2: write backup from the in-memory ORIGINAL bytes (captured at
         // the single O_NOFOLLOW open above) — NOT a fresh re-read of the target,
         // which would be a TOCTOU window for a directory-writable attacker.
-        {
+        // The open fd also yields the backup's (dev, ino) generation id for
+        // the sidecar, binding the record to THIS backup — the deterministic
+        // path alone is ambiguous across exposures of the same target.
+        let backup_id: (u64, u64) = {
             let mut backup_file = match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1471,8 +1474,29 @@ pub async fn inject(
                 )
             })?;
             backup_file.sync_all().ok();
-        }
+            // The id is REQUIRED on new records: silently degrading to None
+            // would put recovery back on existence-only matching and reopen
+            // the stale-sidecar race. No plaintext exists yet, so aborting
+            // (after releasing the lock) is safe.
+            match backup_file.metadata() {
+                Ok(m) => (m.dev(), m.ino()),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&backup_path);
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Failed to stat backup for its generation id: {}",
+                            backup_path.display()
+                        )
+                    });
+                }
+            }
+        };
         debug!("Created backup at: {}", backup_path.display());
+
+        // Holding the exposure lock proves any older sidecar naming this
+        // backup path is stale; retire it before a concurrent `--recover`
+        // can pair its expired deadline with the backup just created.
+        retire_stale_sidecars_for(&backup_path, inject_state_dir().as_deref());
 
         // Step 3: arm supervisor before any plaintext touches disk.
         match spawn_restore_supervisor(
@@ -1481,6 +1505,7 @@ pub async fn inject(
             &backup_path,
             replace_file_path,
             &sidecar_path,
+            backup_id,
         ) {
             Ok(()) => debug!("Restore supervisor armed (timeout={}s)", timeout),
             Err(e) => {
@@ -1499,9 +1524,15 @@ pub async fn inject(
             backup: absolutize(&backup_path).to_string_lossy().into_owned(),
             tmp: absolutize(&tmp_path).to_string_lossy().into_owned(),
             deadline_ms: now_ms().saturating_add((timeout as u64).saturating_mul(1000)),
+            backup_id: Some(backup_id),
         };
         if let Err(e) = write_inject_sidecar(&sidecar_path, &sidecar) {
-            debug!("inject sidecar not written ({e:#}); crash-recovery disabled for this run");
+            // Loud on stderr, not debug!: the user is about to expose
+            // plaintext with no reboot recovery for it.
+            eprintln!(
+                "vt inject: warning: crash-recovery sidecar not written ({e:#}); \
+                 a crash or reboot during this window will NOT be auto-restored"
+            );
         }
 
         // Step 4: write tmp (plaintext).
@@ -1609,6 +1640,12 @@ struct InjectSidecar {
     /// Epoch ms after which the supervisor should already have restored; past
     /// this (plus a grace) a surviving backup means the supervisor died.
     deadline_ms: u64,
+    /// `(st_dev, st_ino)` of the backup at creation — the generation id that
+    /// distinguishes THIS exposure's backup from a successor at the same
+    /// deterministic path. `None` on records written by builds without the
+    /// id; those keep existence-only matching.
+    #[serde(default)]
+    backup_id: Option<(u64, u64)>,
 }
 
 /// Wait past the deadline by this much before `--recover` acts, so a
@@ -1626,10 +1663,15 @@ enum RecoverAction {
 
 /// Pure recovery decision. `None` = leave it alone (an injection whose window
 /// has not yet elapsed — its supervisor is presumed still running).
-fn plan_recovery(deadline_ms: u64, backup_exists: bool, now_ms: u64) -> Option<RecoverAction> {
-    if !backup_exists {
+/// `backup_survives` must be the GENERATION-CHECKED answer from
+/// [`probe_sidecar_backup`], not bare existence: the deterministic backup
+/// path is reused by every exposure of a target.
+fn plan_recovery(deadline_ms: u64, backup_survives: bool, now_ms: u64) -> Option<RecoverAction> {
+    if !backup_survives {
         // The supervisor (or immediate_restore) already renamed the backup
-        // over the target: the injection completed. Only the sidecar lingers.
+        // over the target — or the path now holds a NEWER exposure's backup
+        // (generation mismatch). Either way this sidecar's injection is
+        // over; only the sidecar lingers.
         return Some(RecoverAction::CleanStale);
     }
     if now_ms >= deadline_ms.saturating_add(RECOVER_GRACE_MS) {
@@ -1680,6 +1722,15 @@ fn write_inject_sidecar(path: &std::path::Path, sc: &InjectSidecar) -> Result<()
             .with_context(|| format!("creating inject state dir {}", dir.display()))?;
     }
     let json = serde_json::to_vec(sc).context("serialize inject sidecar")?;
+    // Same bound as read_sidecar_bounded: writing a record recovery would
+    // later skip as unreadable is worse than writing none — the operator
+    // would believe crash recovery exists when it doesn't.
+    ensure!(
+        json.len() as u64 <= SIDECAR_MAX_BYTES,
+        "inject sidecar would be {} bytes, over the {} byte cap recovery reads",
+        json.len(),
+        SIDECAR_MAX_BYTES
+    );
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1704,6 +1755,20 @@ fn write_inject_sidecar(path: &std::path::Path, sc: &InjectSidecar) -> Result<()
 // restore path (supervisor, immediate_restore, --recover). Its existence
 // therefore means exactly "an exposure window is open, or a dead supervisor
 // left the target plaintext" — and a new inject must refuse.
+//
+// The sidecar shares the path's ambiguity in the other direction: it records
+// the deterministic backup path, so a stale record (crash between a restore's
+// rename() and the sidecar's removal) must never be matched against a LATER
+// exposure's backup — and no restore path may consume one. Four complementary
+// guards enforce that: arming retires matching stale sidecars while the lock
+// is held; every new sidecar MUST carry its backup's (dev, ino) generation
+// id, verified before recovery consumes anything; recovery refuses any
+// backup modified past the record's deadline — the ordering bound that
+// covers id-less legacy records and a successor reusing the old inode;
+// and the supervisor re-checks the (dev, ino) it armed for before its
+// timeout restore (see `supervisor_restore` — a suspend can delay its
+// monotonic sleep past the wall-clock deadline, letting --recover and a new
+// exposure run first).
 
 /// Deterministic ciphertext-backup path for `target`: `dir/.{name}.vt-backup`.
 /// Deliberately NOT randomized — see the module comment above. Restore paths
@@ -1752,24 +1817,121 @@ fn classify_exposure_conflict(sidecar: Option<&InjectSidecar>, now_ms: u64) -> E
     }
 }
 
-/// Best-effort scan of `state_dir` for the sidecar recording `backup` as its
-/// ciphertext backup. Unreadable entries are skipped: this only upgrades the
-/// quality of a refusal message, never gates the refusal itself.
+/// What the sidecar's recorded backup path currently holds.
+#[derive(Debug, PartialEq, Eq)]
+enum BackupProbe {
+    /// The exact generation the sidecar recorded — safe to restore.
+    Ours,
+    /// Consumed, or replaced by a successor generation: this exposure is
+    /// settled and only the sidecar lingers.
+    Gone,
+    /// The stat failed for a reason other than "not there" (EACCES, EIO, a
+    /// sick mount): the truth is unknowable right now. Callers must KEEP the
+    /// sidecar and retry later — deleting it would silently turn a transient
+    /// error into permanently unrecoverable exposed plaintext.
+    Unknown,
+}
+
+/// Probe whether the sidecar's recorded backup still exists AS THE GENERATION
+/// THE SIDECAR RECORDED. The backup path is deterministic per target, so bare
+/// existence is ambiguous: a stale sidecar (crash between a restore's
+/// rename() and its own removal) sees the path recreated by the target's
+/// NEXT exposure, and acting on the old deadline would consume that newer
+/// exposure's backup — early-restoring ciphertext mid-window at best,
+/// stranding plaintext with no backup at worst. The `(dev, ino)` id
+/// disambiguates, backed by an mtime ordering bound: a legitimate backup is
+/// written BEFORE its sidecar's deadline is even computed (deadline = arm
+/// time + timeout), so a backup modified after the deadline is a successor.
+/// The bound is the only generation signal an id-less legacy record has —
+/// it cannot catch a successor created before the deadline; arm-time
+/// retirement covers those — and the guard against a successor reusing the
+/// old inode.
+fn probe_sidecar_backup(sc: &InjectSidecar) -> BackupProbe {
+    use std::os::unix::fs::MetadataExt;
+    let md = match std::fs::symlink_metadata(&sc.backup) {
+        Ok(md) => md,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return BackupProbe::Gone;
+        }
+        Err(_) => return BackupProbe::Unknown,
+    };
+    // Generation id (always present on new records) must match.
+    if let Some((dev, ino)) = sc.backup_id {
+        if md.dev() != dev || md.ino() != ino {
+            return BackupProbe::Gone;
+        }
+    }
+    match md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+    {
+        Some(mtime) if (mtime.as_millis() as u64) > sc.deadline_ms => BackupProbe::Gone,
+        // At/before the deadline — or no mtime available, where we skip the
+        // ordering bound rather than strand a genuine record (the id check
+        // above still applies to new records).
+        _ => BackupProbe::Ours,
+    }
+}
+
+/// Upper bound for one sidecar read AND write. Sized so no legitimate record
+/// is ever refused — three PATH_MAX (4096 on Linux) paths under worst-case
+/// `\uXXXX` JSON escaping is ~72 KiB — while still bounding what a planted
+/// file can make the refusal-path scan read. [`write_inject_sidecar`]
+/// enforces the same limit, so a record recovery would skip as unreadable is
+/// refused loudly at arm time (before plaintext exposure) instead.
+const SIDECAR_MAX_BYTES: u64 = 128 * 1024;
+
+/// Read and parse one sidecar file defensively: O_NOFOLLOW + O_NONBLOCK so a
+/// planted symlink or FIFO can't redirect or hang the scan, a regular-file
+/// check before reading, and a hard size cap. Needed because the refusal-path
+/// scan can run over the TARGET's own directory (the no-home-dir fallback
+/// sidecar lives there), which may be shared and attacker-writable — unlike
+/// the 0700 state dir. `None` for anything unreadable or not sidecar-shaped.
+fn read_sidecar_bounded(path: &std::path::Path) -> Option<InjectSidecar> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let md = f.metadata().ok()?;
+    if !md.is_file() || md.len() > SIDECAR_MAX_BYTES {
+        return None;
+    }
+    let mut buf = Vec::new();
+    // Cap the read too — fstat can't bind a file that grows after the check.
+    f.take(SIDECAR_MAX_BYTES).read_to_end(&mut buf).ok()?;
+    serde_json::from_slice(&buf).ok()
+}
+
+/// Best-effort scan of `dir` for the sidecar recording `backup` — the CURRENT
+/// generation of it, per [`probe_sidecar_backup`], so a stale record from
+/// an earlier exposure of the same target can't hijack the classification.
+/// Unreadable entries are skipped: this only upgrades the quality of a
+/// refusal message, never gates the refusal itself.
 fn find_sidecar_for_backup(
-    state_dir: &std::path::Path,
+    dir: &std::path::Path,
     backup: &std::path::Path,
 ) -> Option<InjectSidecar> {
     let want = absolutize(backup);
-    for entry in std::fs::read_dir(state_dir).ok()?.flatten() {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let sc: Option<InjectSidecar> = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok());
-        if let Some(sc) = sc {
-            if std::path::Path::new(&sc.backup) == want.as_path() {
+        if let Some(sc) = read_sidecar_bounded(&path) {
+            // Unknown reads as no-match: this scan only picks a refusal
+            // message, and the conservative fallback is manual guidance.
+            if std::path::Path::new(&sc.backup) == want.as_path()
+                && probe_sidecar_backup(&sc) == BackupProbe::Ours
+            {
                 return Some(sc);
             }
         }
@@ -1777,18 +1939,52 @@ fn find_sidecar_for_backup(
     None
 }
 
+/// Retire state-dir sidecars that record `backup` as their ciphertext backup.
+/// Called right after the O_EXCL backup create — holding the exposure lock
+/// proves the target has no open exposure, so any sidecar still naming this
+/// deterministic path is stale (a crash landed between a restore's rename()
+/// and the sidecar's removal). Left in place, its long-expired deadline would
+/// tell a concurrent `--recover` to consume the backup just created. Best
+/// effort, and complementary to the generation id: the sweep also covers the
+/// (filesystem-dependent) case of the new backup reusing the old inode, while
+/// the id covers a `--recover` that read the stale record before this sweep.
+fn retire_stale_sidecars_for(backup: &std::path::Path, state_dir: Option<&std::path::Path>) {
+    let Some(dir) = state_dir else { return };
+    let want = absolutize(backup);
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(sc) = read_sidecar_bounded(&path) {
+            if std::path::Path::new(&sc.backup) == want.as_path() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 /// Build the refusal error for a colliding backup at `backup`. Consults the
 /// sidecar in `state_dir` — falling back to the target's own directory, where
 /// the no-home-dir fallback sidecar lives — purely to pick the guidance.
+/// `--recover` sweeps only the state dir, so orphan guidance may name it only
+/// for a sidecar found there; a fallback-dir orphan gets the manual restore.
 fn exposure_conflict_refusal(
     target: &str,
     backup: &std::path::Path,
     state_dir: Option<&std::path::Path>,
 ) -> anyhow::Error {
-    let sidecar = [state_dir, backup.parent()]
-        .into_iter()
-        .flatten()
-        .find_map(|d| find_sidecar_for_backup(d, backup));
+    let (sidecar, in_recover_reach) =
+        match state_dir.and_then(|d| find_sidecar_for_backup(d, backup)) {
+            Some(sc) => (Some(sc), true),
+            None => (
+                backup
+                    .parent()
+                    .and_then(|d| find_sidecar_for_backup(d, backup)),
+                false,
+            ),
+        };
     match classify_exposure_conflict(sidecar.as_ref(), now_ms()) {
         ExposureConflict::Live { remaining_s } => anyhow::anyhow!(
             "{} is mid-exposure by another vt inject (auto-restore in ~{}s); \
@@ -1796,10 +1992,22 @@ fn exposure_conflict_refusal(
             target,
             remaining_s
         ),
-        ExposureConflict::Orphaned => anyhow::anyhow!(
+        ExposureConflict::Orphaned if in_recover_reach => anyhow::anyhow!(
             "a previous exposure of {} was never restored (its supervisor is \
              gone) and the file may still be plaintext; run `vt inject \
              --recover` first",
+            target
+        ),
+        // Orphaned, but the record lives beside the target (written when no
+        // home dir was resolvable) where `--recover` never looks: naming
+        // --recover here would end in "nothing to recover" while the
+        // plaintext stays. Manual restore is the only honest guidance.
+        ExposureConflict::Orphaned => anyhow::anyhow!(
+            "a previous exposure of {} was never restored (its supervisor is \
+             gone) and the file may still be plaintext; verify the file's \
+             state, then restore the ciphertext manually: mv '{}' '{}'",
+            target,
+            backup.display(),
             target
         ),
         ExposureConflict::Untracked => anyhow::anyhow!(
@@ -1834,18 +2042,30 @@ pub fn inject_recover() -> Result<()> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let sc: InjectSidecar = match std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-        {
+        let sc: InjectSidecar = match read_sidecar_bounded(&path) {
             Some(sc) => sc,
             None => {
                 eprintln!("vt inject --recover: skipping unreadable sidecar {}", path.display());
                 continue;
             }
         };
-        let backup_exists = std::path::Path::new(&sc.backup).exists();
-        match plan_recovery(sc.deadline_ms, backup_exists, now) {
+        let backup_survives = match probe_sidecar_backup(&sc) {
+            BackupProbe::Ours => true,
+            BackupProbe::Gone => false,
+            // Transient stat failure: leave the record for a later sweep —
+            // cleaning it now could orphan exposed plaintext whose backup
+            // still exists behind the error.
+            BackupProbe::Unknown => {
+                eprintln!(
+                    "vt inject --recover: cannot stat backup {}; leaving {} for a later sweep",
+                    sc.backup,
+                    path.display()
+                );
+                active += 1;
+                continue;
+            }
+        };
+        match plan_recovery(sc.deadline_ms, backup_survives, now) {
             Some(RecoverAction::Restore) => {
                 let _ = std::fs::remove_file(&sc.tmp);
                 if let Err(e) = std::fs::rename(&sc.backup, &sc.target) {
@@ -1883,6 +2103,7 @@ fn spawn_restore_supervisor(
     backup_path: &std::path::Path,
     target_path: &str,
     sidecar_path: &std::path::Path,
+    backup_id: (u64, u64),
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1896,6 +2117,7 @@ fn spawn_restore_supervisor(
         .arg(backup_path)
         .arg(target_path)
         .arg(sidecar_path)
+        .arg(format!("{}:{}", backup_id.0, backup_id.1))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -2286,18 +2508,93 @@ pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<
     Ok(())
 }
 
+/// Parse the supervisor's `dev:ino` argv token — the generation id of the
+/// backup it armed for.
+fn parse_dev_ino(s: &str) -> Option<(u64, u64)> {
+    let (dev, ino) = s.split_once(':')?;
+    Some((dev.parse().ok()?, ino.parse().ok()?))
+}
+
+/// Post-sleep body of the restore supervisor, extracted so tests can drive
+/// it without fork/sleep. `armed_id` is the `(dev, ino)` of the backup this
+/// supervisor was spawned for. The backup path is deterministic per target,
+/// so a DELAYED supervisor (suspend pauses the monotonic sleep while the
+/// wall-clock deadline lapses) can wake to find `--recover` already consumed
+/// its backup and a NEWER exposure owning the path; renaming blindly would
+/// consume the successor's backup — early-restoring its ciphertext
+/// mid-window, or stranding its plaintext if it hasn't renamed its tmp yet.
+/// So: restore only our own generation, and keep the sidecar — `--recover`'s
+/// retry record — on a real rename failure or when the backup's state is
+/// unknowable (stat error other than "not there").
+///
+/// Known, accepted residuals: (a) a successor reusing our exact inode is
+/// indistinguishable here — unlike `--recover` we know no deadline to bound
+/// mtime by; (b) the stat→rename pair is not atomic, so a window of
+/// microseconds remains in which `--recover` consuming the verified backup
+/// AND a new inject recreating the path would misdirect the rename. Both
+/// events landing inside that window is negligible; absolute closure would
+/// need every consumer to serialize on a parent-directory flock.
+fn supervisor_restore(
+    tmp: &std::path::Path,
+    backup: &std::path::Path,
+    target: &std::path::Path,
+    sidecar: &std::path::Path,
+    armed_id: (u64, u64),
+) {
+    use std::os::unix::fs::MetadataExt;
+    // Wipe any orphaned plaintext tmp first. If the parent crashed between
+    // write_plaintext_tmp and rename(tmp,target), this is the only path that
+    // removes it. Random-suffixed per run, so never another run's tmp.
+    let _ = std::fs::remove_file(tmp);
+    let ours = match std::fs::symlink_metadata(backup) {
+        Ok(md) => md.dev() == armed_id.0 && md.ino() == armed_id.1,
+        // Gone: the parent (or --recover) already restored this exposure.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            false
+        }
+        // Transient stat failure (EACCES, EIO, a sick mount): the truth is
+        // unknowable — keep the backup AND the sidecar so `vt inject
+        // --recover` retries once the path is reachable again.
+        Err(_) => return,
+    };
+    if !ours {
+        // Nothing of ours left at the path — the exposure is settled. The
+        // sidecar (per-run random name, always ours) is stale; drop it.
+        let _ = std::fs::remove_file(sidecar);
+        return;
+    }
+    match std::fs::rename(backup, target) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        // Consumed between the check and the rename: --recover won the race
+        // and the exposure is settled — same as the gone case above.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        // Real failure (EACCES, EIO, ...): keep the sidecar so a later
+        // `vt inject --recover` retries the restore we could not perform.
+        Err(_) => {}
+    }
+}
+
 /// Pre-tokio, pre-clap entry point for the detached restore supervisor.
 /// Dispatched from `main()` so this process never builds a tokio runtime,
 /// parses clap definitions, or loads tracing — its RSS is just vt's text
 /// segment (shared with the parent via page cache) + a few KB of heap.
 ///
 /// Args (after the SUPERVISOR_SUBCOMMAND marker):
-/// `<secs> <tmp> <backup> <target> <sidecar>`.
+/// `<secs> <tmp> <backup> <target> <sidecar> <dev>:<ino>`.
 pub fn supervisor_main(args: &[std::ffi::OsString]) -> i32 {
     // Stdio is /dev/null — any failure here is invisible to the user. Parent
     // distinguishes the intermediate's success (exit 0 after double-fork)
     // from any failure (non-zero) via Child::wait().
-    if args.len() != 5 {
+    if args.len() != 6 {
         return 2;
     }
     let secs: u64 = match args[0].to_str().and_then(|s| s.parse().ok()) {
@@ -2308,6 +2605,10 @@ pub fn supervisor_main(args: &[std::ffi::OsString]) -> i32 {
     let backup = std::path::PathBuf::from(&args[2]);
     let target = std::path::PathBuf::from(&args[3]);
     let sidecar = std::path::PathBuf::from(&args[4]);
+    let armed_id = match args[5].to_str().and_then(parse_dev_ino) {
+        Some(id) => id,
+        None => return 2,
+    };
 
     // Install SIG_IGN for the signals that would otherwise sweep us up when
     // the user closes the terminal, hits Ctrl+C, or runs `pkill vt`. These
@@ -2341,8 +2642,8 @@ pub fn supervisor_main(args: &[std::ffi::OsString]) -> i32 {
     // interference with `waitpid(-1)` from the user-cmd or its parent shell).
     //
     // SAFETY: fork has well-defined POSIX behavior; the grandchild runs
-    // only async-signal-safe code below (thread::sleep, remove_file, rename
-    // — all of which are async-signal-safe at the syscall level). The
+    // only async-signal-safe code below (thread::sleep, stat, remove_file,
+    // rename — all of which are async-signal-safe at the syscall level). The
     // intermediate uses _exit(0) which is async-signal-safe and skips any
     // Rust destructors that would touch shared global state.
     unsafe {
@@ -2355,16 +2656,7 @@ pub fn supervisor_main(args: &[std::ffi::OsString]) -> i32 {
 
     std::thread::sleep(std::time::Duration::from_secs(secs));
 
-    // Wipe any orphaned plaintext tmp first. If the parent crashed between
-    // write_plaintext_tmp and rename(tmp,target), this is the only path
-    // that removes it — the supervisor doesn't otherwise know.
-    let _ = std::fs::remove_file(&tmp);
-    // Restore ciphertext over the target. Either succeeds (normal case) or
-    // returns ENOENT (parent already restored on exec failure / rename failure).
-    let _ = std::fs::rename(&backup, &target);
-    // The exposure is over; drop the crash-recovery sidecar so `--recover`
-    // doesn't later see a stale entry.
-    let _ = std::fs::remove_file(&sidecar);
+    supervisor_restore(&tmp, &backup, &target, &sidecar, armed_id);
     0
 }
 
@@ -2657,13 +2949,22 @@ mod tests {
     fn inject_sidecar_json_roundtrips() {
         let sc = InjectSidecar {
             target: "/abs/secret.env".into(),
-            backup: "/abs/.secret.env.vt-backup-ab".into(),
+            backup: "/abs/.secret.env.vt-backup".into(),
             tmp: "/abs/.secret.env.vt-tmp-ab".into(),
             deadline_ms: 1_723_000_000_000,
+            backup_id: Some((16_777_232, 42)),
         };
         let bytes = serde_json::to_vec(&sc).unwrap();
         let back: InjectSidecar = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(sc, back);
+
+        // Records written by builds that predate the generation id must still
+        // parse; they fall back to existence-only backup matching.
+        let legacy: InjectSidecar = serde_json::from_slice(
+            br#"{"target":"/t/f","backup":"/t/.f.vt-backup","tmp":"/t/.f.vt-tmp-ab","deadline_ms":7}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.backup_id, None);
     }
 
     #[test]
@@ -2705,6 +3006,7 @@ mod tests {
             backup: "/t/.f.vt-backup".into(),
             tmp: "/t/.f.vt-tmp-ab".into(),
             deadline_ms: 100_000,
+            backup_id: None,
         };
         // Before the deadline: live, remaining seconds round up.
         assert_eq!(
@@ -2727,29 +3029,341 @@ mod tests {
         );
     }
 
+    /// The real `(dev, ino)` of `backup` — a matching generation id for tests.
+    fn current_backup_id(backup: &std::path::Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(backup).unwrap();
+        (md.dev(), md.ino())
+    }
+
+    /// The real `(dev, ino)` of `backup` with the inode perturbed — a
+    /// guaranteed generation mismatch for tests.
+    fn mismatched_backup_id(backup: &std::path::Path) -> (u64, u64) {
+        let (dev, ino) = current_backup_id(backup);
+        (dev, ino.wrapping_add(1))
+    }
+
     #[test]
     fn find_sidecar_for_backup_matches_and_skips_garbage() {
         let dir = std::env::temp_dir().join(format!("vt-inject-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let backup = "/abs/.secret.env.vt-backup";
+        let backup = dir.join(".secret.env.vt-backup");
+        std::fs::write(&backup, b"ciphertext").unwrap();
         let sc = InjectSidecar {
-            target: "/abs/secret.env".into(),
-            backup: backup.into(),
+            target: dir.join("secret.env").to_string_lossy().into_owned(),
+            backup: backup.to_string_lossy().into_owned(),
             tmp: "/abs/.secret.env.vt-tmp-ab".into(),
-            deadline_ms: 42,
+            // In-window deadline: the ordering bound must not filter a record
+            // whose exposure is simply still open.
+            deadline_ms: now_ms() + 60_000,
+            backup_id: Some(current_backup_id(&backup)),
         };
         std::fs::write(dir.join("aa.json"), serde_json::to_vec(&sc).unwrap()).unwrap();
         std::fs::write(dir.join("bb.json"), b"not json").unwrap(); // skipped
         std::fs::write(dir.join("cc.txt"), b"wrong extension").unwrap(); // ignored
 
-        assert_eq!(
-            find_sidecar_for_backup(&dir, std::path::Path::new(backup)),
-            Some(sc)
-        );
+        assert_eq!(find_sidecar_for_backup(&dir, &backup), Some(sc.clone()));
         assert_eq!(
             find_sidecar_for_backup(&dir, std::path::Path::new("/abs/.other.vt-backup")),
             None
         );
+
+        // A stale record whose generation id names a different inode is not a
+        // match: it describes an earlier, already-consumed backup that
+        // happened to live at the same deterministic path.
+        let stale = InjectSidecar {
+            backup_id: Some(mismatched_backup_id(&backup)),
+            ..sc
+        };
+        std::fs::write(dir.join("aa.json"), serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert_eq!(find_sidecar_for_backup(&dir, &backup), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn probe_sidecar_backup_checks_generation_and_ordering() {
+        let dir = std::env::temp_dir().join(format!("vt-inject-gen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backup = dir.join(".f.vt-backup");
+        std::fs::write(&backup, b"ciphertext").unwrap();
+        let sc = |backup_id, deadline_ms| InjectSidecar {
+            target: dir.join("f").to_string_lossy().into_owned(),
+            backup: backup.to_string_lossy().into_owned(),
+            tmp: "unused".into(),
+            deadline_ms,
+            backup_id,
+        };
+        let future = now_ms() + 60_000;
+        // Legacy in-window record: existence is enough.
+        assert_eq!(probe_sidecar_backup(&sc(None, future)), BackupProbe::Ours);
+        // Matching generation survives; a different inode means the recorded
+        // backup was consumed and the path re-created by a later exposure.
+        assert_eq!(
+            probe_sidecar_backup(&sc(Some(current_backup_id(&backup)), future)),
+            BackupProbe::Ours
+        );
+        assert_eq!(
+            probe_sidecar_backup(&sc(Some(mismatched_backup_id(&backup)), future)),
+            BackupProbe::Gone
+        );
+        // Ordering bound: a backup modified after the record's deadline is a
+        // successor, whatever the record's id says — a legitimate backup
+        // always predates its own deadline. This is what protects id-less
+        // legacy records (and inode reuse) from the stale-sidecar race; the
+        // fresh file here postdates the long-expired deadline.
+        assert_eq!(probe_sidecar_backup(&sc(None, 0)), BackupProbe::Gone);
+        assert_eq!(
+            probe_sidecar_backup(&sc(Some(current_backup_id(&backup)), 0)),
+            BackupProbe::Gone
+        );
+        // A genuinely old backup (mtime at or before the deadline) still
+        // reads as ours for an id-less record: legacy crash recovery keeps
+        // working, including the exact-deadline boundary a zero-timeout arm
+        // produces. One millisecond past the deadline is already a successor
+        // — a supervisor restoring at the deadline and a new inject arming
+        // right after must not pair with this record.
+        let f = std::fs::File::options().write(true).open(&backup).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_000))
+            .unwrap();
+        drop(f);
+        assert_eq!(probe_sidecar_backup(&sc(None, 2_000)), BackupProbe::Ours);
+        assert_eq!(probe_sidecar_backup(&sc(None, 1_000)), BackupProbe::Ours);
+        assert_eq!(probe_sidecar_backup(&sc(None, 999)), BackupProbe::Gone);
+        // Backup gone: consumed; settled regardless of id.
+        std::fs::remove_file(&backup).unwrap();
+        assert_eq!(probe_sidecar_backup(&sc(None, future)), BackupProbe::Gone);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn probe_sidecar_backup_reports_unknown_on_stat_errors() {
+        // Directory modes don't bind root; the EACCES this test relies on
+        // never happens there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vt-inject-probe-{}", std::process::id()));
+        let sealed = dir.join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        let backup = sealed.join(".f.vt-backup");
+        std::fs::write(&backup, b"ciphertext").unwrap();
+        let sc = InjectSidecar {
+            target: sealed.join("f").to_string_lossy().into_owned(),
+            backup: backup.to_string_lossy().into_owned(),
+            tmp: "unused".into(),
+            deadline_ms: 0,
+            backup_id: None,
+        };
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = probe_sidecar_backup(&sc);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // EACCES is not "consumed": recovery must keep the record, not clean
+        // it as stale.
+        assert_eq!(probe, BackupProbe::Unknown);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn supervisor_restore_keeps_sidecar_when_backup_state_unknown() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vt-inject-supstat-{}", std::process::id()));
+        let sealed = dir.join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        let target = sealed.join("f");
+        let backup = sealed.join(".f.vt-backup");
+        std::fs::write(&target, b"plaintext").unwrap();
+        std::fs::write(&backup, b"ciphertext").unwrap();
+        let armed = current_backup_id(&backup);
+        let sidecar = dir.join("sc.json");
+        std::fs::write(&sidecar, b"{}").unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        supervisor_restore(&dir.join("no-tmp"), &backup, &target, &sidecar, armed);
+
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            sidecar.exists(),
+            "an unknowable backup state must keep the sidecar for --recover"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"ciphertext");
+        assert_eq!(std::fs::read(&target).unwrap(), b"plaintext");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_inject_sidecar_refuses_records_over_the_read_cap() {
+        let dir = std::env::temp_dir().join(format!("vt-inject-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aa.json");
+        let sc = InjectSidecar {
+            target: "t".repeat(2 * SIDECAR_MAX_BYTES as usize),
+            backup: "/t/.f.vt-backup".into(),
+            tmp: "unused".into(),
+            deadline_ms: 0,
+            backup_id: Some((1, 2)),
+        };
+        let err = write_inject_sidecar(&path, &sc).unwrap_err();
+        assert!(err.to_string().contains("cap"), "got: {err}");
+        assert!(!path.exists(), "an over-cap record must not be written");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retire_stale_sidecars_removes_only_records_of_this_backup() {
+        let dir = std::env::temp_dir().join(format!("vt-inject-retire-{}", std::process::id()));
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let backup = dir.join(".f.vt-backup");
+        let other = dir.join(".other.vt-backup");
+        let mk = |backup: &std::path::Path| InjectSidecar {
+            target: dir.join("f").to_string_lossy().into_owned(),
+            backup: backup.to_string_lossy().into_owned(),
+            tmp: "unused".into(),
+            deadline_ms: 0,
+            backup_id: None,
+        };
+        std::fs::write(state.join("stale.json"), serde_json::to_vec(&mk(&backup)).unwrap())
+            .unwrap();
+        std::fs::write(state.join("other.json"), serde_json::to_vec(&mk(&other)).unwrap())
+            .unwrap();
+
+        retire_stale_sidecars_for(&backup, Some(&state));
+        assert!(!state.join("stale.json").exists(), "stale record must be retired");
+        assert!(state.join("other.json").exists(), "unrelated record must survive");
+        // No resolvable state dir → quietly a no-op.
+        retire_stale_sidecars_for(&backup, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_dev_ino_parses_and_rejects() {
+        assert_eq!(parse_dev_ino("123:456"), Some((123, 456)));
+        assert_eq!(parse_dev_ino("0:0"), Some((0, 0)));
+        assert_eq!(parse_dev_ino("123"), None);
+        assert_eq!(parse_dev_ino("a:1"), None);
+        assert_eq!(parse_dev_ino("1:b"), None);
+        assert_eq!(parse_dev_ino("-1:2"), None);
+        assert_eq!(parse_dev_ino(""), None);
+    }
+
+    #[test]
+    fn supervisor_restore_restores_only_its_own_generation() {
+        let dir = std::env::temp_dir().join(format!("vt-inject-sup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("f");
+        let backup = dir.join(".f.vt-backup");
+        let tmp = dir.join(".f.vt-tmp-ab");
+        let sidecar = dir.join("sc.json");
+
+        // Our generation: tmp wiped, backup renamed home, sidecar dropped.
+        std::fs::write(&target, b"plaintext").unwrap();
+        std::fs::write(&backup, b"ciphertext").unwrap();
+        std::fs::write(&tmp, b"orphan").unwrap();
+        std::fs::write(&sidecar, b"{}").unwrap();
+        supervisor_restore(&tmp, &backup, &target, &sidecar, current_backup_id(&backup));
+        assert_eq!(std::fs::read(&target).unwrap(), b"ciphertext");
+        assert!(!backup.exists() && !tmp.exists() && !sidecar.exists());
+
+        // A successor's generation at the path (delayed supervisor waking
+        // into a newer exposure): its backup and the target must be left
+        // untouched; only our stale sidecar is dropped.
+        std::fs::write(&target, b"plaintext-B").unwrap();
+        std::fs::write(&backup, b"ciphertext-B").unwrap();
+        std::fs::write(&sidecar, b"{}").unwrap();
+        supervisor_restore(&tmp, &backup, &target, &sidecar, mismatched_backup_id(&backup));
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"plaintext-B",
+            "successor's live exposure must not be restored early"
+        );
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"ciphertext-B",
+            "successor's backup must not be consumed"
+        );
+        assert!(!sidecar.exists());
+
+        // Backup gone (already restored): just drop the sidecar.
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::write(&sidecar, b"{}").unwrap();
+        supervisor_restore(&tmp, &backup, &target, &sidecar, (1, 2));
+        assert_eq!(std::fs::read(&target).unwrap(), b"plaintext-B");
+        assert!(!sidecar.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn supervisor_restore_keeps_sidecar_when_rename_fails() {
+        // Directory modes don't bind root; the EACCES this test relies on
+        // never happens there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vt-inject-supfail-{}", std::process::id()));
+        let ro = dir.join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        let target = ro.join("f");
+        let backup = ro.join(".f.vt-backup");
+        let sidecar = dir.join("sc.json");
+        std::fs::write(&target, b"plaintext").unwrap();
+        std::fs::write(&backup, b"ciphertext").unwrap();
+        std::fs::write(&sidecar, b"{}").unwrap();
+        let armed = current_backup_id(&backup);
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        supervisor_restore(&dir.join("no-tmp"), &backup, &target, &sidecar, armed);
+
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            sidecar.exists(),
+            "sidecar must survive a failed restore so --recover can retry"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"ciphertext");
+        assert_eq!(std::fs::read(&target).unwrap(), b"plaintext");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_sidecar_bounded_refuses_symlinks_fifos_and_oversize() {
+        let dir = std::env::temp_dir().join(format!("vt-inject-bounded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sc = InjectSidecar {
+            target: "/t/f".into(),
+            backup: "/t/.f.vt-backup".into(),
+            tmp: "unused".into(),
+            deadline_ms: 0,
+            backup_id: None,
+        };
+        let real = dir.join("real.json");
+        std::fs::write(&real, serde_json::to_vec(&sc).unwrap()).unwrap();
+        assert_eq!(read_sidecar_bounded(&real), Some(sc));
+
+        // Symlink final component: refused even when it points at a valid
+        // sidecar — the fallback scan may run in an attacker-writable dir.
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(read_sidecar_bounded(&link), None);
+
+        // Oversized file: never read past the cap.
+        let big = dir.join("big.json");
+        std::fs::write(&big, vec![b'x'; (SIDECAR_MAX_BYTES + 1) as usize]).unwrap();
+        assert_eq!(read_sidecar_bounded(&big), None);
+
+        // FIFO: O_NONBLOCK + the regular-file check make this return, not hang.
+        let fifo = dir.join("fifo.json");
+        let cpath = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap()
+        };
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_sidecar_bounded(&fifo), None);
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2761,19 +3375,59 @@ mod tests {
         let target_str = target.to_str().unwrap();
         let backup = exposure_backup_path(target_str).unwrap();
         std::fs::write(&backup, b"ciphertext").unwrap();
+        // Backdate the backup so records with long-past deadlines read as
+        // genuine orphans (a real orphan's backup predates its deadline; a
+        // fresh mtime would trip the ordering bound and classify Untracked).
+        let f = std::fs::File::options().write(true).open(&backup).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_000))
+            .unwrap();
+        drop(f);
 
         // A sidecar whose deadline is long past → Orphaned → names --recover.
+        // The deadline sits at/after the backdated mtime, as it does for any
+        // genuine orphan — the ordering bound rejects mtimes past it.
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
         let sc = InjectSidecar {
             target: target_str.to_string(),
             backup: backup.to_string_lossy().into_owned(),
             tmp: "unused".into(),
-            deadline_ms: 0,
+            deadline_ms: 2_000,
+            backup_id: None,
         };
         std::fs::write(state.join("aa.json"), serde_json::to_vec(&sc).unwrap()).unwrap();
         let err = exposure_conflict_refusal(target_str, &backup, Some(&state));
         assert!(err.to_string().contains("--recover"), "got: {err}");
+
+        // The same orphan record found only beside the target (the no-home-dir
+        // fallback location) must NOT name --recover — it sweeps only the
+        // state dir and would report nothing to recover. Manual restore only.
+        std::fs::remove_file(state.join("aa.json")).unwrap();
+        let fallback = dir.join(".secret.env.vt-recover-ab.json");
+        std::fs::write(&fallback, serde_json::to_vec(&sc).unwrap()).unwrap();
+        let err = exposure_conflict_refusal(target_str, &backup, Some(&state));
+        assert!(
+            err.to_string().contains("never restored") && err.to_string().contains("mv"),
+            "got: {err}"
+        );
+        assert!(!err.to_string().contains("--recover"), "got: {err}");
+        std::fs::remove_file(&fallback).unwrap();
+
+        // A state-dir record whose generation id names a different inode
+        // describes an EARLIER exposure's consumed backup, not this one →
+        // classified Untracked (manual guidance), not Orphaned.
+        std::fs::write(
+            state.join("aa.json"),
+            serde_json::to_vec(&InjectSidecar {
+                backup_id: Some(mismatched_backup_id(&backup)),
+                ..sc.clone()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let err = exposure_conflict_refusal(target_str, &backup, Some(&state));
+        assert!(err.to_string().contains("found leftover backup"), "got: {err}");
+        assert!(!err.to_string().contains("--recover"), "got: {err}");
 
         // A live sidecar (far-future deadline) → retry guidance.
         std::fs::write(
