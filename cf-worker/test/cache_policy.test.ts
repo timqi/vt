@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   planExtend, isAllowedApproveTtl, isAllowedExtendTtl, groupIdOf, isExtendableGroupId,
-  APPROVE_TTL_WHITELIST, EXTEND_TTL_WHITELIST, MAX_CACHE_LIFETIME_MS,
+  APPROVE_TTL_WHITELIST, EXTEND_TTL_WHITELIST, MAX_EXTEND_TTL_MS,
   approveTtlOptions, extendTtlOptions,
 } from '../src/cache_policy';
 
@@ -24,20 +24,12 @@ describe('policy constants', () => {
     ]);
   });
 
-  // The ceiling is DERIVED from what a Passkey ceremony can grant, never
-  // hardcoded — so it can only move when some ceremony can actually grant that
-  // long, and no admin path can out-grant an approver.
-  it('derives the lifetime ceiling from the longest grantable TTL', () => {
-    expect(MAX_CACHE_LIFETIME_MS)
-      .toBe(Math.max(...APPROVE_TTL_WHITELIST, ...EXTEND_TTL_WHITELIST) * 1000);
-    expect(MAX_CACHE_LIFETIME_MS).toBe(7 * 24 * 3600 * 1000);
-  });
-
-  // The ceiling must be strictly greater than the longest APPROVE-time TTL, or an
-  // 8h grant sits at its ceiling from birth and every extension of it is a no-op
-  // — which is what made the first version of this feature useless in practice.
-  it('leaves headroom above the longest approvable TTL', () => {
-    expect(MAX_CACHE_LIFETIME_MS).toBeGreaterThan(Math.max(...APPROVE_TTL_WHITELIST) * 1000);
+  // The per-hop cap is derived from the extend ladder, so trimming the ladder
+  // shortens the longest single grant automatically.
+  it('derives the per-hop cap from the extend ladder', () => {
+    expect(MAX_EXTEND_TTL_MS).toBe(Math.max(...EXTEND_TTL_WHITELIST) * 1000);
+    expect(MAX_EXTEND_TTL_MS).toBe(7 * 24 * 3600 * 1000);
+    expect(MAX_EXTEND_TTL_MS).toBeGreaterThan(Math.max(...APPROVE_TTL_WHITELIST) * 1000);
   });
 
   it('accepts only approve-ladder TTLs at approval time', () => {
@@ -64,11 +56,9 @@ describe('policy constants', () => {
     expect(isAllowedExtendTtl(NaN)).toBe(false);
   });
 
-  // Every extend rung must be reachable: a TTL that always clamps to the ceiling
-  // would be a menu entry that silently does something else.
-  it('keeps every extend rung within the ceiling', () => {
+  it('keeps every extend rung within the per-hop cap', () => {
     for (const t of extendTtlOptions()) {
-      expect(t * 1000).toBeLessThanOrEqual(MAX_CACHE_LIFETIME_MS);
+      expect(t * 1000).toBeLessThanOrEqual(MAX_EXTEND_TTL_MS);
     }
   });
 });
@@ -96,57 +86,37 @@ describe('planExtend', () => {
     expect(p).toEqual({ ok: false, skip: 'no_gain' });
   });
 
-  it('clamps to the absolute lifetime ceiling', () => {
-    // Created 6d23h ago, 30m left, asks for 1w → only ~1h of headroom remains.
-    const age = 7 * 24 * HOUR - HOUR;
-    const p = planExtend(entry(age, 30 * MIN), 7 * 24 * 3600, NOW);
-    expect(p).toEqual({ ok: true, expires_ms: NOW - age + MAX_CACHE_LIFETIME_MS });
-  });
-
-  // The case the multi-day ladder exists for: an 8h grant used to be stuck at its
-  // ceiling from birth, so extending it did nothing.
-  it('can extend a fresh 8h grant now that the ceiling is a week', () => {
-    const p = planExtend(entry(0, 8 * HOUR), 24 * 3600, NOW);
-    expect(p).toEqual({ ok: true, expires_ms: NOW + 24 * HOUR });
-  });
-
-  // Repeated small extensions must converge on the ceiling, not walk past it.
-  // Re-extend forever, always with the LONGEST rung and always just before the
-  // current window lapses (so no iteration is thrown away as 'expired' — that
-  // would make this test vacuous). It must converge exactly on the ceiling and
-  // then refuse, never walk past it.
-  it('cannot synthesize an unbounded window by repeating', () => {
-    const created = NOW;
-    const ceiling = created + MAX_CACHE_LIFETIME_MS;
-    let e = { created_ms: created, expires_ms: created + 20 * MIN };
-    let extensions = 0;
-    let refused: string | null = null;
-    for (let i = 0; i < 50; i++) {
-      const t = e.expires_ms - MIN;        // one minute before it would lapse
-      const p = planExtend(e, 7 * 24 * 3600, t);
-      if (!p.ok) { refused = p.skip; break; }
-      expect(p.expires_ms).toBeLessThanOrEqual(ceiling);
-      expect(p.expires_ms).toBeGreaterThan(e.expires_ms);   // strictly monotonic
-      e = { created_ms: created, expires_ms: p.expires_ms };
-      extensions++;
+  // The headline semantic: every extension is measured from the approval moment,
+  // regardless of how old the entry is — so an entry can be renewed indefinitely,
+  // one Passkey-approved hop at a time.
+  it('always measures from now, never from creation', () => {
+    for (const age of [0, 8 * HOUR, 30 * 24 * HOUR]) {
+      expect(planExtend({ created_ms: NOW - age, expires_ms: NOW + MIN }, 24 * 3600, NOW))
+        .toEqual({ ok: true, expires_ms: NOW + 24 * HOUR });
     }
-    expect(extensions).toBeGreaterThan(0);   // the loop really did extend
-    expect(e.expires_ms).toBe(ceiling);      // and landed exactly on the ceiling
-    expect(refused).toBe('no_gain');         // then stopped, rather than creeping
   });
 
-  it('refuses once the ceiling has passed', () => {
-    expect(planExtend(entry(8 * 24 * HOUR, 10 * MIN), 20 * 60, NOW))
-      .toEqual({ ok: false, skip: 'capped' });
+  it('extends an entry with no created_ms at all (pre-migration)', () => {
+    expect(planExtend({ expires_ms: NOW + MIN }, 7 * 24 * 3600, NOW))
+      .toEqual({ ok: true, expires_ms: NOW + 7 * 24 * HOUR });
   });
 
-  // Pre-migration entries have no created_ms, so their total exposure cannot be
-  // bounded — they stay clearable but are never extendable.
-  it('refuses legacy entries with no created_ms', () => {
-    expect(planExtend({ expires_ms: NOW + HOUR }, 20 * 60, NOW))
-      .toEqual({ ok: false, skip: 'legacy' });
-    expect(planExtend({ created_ms: 0, expires_ms: NOW + HOUR }, 20 * 60, NOW))
-      .toEqual({ ok: false, skip: 'legacy' });
+  // Renewal is unbounded in total, but only ever forward and only from a LIVE
+  // grant: the moment a window lapses, the capability is gone for good.
+  it('renews indefinitely while live, and stops dead once lapsed', () => {
+    let e: { expires_ms: number } = { expires_ms: NOW + 20 * MIN };
+    let t = NOW;
+    for (let i = 0; i < 10; i++) {
+      t = e.expires_ms - MIN;                    // renew just before each lapse
+      const p = planExtend(e, 24 * 3600, t);
+      expect(p.ok).toBe(true);
+      if (!p.ok) break;
+      expect(p.expires_ms).toBe(t + 24 * HOUR);  // exactly now + ttl, no budget
+      e = { expires_ms: p.expires_ms };
+    }
+    // One second past expiry, the same request is refused forever after.
+    expect(planExtend(e, 24 * 3600, e.expires_ms + 1000))
+      .toEqual({ ok: false, skip: 'expired' });
   });
 
   it('treats a malformed expiry as expired', () => {
@@ -160,20 +130,27 @@ describe('group handles', () => {
     expect(groupIdOf({ cache_group_id: 'g_abc', origin_token_id: 'tok' })).toBe('g_abc');
   });
 
-  it('falls back to a legacy handle that is not extendable', () => {
+  // Pre-migration entries fall back to an origin-derived handle, and that handle IS
+  // a valid extend target: origin_token_id is a full 96-bit approve token, and the
+  // group is refused anyway if its entries disagree about their origin. Without
+  // this, everything already cached would be stranded until it lapsed.
+  it('falls back to a legacy handle that is still extendable', () => {
     const gid = groupIdOf({ origin_token_id: 'tok0123456789ab' });
     expect(gid).toBe('legacy:tok0123456789ab');
-    expect(isExtendableGroupId(gid)).toBe(false);
+    expect(isExtendableGroupId(gid)).toBe(true);
   });
 
-  it('rejects forged / oversized handles', () => {
-    expect(isExtendableGroupId('legacy:tok')).toBe(false);
-    expect(isExtendableGroupId('g_' + 'x'.repeat(60))).toBe(false);
+  it('rejects forged / oversized / empty handles', () => {
+    expect(isExtendableGroupId('g_' + 'x'.repeat(60))).toBe(false);  // over the cap
+    expect(isExtendableGroupId('legacy:' + 'x'.repeat(60))).toBe(false);
+    expect(isExtendableGroupId('g_')).toBe(false);                   // no body
+    expect(isExtendableGroupId('legacy:')).toBe(false);
     expect(isExtendableGroupId('')).toBe(false);
     expect(isExtendableGroupId(null)).toBe(false);
-    // A value that merely *starts* with g_ after junk must not pass.
+    expect(isExtendableGroupId('dek:ctx:salt')).toBe(false);         // not a group handle
+    // A value that merely *starts* with g_ after junk must not pass, in either
+    // direction — neither as a selector nor as a minted id when grouping.
     expect(isExtendableGroupId(' g_abc')).toBe(false);
-    // And such a value must not be mistaken for a minted id when grouping.
     expect(groupIdOf({ cache_group_id: ' g_abc', origin_token_id: 'tok' })).toBe('legacy:tok');
   });
 });

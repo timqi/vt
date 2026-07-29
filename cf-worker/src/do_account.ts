@@ -21,7 +21,7 @@ import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
 import { seal, openToCache, cachePublicKey, discardedBoxPublicKey } from './cache_crypto';
 import {
-  MAX_CACHE_LIFETIME_MS, planExtend,
+  MAX_EXTEND_TTL_MS, planExtend,
   isAllowedApproveTtl, isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
   groupIdOf, isExtendableGroupId,
 } from './cache_policy';
@@ -191,8 +191,7 @@ function extendSummary(intent: CacheExtendIntent): string {
   const lines = [
     'op: 延长 DEK 缓存有效期',
     `scope: ${intent.preview.length} 组 / ${entries} 条缓存`,
-    `ttl: ${ttlLabelZh(intent.ttl_s)}（自批准时刻起算）`,
-    `cap: 不超过缓存创建后 ${ttlLabelZh(Math.floor(MAX_CACHE_LIFETIME_MS / 1000))}`,
+    `ttl: ${ttlLabelZh(intent.ttl_s)}（自批准时刻起算，覆盖原有效期）`,
   ];
   for (const t of intent.preview) {
     lines.push(`target: ${t.host || '?'} ${t.ip || '?'} · ${t.live} 条 · 现有效期至 ${fmtTimeZh(t.expires_ms)}`);
@@ -1655,21 +1654,14 @@ export class AccountDO extends DurableObject<Env> {
     const groups: CacheGroupSummary[] = [];
     for (const g of scan.groups.values()) {
       const row = ctxRows.get(g.origin_token_id);
-      const ceiling = g.created_ms === null ? null : g.created_ms + MAX_CACHE_LIFETIME_MS;
       // Extendability is decided here so the UI never has to re-derive the policy
-      // (and can explain a refusal); the commit path re-checks it anyway.
+      // (and can explain a refusal); the commit path re-checks it anyway. With the
+      // lifetime budget gone, the only reasons left are structural: a lapsed grant
+      // cannot be revived, and a drifted group cannot be reasoned about.
       let reason: string | null = null;
-      if (!isExtendableGroupId(g.group_id)) reason = 'legacy';
+      if (!isExtendableGroupId(g.group_id)) reason = 'not_extendable';
       else if (!g.consistent) reason = 'inconsistent';
       else if (g.live === 0) reason = 'expired';
-      else if (g.created_ms === null) reason = 'legacy';
-      else if (ceiling !== null && now >= ceiling) reason = 'capped';
-      // Headroom already spent: the ceiling is at or before the current expiry, so
-      // EVERY whitelisted TTL clamps to a value that cannot move expiry forward
-      // (planExtend would return no_gain for all of them). Offering a button here
-      // would promise an extension that provably does nothing — surface the real
-      // state instead. Common in practice: an 8h grant is capped from birth.
-      else if (ceiling !== null && ceiling <= g.max_expires_ms) reason = 'no_gain';
       groups.push({
         group_id: g.group_id,
         origin_token_id: g.origin_token_id,
@@ -1678,7 +1670,6 @@ export class AccountDO extends DurableObject<Env> {
         min_expires_ms: Number.isFinite(g.min_expires_ms) ? g.min_expires_ms : 0,
         max_expires_ms: g.max_expires_ms,
         created_ms: g.created_ms,
-        lifetime_ceiling_ms: ceiling,
         ip: g.ip,
         ppid: g.ppid,
         ppid_cmd: g.ppid_cmd,
@@ -1705,7 +1696,7 @@ export class AccountDO extends DurableObject<Env> {
       truncated: scan.truncated,
       extend_enabled: cacheAdminExtendEnabled(this.env),
       ttl_options_s: extendTtlOptions(),
-      max_lifetime_ms: MAX_CACHE_LIFETIME_MS,
+      max_extend_ttl_ms: MAX_EXTEND_TTL_MS,
     };
     return Response.json(resp);
   }
@@ -1779,12 +1770,9 @@ export class AccountDO extends DurableObject<Env> {
       if (!agg) { rejected.push({ group_id: gid, reason: 'gone' }); continue; }
       if (!agg.consistent) { rejected.push({ group_id: gid, reason: 'inconsistent' }); continue; }
       if (agg.live === 0) { rejected.push({ group_id: gid, reason: 'expired' }); continue; }
-      if (agg.created_ms === null) { rejected.push({ group_id: gid, reason: 'legacy' }); continue; }
-      const ceiling = agg.created_ms + MAX_CACHE_LIFETIME_MS;
-      if (now >= ceiling) { rejected.push({ group_id: gid, reason: 'capped' }); continue; }
-      // No headroom left ⇒ every whitelisted TTL clamps to no_gain. Refuse here
-      // rather than mint a ceremony that asks a human to approve a no-op.
-      if (ceiling <= agg.max_expires_ms) {
+      // Refuse a request that provably cannot move expiry forward, rather than mint
+      // a ceremony that asks a human to approve a no-op.
+      if (now + ttlS * 1000 <= agg.max_expires_ms) {
         rejected.push({ group_id: gid, reason: 'no_gain' }); continue;
       }
       targets.push({

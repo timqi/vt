@@ -33,38 +33,41 @@ export const EXTEND_TTL_WHITELIST = new Set([
   7 * 24 * 60 * 60,    // 1w
 ]);
 
-// Hard ceiling on the TOTAL lifetime of one cache entry, measured from the
-// moment the phone approval created it — NOT from the last extension.
+// The cap is PER OPERATION, not per entry lifetime: one extension may move expiry
+// to at most `now + max(EXTEND_TTL_WHITELIST)`. Total lifetime is deliberately
+// unbounded — each hop costs a fresh Passkey approval, so the human is in the loop
+// every single time rather than once at the start.
 //
-// It is COMPUTED as the longest TTL any Passkey ceremony can grant (the union of
-// the two ladders above), never hardcoded. That derivation is the invariant: the
-// ceiling can only move when a ceremony is actually able to grant that long, so
-// no admin path can ever out-grant what a human approved, and repeated small
-// extensions converge here instead of walking forever.
+// This replaced an absolute `created_ms + 1w` ceiling. Two reasons:
+//   • It made the feature inert for the common case. Operators cache for 8h, and
+//     the interesting question at hour seven is "another day from now", not "how
+//     much of a week-old budget is left".
+//   • It bought little. The ceiling only constrains someone who can already
+//     complete a WebAuthn ceremony — i.e. holds the Passkey — and against that
+//     adversary nothing here helps. What it did constrain was the legitimate
+//     operator, plus it permanently excluded pre-`created_ms` entries.
 //
-// SECURITY NOTE: with 1w on the extend ladder this ceiling is ONE WEEK. For that
-// whole window, possession of VT_PASSKEY_TOKEN from the same egress IP and `pwd`
-// decrypts the approved records with no phone tap. That is a deliberate operator
-// choice, not a default — reaching it takes an explicit extension request plus a
-// Passkey approval whose page states the new expiry. Shorten this ladder for
-// high-assurance deployments.
-export const MAX_CACHE_LIFETIME_MS =
-  Math.max(...APPROVE_TTL_WHITELIST, ...EXTEND_TTL_WHITELIST) * 1000;
+// SECURITY NOTE: an entry can therefore live indefinitely, one approved hop at a
+// time. For each window, possession of VT_PASSKEY_TOKEN from the same egress IP
+// and `pwd` decrypts the approved records with no phone tap. The safeguards that
+// remain are the ones that hold without a budget: a lapsed entry is never revived
+// (extension only ever continues a LIVE grant), expiry never moves backwards, the
+// per-hop TTL is laddered, and every hop is audited with the approver's identity.
+// Trim EXTEND_TTL_WHITELIST to shorten the longest single hop.
+export const MAX_EXTEND_TTL_MS = Math.max(...EXTEND_TTL_WHITELIST) * 1000;
 
 /** Why an entry was left untouched by an extension. Reported per group so the
  *  admin UI can explain a partial result instead of silently doing nothing. */
 export type ExtendSkip =
   /** Already past expires_ms — an extension must never resurrect a lapsed
-   *  entry (that would be the Worker minting cache authority from nothing). */
+   *  entry (that would be the Worker minting cache authority from nothing).
+   *  This is now the load-bearing bound: extension CONTINUES a live grant and
+   *  can never recreate one the operator let go. */
   | 'expired'
-  /** Pre-migration entry with no created_ms, so its total lifetime cannot be
-   *  bounded. Listable and clearable, never extendable. */
-  | 'legacy'
-  /** Already at (or past) created_ms + MAX_CACHE_LIFETIME_MS. */
-  | 'capped'
-  /** The requested TTL would not move expiry forward. Never shorten an entry:
-   *  "extend" is monotonic by definition, and a shortening extend would be a
-   *  confusing way to spell "clear". */
+  /** The requested TTL would not move expiry forward — i.e. more time is already
+   *  on the clock than the request asks for. Never shorten an entry: "extend" is
+   *  monotonic by definition, and a shortening extend would be a confusing way to
+   *  spell "clear". */
   | 'no_gain';
 
 export type ExtendPlan =
@@ -73,24 +76,22 @@ export type ExtendPlan =
 
 /** Decide the new absolute expiry for ONE entry, or why it is skipped.
  *
+ *  Always measured from NOW — the moment of approval — so "延长 1 天" means one day
+ *  from the tap, not one day from whenever the entry happened to be created.
+ *  created_ms is deliberately NOT consulted: it is forensic metadata now, which is
+ *  what lets pre-migration entries be extended like any other.
+ *
  *  Pure: the caller re-reads the entry under the DO gate and applies this to the
  *  fresh copy, so a stale plan can never be written back. */
 export function planExtend(
-  entry: Pick<CacheEntry, 'expires_ms' | 'created_ms'>,
+  entry: Pick<CacheEntry, 'expires_ms'>,
   ttlS: number,
   now: number,
-  maxLifetimeMs: number = MAX_CACHE_LIFETIME_MS,
 ): ExtendPlan {
   if (typeof entry.expires_ms !== 'number' || entry.expires_ms <= now) {
     return { ok: false, skip: 'expired' };
   }
-  const created = entry.created_ms;
-  if (typeof created !== 'number' || !Number.isFinite(created) || created <= 0) {
-    return { ok: false, skip: 'legacy' };
-  }
-  const ceiling = created + maxLifetimeMs;
-  if (now >= ceiling) return { ok: false, skip: 'capped' };
-  const candidate = Math.min(now + ttlS * 1000, ceiling);
+  const candidate = now + ttlS * 1000;
   if (candidate <= entry.expires_ms) return { ok: false, skip: 'no_gain' };
   return { ok: true, expires_ms: candidate };
 }
@@ -120,19 +121,26 @@ export function extendTtlOptions(): number[] {
 /** Stable grouping handle for a cache entry.
  *
  *  New entries carry a random `cache_group_id` minted once per writeCache call
- *  (= per approval, per binding ctx), which is what an extension selects on.
- *  Pre-migration entries have none; they are grouped under a `legacy:` handle
- *  derived from the origin audit token so they remain listable and clearable —
- *  but `legacy:` is deliberately NOT a valid extend selector (planExtend also
- *  refuses them for lack of created_ms), because a truncated approve_token is
- *  too weak a key to hang an authority-granting mutation on. */
+ *  (= per approval, per binding ctx). Pre-migration entries have none and are
+ *  grouped under a `legacy:` handle derived from the origin audit token.
+ *
+ *  Both forms are valid selectors. The `legacy:` half rests on origin_token_id
+ *  being a FULL 96-bit approve token (auditKey keeps all 16 b64u chars of a
+ *  12-byte token — it is "truncated" only in name), so a collision is not a real
+ *  ambiguity; and the group is refused anyway if its entries disagree about their
+ *  origin. That is what makes already-cached entries extendable instead of
+ *  stranded until they lapse. */
 export function groupIdOf(entry: Pick<CacheEntry, 'cache_group_id' | 'origin_token_id'>): string {
   const gid = entry.cache_group_id;
   if (typeof gid === 'string' && gid.startsWith('g_') && gid.length <= 40) return gid;
   return `legacy:${entry.origin_token_id ?? ''}`;
 }
 
-/** Is this group handle one an extension is allowed to target? */
+/** Is this a well-formed group handle an extension may target? Shape-checked so a
+ *  hostile body cannot smuggle in a wildcard or an over-long storage key. */
 export function isExtendableGroupId(groupId: unknown): groupId is string {
-  return typeof groupId === 'string' && groupId.startsWith('g_') && groupId.length <= 40;
+  if (typeof groupId !== 'string' || groupId.length > 40) return false;
+  if (groupId.startsWith('g_')) return groupId.length > 2;
+  if (groupId.startsWith('legacy:')) return groupId.length > 'legacy:'.length;
+  return false;
 }

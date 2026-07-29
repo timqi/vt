@@ -272,6 +272,23 @@ th.col-pick input, td.col-pick input { accent-color: var(--accent); margin: 0; c
 #cache td.col-act { white-space: nowrap; width: 1%; }
 #cache td.col-act button { margin: 0 0 0 6px; }
 #cache td.col-act button:first-child { margin-left: 0; }
+/* Hover card for the directory / command cells. Replaces the native `title`
+   tooltip: readable size, wraps, and keeps a multi-line command multi-line.
+   Positioned from JS via element.style.* (CSSOM), which `style-src 'self'`
+   permits — an inline style ATTRIBUTE would be blocked. */
+.hovercard {
+  position: fixed; z-index: 30; max-width: min(620px, 92vw);
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 12px; box-shadow: 0 8px 28px rgba(0,0,0,.32);
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.55;
+  white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none;
+}
+.hovercard[hidden] { display: none; }
+/* Signal that a cell holds more than it shows, without adding visual noise. */
+#cache .has-hover { cursor: help; }
+#cache .has-hover:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
+
 /* "Why this group can't be extended" — muted pill, always in view. */
 #cache .reason-badge {
   display: inline-block; padding: 1px 7px; border-radius: 999px;

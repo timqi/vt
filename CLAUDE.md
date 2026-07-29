@@ -47,27 +47,34 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   the ciphertext backup back over the target.
 - DEK caching is opt-in, requires `CACHE_SECKEY`, and uses the Worker-selected
   TTLs. A cache hit is not a phone approval; preserve its audit row and IP
-  binding. Every write mints an immutable `cache_group_id` + `created_ms`; both
-  are the anchors the admin surface selects and bounds by, so never rewrite them.
+  binding. Every write mints an immutable `cache_group_id` (the handle the admin
+  surface selects on) plus a `created_ms` stamp (forensic only since the lifetime
+  budget was removed). Never rewrite either — an extension touches `expires_ms`
+  and nothing else.
 - The admin cache surface is deliberately asymmetric
   ([`docs/dek-cache.md`](docs/dek-cache.md)): listing and clearing reduce
   authority and need only the Cloudflare Access gate, while EXTENDING a cache
   grants it and must never be reachable from an Access session alone. The extend
   route only mints a pending ceremony; `expires_ms` moves solely in
   `commitExtend`, called from `opApprove` after a verified Passkey assertion.
-  Keep all of: laddered TTLs only, never resurrect a lapsed entry, never
-  shorten, clamp to `created_ms + MAX_CACHE_LIFETIME_MS`, refuse
-  legacy/inconsistent/`no_gain` groups, re-read each entry with no await before
-  the write, and audit both the authorization and the effect.
+  Keep all of: laddered TTLs only, NEVER resurrect a lapsed entry (this is now the
+  load-bearing bound — see below), never shorten, refuse drifted/`no_gain` groups,
+  re-read each entry with no await before the write, and audit both the
+  authorization and the effect.
+- Extension is measured from the APPROVAL, every time: `expires_ms = now + ttl`.
+  There is deliberately NO total-lifetime ceiling — an entry may be renewed
+  indefinitely, one Passkey-approved hop at a time — so `created_ms` is forensic
+  only and pre-migration entries are extendable like any other. Do not reintroduce
+  a `created_ms`-anchored budget: the previous one made the feature a no-op for the
+  common 8h grant and constrained only the legitimate operator, since a ceiling
+  binds nobody who can already complete a WebAuthn ceremony. What replaces it is
+  liveness — extension CONTINUES a live grant and can never recreate a lapsed one.
 - Two TTL ladders, one rule — a TTL is legal only if some PASSKEY ceremony offers
   it. `APPROVE_TTL_WHITELIST` (20m/2h/8h) guards `writeCache`, so a tampered
   approve body cannot arm a multi-day cache without the extension ceremony;
   `EXTEND_TTL_WHITELIST` (adds 1d/2d/1w) guards extension requests.
-  `MAX_CACHE_LIFETIME_MS` must stay COMPUTED as the max of the union — never
-  hardcoded — so the ceiling can only move when a ceremony can actually grant that
-  long. It must also stay strictly greater than the largest approve-time TTL, or an
-  8h grant sits at its ceiling from birth and every extension of it is a silent
-  no-op (that bug shipped once; `test/cache_policy.test.ts` now pins it). `CACHE_ADMIN_EXTEND` is
+  `MAX_EXTEND_TTL_MS` (the largest single hop) must stay COMPUTED from the extend
+  ladder, never hardcoded, so trimming the ladder shortens the hop automatically. `CACHE_ADMIN_EXTEND` is
   a kill switch, NOT an authorization — never treat it as one. The arithmetic
   lives in `cf-worker/src/cache_policy.ts` and is unit-tested; keep it pure.
 - Cache listings must never expose sealed material, salts, or the binding ctx

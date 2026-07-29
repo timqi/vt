@@ -14,9 +14,13 @@ TTL, a caller can decrypt the approved records without another phone tap.
   reviewed on the approval page before the tap. The multi-day rungs also make the
   feature useful at all: with the ceiling pinned to `8h`, an `8h` grant sat at its
   ceiling from birth and every extension of it was a no-op.
-- The total-lifetime ceiling is therefore **1 week**, computed as the longest TTL
-  any Passkey ceremony can grant. Shorten `EXTEND_TTL_WHITELIST` for
-  high-assurance deployments; the ceiling follows automatically.
+- The cap is **per operation, not per lifetime**: one extension sets expiry to
+  `now + chosen TTL` (max 1w), and an entry may be renewed indefinitely — one
+  Passkey-approved hop at a time. `MAX_EXTEND_TTL_MS` follows the ladder, so
+  trimming `EXTEND_TTL_WHITELIST` shortens the longest single hop.
+- What bounds renewal is **liveness, not a budget**: an extension can only continue
+  a window that has not yet lapsed. Once a cache expires it is gone for good and
+  only a fresh phone approval can arm a new one.
 - Caching is enabled only when the Worker secret `CACHE_SECKEY` is configured.
   There is no `VT_DEK_CACHE` environment variable and no separate client-side
   no-cache flag.
@@ -97,17 +101,22 @@ until a Passkey approves it, and every one of these holds:
 3. **Never resurrects.** An entry already past `expires_ms` is skipped. Only a
    new phone approval can bring a lapsed capability back.
 4. **Never shortens.** A request that would not move expiry forward is a no-op.
-5. **Absolute lifetime ceiling.** New expiry is clamped to `created_ms + 1w`,
-   computed as the longest TTL any Passkey ceremony can grant (the union of both
-   ladders) — never hardcoded. Repeated extensions therefore converge on that
-   ceiling instead of walking forever, and the ceiling can only move when a
-   ceremony can actually grant that long, so no admin path out-grants an approver.
-   A group already at its ceiling reports `no_gain` and offers no button, rather
-   than promising an extension that would do nothing.
-6. **Legacy and drifted groups are never extendable.** Entries written before
-   `created_ms` existed cannot have their total lifetime bounded, and a group
-   whose entries disagree on origin/creation/IP is refused outright. Both stay
-   listable and clearable.
+5. **Measured from the approval, every time.** New expiry is `now + TTL`, where
+   `now` is the moment of the tap — not an offset from creation, and not additive
+   with whatever remains. `created_ms` is forensic metadata only, which is exactly
+   what lets pre-migration entries be renewed like any other. Total lifetime is
+   unbounded by design; the price is a Passkey approval per hop, so a human is in
+   the loop every single time instead of once at the start.
+
+   This replaced an absolute `created_ms + 1w` ceiling, which failed twice over: it
+   made the feature inert for the common case (operators cache for `8h`, so an
+   entry sat at its ceiling from birth and every extension was a silent no-op), and
+   it only ever constrained the legitimate operator — the ceiling binds nobody who
+   can already complete a WebAuthn ceremony.
+6. **Drifted groups are never extendable.** A group whose entries disagree on
+   origin/creation/IP is refused outright rather than guessed at; it stays listable
+   and clearable. Pre-`created_ms` entries ARE extendable (their `legacy:` handle
+   rests on a full 96-bit origin token), so nothing already cached is stranded.
 7. **Audited twice.** The ceremony row records the authorization (with the
    verified Cloudflare Access email); a second `op_kind='cache'`,
    `status='extended'` row records the effect — how many entries moved, to when,
@@ -135,11 +144,13 @@ egress IP and matching `pwd` is sufficient to obtain the cached DEK.
 
 Keep the default TTL at `0` for high-assurance or unattended workloads. Use
 short TTLs for automation that needs repeated decrypts. The multi-day extension
-rungs (`1d`/`2d`/`1w`) are for long-running attended or CI sessions and are the
-single largest exposure this system can grant: for that whole window, possession
-of `VT_PASSKEY_TOKEN` from the same egress IP and `pwd` decrypts with no phone
-tap. Reaching one always takes an explicit request plus a Passkey approval whose
-page states the new expiry — but budget them accordingly. `8h` is a
+rungs (`1d`/`2d`/`1w`) are for long-running attended or CI sessions, and since
+renewal is unbounded in total, a cache can in principle be kept alive for as long
+as someone keeps approving it: for each window, possession of `VT_PASSKEY_TOKEN`
+from the same egress IP and `pwd` decrypts with no phone tap. Every hop takes an
+explicit request plus a Passkey approval whose page states the new expiry, and the
+audit table records each one — treat a long chain of `缓存已延长` rows on one
+record as a signal worth reviewing. `8h` is a
 workday-session choice for an attended desktop only: for its whole window,
 possession of `VT_PASSKEY_TOKEN` from the same egress IP and `pwd` decrypts the
 approved records with no phone tap, so do not select it on shared, unattended,

@@ -35,8 +35,8 @@ export interface Env {
   /** "1" | "true" | "on" | "yes" → the admin cache tab may REQUEST a DEK-cache
    *  extension. A kill switch, NOT an authorization: even when on, extending
    *  requires a fresh phone Passkey ceremony (see docs/dek-cache.md §extend), is
-   *  bounded by EXTEND_TTL_WHITELIST, can never resurrect a lapsed entry, and can
-   *  never push an entry past MAX_CACHE_LIFETIME_MS from its creation. Off by
+   *  bounded per-hop by EXTEND_TTL_WHITELIST and can never resurrect a lapsed
+   *  entry. Total lifetime is unbounded — every hop needs its own approval. Off by
    *  default so a deployment that never wants the capability simply does not
    *  have it (the routes 404 and the UI hides the controls). */
   CACHE_ADMIN_EXTEND?: string;
@@ -238,11 +238,9 @@ export interface CacheGroupSummary {
   /** Earliest / latest expiry across the group (epoch ms). */
   min_expires_ms: number;
   max_expires_ms: number;
-  /** Entry creation time (epoch ms); null for pre-migration entries. */
+  /** Entry creation time (epoch ms); null for pre-migration entries. Forensic
+   *  only — extension is measured from the approval, not from creation. */
   created_ms: number | null;
-  /** Absolute ceiling this group can ever be extended to; null when unknown
-   *  (legacy) — the UI shows the remaining extendable headroom from it. */
-  lifetime_ceiling_ms: number | null;
   /** Worker-derived source IP the entries are bound to. */
   ip: string;
   ppid: number;
@@ -279,8 +277,9 @@ export interface CacheListResponse {
   extend_enabled: boolean;
   /** TTL options (seconds) an extension may request. */
   ttl_options_s: number[];
-  /** MAX_CACHE_LIFETIME_MS, so the UI can explain the ceiling. */
-  max_lifetime_ms: number;
+  /** MAX_EXTEND_TTL_MS — the largest single hop one extension may grant. Total
+   *  lifetime is unbounded; each hop costs a fresh Passkey approval. */
+  max_extend_ttl_ms: number;
 }
 
 /** Handle to edit a sent Slack App message in place: `channel` is the resolved

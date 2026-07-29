@@ -775,7 +775,7 @@ function buildCachePage(): string {
 <body>
   <main>
     ${adminTabs('cache')}
-    <p class="hint">当前<strong>真实存在</strong>的 DEK 缓存（按授予它的那次审批分组）。在有效期内，持有 <code>VT_PASSKEY_TOKEN</code> 且来源 IP 与工作目录一致的调用者可<strong>免手机审批</strong>解密这些记录，所以此处的每一行都是一份仍然生效的授权。清除立即生效；<strong>延长必须经手机 Passkey 重新批准</strong>，且不得超过缓存创建后的总时长上限。</p>
+    <p class="hint">当前<strong>真实存在</strong>的 DEK 缓存（按授予它的那次审批分组）。在有效期内，持有 <code>VT_PASSKEY_TOKEN</code> 且来源 IP 与工作目录一致的调用者可<strong>免手机审批</strong>解密这些记录，所以此处的每一行都是一份仍然生效的授权。清除立即生效；<strong>延长必须经手机 Passkey 重新批准</strong>，每次延长把有效期重设为「批准时刻 + 所选时长」，可反复续期，但<strong>已过期的缓存无法续期</strong>——只能重新审批。</p>
     <section id="filters">
       <label>状态 <select id="f-live">
         <option value="live">仅有效</option>
@@ -801,7 +801,7 @@ function buildCachePage(): string {
     <div id="table-wrap"><table id="cache"><thead><tr>
       <th class="col-pick"><input id="pick-all" type="checkbox" aria-label="全选"></th>
       <th>目标 / 用户 · 目录</th><th>命令 / IP</th><th class="col-num">条目</th>
-      <th>剩余 / 可延长余量</th><th>操作</th>
+      <th>剩余 / 到期时间</th><th>操作</th>
     </tr></thead><tbody id="rows"></tbody></table></div>
     <section id="actions">
       <span id="status" role="status" aria-live="polite"></span>

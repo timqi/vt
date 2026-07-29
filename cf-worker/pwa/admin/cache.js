@@ -25,7 +25,7 @@
   var byGroup = {};           // group_id -> summary
   var selected = {};          // group_id -> true
   var meta = {                // listing-level fields
-    extend_enabled: false, ttl_options_s: [], max_lifetime_ms: 0,
+    extend_enabled: false, ttl_options_s: [], max_extend_ttl_ms: 0,
     truncated: false, scanned: 0,
   };
   // Server clock at listing time + the local monotonic reference we advance it
@@ -101,12 +101,10 @@
   // server's reason codes 1:1 (do_account.opCacheList) — the server decides, the
   // UI only translates, so the button state can never disagree with the policy.
   var REASON_TEXT = {
-    legacy: '旧版条目（无创建时间，无法限定总时长）',
+    expired: '已过期，需重新手机审批（延长只能续期仍然有效的缓存）',
     inconsistent: '组内条目不一致，仅允许清除',
-    expired: '已全部过期',
-    capped: '已达创建后总时长上限',
-    no_gain: '已用满总时长，延长不会生效',
-    not_extendable: '不可延长',
+    no_gain: '现有剩余时间已长于所选时长',
+    not_extendable: '分组标识异常，仅允许清除',
     gone: '已被清除',
   };
 
@@ -144,6 +142,77 @@
     return '…/' + parts.slice(-2).join('/');
   }
 
+  // ── Hover card ────────────────────────────────────────────────────────────
+  // The native `title` tooltip is the wrong tool here: ~1s browser delay, tiny
+  // system font, no wrapping, and it collapses a multi-line command onto one line.
+  // These cells hold the two values an operator most needs to read in full — the
+  // bound working directory and the exact command — so they get a real popup:
+  // ~90ms, wrapping, monospace, and multi-line preserved.
+  //
+  // Positioned by assigning to element.style.* (CSSOM), which is NOT an inline
+  // style attribute and so is allowed under `style-src 'self'` — do not switch this
+  // to setAttribute('style', …), which the CSP would block.
+  var hoverCard = null;
+  var hoverTimer = null;
+
+  function ensureHoverCard() {
+    if (!hoverCard) {
+      hoverCard = el('div', 'hovercard');
+      hoverCard.hidden = true;
+      document.body.appendChild(hoverCard);
+    }
+    return hoverCard;
+  }
+
+  function showHover(target, text) {
+    var card = ensureHoverCard();
+    card.textContent = text;
+    card.hidden = false;
+    // Measure after the text is in, then place: below the cell by default, flipped
+    // above when it would overflow the viewport, and clamped horizontally.
+    var r = target.getBoundingClientRect();
+    var cw = card.offsetWidth, ch = card.offsetHeight;
+    var pad = 8;
+    var left = Math.min(Math.max(pad, r.left), window.innerWidth - cw - pad);
+    var top = r.bottom + 6;
+    if (top + ch > window.innerHeight - pad) top = Math.max(pad, r.top - ch - 6);
+    card.style.left = left + 'px';
+    card.style.top = top + 'px';
+  }
+
+  function hideHover() {
+    if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+    if (hoverCard) { hoverCard.hidden = true; hoverCard.textContent = ''; }
+  }
+
+  // Delegated, so re-rendering rows every 15s never leaves stale listeners behind.
+  function initHover(scopeId) {
+    var scope = document.getElementById(scopeId);
+    if (!scope) return;
+    scope.addEventListener('mouseover', function (e) {
+      var t = e.target.closest ? e.target.closest('[data-hover]') : null;
+      if (!t) return;
+      var text = t.getAttribute('data-hover');
+      if (!text) return;
+      if (hoverTimer) clearTimeout(hoverTimer);
+      hoverTimer = setTimeout(function () { showHover(t, text); }, 90);
+    });
+    scope.addEventListener('mouseout', function (e) {
+      var t = e.target.closest ? e.target.closest('[data-hover]') : null;
+      if (t) hideHover();
+    });
+    // Tap-to-inspect on touch devices, where there is no hover at all.
+    scope.addEventListener('click', function (e) {
+      var t = e.target.closest ? e.target.closest('[data-hover]') : null;
+      if (!t) { hideHover(); return; }
+      if (hoverCard && !hoverCard.hidden) { hideHover(); return; }
+      showHover(t, t.getAttribute('data-hover') || '');
+    });
+    window.addEventListener('scroll', hideHover, true);
+    window.addEventListener('resize', hideHover);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideHover(); });
+  }
+
   // ── Filtering (client-side; the listing is one bounded snapshot) ───────────
 
   function visibleGroups() {
@@ -166,11 +235,11 @@
     opts = opts || {};
     var td = document.createElement('td');
     var m = el('div', 'cell-main' + (opts.mainCls ? ' ' + opts.mainCls : ''), main || '—');
-    if (opts.mainTitle) m.title = opts.mainTitle;
+    if (opts.mainHover) { m.setAttribute('data-hover', opts.mainHover); m.classList.add('has-hover'); }
     td.appendChild(m);
     if (sub != null && sub !== '') {
       var s = el('div', 'cell-sub' + (opts.subCls ? ' ' + opts.subCls : ''), sub);
-      if (opts.subTitle) s.title = opts.subTitle;
+      if (opts.subHover) { s.setAttribute('data-hover', opts.subHover); s.classList.add('has-hover'); }
       td.appendChild(s);
     } else if (opts.subNode) {
       td.appendChild(opts.subNode);
@@ -203,12 +272,20 @@
     // it is half the cache binding, so it must stay inspectable.
     cell2(tr, g.host || '—',
       (g.user || '?') + (g.pwd ? ' · ' + shortPath(g.pwd) : ''),
-      { mainCls: 'trunc-host', mainTitle: g.host || '',
-        subCls: 'trunc-sub', subTitle: (g.user || '') + (g.pwd ? '  ' + g.pwd : '') });
+      { mainCls: 'trunc-host',
+        mainHover: '主机: ' + (g.host || '—') + '\n分组: ' + g.group_id
+          + '\n来源审批: ' + g.origin_token_id,
+        subCls: 'trunc-sub',
+        subHover: '用户: ' + (g.user || '—') + '\n工作目录: ' + (g.pwd || '—')
+          + '\n\n（目录与来源 IP 共同构成缓存绑定，两者一致才会命中）' });
 
     // 命令: the command over the bound source IP (the hard half of the binding).
     cell2(tr, commandSummary(g.command, 120), g.ip,
-      { mainCls: 'trunc-cmd', mainTitle: g.command || '', subCls: 'mono' });
+      { mainCls: 'trunc-cmd',
+        mainHover: (g.command || '—') + (g.ppid_cmd ? '\n\n父进程: ' + g.ppid_cmd : ''),
+        subCls: 'mono',
+        subHover: '来源 IP: ' + (g.ip || '—')
+          + '\n（Worker 侧取自 CF-Connecting-IP，客户端无法伪造）' });
 
     // 条目: live count, with the swept-but-present total only when they differ.
     cell2(tr, String(g.live), g.entries !== g.live ? '共 ' + g.entries : '',
@@ -221,14 +298,12 @@
     var remTd = cell2(tr, live ? fmtRemaining(g.max_expires_ms - t) : '已过期', '',
       { mainCls: live ? '' : 'cache-expired',
         mainTitle: live ? '有效期至 ' + fmtTime(g.max_expires_ms) : '' });
-    var sub;
-    if (!meta.extend_enabled) {
-      sub = null;                                   // extension off: no promise to explain
-    } else if (g.extendable && g.lifetime_ceiling_ms) {
-      sub = el('div', 'cell-sub', '余 ' + fmtRemaining(g.lifetime_ceiling_ms - t) + '可延长');
-      sub.title = '上限 ' + fmtTime(g.lifetime_ceiling_ms);
-    } else if (g.reason) {
+    // Sub-line: the exact expiry while live, or WHY the row cannot be extended.
+    var sub = null;
+    if (meta.extend_enabled && !g.extendable && g.reason) {
       sub = el('div', 'cell-sub reason-badge', REASON_TEXT[g.reason] || g.reason);
+    } else if (live) {
+      sub = el('div', 'cell-sub', '至 ' + fmtTime(g.max_expires_ms));
     }
     if (sub) remTd.appendChild(sub);
 
@@ -340,8 +415,7 @@
           + ' 组记录的解密将持续免手机审批（同一来源 IP + 工作目录）');
         warn = true;
       }
-      parts.push('自批准时刻起算，最长不超过创建后 '
-        + ttlLabel(Math.floor(meta.max_lifetime_ms / 1000)));
+      parts.push('批准后有效期重设为「批准时刻 + ' + ttlLabel(ttl) + '」，可再次延长');
     }
     note.textContent = parts.join('；');
     note.className = warn ? 'hint warn' : 'hint';
@@ -368,7 +442,7 @@
       localRefMs = Date.now();
       meta.extend_enabled = !!json.extend_enabled;
       meta.ttl_options_s = json.ttl_options_s || [];
-      meta.max_lifetime_ms = json.max_lifetime_ms || 0;
+      meta.max_extend_ttl_ms = json.max_extend_ttl_ms || 0;
       meta.truncated = !!json.truncated;
       meta.scanned = json.scanned || 0;
       renderTtlOptions();
@@ -482,7 +556,7 @@
     var entries = (req.targets || []).reduce(function (n, t) { return n + t.live; }, 0);
     addDetail(dl, '范围', (req.targets || []).length + ' 组 / ' + entries + ' 条');
     addDetail(dl, '延长', ttlLabel(ttl) + '（自批准时刻起算）');
-    addDetail(dl, '上限', '缓存创建后 ' + ttlLabel(Math.floor(meta.max_lifetime_ms / 1000)));
+    addDetail(dl, '生效方式', '批准后有效期重设为「批准时刻 + ' + ttlLabel(ttl) + '」，覆盖原有效期');
     (req.targets || []).forEach(function (t) {
       addDetail(dl, t.host || '?', t.ip + ' · ' + t.live + ' 条 · 现有效期至 ' + fmtTime(t.expires_ms));
     });
@@ -574,5 +648,6 @@
   // ceremony modal is open so a re-render cannot tear down a live WebAuthn prompt.
   setInterval(function () { if (backdrop.hidden) render(); }, 15000);
 
+  initHover('table-wrap');
   load();
 })();
