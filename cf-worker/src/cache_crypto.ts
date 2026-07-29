@@ -47,6 +47,26 @@ export function cachePublicKey(secKeyB64u: string): Uint8Array {
   return nacl.scalarMult.base(sk);
 }
 
+/** A one-shot X25519 public key whose secret is destroyed before returning, so
+ *  NOTHING can ever open a box sealed to it.
+ *
+ *  Used as the `daemon_pubkey` of a cache-extension ceremony: that flow reuses the
+ *  standard approval PWA (one code path, no forked ceremony logic), and the PWA
+ *  unconditionally seals its placeholder DEK block to the challenge's
+ *  daemon_pubkey. There is no daemon on the far side — an extension delivers no
+ *  key material — so the sealed blob must be undecryptable by construction rather
+ *  than merely unused. Returning a real curve point (not random bytes) keeps the
+ *  PWA's seal on the normal libsodium path. */
+export function discardedBoxPublicKey(): Uint8Array {
+  const sk = new Uint8Array(X25519_KEYBYTES);
+  crypto.getRandomValues(sk);
+  try {
+    return nacl.scalarMult.base(sk);
+  } finally {
+    sk.fill(0);
+  }
+}
+
 /** crypto_box_seal(plaintext, recipientPk) → b64u. recipientPk is 32 bytes. */
 export function seal(plaintext: Uint8Array, recipientPk: Uint8Array): string {
   const eph = nacl.box.keyPair();

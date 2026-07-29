@@ -18,8 +18,12 @@ TTL, a caller can decrypt the approved records without another phone tap.
   a miss and falls back to the normal phone ceremony.
 - A hit re-seals the DEKs to the current CLI request's ephemeral public key.
   The Worker never sends a cached DEK in the form stored at rest.
-- Cache hits and write failures are recorded in the unified `audit` table.
-  Routine misses are logged and then followed by the normal ceremony audit.
+- Cache hits, write failures, and approved extensions are recorded in the
+  unified `audit` table. Routine misses are logged and then followed by the
+  normal ceremony audit.
+- Each write mints one `cache_group_id` (all entries from one approval under one
+  binding ctx) and stamps an immutable `created_ms`. The group id is the handle
+  the admin surface lists, clears, and extends by.
 - A hit sends a best-effort notification through configured Pushover, Slack
   Webhook, Slack App, or Feishu channels. Notifications never block DEK
   delivery and contain no approval URL.
@@ -43,6 +47,70 @@ The cache public key is derived at runtime from `CACHE_SECKEY`. The Worker
 uses `tweetnacl` + `blakejs` for the sealed-box compatibility layer; the Rust
 client opens the result with the existing sealed-box implementation.
 
+## Admin surface: the DEK 缓存 tab
+
+`/<ADMIN_SEG>/cache` lists what is **actually cached right now**, one row per
+cache group, joined with the approval that armed it (host, user, directory,
+command). It is the only view of the real entry set — the audit tab can merely
+show which approvals *armed* a cache, which is an inference, not an inventory.
+
+The listing deliberately carries no secret material: no sealed DEK, no salts, and
+**no binding ctx digest**. The ctx is `SHA-256(tag ‖ ip ‖ pwd)`, so publishing it
+next to an already-visible IP would turn the page into an offline oracle for the
+client-reported `pwd`. Entries scanned per request are capped; the response
+reports `truncated` and the UI says so rather than implying a complete view.
+
+Two classes of action, with deliberately different gates:
+
+| Action | Gate | Why |
+|---|---|---|
+| List | Cloudflare Access | Read-only |
+| Clear (row / selected / all) | Cloudflare Access | Authority-**reducing**: worst case is "decrypts re-prompt" |
+| Extend | Access **+ a fresh phone Passkey approval** | Authority-**granting**: prolongs no-human-in-the-loop decrypts |
+
+### Extension contract
+
+Extension is off by default (`CACHE_ADMIN_EXTEND`, a kill switch — not an
+authorization). When enabled, an admin selects groups and a TTL and presses
+延长; the Worker then only **mints a pending ceremony**. Nothing expires later
+until a Passkey approves it, and every one of these holds:
+
+1. **Passkey required.** The intent (group ids, TTL, requester) is written onto
+   the challenge at request time and never mutated, so the approval finalizes
+   exactly what was proposed. The ceremony is single-use, expires in 5 minutes if
+   untouched, is pushed to every configured notification channel, and appears on
+   the audit tab as `cache-extend` — an unexpected extension request is visible
+   to the operator who did not initiate it.
+2. **Whitelisted TTLs only** (`20m` / `2h` / `8h`) — the same set the phone
+   offers. No arbitrary deltas.
+3. **Never resurrects.** An entry already past `expires_ms` is skipped. Only a
+   new phone approval can bring a lapsed capability back.
+4. **Never shortens.** A request that would not move expiry forward is a no-op.
+5. **Absolute lifetime ceiling.** New expiry is clamped to
+   `created_ms + 8h`, which equals the longest TTL a human can pick. Repeated
+   20m extensions therefore converge on that ceiling instead of synthesizing a
+   window nobody approved — the admin surface can never out-grant the approver.
+6. **Legacy and drifted groups are never extendable.** Entries written before
+   `created_ms` existed cannot have their total lifetime bounded, and a group
+   whose entries disagree on origin/creation/IP is refused outright. Both stay
+   listable and clearable.
+7. **Audited twice.** The ceremony row records the authorization (with the
+   verified Cloudflare Access email); a second `op_kind='cache'`,
+   `status='extended'` row records the effect — how many entries moved, to when,
+   and what was skipped. Clears remain CF-logs-only: they reduce authority.
+8. `audit.cache_ttl_s` keeps its original meaning (the TTL the approver chose)
+   and is never rewritten. The new `audit.cache_expires_ms` column tracks the
+   live expiry, so the audit tab shows real liveness instead of an inference that
+   an extension would falsify.
+
+Residual gap, stated plainly: the approver reads the intent as rendered by the
+Worker, and the assertion covers the challenge rather than a hash of the
+displayed text. A compromised Worker could therefore show one intent and hold
+another — but a compromised Worker already holds `CACHE_SECKEY` and can read
+cached DEKs outright, so this adds no new capability to that adversary. Against
+the adversary the gate is actually for — someone holding only a Cloudflare Access
+session — the Passkey requirement is decisive.
+
 ## Security boundary
 
 `CACHE_SECKEY` is present in the Worker process and protects cached entries if
@@ -64,11 +132,13 @@ The cache does not re-key existing `vt://` records.
 
 | Concern | Source |
 |---|---|
-| TTL whitelist, cache writes/reads, audit, notifications | `cf-worker/src/do_account.ts` |
+| TTL whitelist, lifetime ceiling, extension arithmetic | `cf-worker/src/cache_policy.ts` (+ `test/cache_policy.test.ts`) |
+| Cache writes/reads, listing, extension commit, audit, notifications | `cf-worker/src/do_account.ts` |
 | Sealed-box cache crypto | `cf-worker/src/cache_crypto.ts` |
 | PWA TTL selection and sealing | `cf-worker/pwa/approve.js` |
 | CLI cache request and source check | `src/cf.rs`, `src/client.rs` |
-| Admin cache clear/filter UI | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/audit.js` |
+| Admin cache inventory / clear / extend UI | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/cache.js` |
+| Admin audit cache column + per-row clear | `cf-worker/pwa/admin/audit.js` |
 | Deployment secret and rotation | [`cf-worker-deploy.md`](cf-worker-deploy.md) |
 
 ## Verification
@@ -78,7 +148,13 @@ The cache does not re-key existing `vt://` records.
 3. Read the same record again from the same egress IP and working directory;
    the second read should not open a phone ceremony.
 4. Check the admin audit page for the cache grant and hit.
-5. Rotate `CACHE_SECKEY` or clear the cache, then confirm the next read returns
+5. Open the admin `DEK 缓存` tab: the entry group appears with its remaining time
+   and its extendable ceiling.
+6. With `CACHE_ADMIN_EXTEND = "1"`, select the group, press 延长, and approve on a
+   Passkey. Confirm the remaining time moves, the ceiling does not, and two audit
+   rows appear (`cache-extend` approved + `缓存已延长`). Repeat past the 8h mark
+   and confirm the request is refused rather than clamped silently.
+7. Rotate `CACHE_SECKEY` or clear the cache, then confirm the next read returns
    to the phone ceremony.
 
 For implementation changes, run the focused Rust/Worker tests and then the

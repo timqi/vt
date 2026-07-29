@@ -170,8 +170,13 @@ npm run dev        # wrangler dev — local Worker + DO
 
 - Workers Logs (dashboard) show the structured audit events; retention is
   platform-managed (~3 days Free, ~7 days Paid).
-- The admin **audit** page (`/kestrel/…`) shows the SQLite audit table, cache
-  TTL/hit columns, and the **“立即清空 DEK 缓存”** (clear-cache) button.
+- The admin **audit** page (`/kestrel/audit`) shows the SQLite audit table, cache
+  TTL/expiry columns, and the **“清除 DEK 缓存”** (clear-cache) button.
+- The admin **DEK 缓存** page (`/kestrel/cache`) is the inventory of entries that
+  actually exist right now, grouped by the approval that armed them, with
+  per-group and bulk clear. Extending a group's window is gated on both Access
+  and a fresh phone Passkey approval, and is off unless `CACHE_ADMIN_EXTEND` is
+  set — see [`docs/dek-cache.md`](dek-cache.md).
 
 ## Updates & rotation
 

@@ -238,6 +238,28 @@ tbody tr.clickable { cursor: pointer; }
 .vt-ap-status.ok { color: var(--ok); }
 .vt-ap-status.error { color: var(--err); }
 
+/* ── DEK-cache tab ───────────────────────────────────────────────────────── */
+/* Bulk-action bar: appears only once something is selected, so the destructive
+   and authority-granting controls are not permanently on screen. */
+#bulkbar {
+  display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel-2);
+}
+#bulkbar[hidden] { display: none; }
+#bulkbar label[hidden], #bulkbar button[hidden] { display: none; }
+#bulkbar label { margin-right: 0; }
+#bulkbar select, #bulkbar button { height: 38px; box-sizing: border-box; margin: 0; }
+#bulkbar #bulk-count { align-self: center; }
+#bulkbar #extend-note { margin: 0; align-self: center; }
+/* Selection column: keep it tight so the data columns keep the width. */
+th.col-pick, td.col-pick { width: 1%; padding-right: 0; }
+th.col-pick input, td.col-pick input { accent-color: var(--accent); margin: 0; cursor: pointer; }
+/* Inline "why this row can't be extended", in place of the 延长 button. */
+td .hint.reason { margin: 0; font-size: 12px; }
+/* The cache tab's modal has a real heading (the audit tab's starts with a dl). */
+#detail-card > h2 { margin: 0 0 12px; padding-right: 32px; }
+
 /* Setup: current Passkey list + CLI command block */
 .cred-list { list-style: none; margin: 0 0 16px; padding: 0; }
 .cred-list li {

@@ -32,6 +32,14 @@ export interface Env {
    *  approval messages that need a human. The audit row is written regardless,
    *  so cache hits remain fully visible on the admin audit page. */
   CACHE_HIT_NOTIFY?: string;
+  /** "1" | "true" | "on" | "yes" → the admin cache tab may REQUEST a DEK-cache
+   *  extension. A kill switch, NOT an authorization: even when on, extending
+   *  requires a fresh phone Passkey ceremony (see docs/dek-cache.md §extend), is
+   *  bounded by CACHE_TTL_WHITELIST, can never resurrect a lapsed entry, and can
+   *  never push an entry past MAX_CACHE_LIFETIME_MS from its creation. Off by
+   *  default so a deployment that never wants the capability simply does not
+   *  have it (the routes 404 and the UI hides the controls). */
+  CACHE_ADMIN_EXTEND?: string;
   WORKER_ORIGIN: string;
   RP_ID: string;
   /** Cloudflare Access team domain, e.g. "myteam.cloudflareaccess.com". Empty → admin surface fails closed. */
@@ -63,8 +71,17 @@ export interface AuditRow {
   salts: number | null;
   latency_ms: number | null;
   verify_failures: number;
-  /** DEK-cache TTL (seconds) the approver chose; 0/null = not cached. */
+  /** DEK-cache TTL (seconds) the approver chose; 0/null = not cached. This keeps
+   *  its original meaning forever — it is the DECISION, not the live state, so an
+   *  admin extension does NOT rewrite it (see cache_expires_ms). */
   cache_ttl_s: number | null;
+  /** Absolute epoch-ms this row's cache entries currently expire at, mirroring
+   *  CacheEntry.expires_ms. Written with the cache and UPDATED by an approved
+   *  extension, so the admin UI can show real liveness instead of inferring
+   *  finalized_ms + cache_ttl_s (which an extension would make a lie). NULL on
+   *  pre-migration rows and on rows that never armed a cache — the UI falls back
+   *  to the old inference there. */
+  cache_expires_ms: number | null;
   /** Numeric parent PID. Set for ceremony rows (from meta) and DEK-cache rows
    *  (op_kind='cache'). */
   ppid: number | null;
@@ -160,6 +177,110 @@ export interface Challenge {
    *  the DO can chat.update it to its terminal state on approve/reject/expire.
    *  Absent when the Slack App channel is off or the send failed. */
   slackapp?: SlackAppMsgRef;
+  /** Present ONLY on a cache-extension ceremony (op_kind='cache-extend'): the
+   *  immutable intent this approval authorizes. Written once by
+   *  opCacheExtendCreate and never mutated, so the thing the approver's assertion
+   *  finalizes is the thing that was proposed. A challenge carrying this has NO
+   *  salts and mints no DEKs — approving it only moves expires_ms forward on the
+   *  named groups. */
+  extend?: CacheExtendIntent;
+}
+
+// ── Cache extension (admin-requested, phone-approved) ──────────────────────
+
+/** What one cache-extension ceremony proposes. Stored on the Challenge, so it
+ *  cannot be swapped between the request and the approval. */
+export interface CacheExtendIntent {
+  /** Target group handles (CacheEntry.cache_group_id). Only `g_…` handles are
+   *  accepted — see cache_policy.isExtendableGroupId. */
+  group_ids: string[];
+  /** Requested TTL in seconds; must be a CACHE_TTL_WHITELIST member. Absolute
+   *  from the moment of approval, not additive. */
+  ttl_s: number;
+  /** Verified Cloudflare Access email of the admin who requested it (audit). */
+  requested_by: string;
+  /** Snapshot of each target group at request time, so the approval page and the
+   *  audit row show what the admin was actually looking at. */
+  preview: CacheExtendPreview[];
+}
+
+export interface CacheExtendPreview {
+  group_id: string;
+  /** Entries live at request time. */
+  live: number;
+  /** Latest expiry across the group at request time (epoch ms). */
+  expires_ms: number;
+  host: string;
+  ip: string;
+}
+
+/** Outcome of committing an approved extension, per group. */
+export interface CacheExtendGroupResult {
+  group_id: string;
+  extended: number;
+  skipped: Record<string, number>;
+  /** New latest expiry across the group, or null if nothing moved. */
+  expires_ms: number | null;
+}
+
+// ── Admin cache listing ────────────────────────────────────────────────────
+
+/** One row of the admin cache tab: all entries written by ONE approval under one
+ *  binding ctx. Deliberately carries NO secret material — no sealed blob, no
+ *  binding ctx digest, and no salts (the ctx digest plus a known IP would turn
+ *  the listing into an offline oracle for the client-reported `pwd`). */
+export interface CacheGroupSummary {
+  group_id: string;
+  /** Audit token_id of the approval that armed this cache. */
+  origin_token_id: string;
+  entries: number;
+  live: number;
+  /** Earliest / latest expiry across the group (epoch ms). */
+  min_expires_ms: number;
+  max_expires_ms: number;
+  /** Entry creation time (epoch ms); null for pre-migration entries. */
+  created_ms: number | null;
+  /** Absolute ceiling this group can ever be extended to; null when unknown
+   *  (legacy) — the UI shows the remaining extendable headroom from it. */
+  lifetime_ceiling_ms: number | null;
+  /** Worker-derived source IP the entries are bound to. */
+  ip: string;
+  ppid: number;
+  ppid_cmd: string;
+  /** Joined from the origin audit row (same fields the audit tab already shows
+   *  on the same Access gate). */
+  host: string | null;
+  user: string | null;
+  pwd: string | null;
+  command: string | null;
+  finalized_ms: number | null;
+  cache_ttl_s: number | null;
+  /** False when entries in the group disagree on their origin/creation/IP — such
+   *  a group is clearable but never extendable (we refuse to guess which record
+   *  the human meant). */
+  consistent: boolean;
+  /** True when this group may be targeted by an extension request. */
+  extendable: boolean;
+  /** Why not, when extendable is false. */
+  reason: string | null;
+}
+
+export interface CacheListResponse {
+  groups: CacheGroupSummary[];
+  /** Server clock, so the UI counts down against the same time base that
+   *  enforces expiry (a skewed browser clock cannot invent liveness). */
+  now_ms: number;
+  /** Entries scanned to build this listing. */
+  scanned: number;
+  /** True when the scan hit its cap — some groups are NOT shown. Never silently
+   *  truncate: the UI must say so, and 清除全部 still covers everything. */
+  truncated: boolean;
+  /** Whether extension requests are enabled (CACHE_ADMIN_EXTEND). */
+  extend_enabled: boolean;
+  /** TTL options (seconds) an extension may request. */
+  ttl_options_s: number[];
+  /** MAX_CACHE_LIFETIME_MS, so the UI can explain the ceiling. */
+  max_lifetime_ms: number;
 }
 
 /** Handle to edit a sent Slack App message in place: `channel` is the resolved
@@ -321,6 +442,17 @@ export interface CacheEntry {
   ip: string;
   ppid: number;
   ppid_cmd: string;
+  /** `g_…` handle minted once per writeCache call (one approval, one binding
+   *  ctx). This — not the truncated origin_token_id — is what an extension
+   *  selects on: a mutation that GRANTS authority needs an unambiguous key of its
+   *  own. ABSENT on pre-migration entries, which stay listable/clearable but are
+   *  never extendable (see cache_policy.groupIdOf). */
+  cache_group_id?: string;
+  /** When the phone approval created this entry (epoch ms). Immutable — an
+   *  extension moves expires_ms only, so created_ms remains the anchor for the
+   *  absolute lifetime ceiling. ABSENT on pre-migration entries, which therefore
+   *  cannot be extended (their total exposure could not be bounded). */
+  created_ms?: number;
 }
 
 // ── Agent audit push (SSH-agent → Worker) ──────────────────────────────────
@@ -426,6 +558,39 @@ export interface DoApproveOp {
 export interface DoDekCacheOp {
   daemon_pubkey_b64u: string;
   salts_b64u: string[];
+  meta: ChallengeMeta;
+}
+
+/** Internal DO op for POST /{ADMIN_SEG}/api/cache-extend-request. The Worker has
+ *  already passed the Cloudflare Access gate; it forwards the VERIFIED admin
+ *  identity and the connecting IP, never anything client-claimed. The DO builds
+ *  the ceremony (tokens, challenge hashes, immutable intent) itself, so a request
+ *  and its approval cannot disagree about what is being extended. */
+export interface DoCacheExtendCreateOp {
+  group_ids: unknown;
+  ttl_s: unknown;
+  /** Verified Cloudflare Access email (access.ts sets it after JWT verify). */
+  admin_email: string;
+  /** CF-Connecting-IP of the admin browser (display/audit only). */
+  admin_ip: string;
+}
+
+/** Response of a successful cache-extend-request: a pending ceremony that does
+ *  nothing until a Passkey approves it. */
+export interface CacheExtendCreateResponse {
+  approve_token: string;
+  approve_url: string;
+  /** Human-readable summary shown on the approval page and in the audit row. */
+  summary: string;
+  /** Groups accepted into the ceremony. */
+  targets: CacheExtendPreview[];
+  /** Requested group ids that were dropped, with the reason. */
+  rejected: Array<{ group_id: string; reason: string }>;
+  /** The ceremony's display meta. Returned so the Worker edge can fan the request
+   *  out to the STATELESS push channels (Pushover / Slack webhook, which
+   *  index.ts owns) exactly like a decrypt request — an authority-granting
+   *  request should be at least as visible as a routine one. The DO already sent
+   *  the stateful, editable Feishu / Slack App cards itself. */
   meta: ChallengeMeta;
 }
 

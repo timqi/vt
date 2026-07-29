@@ -47,7 +47,28 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   the ciphertext backup back over the target.
 - DEK caching is opt-in, requires `CACHE_SECKEY`, and uses the Worker-selected
   TTLs. A cache hit is not a phone approval; preserve its audit row and IP
-  binding. The real-time 免审批 push (Pushover / Slack / Slack App / Feishu)
+  binding. Every write mints an immutable `cache_group_id` + `created_ms`; both
+  are the anchors the admin surface selects and bounds by, so never rewrite them.
+- The admin cache surface is deliberately asymmetric
+  ([`docs/dek-cache.md`](docs/dek-cache.md)): listing and clearing reduce
+  authority and need only the Cloudflare Access gate, while EXTENDING a cache
+  grants it and must never be reachable from an Access session alone. The extend
+  route only mints a pending ceremony; `expires_ms` moves solely in
+  `commitExtend`, called from `opApprove` after a verified Passkey assertion.
+  Keep all of: whitelisted TTLs only, never resurrect a lapsed entry, never
+  shorten, clamp to `created_ms + MAX_CACHE_LIFETIME_MS` (which must stay equal to
+  the largest whitelisted TTL, so the admin can never out-grant the approver),
+  refuse legacy/inconsistent groups, re-read each entry with no await before the
+  write, and audit both the authorization and the effect. `CACHE_ADMIN_EXTEND` is
+  a kill switch, NOT an authorization — never treat it as one. The arithmetic
+  lives in `cf-worker/src/cache_policy.ts` and is unit-tested; keep it pure.
+- Cache listings must never expose sealed material, salts, or the binding ctx
+  digest (ctx + a known IP is an offline oracle for the client-reported `pwd`),
+  and must report `truncated` rather than silently showing a partial view.
+  `audit.cache_ttl_s` is the TTL the approver CHOSE and is never rewritten;
+  `audit.cache_expires_ms` is the live expiry an extension updates. The admin
+  per-row clear button must render for every cache-armed row — a wrong liveness
+  projection may cost an extra click, but must never hide the only revoke path. The real-time 免审批 push (Pushover / Slack / Slack App / Feishu)
   is separately opt-in via the `CACHE_HIT_NOTIFY` var and off by default —
   it is too noisy on busy hosts. Never make the audit row conditional on it.
 - `auth@vt` and `run@vt` always require a fresh approval. Do not add them to
@@ -92,8 +113,11 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   `--ui-token-fd` (never env/argv/file; constant-time compare; no token ⇒
   every request fails unstructured). It never resets the idle clock, is never
   audit-pushed, and its only actions are `status` and the authority-reducing
-  `revoke_all` — no action may grant, extend, or approve. The relay filter
-  must keep refusing it. Grant `display` labels are memory-only.
+  `revoke_all` — no action may grant, extend, or approve. (This is the AGENT's
+  unauthenticated UI channel and stays authority-reducing-only; it is not the
+  Worker's Passkey-gated cache extension, which is a separate surface with its own
+  ceremony.) The relay filter must keep refusing it. Grant `display` labels are
+  memory-only.
 - The master-key wrap is versioned (`KeychainStore.wrap_v`): new stores are
   always wrap v2 (path-independent `vt-wrap-v2` label); v1 stores upgrade
   transparently at agent startup via the flock-guarded minimal mutator that

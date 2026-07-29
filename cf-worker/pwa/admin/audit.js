@@ -114,8 +114,11 @@
     if (row.op_kind === 'cache') {
       if (row.status === 'approved') return 'DEK缓存自动审批';
       if (row.status === 'write_failed') return 'DEK缓存写入失败';
+      if (row.status === 'extended') return 'DEK缓存已延长';
       return 'DEK缓存';
     }
+    // The admin-requested, Passkey-approved cache extension ceremony.
+    if (row.op_kind === 'cache-extend') return '延长DEK缓存(审批)';
     return row.op_kind || '';
   }
 
@@ -125,8 +128,10 @@
     // Cache rows render a distinct, self-explaining badge instead of a bare
     // "approved" (which would look like a normal phone approval).
     if (row.op_kind === 'cache') {
-      span.className = 'badge badge-' + (s === 'write_failed' ? 'rejected' : 'approved');
-      span.textContent = (s === 'write_failed') ? '缓存写入失败' : '缓存命中';
+      span.className = 'badge badge-' + (s === 'write_failed' ? 'rejected'
+        : s === 'extended' ? 'expired' : 'approved');
+      span.textContent = (s === 'write_failed') ? '缓存写入失败'
+        : (s === 'extended') ? '缓存已延长' : '缓存命中';
       return span;
     }
     span.className = 'badge badge-' + s;
@@ -163,9 +168,13 @@
       cc.textContent = '—';
     }
     tr.appendChild(cc);
-    // 操作: a "清除缓存" button on approvals that armed a still-live cache.
+    // 操作: a "清除缓存" button on EVERY approval that ever armed a cache — not
+    // just ones this view believes are still live. Liveness here is a projection
+    // (and, for a pre-migration row, an inference); if it is ever wrong, an extra
+    // clear click is harmless, whereas hiding the button would leave a live cache
+    // unrevokable from this page. Fail toward being able to revoke.
     var act = document.createElement('td');
-    if (live) {
+    if (armedCache(r)) {
       var btn = document.createElement('button');
       btn.type = 'button'; btn.className = 'danger small'; btn.textContent = '清除缓存';
       btn.addEventListener('click', function (e) { e.stopPropagation(); clearOrigin(r.token_id, btn); });
@@ -263,12 +272,24 @@
     applyRow(r);
   }
 
-  // A row "has a live cache" when it armed one (cache_ttl_s>0) and that window
-  // hasn't elapsed. Cache-event rows (op_kind='cache') themselves are excluded.
-  function hasLiveCache(r) {
+  // Did this row ever arm a DEK cache? Cache-event rows (op_kind='cache') are
+  // themselves excluded — they are consumption logs, not grants.
+  function armedCache(r) {
     return r.op_kind !== 'cache'
-      && typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0
-      && typeof r.finalized_ms === 'number'
+      && typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0;
+  }
+
+  // A row "has a live cache" when it armed one and that window hasn't elapsed.
+  //
+  // Prefer cache_expires_ms — the server's record of the ACTUAL expiry, which an
+  // approved extension updates. Only fall back to finalized_ms + cache_ttl_s for
+  // pre-migration rows (NULL column): that inference is wrong for any extended
+  // entry, which is why the column exists. cache_ttl_s keeps its original meaning
+  // (the TTL the approver chose) and is never rewritten by an extension.
+  function hasLiveCache(r) {
+    if (!armedCache(r)) return false;
+    if (typeof r.cache_expires_ms === 'number') return r.cache_expires_ms > Date.now();
+    return typeof r.finalized_ms === 'number'
       && (r.finalized_ms + r.cache_ttl_s * 1000 > Date.now());
   }
 
@@ -336,6 +357,9 @@
     addRow(dl, 'IP', r.ip);
     addRow(dl, 'DEK 数', r.salts);
     if (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) addRow(dl, '缓存 TTL', cacheTtlLabel(r.cache_ttl_s));
+    // Actual expiry (updated by an approved extension); shown alongside the
+    // originally-approved TTL so an extended row is self-explaining.
+    if (typeof r.cache_expires_ms === 'number') addRow(dl, '缓存到期', fmtTime(r.cache_expires_ms));
     addRow(dl, '命令', r.command, true);
     addRow(dl, '原因', r.reason);
     addRow(dl, '创建时间', fmtTime(r.created_ms));

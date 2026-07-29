@@ -60,6 +60,14 @@ ACCESS_AUD = "<YOUR_ACCESS_APPLICATION_AUD_TAG>"
 # messages that need a tap. Audit rows are written either way, so cache hits
 # stay visible on the admin audit page.
 CACHE_HIT_NOTIFY = "0"
+# Admin-requested DEK-cache extension (the「延长」buttons on the admin DEK 缓存
+# tab). Off unless set to 1/true/on/yes. This is a KILL SWITCH, not an
+# authorization: even when on, extending requires a fresh phone Passkey approval,
+# may only request a whitelisted TTL (20m/2h/8h), can never revive an entry that
+# already lapsed, and can never push one past 8h from its creation. Off means the
+# capability does not exist — the routes 404 and the UI hides the controls.
+# Listing and clearing cached DEKs are unaffected (they only reduce authority).
+CACHE_ADMIN_EXTEND = "0"
 
 # Secrets (wrangler secret put — never inlined):
 #   VT_AUTH_CF        32-byte base64url token, daemon→Worker HMAC on /api/challenge

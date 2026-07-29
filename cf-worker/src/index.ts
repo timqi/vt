@@ -16,7 +16,7 @@ import { parsePushoverConfig } from './pushover';
 import { parseSlackConfig } from './slack';
 import { parseSlackAppConfig } from './slack_app';
 import { parseFeishuConfig } from './feishu';
-import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp } from './types';
+import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, CacheExtendCreateResponse } from './types';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess, type AccessVars } from './access';
 
@@ -48,7 +48,7 @@ const ADMIN_SEG = 'kestrel';
 // stale far-future-cached copy. (Workers Assets serves static files with a
 // cacheable response; without a versioned URL a changed audit.js can refresh
 // while admin.css stays stale, which desyncs markup from styles.)
-const ASSET_VER = '20260706-1';
+const ASSET_VER = '20260729-1';
 
 // Escape a JSON string for safe embedding in a <script type="application/json"> block.
 function escapeJsonForHtml(obj: unknown): string {
@@ -165,6 +165,13 @@ app.get(`/${ADMIN_SEG}/audit`, (c) => {
   return resp;
 });
 
+// DEK-cache page (HTML shell; data from /api/cache-list).
+app.get(`/${ADMIN_SEG}/cache`, (c) => {
+  const resp = c.html(buildCachePage());
+  resp.headers.set('Content-Security-Policy', STRICT_CSP);
+  return resp;
+});
+
 // Setup page (client-side CREDENTIALS_JSON generator). The current
 // CREDENTIALS_JSON secret is injected into the page so add/revoke read it
 // directly from the env binding (no manual paste). It carries only wrapped
@@ -231,6 +238,73 @@ app.post(`/${ADMIN_SEG}/api/cache-clear-origin`, async (c) => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ token_id: body.token_id }),
   });
+});
+
+// Cache inventory — what is actually cached right now, grouped by the approval
+// that armed it. Read-only. `no-store` because the payload is live security state
+// (an intermediary or a back-button replay must not resurrect a stale view of what
+// is decryptable without a phone tap).
+app.get(`/${ADMIN_SEG}/api/cache-list`, async (c) => {
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  const resp = await stub.fetch('https://account.do/op/cache-list');
+  const out = new Response(resp.body, resp);
+  out.headers.set('Cache-Control', 'no-store');
+  return out;
+});
+
+// Bulk clear by group — authority-REDUCING, so the Access gate alone is enough.
+app.post(`/${ADMIN_SEG}/api/cache-clear-groups`, async (c) => {
+  let body: { group_ids?: unknown };
+  try { body = await c.req.json(); }
+  catch { return c.text('invalid json', 400); }
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  return stub.fetch('https://account.do/op/cache-clear-groups', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ group_ids: body.group_ids }),
+  });
+});
+
+// REQUEST a cache extension. Unlike every other admin action this one GRANTS
+// authority (it prolongs no-phone-in-the-loop decrypts), so the Access gate is
+// explicitly NOT sufficient: this endpoint only mints a pending Passkey ceremony,
+// and nothing expires later until that ceremony is approved. The verified Access
+// identity is forwarded for the audit trail — the body cannot claim it.
+app.post(`/${ADMIN_SEG}/api/cache-extend-request`, async (c) => {
+  let body: { group_ids?: unknown; ttl_s?: unknown };
+  try { body = await c.req.json(); }
+  catch { return c.text('invalid json', 400); }
+  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
+  const doResp = await stub.fetch('https://account.do/op/cache-extend-create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      group_ids: body.group_ids,
+      ttl_s: body.ttl_s,
+      admin_email: c.get('accessEmail') ?? '',
+      admin_ip: c.req.header('CF-Connecting-IP') ?? '',
+    }),
+  });
+  if (!doResp.ok) return doResp;
+  // Fan the pending request out to the STATELESS channels too (the DO already
+  // sent the editable Feishu / Slack App cards). An extension request is the one
+  // admin action that grants authority, so it should be at least as visible on
+  // the notification channels as a routine decrypt — including to an operator who
+  // did NOT initiate it. Never fatal: the ceremony already exists.
+  let created: CacheExtendCreateResponse;
+  try { created = await doResp.clone().json() as CacheExtendCreateResponse; }
+  catch { return doResp; }
+  const pushWarning = await notifyApproval(
+    c.env, created.meta.op_kind, created.meta, created.approve_url, 0);
+  if (pushWarning) {
+    logErr('notify.failed', pushWarning, { at: tokenPrefix(created.approve_token) });
+  }
+  log('cache.extend_request', {
+    at: tokenPrefix(created.approve_token),
+    by: created.meta.user,
+    groups: created.targets.length,
+  });
+  return doResp;
 });
 
 // POST clear-cache — emergency revocation: drop ALL cached DEKs now. Access-gated.
@@ -617,11 +691,11 @@ function buildApprovePage(data: ApprovePageData): string {
 
 // Tab bar shared by all admin pages. Every tab carries equal weight; `active`
 // marks the current one.
-type AdminTab = 'audit' | 'setup' | 'channels';
+type AdminTab = 'audit' | 'cache' | 'setup' | 'channels';
 function adminTabs(active: AdminTab): string {
   const tab = (href: string, key: AdminTab, label: string) =>
     `<a class="tab${key === active ? ' active' : ''}" href="${href}"${key === active ? ' aria-current="page"' : ''}>${label}</a>`;
-  return `<nav class="tabs">${tab(`/${ADMIN_SEG}/audit`, 'audit', '审计')}${tab(`/${ADMIN_SEG}/setup`, 'setup', 'Passkey')}${tab(`/${ADMIN_SEG}/channels`, 'channels', '推送渠道')}</nav>`;
+  return `<nav class="tabs">${tab(`/${ADMIN_SEG}/audit`, 'audit', '审计')}${tab(`/${ADMIN_SEG}/cache`, 'cache', 'DEK 缓存')}${tab(`/${ADMIN_SEG}/setup`, 'setup', 'Passkey')}${tab(`/${ADMIN_SEG}/channels`, 'channels', '推送渠道')}</nav>`;
 }
 
 function buildAuditPage(): string {
@@ -678,6 +752,69 @@ function buildAuditPage(): string {
   <script src="/pwa/common.js"></script>
   <script src="/pwa/approve.js?v=${ASSET_VER}"></script>
   <script src="${base}/pwa/audit.js?v=${ASSET_VER}"></script>
+</body>
+</html>`;
+}
+
+// DEK-cache inventory page. Lists what is cached right now (grouped by the
+// approval that armed it), with per-group and bulk clear, and — when
+// CACHE_ADMIN_EXTEND is on — an extension request that opens a Passkey ceremony
+// inline. The ceremony deps are the SAME /pwa/* scripts the approval page and the
+// audit tab's inline modal use; no forked ceremony logic.
+function buildCachePage(): string {
+  const base = `/${ADMIN_SEG}`;
+  return `<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>VT — DEK 缓存</title>
+  ${FAVICON_TAGS}
+  <link rel="stylesheet" href="${base}/pwa/admin.css?v=${ASSET_VER}">
+</head>
+<body>
+  <main>
+    ${adminTabs('cache')}
+    <p class="hint">当前<strong>真实存在</strong>的 DEK 缓存（按授予它的那次审批分组）。在有效期内，持有 <code>VT_PASSKEY_TOKEN</code> 且来源 IP 与工作目录一致的调用者可<strong>免手机审批</strong>解密这些记录，所以此处的每一行都是一份仍然生效的授权。清除立即生效；<strong>延长必须经手机 Passkey 重新批准</strong>，且不得超过缓存创建后的总时长上限。</p>
+    <section id="filters">
+      <label>状态 <select id="f-live">
+        <option value="live">仅有效</option>
+        <option value="">全部（含已过期未清理）</option>
+      </select></label>
+      <label>主机 <input id="f-host" type="text" placeholder="host"></label>
+      <button id="refresh" type="button">刷新</button>
+      <span class="filter-spacer"></span>
+      <div class="filter-danger">
+        <button id="clear-selected" type="button" class="danger">清除选中</button>
+        <button id="clear-all-cache" type="button" class="danger">清除全部</button>
+      </div>
+    </section>
+    <section id="bulkbar" hidden>
+      <span id="bulk-count" class="badge"></span>
+      <label id="extend-ttl-label">延长时长 <select id="extend-ttl"></select></label>
+      <button id="extend-selected" type="button">申请延长（需 Passkey）</button>
+      <span id="extend-note" class="hint"></span>
+    </section>
+    <div id="table-wrap"><table id="cache"><thead><tr>
+      <th class="col-pick"><input id="pick-all" type="checkbox" aria-label="全选"></th>
+      <th>主机</th><th>用户 / 目录</th><th>命令</th><th>IP</th><th>条目</th><th>剩余</th><th>可延长至</th><th>操作</th>
+    </tr></thead><tbody id="rows"></tbody></table></div>
+    <section id="actions">
+      <span id="status" role="status" aria-live="polite"></span>
+    </section>
+  </main>
+  <div id="detail-backdrop" hidden><div id="detail-card" role="dialog" aria-modal="true">
+    <button id="detail-close" type="button" aria-label="关闭">×</button>
+    <h2>延长 DEK 缓存</h2>
+    <dl id="detail-dl"></dl>
+    <p class="warn">⚠️ 批准即延长这些缓存的免审批解密窗口。请确认上面的主机、IP 与条目数符合预期。</p>
+    <div id="detail-approve"></div>
+  </div></div>
+  <!-- Passkey ceremony deps (root /pwa/*, public), identical to the audit tab. -->
+  <script src="/pwa/libsodium.js"></script>
+  <script src="/pwa/common.js"></script>
+  <script src="/pwa/approve.js?v=${ASSET_VER}"></script>
+  <script src="${base}/pwa/cache.js?v=${ASSET_VER}"></script>
 </body>
 </html>`;
 }
