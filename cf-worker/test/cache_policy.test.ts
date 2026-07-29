@@ -21,14 +21,37 @@ describe('policy constants', () => {
   it('offers the multi-day rungs only for extension', () => {
     expect(extendTtlOptions()).toEqual([
       20 * 60, 2 * 60 * 60, 8 * 60 * 60, 24 * 3600, 2 * 24 * 3600, 7 * 24 * 3600,
+      100 * 365 * 24 * 3600,
     ]);
+  });
+
+  // "Permanent" is a finite far-future TTL on purpose: every consumer (read check,
+  // sweeper, audit, countdown) keeps working with no special case. Guard the two
+  // properties that makes it depend on — it must stay a plain number, and the
+  // resulting expiry must stay inside the safe-integer range for the next century.
+  it('expresses permanence as a finite, safe magnitude', () => {
+    const perm = 100 * 365 * 24 * 3600;
+    expect(isAllowedExtendTtl(perm)).toBe(true);
+    expect(Number.isFinite(perm)).toBe(true);
+    const p = planExtend({ expires_ms: NOW + MIN }, perm, NOW);
+    expect(p).toEqual({ ok: true, expires_ms: NOW + perm * 1000 });
+    if (p.ok) {
+      expect(p.expires_ms).toBeLessThan(Number.MAX_SAFE_INTEGER);
+      expect(new Date(p.expires_ms).getUTCFullYear()).toBeGreaterThan(2100);
+    }
+  });
+
+  // It must never be armable straight from a phone tap — the multi-day and
+  // permanent rungs exist only behind the deliberate extension ceremony.
+  it('never lets a phone approval arm the permanent rung', () => {
+    expect(isAllowedApproveTtl(100 * 365 * 24 * 3600)).toBe(false);
   });
 
   // The per-hop cap is derived from the extend ladder, so trimming the ladder
   // shortens the longest single grant automatically.
   it('derives the per-hop cap from the extend ladder', () => {
     expect(MAX_EXTEND_TTL_MS).toBe(Math.max(...EXTEND_TTL_WHITELIST) * 1000);
-    expect(MAX_EXTEND_TTL_MS).toBe(7 * 24 * 3600 * 1000);
+    expect(MAX_EXTEND_TTL_MS).toBe(100 * 365 * 24 * 3600 * 1000);
     expect(MAX_EXTEND_TTL_MS).toBeGreaterThan(Math.max(...APPROVE_TTL_WHITELIST) * 1000);
   });
 

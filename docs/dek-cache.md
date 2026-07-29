@@ -9,18 +9,29 @@ TTL, a caller can decrypt the approved records without another phone tap.
 - Approve-time TTL choices are `0`, `20m`, `2h`, and `8h`. `0` is the default and
   means no cache write. This ladder is deliberately short: the tap happens on a
   phone, in a hurry, and a mis-tap widens the window for the whole batch.
-- The admin extension ladder is a superset — `20m`, `2h`, `8h`, `1d`, `2d`, `1w` —
+- The admin extension ladder is a superset — `20m`, `2h`, `8h`, `1d`, `2d`, `1w`,
+  plus a 100-year rung that is permanent in practice —
   because an extension is a deliberate, desk-bound act on named live entries,
   reviewed on the approval page before the tap. The multi-day rungs also make the
   feature useful at all: with the ceiling pinned to `8h`, an `8h` grant sat at its
   ceiling from birth and every extension of it was a no-op.
 - The cap is **per operation, not per lifetime**: one extension sets expiry to
-  `now + chosen TTL` (max 1w), and an entry may be renewed indefinitely — one
+  `now + chosen TTL`, and an entry may be renewed indefinitely — one
   Passkey-approved hop at a time. `MAX_EXTEND_TTL_MS` follows the ladder, so
   trimming `EXTEND_TTL_WHITELIST` shortens the longest single hop.
 - What bounds renewal is **liveness, not a budget**: an extension can only continue
   a window that has not yet lapsed. Once a cache expires it is gone for good and
   only a fresh phone approval can arm a new one.
+- The 100-year rung deliberately gives up that bound for the records it is applied
+  to. It is a FINITE far-future expiry (year ~2126), not a null/Infinity sentinel,
+  so `opDekCache`'s read check, the alarm sweep, `audit.cache_expires_ms`, and the
+  admin countdown all stay on their normal code path — expiry logic is where a
+  missed special case becomes a cache that outlives its revocation. Nothing revokes
+  such an entry but an explicit admin clear or rotating `CACHE_SECKEY`, it is never
+  swept, and there is no expiry to prompt a future review; pair it with
+  `CACHE_HIT_NOTIFY = "1"` so each no-tap decrypt stays visible somewhere. The UI
+  renders it with the ordinary duration formatter (`36500 天`) rather than a special
+  "permanent" label, so no reader has to trust a word over a number.
 - Caching is enabled only when the Worker secret `CACHE_SECKEY` is configured.
   There is no `VT_DEK_CACHE` environment variable and no separate client-side
   no-cache flag.

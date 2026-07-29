@@ -28,10 +28,27 @@ export const APPROVE_TTL_WHITELIST = new Set([20 * 60, 2 * 60 * 60, 8 * 60 * 60]
 // decoration.
 export const EXTEND_TTL_WHITELIST = new Set([
   20 * 60, 2 * 60 * 60, 8 * 60 * 60,
-  24 * 60 * 60,        // 1d
-  2 * 24 * 60 * 60,    // 2d
-  7 * 24 * 60 * 60,    // 1w
+  24 * 60 * 60,          // 1d
+  2 * 24 * 60 * 60,      // 2d
+  7 * 24 * 60 * 60,      // 1w
+  100 * 365 * 24 * 3600, // effectively permanent — see below
 ]);
+
+// The "permanent" rung is a FINITE 100-year TTL, deliberately not a null/Infinity
+// sentinel. An unbounded expiry would need a special case in every consumer —
+// opDekCache's `expires_ms <= now` read check, the alarm sweep, audit
+// cache_expires_ms, the admin countdown — and expiry logic is exactly where a
+// missed branch becomes a cache that outlives its revocation. A far-future
+// timestamp keeps all of those paths on their normal course: it simply never
+// arrives (year ~2126, and ~4.9e12 ms stays well inside both the safe-integer
+// range and SQLite INTEGER).
+//
+// SECURITY NOTE: this rung opts a record OUT of the phone-approval premise for
+// practical purposes. Liveness is what bounds every other rung — stop approving and
+// the capability dies on its own — and an entry on this one never lapses, so
+// nothing revokes it but an explicit admin clear or rotating CACHE_SECKEY, and it
+// is never swept. There is also no expiry to prompt a future review. Consider
+// CACHE_HIT_NOTIFY=1 alongside it so each no-tap decrypt remains visible somewhere.
 
 // The cap is PER OPERATION, not per entry lifetime: one extension may move expiry
 // to at most `now + max(EXTEND_TTL_WHITELIST)`. Total lifetime is deliberately

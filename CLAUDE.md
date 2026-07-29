@@ -72,7 +72,13 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
 - Two TTL ladders, one rule — a TTL is legal only if some PASSKEY ceremony offers
   it. `APPROVE_TTL_WHITELIST` (20m/2h/8h) guards `writeCache`, so a tampered
   approve body cannot arm a multi-day cache without the extension ceremony;
-  `EXTEND_TTL_WHITELIST` (adds 1d/2d/1w) guards extension requests.
+  `EXTEND_TTL_WHITELIST` (adds 1d/2d/1w and a 100-year, effectively-permanent rung)
+  guards extension requests. That rung MUST stay a finite far-future TTL, never a
+  null/Infinity sentinel: a sentinel would need a branch in the read check, the
+  sweep, the audit column, and the countdown, and a missed branch there is a cache
+  that survives its own revocation. It is also the one rung that forfeits the
+  liveness bound — an entry on it never lapses, so only an explicit clear or a
+  `CACHE_SECKEY` rotation revokes it.
   `MAX_EXTEND_TTL_MS` (the largest single hop) must stay COMPUTED from the extend
   ladder, never hardcoded, so trimming the ladder shortens the hop automatically. `CACHE_ADMIN_EXTEND` is
   a kill switch, NOT an authorization — never treat it as one. The arithmetic
