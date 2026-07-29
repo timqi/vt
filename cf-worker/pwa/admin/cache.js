@@ -75,15 +75,27 @@
     var mins = Math.floor(ms / 60000);
     if (mins < 1) return '< 1 分钟';
     if (mins < 60) return mins + ' 分钟';
+    // Roll over to days past 24h: with a one-week ceiling, "167 小时 47 分" is a
+    // number an operator has to do arithmetic on before they can judge the risk.
+    if (mins >= 1440) {
+      var d = Math.floor(mins / 1440), dh = Math.floor((mins % 1440) / 60);
+      return d + ' 天' + (dh ? ' ' + dh + ' 小时' : '');
+    }
     var h = Math.floor(mins / 60), m = mins % 60;
     return h + ' 小时' + (m ? ' ' + m + ' 分' : '');
   }
 
   function ttlLabel(s) {
+    if (s % 604800 === 0) return (s / 604800) + ' 周';
+    if (s % 86400 === 0) return (s / 86400) + ' 天';
     if (s % 3600 === 0) return (s / 3600) + ' 小时';
     if (s % 60 === 0) return (s / 60) + ' 分钟';
     return s + ' 秒';
   }
+
+  // A multi-day window is a materially different exposure from a workday one, so
+  // the picker says so instead of letting "1 周" read like just another option.
+  function ttlIsLong(s) { return s >= 86400; }
 
   // Why a group cannot be extended, in the operator's language. These mirror the
   // server's reason codes 1:1 (do_account.opCacheList) — the server decides, the
@@ -98,17 +110,38 @@
     gone: '已被清除',
   };
 
+  // Cosmetic, FRONTEND-ONLY (same rule as the audit tab): if the command's leading
+  // program is an absolute path, show just its basename, so a row reads
+  // `gh pr view 1064 …` instead of `/home/qiqi/.local/bin/gh pr view …` — which
+  // ate the whole column. Only argv[0] is trimmed; path-valued arguments stay
+  // intact so the command remains unambiguous.
+  function basenameLeadingProgram(s) {
+    var m = /^(\s*)(\/\S*)(.*)$/.exec(s);
+    if (!m) return s;
+    var prog = m[2];
+    var base = prog.slice(prog.lastIndexOf('/') + 1);
+    if (base === '') return s;
+    return m[1] + base + m[3];
+  }
+
   function commandSummary(cmd, max) {
     if (!cmd) return '';
     var lines = String(cmd).split('\n');
+    var pick = lines[0];
     for (var i = 0; i < lines.length; i++) {
-      if (lines[i].indexOf('cmd:') === 0) {
-        var v = lines[i].slice(4).trim();
-        return v.length > max ? v.slice(0, max) + '…' : v;
-      }
+      if (lines[i].indexOf('cmd:') === 0) { pick = lines[i].slice(4).trim(); break; }
     }
-    var first = lines[0];
-    return first.length > max ? first.slice(0, max) + '…' : first;
+    var v = basenameLeadingProgram(pick);
+    return v.length > max ? v.slice(0, max) + '…' : v;
+  }
+
+  // Shorten a long path for the sub-line: keep the last two segments, which is
+  // what identifies the working tree (…/code/dev/avibe), not the mount prefix.
+  function shortPath(p) {
+    if (!p) return '';
+    var parts = String(p).split('/').filter(Boolean);
+    if (parts.length <= 2) return p;
+    return '…/' + parts.slice(-2).join('/');
   }
 
   // ── Filtering (client-side; the listing is one bounded snapshot) ───────────
@@ -125,6 +158,26 @@
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
+
+  // Two-line cell: a primary value plus a muted secondary line. Halves the column
+  // count so the action buttons and the extendability reason stay on screen at
+  // laptop width instead of hiding behind a horizontal scroll.
+  function cell2(tr, main, sub, opts) {
+    opts = opts || {};
+    var td = document.createElement('td');
+    var m = el('div', 'cell-main' + (opts.mainCls ? ' ' + opts.mainCls : ''), main || '—');
+    if (opts.mainTitle) m.title = opts.mainTitle;
+    td.appendChild(m);
+    if (sub != null && sub !== '') {
+      var s = el('div', 'cell-sub' + (opts.subCls ? ' ' + opts.subCls : ''), sub);
+      if (opts.subTitle) s.title = opts.subTitle;
+      td.appendChild(s);
+    } else if (opts.subNode) {
+      td.appendChild(opts.subNode);
+    }
+    tr.appendChild(td);
+    return td;
+  }
 
   function renderRow(g) {
     var t = now();
@@ -146,47 +199,52 @@
     pickTd.appendChild(pick);
     tr.appendChild(pickTd);
 
-    cellClipped(tr, g.host || '—', 'col-host');
-    cellClipped(tr, (g.user || '?') + (g.pwd ? ' · ' + g.pwd : ''), 'col-cmd');
-    cellClipped(tr, commandSummary(g.command, 200), 'col-cmd');
-    cell(tr, g.ip);
-    // 条目: live / total, so a partially-swept group is visible as such.
-    cell(tr, g.live + (g.entries !== g.live ? ' / ' + g.entries : ''));
+    // 目标: host over user · directory. The full directory is the hover title —
+    // it is half the cache binding, so it must stay inspectable.
+    cell2(tr, g.host || '—',
+      (g.user || '?') + (g.pwd ? ' · ' + shortPath(g.pwd) : ''),
+      { mainCls: 'trunc-host', mainTitle: g.host || '',
+        subCls: 'trunc-sub', subTitle: (g.user || '') + (g.pwd ? '  ' + g.pwd : '') });
 
-    var rem = cell(tr, fmtRemaining(g.max_expires_ms - t));
-    if (!live) rem.className = 'cache-expired';
-    else rem.title = '有效期至 ' + fmtTime(g.max_expires_ms);
+    // 命令: the command over the bound source IP (the hard half of the binding).
+    cell2(tr, commandSummary(g.command, 120), g.ip,
+      { mainCls: 'trunc-cmd', mainTitle: g.command || '', subCls: 'mono' });
 
-    // 可延长至: the absolute ceiling, i.e. how much headroom an extension has.
-    // Showing the cap next to the remaining time is the whole point — it makes
-    // "extend" visibly bounded rather than open-ended.
-    var capTd = document.createElement('td');
-    if (g.lifetime_ceiling_ms) {
-      var headroom = g.lifetime_ceiling_ms - t;
-      capTd.textContent = headroom > 0 ? fmtRemaining(headroom) : '已达上限';
-      capTd.title = '上限 ' + fmtTime(g.lifetime_ceiling_ms);
-      if (headroom <= 0) capTd.className = 'cache-expired';
-    } else {
-      capTd.textContent = '—';
-      capTd.className = 'cache-expired';
+    // 条目: live count, with the swept-but-present total only when they differ.
+    cell2(tr, String(g.live), g.entries !== g.live ? '共 ' + g.entries : '',
+      { mainCls: 'col-num' }).className = 'col-num';
+
+    // 剩余 / 余量: remaining window on top; below it either the extendable
+    // headroom or — critically — WHY this group cannot be extended. The reason
+    // used to live only in the far-right action cell, which scrolled off screen,
+    // so the page never explained itself.
+    var remTd = cell2(tr, live ? fmtRemaining(g.max_expires_ms - t) : '已过期', '',
+      { mainCls: live ? '' : 'cache-expired',
+        mainTitle: live ? '有效期至 ' + fmtTime(g.max_expires_ms) : '' });
+    var sub;
+    if (!meta.extend_enabled) {
+      sub = null;                                   // extension off: no promise to explain
+    } else if (g.extendable && g.lifetime_ceiling_ms) {
+      sub = el('div', 'cell-sub', '余 ' + fmtRemaining(g.lifetime_ceiling_ms - t) + '可延长');
+      sub.title = '上限 ' + fmtTime(g.lifetime_ceiling_ms);
+    } else if (g.reason) {
+      sub = el('div', 'cell-sub reason-badge', REASON_TEXT[g.reason] || g.reason);
     }
-    tr.appendChild(capTd);
+    if (sub) remTd.appendChild(sub);
 
     var act = document.createElement('td');
+    act.className = 'col-act';
     var clr = el('button', 'danger small', '清除');
     clr.type = 'button';
+    clr.title = '立即失效这 ' + g.live + ' 条缓存，之后解密需重新手机审批';
     clr.addEventListener('click', function () { clearGroups([g.group_id], clr); });
     act.appendChild(clr);
-    if (meta.extend_enabled) {
-      if (g.extendable) {
-        var ext = el('button', 'small', '延长');
-        ext.type = 'button';
-        ext.addEventListener('click', function () { requestExtend([g.group_id], ext); });
-        act.appendChild(ext);
-      } else if (g.reason && live) {
-        var why = el('span', 'hint reason', REASON_TEXT[g.reason] || g.reason);
-        act.appendChild(why);
-      }
+    if (meta.extend_enabled && g.extendable) {
+      var ext = el('button', 'small ghost', '延长');
+      ext.type = 'button';
+      ext.title = '发起延长审批（需 Passkey 批准）';
+      ext.addEventListener('click', function () { requestExtend([g.group_id], ext); });
+      act.appendChild(ext);
     }
     tr.appendChild(act);
     return tr;
@@ -202,6 +260,18 @@
     syncBulkBar();
     var liveTotal = groups.reduce(function (n, g) { return n + g.live; }, 0);
     var msg = rows.length + ' 组 / 共 ' + liveTotal + ' 条有效缓存';
+    // When extension is on but NOTHING is extendable, say why up front. Without
+    // this the page looks broken: buttons absent, no explanation in view.
+    if (meta.extend_enabled && rows.length > 0) {
+      var extendable = rows.filter(function (g) { return g.extendable; }).length;
+      if (extendable === 0) {
+        var why = {};
+        rows.forEach(function (g) { if (g.reason) why[g.reason] = (why[g.reason] || 0) + 1; });
+        msg += ' · 均不可延长（' + Object.keys(why).map(function (k) {
+          return (REASON_TEXT[k] || k) + ' ×' + why[k];
+        }).join('；') + '）';
+      }
+    }
     if (meta.truncated) {
       msg += ' ⚠ 已扫描 ' + meta.scanned + ' 条并截断，列表不完整（「清除全部」仍覆盖所有条目）';
     }
@@ -241,9 +311,40 @@
     ttlLabelEl.hidden = false;
     extendBtn.hidden = false;
     extendBtn.disabled = extendable === 0;
-    note.textContent = extendable === ids.length
-      ? '批准后自当前时刻起算，且不超过创建后 ' + ttlLabel(Math.floor(meta.max_lifetime_ms / 1000))
-      : extendable + ' / ' + ids.length + ' 组可延长，其余将被忽略';
+    // Build the note additively: a partial selection and a long-window warning are
+    // independent facts, and the earlier version let the former hide the latter —
+    // so picking 1 週 on a mixed selection showed no exposure warning at all.
+    var ttl = selectedTtl();
+    var parts = [];
+    var warn = false;
+    if (extendable === 0) {
+      // Explain the disabled button instead of leaving a dead control on screen.
+      var reasons = {};
+      ids.forEach(function (id) {
+        var r = byGroup[id].reason;
+        if (r) reasons[r] = (reasons[r] || 0) + 1;
+      });
+      parts.push('所选分组均不可延长：' + Object.keys(reasons).map(function (k) {
+        return (REASON_TEXT[k] || k) + ' ×' + reasons[k];
+      }).join('；'));
+      warn = true;
+    } else {
+      if (extendable < ids.length) {
+        parts.push('仅 ' + extendable + ' / ' + ids.length + ' 组可延长，其余将被忽略');
+        warn = true;
+      }
+      // A multi-day pick is a materially larger exposure than a workday one. The
+      // approval page states it too, but say it before the request is even made.
+      if (ttlIsLong(ttl)) {
+        parts.push('⚠ ' + ttlLabel(ttl) + '内这 ' + extendable
+          + ' 组记录的解密将持续免手机审批（同一来源 IP + 工作目录）');
+        warn = true;
+      }
+      parts.push('自批准时刻起算，最长不超过创建后 '
+        + ttlLabel(Math.floor(meta.max_lifetime_ms / 1000)));
+    }
+    note.textContent = parts.join('；');
+    note.className = warn ? 'hint warn' : 'hint';
   }
 
   // ── Load ──────────────────────────────────────────────────────────────────
@@ -429,6 +530,8 @@
   document.getElementById('refresh').addEventListener('click', function () { load(); });
   document.getElementById('f-live').addEventListener('change', render);
   document.getElementById('f-host').addEventListener('input', render);
+  // Re-run the note so the multi-day warning appears the moment 1d/2d/1w is picked.
+  document.getElementById('extend-ttl').addEventListener('change', syncBulkBar);
 
   document.getElementById('pick-all').addEventListener('change', function () {
     var on = this.checked;

@@ -48,7 +48,7 @@ const ADMIN_SEG = 'kestrel';
 // stale far-future-cached copy. (Workers Assets serves static files with a
 // cacheable response; without a versioned URL a changed audit.js can refresh
 // while admin.css stays stale, which desyncs markup from styles.)
-const ASSET_VER = '20260729-1';
+const ASSET_VER = '20260729-2';
 
 // Escape a JSON string for safe embedding in a <script type="application/json"> block.
 function escapeJsonForHtml(obj: unknown): string {
@@ -795,9 +795,13 @@ function buildCachePage(): string {
       <button id="extend-selected" type="button">申请延长（需 Passkey）</button>
       <span id="extend-note" class="hint"></span>
     </section>
+    <!-- Six columns, two lines per cell: the previous nine columns pushed the
+         action buttons (and the "why not extendable" reason) off-screen at
+         1280px, so the page silently hid the one thing an operator needs. -->
     <div id="table-wrap"><table id="cache"><thead><tr>
       <th class="col-pick"><input id="pick-all" type="checkbox" aria-label="全选"></th>
-      <th>主机</th><th>用户 / 目录</th><th>命令</th><th>IP</th><th>条目</th><th>剩余</th><th>可延长至</th><th>操作</th>
+      <th>目标 / 用户 · 目录</th><th>命令 / IP</th><th class="col-num">条目</th>
+      <th>剩余 / 可延长余量</th><th>操作</th>
     </tr></thead><tbody id="rows"></tbody></table></div>
     <section id="actions">
       <span id="status" role="status" aria-live="polite"></span>

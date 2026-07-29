@@ -33,6 +33,8 @@
 
     function ttlLabel(s) {
         if (s === 0) return '不缓存';
+        if (s % 604800 === 0) return (s / 604800) + ' 周';
+        if (s % 86400 === 0) return (s / 86400) + ' 天';
         if (s % 3600 === 0) return (s / 3600) + ' 小时';
         if (s % 60 === 0) return (s / 60) + ' 分钟';
         return s + ' 秒';

@@ -6,8 +6,17 @@ TTL, a caller can decrypt the approved records without another phone tap.
 
 ## Current contract
 
-- TTL choices are `0`, `20m`, `2h`, and `8h`. `0` is the default and means no
-  cache write.
+- Approve-time TTL choices are `0`, `20m`, `2h`, and `8h`. `0` is the default and
+  means no cache write. This ladder is deliberately short: the tap happens on a
+  phone, in a hurry, and a mis-tap widens the window for the whole batch.
+- The admin extension ladder is a superset — `20m`, `2h`, `8h`, `1d`, `2d`, `1w` —
+  because an extension is a deliberate, desk-bound act on named live entries,
+  reviewed on the approval page before the tap. The multi-day rungs also make the
+  feature useful at all: with the ceiling pinned to `8h`, an `8h` grant sat at its
+  ceiling from birth and every extension of it was a no-op.
+- The total-lifetime ceiling is therefore **1 week**, computed as the longest TTL
+  any Passkey ceremony can grant. Shorten `EXTEND_TTL_WHITELIST` for
+  high-assurance deployments; the ceiling follows automatically.
 - Caching is enabled only when the Worker secret `CACHE_SECKEY` is configured.
   There is no `VT_DEK_CACHE` environment variable and no separate client-side
   no-cache flag.
@@ -81,15 +90,20 @@ until a Passkey approves it, and every one of these holds:
    untouched, is pushed to every configured notification channel, and appears on
    the audit tab as `cache-extend` — an unexpected extension request is visible
    to the operator who did not initiate it.
-2. **Whitelisted TTLs only** (`20m` / `2h` / `8h`) — the same set the phone
-   offers. No arbitrary deltas.
+2. **Laddered TTLs only** (`20m` / `2h` / `8h` / `1d` / `2d` / `1w`). No arbitrary
+   deltas. The multi-day rungs are extension-only: `writeCache` validates against
+   the shorter approve ladder, so a tampered approve body cannot arm a multi-day
+   cache without going through this ceremony.
 3. **Never resurrects.** An entry already past `expires_ms` is skipped. Only a
    new phone approval can bring a lapsed capability back.
 4. **Never shortens.** A request that would not move expiry forward is a no-op.
-5. **Absolute lifetime ceiling.** New expiry is clamped to
-   `created_ms + 8h`, which equals the longest TTL a human can pick. Repeated
-   20m extensions therefore converge on that ceiling instead of synthesizing a
-   window nobody approved — the admin surface can never out-grant the approver.
+5. **Absolute lifetime ceiling.** New expiry is clamped to `created_ms + 1w`,
+   computed as the longest TTL any Passkey ceremony can grant (the union of both
+   ladders) — never hardcoded. Repeated extensions therefore converge on that
+   ceiling instead of walking forever, and the ceiling can only move when a
+   ceremony can actually grant that long, so no admin path out-grants an approver.
+   A group already at its ceiling reports `no_gain` and offers no button, rather
+   than promising an extension that would do nothing.
 6. **Legacy and drifted groups are never extendable.** Entries written before
    `created_ms` existed cannot have their total lifetime bounded, and a group
    whose entries disagree on origin/creation/IP is refused outright. Both stay
@@ -120,7 +134,12 @@ credential; when a cache entry is live, possession of that token from the same
 egress IP and matching `pwd` is sufficient to obtain the cached DEK.
 
 Keep the default TTL at `0` for high-assurance or unattended workloads. Use
-short TTLs for automation that needs repeated decrypts. `8h` is a
+short TTLs for automation that needs repeated decrypts. The multi-day extension
+rungs (`1d`/`2d`/`1w`) are for long-running attended or CI sessions and are the
+single largest exposure this system can grant: for that whole window, possession
+of `VT_PASSKEY_TOKEN` from the same egress IP and `pwd` decrypts with no phone
+tap. Reaching one always takes an explicit request plus a Passkey approval whose
+page states the new expiry — but budget them accordingly. `8h` is a
 workday-session choice for an attended desktop only: for its whole window,
 possession of `VT_PASSKEY_TOKEN` from the same egress IP and `pwd` decrypts the
 approved records with no phone tap, so do not select it on shared, unattended,

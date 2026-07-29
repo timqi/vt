@@ -7,24 +7,49 @@
 
 import { CacheEntry } from './types';
 
-// Allowed positive DEK-cache TTLs (seconds). A write with any value outside this
-// set is rejected, so neither a tampered approve body nor a future UI typo can
-// mint an over-long window. 0 ("do not cache") is NOT a member — it is the
-// absence of a write. The PWA's radio options are [0, ...this] (see opPageData),
-// and an extension may only request a member of this same set.
-export const CACHE_TTL_WHITELIST = new Set([20 * 60, 2 * 60 * 60, 8 * 60 * 60]);
+// Two ladders, one rule: a TTL is legal only if some PASSKEY ceremony offers it.
+//
+// APPROVE — what the phone offers at approval time. Deliberately short and
+// unchanged: that tap happens in a hurry, often one-handed, and a mis-tap here
+// silently widens the no-phone-approval window for the whole batch. 0 ("do not
+// cache") is not a member — it is the absence of a write. The PWA's radios are
+// [0, ...this] (see opPageData).
+export const APPROVE_TTL_WHITELIST = new Set([20 * 60, 2 * 60 * 60, 8 * 60 * 60]);
+
+// EXTEND — what the admin cache tab may REQUEST, still settled by a Passkey
+// ceremony. A superset: extension is a deliberate, desk-bound act on a named set
+// of live entries, reviewed on the approval page before the tap, so the
+// multi-day rungs live here rather than on the phone's approve-time radios.
+//
+// The multi-day options exist because the 8h-ceiling design made extension
+// useless for the case that actually matters: an 8h grant is at its ceiling from
+// birth, so every extension of it was a no-op. Long-running CI and attended
+// desktop sessions need a window longer than one workday or the feature is
+// decoration.
+export const EXTEND_TTL_WHITELIST = new Set([
+  20 * 60, 2 * 60 * 60, 8 * 60 * 60,
+  24 * 60 * 60,        // 1d
+  2 * 24 * 60 * 60,    // 2d
+  7 * 24 * 60 * 60,    // 1w
+]);
 
 // Hard ceiling on the TOTAL lifetime of one cache entry, measured from the
 // moment the phone approval created it — NOT from the last extension.
 //
-// It equals the longest TTL a human can pick on the approval page
-// (max(CACHE_TTL_WHITELIST) = 8h). That equality is the whole point: an
-// extension may only re-spend time inside the window the approver could have
-// granted in the first place, so repeated 20m extensions can never synthesize a
-// 24h window that nobody ever approved. Raising this above the whitelist maximum
-// would mean the admin surface can grant more exposure than the phone can, which
-// is exactly the authority inversion the extend feature must not introduce.
-export const MAX_CACHE_LIFETIME_MS = Math.max(...CACHE_TTL_WHITELIST) * 1000;
+// It is COMPUTED as the longest TTL any Passkey ceremony can grant (the union of
+// the two ladders above), never hardcoded. That derivation is the invariant: the
+// ceiling can only move when a ceremony is actually able to grant that long, so
+// no admin path can ever out-grant what a human approved, and repeated small
+// extensions converge here instead of walking forever.
+//
+// SECURITY NOTE: with 1w on the extend ladder this ceiling is ONE WEEK. For that
+// whole window, possession of VT_PASSKEY_TOKEN from the same egress IP and `pwd`
+// decrypts the approved records with no phone tap. That is a deliberate operator
+// choice, not a default — reaching it takes an explicit extension request plus a
+// Passkey approval whose page states the new expiry. Shorten this ladder for
+// high-assurance deployments.
+export const MAX_CACHE_LIFETIME_MS =
+  Math.max(...APPROVE_TTL_WHITELIST, ...EXTEND_TTL_WHITELIST) * 1000;
 
 /** Why an entry was left untouched by an extension. Reported per group so the
  *  admin UI can explain a partial result instead of silently doing nothing. */
@@ -70,14 +95,26 @@ export function planExtend(
   return { ok: true, expires_ms: candidate };
 }
 
-/** An extension may only request a TTL the phone itself could have granted. */
-export function isAllowedTtl(ttlS: unknown): ttlS is number {
-  return typeof ttlS === 'number' && Number.isFinite(ttlS) && CACHE_TTL_WHITELIST.has(ttlS);
+/** A phone approval may only arm a cache with a TTL from the approve ladder.
+ *  Guards writeCache, so a tampered approve body cannot smuggle in an extend-only
+ *  (multi-day) rung and bypass the deliberate extension ceremony. */
+export function isAllowedApproveTtl(ttlS: unknown): ttlS is number {
+  return typeof ttlS === 'number' && Number.isFinite(ttlS) && APPROVE_TTL_WHITELIST.has(ttlS);
 }
 
-/** Sorted TTL options for a UI (ascending seconds), excluding 0. */
-export function ttlOptions(): number[] {
-  return [...CACHE_TTL_WHITELIST].sort((a, b) => a - b);
+/** An extension request may only ask for a TTL from the extend ladder. */
+export function isAllowedExtendTtl(ttlS: unknown): ttlS is number {
+  return typeof ttlS === 'number' && Number.isFinite(ttlS) && EXTEND_TTL_WHITELIST.has(ttlS);
+}
+
+/** Sorted approve-time options (ascending seconds), excluding 0 — the phone's radios. */
+export function approveTtlOptions(): number[] {
+  return [...APPROVE_TTL_WHITELIST].sort((a, b) => a - b);
+}
+
+/** Sorted extension options (ascending seconds) — the admin tab's dropdown. */
+export function extendTtlOptions(): number[] {
+  return [...EXTEND_TTL_WHITELIST].sort((a, b) => a - b);
 }
 
 /** Stable grouping handle for a cache entry.

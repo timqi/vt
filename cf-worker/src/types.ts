@@ -35,7 +35,7 @@ export interface Env {
   /** "1" | "true" | "on" | "yes" → the admin cache tab may REQUEST a DEK-cache
    *  extension. A kill switch, NOT an authorization: even when on, extending
    *  requires a fresh phone Passkey ceremony (see docs/dek-cache.md §extend), is
-   *  bounded by CACHE_TTL_WHITELIST, can never resurrect a lapsed entry, and can
+   *  bounded by EXTEND_TTL_WHITELIST, can never resurrect a lapsed entry, and can
    *  never push an entry past MAX_CACHE_LIFETIME_MS from its creation. Off by
    *  default so a deployment that never wants the capability simply does not
    *  have it (the routes 404 and the UI hides the controls). */
@@ -194,7 +194,7 @@ export interface CacheExtendIntent {
   /** Target group handles (CacheEntry.cache_group_id). Only `g_…` handles are
    *  accepted — see cache_policy.isExtendableGroupId. */
   group_ids: string[];
-  /** Requested TTL in seconds; must be a CACHE_TTL_WHITELIST member. Absolute
+  /** Requested TTL in seconds; must be an EXTEND_TTL_WHITELIST member. Absolute
    *  from the moment of approval, not additive. */
   ttl_s: number;
   /** Verified Cloudflare Access email of the admin who requested it (audit). */

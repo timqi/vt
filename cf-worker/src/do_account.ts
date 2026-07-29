@@ -21,8 +21,9 @@ import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
 import { seal, openToCache, cachePublicKey, discardedBoxPublicKey } from './cache_crypto';
 import {
-  CACHE_TTL_WHITELIST, MAX_CACHE_LIFETIME_MS, planExtend, isAllowedTtl,
-  ttlOptions, groupIdOf, isExtendableGroupId,
+  MAX_CACHE_LIFETIME_MS, planExtend,
+  isAllowedApproveTtl, isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
+  groupIdOf, isExtendableGroupId,
 } from './cache_policy';
 import { notifyCacheHit } from './notify';
 import { parseFeishuConfig, sendApprovalCard, editCard, sendCacheHitNotice, FeishuConfig, FeishuState, Kv as FeishuKv } from './feishu';
@@ -167,6 +168,10 @@ interface CacheAgg {
 // Human TTL label matching the PWA's (approve.js ttlLabel), used in the approval
 // page's 命令 field so the approver reads the same wording everywhere.
 function ttlLabelZh(s: number): string {
+  // Days/weeks first: an approver reading "168 小时" on their phone cannot judge
+  // it at a glance, and this string is the authority they are granting.
+  if (s % (7 * 86400) === 0) return (s / (7 * 86400)) + ' 周';
+  if (s % 86400 === 0) return (s / 86400) + ' 天';
   if (s % 3600 === 0) return (s / 3600) + ' 小时';
   if (s % 60 === 0) return (s / 60) + ' 分钟';
   return s + ' 秒';
@@ -1258,7 +1263,9 @@ export class AccountDO extends DurableObject<Env> {
       );
     };
 
-    if (!CACHE_TTL_WHITELIST.has(ttlS)) { reject(`ttl ${ttlS} not whitelisted`); return; }
+    // Approve ladder only: the multi-day rungs are extension-only, so a tampered
+    // approve body cannot skip the deliberate extension ceremony.
+    if (!isAllowedApproveTtl(ttlS)) { reject(`ttl ${ttlS} not approvable`); return; }
     if (!this.env.CACHE_SECKEY || !this.env.CACHE_SECKEY.trim()) {
       reject('CACHE_SECKEY unset (caching disabled)'); return;
     }
@@ -1697,7 +1704,7 @@ export class AccountDO extends DurableObject<Env> {
       scanned: scan.scanned,
       truncated: scan.truncated,
       extend_enabled: cacheAdminExtendEnabled(this.env),
-      ttl_options_s: ttlOptions(),
+      ttl_options_s: extendTtlOptions(),
       max_lifetime_ms: MAX_CACHE_LIFETIME_MS,
     };
     return Response.json(resp);
@@ -1743,7 +1750,7 @@ export class AccountDO extends DurableObject<Env> {
     let op: DoCacheExtendCreateOp;
     try { op = await request.json() as DoCacheExtendCreateOp; }
     catch { return badRequest('invalid json'); }
-    if (!isAllowedTtl(op.ttl_s)) return badRequest('ttl_s not whitelisted');
+    if (!isAllowedExtendTtl(op.ttl_s)) return badRequest('ttl_s not whitelisted');
     const ttlS = op.ttl_s;
     if (!Array.isArray(op.group_ids) || op.group_ids.length === 0) {
       return badRequest('group_ids required');
@@ -1872,7 +1879,7 @@ export class AccountDO extends DurableObject<Env> {
       logErr('cache.extend_disabled_at_commit', new Error('CACHE_ADMIN_EXTEND off'));
       return;
     }
-    if (!isAllowedTtl(intent.ttl_s)) {
+    if (!isAllowedExtendTtl(intent.ttl_s)) {
       logErr('cache.extend_bad_ttl', new Error(`ttl ${intent.ttl_s}`));
       return;
     }
@@ -2119,7 +2126,7 @@ export class AccountDO extends DurableObject<Env> {
     if (cachingConfigured && ch.salts_b64u.length > 0) {
       try {
         cachePubkeyB64u = b64uEnc(cachePublicKey(this.env.CACHE_SECKEY));
-        cacheOptionsS = [0, ...[...CACHE_TTL_WHITELIST].sort((a, b) => a - b)];
+        cacheOptionsS = [0, ...approveTtlOptions()];
       } catch (e) {
         logErr('cache.pubkey_failed', e);
         cacheOptionsS = [0];

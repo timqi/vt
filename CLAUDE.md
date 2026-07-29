@@ -55,11 +55,19 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   grants it and must never be reachable from an Access session alone. The extend
   route only mints a pending ceremony; `expires_ms` moves solely in
   `commitExtend`, called from `opApprove` after a verified Passkey assertion.
-  Keep all of: whitelisted TTLs only, never resurrect a lapsed entry, never
-  shorten, clamp to `created_ms + MAX_CACHE_LIFETIME_MS` (which must stay equal to
-  the largest whitelisted TTL, so the admin can never out-grant the approver),
-  refuse legacy/inconsistent groups, re-read each entry with no await before the
-  write, and audit both the authorization and the effect. `CACHE_ADMIN_EXTEND` is
+  Keep all of: laddered TTLs only, never resurrect a lapsed entry, never
+  shorten, clamp to `created_ms + MAX_CACHE_LIFETIME_MS`, refuse
+  legacy/inconsistent/`no_gain` groups, re-read each entry with no await before
+  the write, and audit both the authorization and the effect.
+- Two TTL ladders, one rule — a TTL is legal only if some PASSKEY ceremony offers
+  it. `APPROVE_TTL_WHITELIST` (20m/2h/8h) guards `writeCache`, so a tampered
+  approve body cannot arm a multi-day cache without the extension ceremony;
+  `EXTEND_TTL_WHITELIST` (adds 1d/2d/1w) guards extension requests.
+  `MAX_CACHE_LIFETIME_MS` must stay COMPUTED as the max of the union — never
+  hardcoded — so the ceiling can only move when a ceremony can actually grant that
+  long. It must also stay strictly greater than the largest approve-time TTL, or an
+  8h grant sits at its ceiling from birth and every extension of it is a silent
+  no-op (that bug shipped once; `test/cache_policy.test.ts` now pins it). `CACHE_ADMIN_EXTEND` is
   a kill switch, NOT an authorization — never treat it as one. The arithmetic
   lives in `cf-worker/src/cache_policy.ts` and is unit-tested; keep it pure.
 - Cache listings must never expose sealed material, salts, or the binding ctx

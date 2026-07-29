@@ -63,10 +63,17 @@ CACHE_HIT_NOTIFY = "0"
 # Admin-requested DEK-cache extension (the「延长」buttons on the admin DEK 缓存
 # tab). Off unless set to 1/true/on/yes. This is a KILL SWITCH, not an
 # authorization: even when on, extending requires a fresh phone Passkey approval,
-# may only request a whitelisted TTL (20m/2h/8h), can never revive an entry that
-# already lapsed, and can never push one past 8h from its creation. Off means the
-# capability does not exist — the routes 404 and the UI hides the controls.
-# Listing and clearing cached DEKs are unaffected (they only reduce authority).
+# may only request a laddered TTL (20m/2h/8h/1d/2d/1w), can never revive an entry
+# that already lapsed, and can never push one past 1 WEEK from its creation. Off
+# means the capability does not exist — the routes 404 and the UI hides the
+# controls. Listing and clearing cached DEKs are unaffected (they only reduce
+# authority). Note the ceiling: enabling this makes a one-week no-phone-approval
+# window reachable (always via an explicit request + a Passkey tap). Trim
+# EXTEND_TTL_WHITELIST in src/cache_policy.ts to lower it.
+#
+# Set it HERE, not in the Cloudflare dashboard: `wrangler deploy` replaces the
+# Worker's vars with this file's [vars] block, so a dashboard-only value is
+# silently wiped on the next deploy and the feature turns itself off.
 CACHE_ADMIN_EXTEND = "0"
 
 # Secrets (wrangler secret put — never inlined):

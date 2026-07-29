@@ -255,8 +255,33 @@ tbody tr.clickable { cursor: pointer; }
 /* Selection column: keep it tight so the data columns keep the width. */
 th.col-pick, td.col-pick { width: 1%; padding-right: 0; }
 th.col-pick input, td.col-pick input { accent-color: var(--accent); margin: 0; cursor: pointer; }
-/* Inline "why this row can't be extended", in place of the 延长 button. */
-td .hint.reason { margin: 0; font-size: 12px; }
+/* Two-line cells (#cache): a primary value with a muted secondary line. This is
+   what lets six columns carry what nine used to, so the action buttons and the
+   extendability reason stay visible without horizontal scrolling. */
+#cache td { padding-top: 7px; padding-bottom: 7px; vertical-align: top; }
+#cache .cell-main { font-size: 13px; line-height: 1.35; }
+#cache .cell-sub {
+  font-size: 11.5px; color: var(--muted); line-height: 1.35; margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#cache .cell-main.trunc-host { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+#cache .cell-main.trunc-cmd  { max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+#cache .cell-sub.trunc-sub   { max-width: 200px; }
+#cache th.col-num, #cache td.col-num { text-align: right; width: 1%; white-space: nowrap; }
+#cache td.col-num .cell-main { font-variant-numeric: tabular-nums; }
+#cache td.col-act { white-space: nowrap; width: 1%; }
+#cache td.col-act button { margin: 0 0 0 6px; }
+#cache td.col-act button:first-child { margin-left: 0; }
+/* "Why this group can't be extended" — muted pill, always in view. */
+#cache .reason-badge {
+  display: inline-block; padding: 1px 7px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+  max-width: 100%;
+}
+@media (max-width: 640px) {
+  #cache .cell-main.trunc-host, #cache .cell-sub.trunc-sub { max-width: 120px; }
+  #cache .cell-main.trunc-cmd { max-width: 160px; }
+}
 /* The cache tab's modal has a real heading (the audit tab's starts with a dl). */
 #detail-card > h2 { margin: 0 0 12px; padding-right: 32px; }
 
