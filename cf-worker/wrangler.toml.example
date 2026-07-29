@@ -17,6 +17,16 @@ account_id = "<YOUR_CLOUDFLARE_ACCOUNT_ID>"
 workers_dev = false
 preview_urls = false
 
+# Declare the custom domain HERE, even though you attached it in the dashboard.
+# `wrangler deploy` treats this file as the source of truth and warns
+# "Uploading the Worker will override the remote configuration with your local
+# one" when it sees a route remotely that is missing locally — a deploy from a
+# config without this block is one step away from detaching the hostname that
+# serves every approval URL. Declaring it makes the warning (and the risk) go away.
+[[routes]]
+pattern = "<your-worker-hostname, e.g. vt.example.com>"
+custom_domain = true
+
 # Workers Logs: persist structured audit events (challenge.created /
 # approved / rejected / expired / error) for dashboard viewing. Retention
 # is platform-managed (currently 3 days on Free, 7 days on Paid). Log volume
