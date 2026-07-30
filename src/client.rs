@@ -1391,18 +1391,17 @@ pub async fn inject(
     //   5. rename(tmp, target) — atomic plaintext exposure.
     //   6. Parent execs the user command; supervisor restores after timeout.
     //
-    // Steps 4, 5, and 6 each call `immediate_restore` on failure so the
-    // observable post-failure state collapses to "target = ciphertext, no
-    // sidecars" without waiting for the supervisor. The supervisor is the
-    // durable backstop: even if a parent crash makes immediate_restore
-    // unreachable, the supervisor's `unlink(tmp) + rename(backup, target)`
-    // after timeout still brings everything home (modulo SIGKILL / reboot).
-    let armed: Option<(String, std::path::PathBuf, std::path::PathBuf)> =
-        if let Some(replace_file_path) = &replace_file
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
+    // Steps 4, 5, and 6 each call `restore_exposure` on failure so the
+    // observable post-failure state normally collapses to "target =
+    // ciphertext, no sidecars" without waiting for the supervisor — under
+    // the same generation check the supervisor applies: a parent suspended
+    // past its own window can resume to find the deterministic backup path
+    // owned by a NEWER exposure, whose backup a blind rename would consume.
+    // The supervisor is the durable backstop: even if a parent crash makes
+    // the fast path unreachable, the supervisor's `unlink(tmp) +
+    // rename(backup, target)` after timeout still brings everything home
+    // (modulo SIGKILL / reboot).
+    let armed: Option<ArmedExposure> = if let Some(replace_file_path) = &replace_file {
         let orig_path = std::path::Path::new(replace_file_path);
         let dir = orig_path
             .parent()
@@ -1439,18 +1438,12 @@ pub async fn inject(
         // Step 2: write backup from the in-memory ORIGINAL bytes (captured at
         // the single O_NOFOLLOW open above) — NOT a fresh re-read of the target,
         // which would be a TOCTOU window for a directory-writable attacker.
-        // The open fd also yields the backup's (dev, ino) generation id for
-        // the sidecar, binding the record to THIS backup — the deterministic
+        // The backup fd also yields the (dev, ino) generation id for the
+        // sidecar, binding the record to THIS backup — the deterministic
         // path alone is ambiguous across exposures of the same target.
-        let backup_id: (u64, u64) = {
-            let mut backup_file = match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .mode(orig_mode)
-                .open(&backup_path)
-            {
-                Ok(f) => f,
+        let backup_id: (u64, u64) =
+            match create_exposure_backup(&backup_path, &orig_file_bytes, orig_mode) {
+                Ok(id) => id,
                 // EEXIST: another exposure of this target is open (or a dead
                 // supervisor left one). The pre-decrypt check already refused
                 // the common case; this is the authoritative race-free gate.
@@ -1463,34 +1456,10 @@ pub async fn inject(
                 }
                 Err(e) => {
                     return Err(e).with_context(|| {
-                        format!("Failed to create backup file: {}", backup_path.display())
+                        format!("Failed to write backup file: {}", backup_path.display())
                     });
                 }
             };
-            backup_file.write_all(&orig_file_bytes).with_context(|| {
-                format!(
-                    "Failed to copy content to backup: {}",
-                    backup_path.display()
-                )
-            })?;
-            backup_file.sync_all().ok();
-            // The id is REQUIRED on new records: silently degrading to None
-            // would put recovery back on existence-only matching and reopen
-            // the stale-sidecar race. No plaintext exists yet, so aborting
-            // (after releasing the lock) is safe.
-            match backup_file.metadata() {
-                Ok(m) => (m.dev(), m.ino()),
-                Err(e) => {
-                    let _ = std::fs::remove_file(&backup_path);
-                    return Err(e).with_context(|| {
-                        format!(
-                            "Failed to stat backup for its generation id: {}",
-                            backup_path.display()
-                        )
-                    });
-                }
-            }
-        };
         debug!("Created backup at: {}", backup_path.display());
 
         // Holding the exposure lock proves any older sidecar naming this
@@ -1535,29 +1504,43 @@ pub async fn inject(
             );
         }
 
-        // Step 4: write tmp (plaintext).
+        // Step 4: write tmp (plaintext). Parent-side cleanup here (and in
+        // steps 5/6) normally leaves no visible sidecar state for the
+        // timeout window; the supervisor later observes ENOENT on the
+        // backup and exits silently.
         if let Err(e) = write_plaintext_tmp(&tmp_path, orig_mode, &decrypted_file_content) {
-            // Parent does immediate cleanup so the failure leaves no visible
-            // sidecar state for the timeout window. Supervisor will later
-            // observe ENOENT on backup and exit silently.
-            let _ = std::fs::remove_file(&tmp_path);
-            let _ = std::fs::remove_file(&sidecar_path);
-            immediate_restore(replace_file_path, &backup_path);
+            restore_exposure(
+                &tmp_path,
+                &backup_path,
+                std::path::Path::new(replace_file_path),
+                &sidecar_path,
+                backup_id,
+            );
             return Err(e);
         }
 
         // Step 5: atomically expose plaintext at target.
         if let Err(e) = std::fs::rename(&tmp_path, replace_file_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            let _ = std::fs::remove_file(&sidecar_path);
-            immediate_restore(replace_file_path, &backup_path);
+            restore_exposure(
+                &tmp_path,
+                &backup_path,
+                std::path::Path::new(replace_file_path),
+                &sidecar_path,
+                backup_id,
+            );
             return Err(e).with_context(|| {
                 format!("Failed to atomically replace file: {}", replace_file_path)
             });
         }
         debug!("Content written to replace file: {}", replace_file_path);
 
-        Some((replace_file_path.clone(), backup_path, sidecar_path))
+        Some(ArmedExposure {
+            target: replace_file_path.clone(),
+            backup: backup_path,
+            tmp: tmp_path,
+            sidecar: sidecar_path,
+            backup_id,
+        })
     } else {
         None
     };
@@ -1576,29 +1559,29 @@ pub async fn inject(
     // exec() never returns on success; reaching here means it failed.
     let err = exec::Command::new(command).args(args).exec();
 
-    // Restore immediately on exec failure so the user doesn't wait out the
+    // Restore on exec failure so the user doesn't wait out the
     // supervisor's timeout. The supervisor will later observe ENOENT on the
     // backup and exit silently.
-    if let Some((target, backup, sidecar)) = &armed {
-        immediate_restore(target, backup);
-        let _ = std::fs::remove_file(sidecar);
+    if let Some(a) = &armed {
+        restore_exposure(
+            &a.tmp,
+            &a.backup,
+            std::path::Path::new(&a.target),
+            &a.sidecar,
+            a.backup_id,
+        );
     }
     Err(anyhow::anyhow!("Failed to execute command: {}", err))
 }
 
-/// Best-effort parent-side restore. Called on any step-4/5/6 failure to
-/// collapse the post-failure state to "target = ciphertext, no sidecars" as
-/// fast as possible. The detached supervisor will later see ENOENT on backup
-/// and exit silently — there are deliberately two restorers, with the parent
-/// as the fast path and the supervisor as the durable fallback.
-fn immediate_restore(target: &str, backup: &std::path::Path) {
-    if let Err(e) = std::fs::rename(backup, target) {
-        eprintln!(
-            "vt inject: restore-on-fail failed: {}; backup remains at {}",
-            e,
-            backup.display()
-        );
-    }
+/// One armed exposure's unwind state, kept by the parent for the exec-failure
+/// path — the same tuple the supervisor got via argv at spawn.
+struct ArmedExposure {
+    target: String,
+    backup: std::path::PathBuf,
+    tmp: std::path::PathBuf,
+    sidecar: std::path::PathBuf,
+    backup_id: (u64, u64),
 }
 
 fn write_plaintext_tmp(tmp: &std::path::Path, mode: u32, content: &str) -> Result<()> {
@@ -1668,10 +1651,10 @@ enum RecoverAction {
 /// path is reused by every exposure of a target.
 fn plan_recovery(deadline_ms: u64, backup_survives: bool, now_ms: u64) -> Option<RecoverAction> {
     if !backup_survives {
-        // The supervisor (or immediate_restore) already renamed the backup
-        // over the target — or the path now holds a NEWER exposure's backup
-        // (generation mismatch). Either way this sidecar's injection is
-        // over; only the sidecar lingers.
+        // The supervisor (or the parent's fast path) already renamed the
+        // backup over the target — or the path now holds a NEWER exposure's
+        // backup (generation mismatch). Either way this sidecar's injection
+        // is over; only the sidecar lingers.
         return Some(RecoverAction::CleanStale);
     }
     if now_ms >= deadline_ms.saturating_add(RECOVER_GRACE_MS) {
@@ -1751,10 +1734,11 @@ fn write_inject_sidecar(path: &std::path::Path, sc: &InjectSidecar) -> Result<()
 // that plaintext back over the target permanently, with no sidecar or backup
 // left for `--recover` to find. The lock that prevents this is the backup
 // file itself: its name is deterministic per target, it is created O_EXCL
-// before any plaintext hits disk, and it is consumed by rename() on every
-// restore path (supervisor, immediate_restore, --recover). Its existence
-// therefore means exactly "an exposure window is open, or a dead supervisor
-// left the target plaintext" — and a new inject must refuse.
+// before any plaintext hits disk (and removed if filling it fails — a
+// partial copy must not read as a lock), and it is consumed by rename() on
+// every restore path (supervisor, parent failure paths, --recover). Its
+// existence therefore means exactly "an exposure window is open, or a dead
+// supervisor left the target plaintext" — and a new inject must refuse.
 //
 // The sidecar shares the path's ambiguity in the other direction: it records
 // the deterministic backup path, so a stale record (crash between a restore's
@@ -1765,10 +1749,10 @@ fn write_inject_sidecar(path: &std::path::Path, sc: &InjectSidecar) -> Result<()
 // id, verified before recovery consumes anything; recovery refuses any
 // backup modified past the record's deadline — the ordering bound that
 // covers id-less legacy records and a successor reusing the old inode;
-// and the supervisor re-checks the (dev, ino) it armed for before its
-// timeout restore (see `supervisor_restore` — a suspend can delay its
-// monotonic sleep past the wall-clock deadline, letting --recover and a new
-// exposure run first).
+// and every restorer re-checks the (dev, ino) it armed for before renaming
+// (see `restore_exposure` — a suspend can delay the supervisor's monotonic
+// sleep, or stop the parent short of its failure path, past the wall-clock
+// deadline, letting --recover and a new exposure run first).
 
 /// Deterministic ciphertext-backup path for `target`: `dir/.{name}.vt-backup`.
 /// Deliberately NOT randomized — see the module comment above. Restore paths
@@ -1786,6 +1770,42 @@ fn exposure_backup_path(target: &str) -> Result<std::path::PathBuf> {
         .to_string_lossy()
         .into_owned();
     Ok(dir.join(format!(".{}.vt-backup", file_name)))
+}
+
+/// Create the exposure-lock backup (O_CREAT|O_EXCL|O_NOFOLLOW, `mode`), fill
+/// it with the ciphertext `bytes`, and return its `(dev, ino)` generation id.
+/// On any failure AFTER the exclusive create — a partial write (ENOSPC/EIO)
+/// or the generation-id stat — the just-created file is removed before
+/// returning: a partial backup with no sidecar and no supervisor would read
+/// as an untracked exposure lock to the next inject, whose refusal guidance
+/// would then move truncated bytes over the intact ciphertext target. No
+/// plaintext exists yet at that point, so aborting (releasing the lock) is
+/// safe. The EEXIST failure propagates untouched and must NEVER remove: that
+/// file is another exposure's live lock (or its orphaned backup).
+///
+/// The generation id is REQUIRED on new records: silently degrading to None
+/// would put recovery back on existence-only matching and reopen the
+/// stale-sidecar race.
+fn create_exposure_backup(
+    backup_path: &std::path::Path,
+    bytes: &[u8],
+    mode: u32,
+) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode)
+        .open(backup_path)?;
+    let filled = f.write_all(bytes).and_then(|()| {
+        f.sync_all().ok();
+        f.metadata().map(|m| (m.dev(), m.ino()))
+    });
+    if filled.is_err() {
+        let _ = std::fs::remove_file(backup_path);
+    }
+    filled
 }
 
 /// Why an inject over an existing backup was refused — picks the operator
@@ -2515,17 +2535,22 @@ fn parse_dev_ino(s: &str) -> Option<(u64, u64)> {
     Some((dev.parse().ok()?, ino.parse().ok()?))
 }
 
-/// Post-sleep body of the restore supervisor, extracted so tests can drive
-/// it without fork/sleep. `armed_id` is the `(dev, ino)` of the backup this
-/// supervisor was spawned for. The backup path is deterministic per target,
-/// so a DELAYED supervisor (suspend pauses the monotonic sleep while the
-/// wall-clock deadline lapses) can wake to find `--recover` already consumed
-/// its backup and a NEWER exposure owning the path; renaming blindly would
-/// consume the successor's backup — early-restoring its ciphertext
-/// mid-window, or stranding its plaintext if it hasn't renamed its tmp yet.
-/// So: restore only our own generation, and keep the sidecar — `--recover`'s
-/// retry record — on a real rename failure or when the backup's state is
-/// unknowable (stat error other than "not there").
+/// The generation-checked restore shared by the supervisor (its post-sleep
+/// body, extracted so tests can drive it without fork/sleep) and the parent's
+/// step-4/5/6 failure paths. `armed_id` is the `(dev, ino)` of the backup
+/// this caller armed. The backup path is deterministic per target, so a
+/// DELAYED caller — a supervisor whose monotonic sleep a suspend paused while
+/// the wall-clock deadline lapsed, or a parent stopped between arming and its
+/// failure path — can find `--recover` already consumed its backup and a
+/// NEWER exposure owning the path; renaming blindly would consume the
+/// successor's backup — early-restoring its ciphertext mid-window, or
+/// stranding its plaintext with no restore source if it hasn't renamed its
+/// tmp yet. So: restore only our own generation, and keep the sidecar —
+/// `--recover`'s retry record — on a real rename failure or when the backup's
+/// state is unknowable (stat error other than "not there").
+///
+/// Failure warnings go to stderr: user-visible on the parent paths, /dev/null
+/// in the supervisor.
 ///
 /// Known, accepted residuals: (a) a successor reusing our exact inode is
 /// indistinguishable here — unlike `--recover` we know no deadline to bound
@@ -2534,7 +2559,7 @@ fn parse_dev_ino(s: &str) -> Option<(u64, u64)> {
 /// AND a new inject recreating the path would misdirect the rename. Both
 /// events landing inside that window is negligible; absolute closure would
 /// need every consumer to serialize on a parent-directory flock.
-fn supervisor_restore(
+fn restore_exposure(
     tmp: &std::path::Path,
     backup: &std::path::Path,
     target: &std::path::Path,
@@ -2560,7 +2585,14 @@ fn supervisor_restore(
         // Transient stat failure (EACCES, EIO, a sick mount): the truth is
         // unknowable — keep the backup AND the sidecar so `vt inject
         // --recover` retries once the path is reachable again.
-        Err(_) => return,
+        Err(e) => {
+            eprintln!(
+                "vt inject: cannot stat backup {}: {}; leaving it for `vt inject --recover`",
+                backup.display(),
+                e
+            );
+            return;
+        }
     };
     if !ours {
         // Nothing of ours left at the path — the exposure is settled. The
@@ -2579,7 +2611,13 @@ fn supervisor_restore(
         }
         // Real failure (EACCES, EIO, ...): keep the sidecar so a later
         // `vt inject --recover` retries the restore we could not perform.
-        Err(_) => {}
+        Err(e) => {
+            eprintln!(
+                "vt inject: restore failed: {}; backup remains at {}",
+                e,
+                backup.display()
+            );
+        }
     }
 }
 
@@ -2656,7 +2694,7 @@ pub fn supervisor_main(args: &[std::ffi::OsString]) -> i32 {
 
     std::thread::sleep(std::time::Duration::from_secs(secs));
 
-    supervisor_restore(&tmp, &backup, &target, &sidecar, armed_id);
+    restore_exposure(&tmp, &backup, &target, &sidecar, armed_id);
     0
 }
 
@@ -2916,7 +2954,7 @@ mod tests {
 
     #[test]
     fn plan_recovery_cleans_stale_when_backup_gone() {
-        // Backup already consumed (supervisor/immediate_restore renamed it) →
+        // Backup already consumed (a restorer renamed it home) →
         // the injection completed; only the sidecar lingers. Deadline is
         // irrelevant on this arm.
         assert_eq!(
@@ -2997,6 +3035,27 @@ mod tests {
         );
         // A path with no file name is refused.
         assert!(exposure_backup_path("/").is_err());
+    }
+
+    #[test]
+    fn create_exposure_backup_returns_live_id_and_keeps_foreign_locks() {
+        let dir = std::env::temp_dir().join(format!("vt-inject-mkbak-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backup = dir.join(".f.vt-backup");
+
+        // Success: bytes land, and the returned generation id is the live one.
+        let id = create_exposure_backup(&backup, b"ciphertext", 0o600).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"ciphertext");
+        assert_eq!(id, current_backup_id(&backup));
+
+        // EEXIST: propagated for the conflict-refusal path, and the existing
+        // lock must NOT be removed — it is another exposure's live backup,
+        // not something this call created and may clean up.
+        let err = create_exposure_backup(&backup, b"other", 0o600).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&backup).unwrap(), b"ciphertext");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3165,7 +3224,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_restore_keeps_sidecar_when_backup_state_unknown() {
+    fn restore_exposure_keeps_sidecar_when_backup_state_unknown() {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
@@ -3182,7 +3241,7 @@ mod tests {
         std::fs::write(&sidecar, b"{}").unwrap();
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        supervisor_restore(&dir.join("no-tmp"), &backup, &target, &sidecar, armed);
+        restore_exposure(&dir.join("no-tmp"), &backup, &target, &sidecar, armed);
 
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
@@ -3251,7 +3310,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_restore_restores_only_its_own_generation() {
+    fn restore_exposure_restores_only_its_own_generation() {
         let dir = std::env::temp_dir().join(format!("vt-inject-sup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("f");
@@ -3264,7 +3323,7 @@ mod tests {
         std::fs::write(&backup, b"ciphertext").unwrap();
         std::fs::write(&tmp, b"orphan").unwrap();
         std::fs::write(&sidecar, b"{}").unwrap();
-        supervisor_restore(&tmp, &backup, &target, &sidecar, current_backup_id(&backup));
+        restore_exposure(&tmp, &backup, &target, &sidecar, current_backup_id(&backup));
         assert_eq!(std::fs::read(&target).unwrap(), b"ciphertext");
         assert!(!backup.exists() && !tmp.exists() && !sidecar.exists());
 
@@ -3274,7 +3333,7 @@ mod tests {
         std::fs::write(&target, b"plaintext-B").unwrap();
         std::fs::write(&backup, b"ciphertext-B").unwrap();
         std::fs::write(&sidecar, b"{}").unwrap();
-        supervisor_restore(&tmp, &backup, &target, &sidecar, mismatched_backup_id(&backup));
+        restore_exposure(&tmp, &backup, &target, &sidecar, mismatched_backup_id(&backup));
         assert_eq!(
             std::fs::read(&target).unwrap(),
             b"plaintext-B",
@@ -3290,7 +3349,7 @@ mod tests {
         // Backup gone (already restored): just drop the sidecar.
         std::fs::remove_file(&backup).unwrap();
         std::fs::write(&sidecar, b"{}").unwrap();
-        supervisor_restore(&tmp, &backup, &target, &sidecar, (1, 2));
+        restore_exposure(&tmp, &backup, &target, &sidecar, (1, 2));
         assert_eq!(std::fs::read(&target).unwrap(), b"plaintext-B");
         assert!(!sidecar.exists());
 
@@ -3298,7 +3357,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_restore_keeps_sidecar_when_rename_fails() {
+    fn restore_exposure_keeps_sidecar_when_rename_fails() {
         // Directory modes don't bind root; the EACCES this test relies on
         // never happens there.
         if unsafe { libc::geteuid() } == 0 {
@@ -3317,7 +3376,7 @@ mod tests {
         let armed = current_backup_id(&backup);
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        supervisor_restore(&dir.join("no-tmp"), &backup, &target, &sidecar, armed);
+        restore_exposure(&dir.join("no-tmp"), &backup, &target, &sidecar, armed);
 
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
