@@ -44,7 +44,24 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   behavior when adding a new command.
 - `vt inject -r` restores ciphertext through its self-exec'd restore
   supervisor. `vt inject --recover` must remain unauthenticated and only move
-  the ciphertext backup back over the target.
+  the ciphertext backup back over the target. The ciphertext backup's
+  deterministic per-target name (`.{name}.vt-backup`) IS the exposure lock:
+  it is created O_EXCL before any plaintext hits disk (and removed if
+  filling it fails — a partial copy must not read as a lock), and every
+  restore path must consume it via rename() — never copy+delete — so an
+  overlapping `inject -r` of the same file fails EEXIST instead of
+  snapshotting exposed plaintext as its "ciphertext" backup. Because that
+  path is reused across exposures, every new sidecar MUST carry its backup's
+  `(dev, ino)` generation id, recovery refuses a backup whose generation or
+  mtime-vs-deadline ordering its sidecar did not record (the ordering bound
+  is all an id-less legacy record has), arming retires stale sidecars naming
+  the path, and every restorer — the supervisor and the parent's failure
+  paths alike — only renames the `(dev, ino)` generation it armed for (a
+  suspend can delay either past the wall-clock deadline, into a successor's
+  window) and keeps its sidecar when a restore fails or the backup's state
+  is unknowable — only "not there" counts as consumed; other stat errors
+  must never clean a recovery record. Do not reintroduce a randomized
+  backup name, and keep refusing `-r` files with zero `vt://` records.
 - DEK caching is opt-in, requires `CACHE_SECKEY`, and uses the Worker-selected
   TTLs. A cache hit is not a phone approval; preserve its audit row and IP
   binding. Every write mints an immutable `cache_group_id` (the handle the admin

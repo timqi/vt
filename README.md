@@ -167,6 +167,14 @@ Options:
   or rebooted restore supervisor left decrypted. Needs no auth (it only moves
   the ciphertext backup back). Safe to run from a login/boot hook.
 
+Overlap protection: only one exposure window per file may be open at a time.
+A second `inject -r` of the same file is refused while the first window is
+open — retry after it closes (the error says how long). If a previous run's
+restore supervisor died (crash/reboot), the refusal points at
+`vt inject --recover`. A file containing no `vt://` records is also refused:
+there is nothing to decrypt, which usually means the wrong file — or plaintext
+left behind by a broken exposure.
+
 ### SSH Agent
 
 VT can act as an SSH agent, storing private keys in VT's encrypted
