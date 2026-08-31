@@ -388,6 +388,11 @@ export interface ApprovePageData {
   /** base64url 32-byte X25519 public key the PWA seals cached DEKs to. Empty
    *  string when CACHE_SECKEY is unset (caching disabled — PWA hides the UI). */
   cache_pubkey_b64u: string;
+  /** `cacheScopePwd(metadata.pwd)` — the directory scope a cache armed by this
+   *  approval would answer for (worktree suffixes stripped). Display only: it
+   *  tells the approver the reuse scope, while `metadata.pwd` keeps the literal
+   *  working directory. */
+  cache_scope_pwd: string;
 }
 
 // ── DEK cache (opt-in, IP+pwd-scoped) ──────────────────────────────────────
@@ -400,8 +405,8 @@ export interface DekCacheRequest {
   salts_b64u: string[];
   timestamp_ms: number;
   /** Full display meta (same shape as the challenge request). `meta.pwd` is the
-   *  client-reported half of the cache binding ctx (ctx = IP + pwd); IP is the
-   *  worker-derived hard boundary. `meta.ppid` is forensic-only. The rest is
+   *  client-reported half of the cache binding ctx (ctx = IP + cacheScopePwd(pwd));
+   *  IP is the worker-derived hard boundary. `meta.ppid` is forensic-only. The rest is
    *  stored on the hit audit row so a cache hit carries the same context as a
    *  ceremony decrypt. */
   meta?: Partial<ChallengeMeta>;
@@ -415,8 +420,9 @@ export type DekCacheResponse =
   | { miss: true };
 
 /** A single cached DEK in DO storage, keyed `dek:{ctx}:{salt_b64u}` where
- *  ctx = b64u(SHA-256("vt-dek-ctx-v3" || len(ip) || ip || pwd)). (v3 binds IP +
- *  pwd; v2 was IP-only; the v1 ppid component was removed — see
+ *  ctx = b64u(SHA-256("vt-dek-ctx-v4" || len(ip) || ip || cacheScopePwd(pwd))).
+ *  (v4 normalizes the pwd so git-worktree siblings share one scope; v3 bound the
+ *  literal IP + pwd; v2 was IP-only; the v1 ppid component was removed — see
  *  docs/dek-cache.md §2.5.) */
 export interface CacheEntry {
   /** crypto_box_seal(DEK_raw, CACHE_PUBKEY) — Worker opens with CACHE_SECKEY. */

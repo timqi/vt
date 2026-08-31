@@ -48,7 +48,7 @@ const ADMIN_SEG = 'kestrel';
 // stale far-future-cached copy. (Workers Assets serves static files with a
 // cacheable response; without a versioned URL a changed audit.js can refresh
 // while admin.css stays stale, which desyncs markup from styles.)
-const ASSET_VER = '20260729-5';
+const ASSET_VER = '20260729-6';
 
 // Escape a JSON string for safe embedding in a <script type="application/json"> block.
 function escapeJsonForHtml(obj: unknown): string {
@@ -653,7 +653,7 @@ function buildApprovePage(data: ApprovePageData): string {
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>VT 审批请求</title>
   ${FAVICON_TAGS}
-  <link rel="stylesheet" href="${base}/approve.css">
+  <link rel="stylesheet" href="${base}/approve.css?v=${ASSET_VER}">
 </head>
 <body>
   <script type="application/json" id="vt-data">${dataJson}</script>

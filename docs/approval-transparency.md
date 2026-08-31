@@ -159,9 +159,14 @@ Worker side (`cf-worker`):
   `ip` row is labeled `IP（已验证）`; a footnote under the field list
   states `除 IP 外均为客户端自报信息，仅供参考`. New row `记录数: N`
   (from `salts_b64u.length`, worker-derived) when N > 0.
-- **C2 — cache consent copy**: 「同一来源 IP（已验证）且同一工作目录
-  （客户端自报）」 so the stated boundary matches the implemented one
-  (ctx = verified IP + advisory pwd).
+- **C2 — cache consent copy**: 「同一来源 IP（已验证）且同一缓存范围
+  （客户端自报目录，归一化后）」 so the stated boundary matches the
+  implemented one (ctx = verified IP + advisory `cacheScopePwd(pwd)`). Since
+  that scope can be WIDER than the reported directory (worktree suffixes are
+  stripped — see [`dek-cache.md`](dek-cache.md)), the cache section also renders
+  the scope itself (`缓存范围`, from `ApprovePageData.cache_scope_pwd`) plus the
+  literal `目录` row: the approver reads both the reuse scope and where the
+  request actually came from.
 - **C3 — batch size in approval notifications**: `metaLines` gains a
   `salts` parameter; when > 0 the head line becomes `user@host · N 条`
   (mirrors the cache-hit head). Ripple is wider than one call site:

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   planExtend, isAllowedApproveTtl, isAllowedExtendTtl, groupIdOf, isExtendableGroupId,
+  cacheScopePwd,
   APPROVE_TTL_WHITELIST, EXTEND_TTL_WHITELIST, MAX_EXTEND_TTL_MS,
   approveTtlOptions, extendTtlOptions,
 } from '../src/cache_policy';
@@ -175,5 +176,49 @@ describe('group handles', () => {
     // direction — neither as a selector nor as a minted id when grouping.
     expect(isExtendableGroupId(' g_abc')).toBe(false);
     expect(groupIdOf({ cache_group_id: ' g_abc', origin_token_id: 'tok' })).toBe('legacy:tok');
+  });
+});
+
+describe('cache scope (pwd normalization)', () => {
+  // The reason the rule exists: worktrunk/`wt` lays worktrees out as a sibling
+  // `<repo>.<branch>`, so without this every branch costs its own phone approval.
+  it('folds git-worktree siblings onto the trunk scope', () => {
+    expect(cacheScopePwd('/home/me/code/pier.stable')).toBe('/home/me/code/pier');
+    expect(cacheScopePwd('/home/me/code/pier.feat-x')).toBe('/home/me/code/pier');
+    expect(cacheScopePwd('/home/me/code/pier')).toBe('/home/me/code/pier');
+  });
+
+  // Every segment, not just the last: work also happens in subdirectories of a
+  // worktree, and those must land in the same scope as the worktree root.
+  it('normalizes every segment', () => {
+    expect(cacheScopePwd('/home/me/code/pier.stable/skills/pier-boards'))
+      .toBe('/home/me/code/pier/skills/pier-boards');
+    expect(cacheScopePwd('/a.b/c.d/e.f')).toBe('/a/c/e');
+  });
+
+  // A leading dot is a hidden directory, not an extension — stripping it would
+  // produce an empty segment and collapse unrelated trees onto "/…//…".
+  it('keeps hidden directories and path syntax intact', () => {
+    expect(cacheScopePwd('/home/me/.config/vt')).toBe('/home/me/.config/vt');
+    expect(cacheScopePwd('/home/me/.env.local')).toBe('/home/me/.env');
+    expect(cacheScopePwd('/a/./b')).toBe('/a/./b');
+    expect(cacheScopePwd('/a/../b')).toBe('/a/../b');
+    expect(cacheScopePwd('..')).toBe('..');
+  });
+
+  it('is idempotent and total', () => {
+    const p = '/home/me/code/pier.stable/x.y';
+    expect(cacheScopePwd(cacheScopePwd(p))).toBe(cacheScopePwd(p));
+    expect(cacheScopePwd('')).toBe('');
+    // pwd reaches the Worker as client JSON: a non-string must key the empty
+    // scope, never throw a 500 on the decrypt path.
+    const anyPwd = cacheScopePwd as (v: unknown) => string;
+    expect(anyPwd(null)).toBe('');
+    expect(anyPwd(undefined)).toBe('');
+    expect(anyPwd(42)).toBe('');
+    // Only the LAST dot of a segment goes, so a multi-dot name keeps its stem.
+    expect(cacheScopePwd('/srv/app.v1.2')).toBe('/srv/app.v1');
+    expect(cacheScopePwd('/srv/app.')).toBe('/srv/app');
+    expect(cacheScopePwd('relative/dir.wt')).toBe('relative/dir');
   });
 });

@@ -67,12 +67,52 @@ export const EXTEND_TTL_WHITELIST = new Set([
 //
 // SECURITY NOTE: an entry can therefore live indefinitely, one approved hop at a
 // time. For each window, possession of VT_PASSKEY_TOKEN from the same egress IP
-// and `pwd` decrypts the approved records with no phone tap. The safeguards that
+// and a `pwd` in the same cacheScopePwd scope decrypts the approved records with
+// no phone tap. The safeguards that
 // remain are the ones that hold without a budget: a lapsed entry is never revived
 // (extension only ever continues a LIVE grant), expiry never moves backwards, the
 // per-hop TTL is laddered, and every hop is audited with the approver's identity.
 // Trim EXTEND_TTL_WHITELIST to shorten the longest single hop.
 export const MAX_EXTEND_TTL_MS = Math.max(...EXTEND_TTL_WHITELIST) * 1000;
+
+// ── Cache scope: how a working directory becomes the `pwd` half of the ctx ──
+//
+// The binding ctx is derived from a NORMALIZED pwd, not the literal one: every
+// path segment loses its final `.suffix`, so a git-worktree tree
+// (`<repo>.<branch>`, the layout `wt`/worktrunk generates as a sibling of the
+// trunk) shares one cache with its trunk instead of demanding a fresh phone
+// approval per branch.
+//
+//   /home/me/code/pier.stable/skills  ->  /home/me/code/pier/skills
+//   /home/me/code/pier                ->  /home/me/code/pier       (unchanged)
+//
+// This WIDENS the advisory half of the binding on purpose: `pier.stable`,
+// `pier.dev` and `pier` become one cache scope, and so do incidental neighbours
+// like `node-v20.11` / `node-v20.12`. It does not touch the hard boundary — a
+// hit still requires the same worker-derived egress IP — and it changes only
+// the KEY: `meta.pwd` keeps the literal directory everywhere a human reads it
+// (approval page, notifications, audit, admin listing), and the approval page
+// additionally states the normalized scope the approval would arm.
+function stripSegmentExt(seg: string): string {
+  // All-dots segments (`.`, `..`) are path syntax, never a name with an
+  // extension — stripping `..` would rewrite the path itself.
+  if (/^\.+$/.test(seg)) return seg;
+  const dot = seg.lastIndexOf('.');
+  // dot <= 0: no extension, or a leading dot (`.config`, `.git`) whose "base"
+  // would be empty — a hidden directory keeps its whole name.
+  return dot <= 0 ? seg : seg.slice(0, dot);
+}
+
+/** The `pwd` half of the cache binding ctx. Pure; see the note above.
+ *
+ *  Typed `string` so a call site cannot pass the wrong field by accident (this
+ *  derives a storage key), but the body still tolerates a non-string: the value
+ *  originates in a client-controlled JSON body, and a throw here would be a 500
+ *  on the decrypt path. */
+export function cacheScopePwd(pwd: string): string {
+  if (typeof pwd !== 'string' || pwd === '') return '';
+  return pwd.split('/').map(stripSegmentExt).join('/');
+}
 
 /** Why an entry was left untouched by an extension. Tallied across the commit so
  *  the audit row can explain a partial result instead of silently doing nothing. */

@@ -104,6 +104,11 @@ button[disabled] { opacity: .38; cursor: not-allowed; }
 .cache-warn { margin: 0 0 .4rem; font-size: .74rem; }
 .cache-warn strong { color: var(--err); }
 
+/* Reuse scope of the cache this approval would arm — a path, so let it wrap
+   instead of overflowing a phone screen. */
+.cache-scope { margin: 0 0 .4rem; font-size: .74rem; overflow-wrap: anywhere; }
+.cache-scope strong { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
 .vt-ap-cache-opts {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));

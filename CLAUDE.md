@@ -62,6 +62,16 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   is unknowable — only "not there" counts as consumed; other stat errors
   must never clean a recovery record. Do not reintroduce a randomized
   backup name, and keep refusing `-r` files with zero `vt://` records.
+- The DEK cache binding ctx is `SHA-256("vt-dek-ctx-v4" || len(ip) || ip ||
+  cacheScopePwd(pwd))`. The worker-derived IP is the hard boundary; the pwd half
+  is advisory and is NORMALIZED by `cacheScopePwd` (each path segment loses its
+  final `.suffix`, hidden dirs and `.`/`..` untouched) so git-worktree siblings
+  (`<repo>.<branch>`) share one scope instead of one approval each. Normalize
+  inside `cacheCtx` only — a write and a read must never key on different halves
+  of the rule — and never normalize `meta.pwd` itself: the literal directory is
+  what the approval page, notifications, audit, and admin listing show. Since the
+  scope can be wider than the caller's cwd, the approval page must keep stating
+  it (`cache_scope_pwd`) beside the duration radios.
 - DEK caching is opt-in, requires `CACHE_SECKEY`, and uses the Worker-selected
   TTLs. A cache hit is not a phone approval; preserve its audit row and IP
   binding. Every write mints an immutable `cache_group_id` (the handle the admin

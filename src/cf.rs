@@ -489,7 +489,9 @@ pub async fn get_deks(
 
 /// Fast path: try the opt-in server-side DEK cache before running a full phone
 /// approval. Returns `Some(deks)` on a full cache hit (all `salts` present,
-/// unexpired, and the request's IP+pwd match what was recorded at approval),
+/// unexpired, and the request's IP + normalized pwd scope match what was
+/// recorded at approval — the worker strips each path segment's `.suffix`, so a
+/// git-worktree sibling shares the approval's scope; see docs/dek-cache.md),
 /// or `None` on any miss / disabled cache / recoverable transport error (the
 /// caller then falls back to `get_deks`).
 ///

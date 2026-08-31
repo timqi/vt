@@ -23,7 +23,7 @@ import { seal, openToCache, cachePublicKey, discardedBoxPublicKey } from './cach
 import {
   planExtend,
   isAllowedApproveTtl, isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
-  groupIdOf, isExtendableGroupId,
+  groupIdOf, isExtendableGroupId, cacheScopePwd,
 } from './cache_policy';
 import { notifyCacheHit } from './notify';
 import { parseFeishuConfig, sendApprovalCard, editCard, sendCacheHitNotice, FeishuConfig, FeishuState, Kv as FeishuKv } from './feishu';
@@ -101,9 +101,9 @@ const AUDIT_SELECT_COLS =
 
 // DEK cache entry key. ctx binds the entry to (a) the requester's worker-derived
 // IP (CF-Connecting-IP — unspoofable by the client, the hard boundary) AND (b)
-// the client-reported working directory (pwd). A lookup recomputes ctx from the
-// same IP + pwd, so a request from a different egress IP OR a different cwd finds
-// no key (a clean miss, no oracle).
+// the client-reported working directory (pwd), normalized by cacheScopePwd. A
+// lookup recomputes ctx from the same IP + scope, so a request from a different
+// egress IP OR an unrelated cwd finds no key (a clean miss, no oracle).
 //
 // pwd is CLIENT-REPORTED, so — like the removed ppid — it is advisory: a fully
 // compromised local host can spoof it, so it does not widen the real (IP) hard
@@ -116,14 +116,21 @@ const AUDIT_SELECT_COLS =
 // History: ctx v1 folded in the client-reported parent PID; that was dropped
 // (v1→v2) because ppid is BOTH spoofable AND unstable (getppid() changes every
 // call under orchestrators, so the cache never hit). ppid is still recorded on
-// each entry + audit row for forensics. v2→v3 adds pwd. The effective hard
-// guarantee is unchanged: within the TTL, possession of VT_PASSKEY_TOKEN behind
-// the SAME egress IP; pwd only narrows it further, it never widens it.
+// each entry + audit row for forensics. v2→v3 adds pwd. v3→v4 folds in
+// cacheScopePwd (worktree suffixes stripped) instead of the literal pwd; the tag
+// bump keeps the two derivations from ever sharing a storage key, at the cost of
+// stranding v3 entries (they lapse/sweep normally, and can be cleared from the
+// admin tab). The effective hard guarantee is unchanged: within the TTL,
+// possession of VT_PASSKEY_TOKEN behind the SAME egress IP; the pwd scope only
+// narrows it further, it never widens beyond that IP.
+//
+// Normalization happens HERE, not at the call sites, so no future caller can
+// key a write and a read on different halves of the rule.
 async function cacheCtx(ip: string, pwd: string): Promise<string> {
   const enc = new TextEncoder();
-  const tag = enc.encode('vt-dek-ctx-v3');
+  const tag = enc.encode('vt-dek-ctx-v4');
   const ipBytes = enc.encode(ip);
-  const pwdBytes = enc.encode(pwd);
+  const pwdBytes = enc.encode(cacheScopePwd(pwd));
   // Length-prefix the IP so (ip="a", pwd="bc") and (ip="ab", pwd="c") can't
   // collide into the same digest. IP has no NUL, so a NUL separator is
   // unambiguous, but an explicit u32 length is simplest and future-proof.
@@ -2118,6 +2125,10 @@ export class AccountDO extends DurableObject<Env> {
       metadata: ch.meta,
       cache_options_s: cacheOptionsS,
       cache_pubkey_b64u: cachePubkeyB64u,
+      // The reuse scope the approval would arm — normalized, so an approver on a
+      // worktree path sees that the grant also covers the trunk and its siblings.
+      // metadata.pwd keeps the literal directory next to it.
+      cache_scope_pwd: cacheScopePwd(ch.meta.pwd ?? ''),
     };
     return Response.json(pageData);
   }
