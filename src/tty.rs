@@ -5,6 +5,37 @@
 
 use anyhow::{Context, Result};
 
+/// Read a secret from a non-terminal stdin (pipe, file, here-doc) for
+/// `vt create`. The counterpart of `prompt_input_password`: same contract
+/// (non-empty plaintext back), no terminal required, and no confirmation echo
+/// — nobody is watching. Exactly one trailing newline is stripped so
+/// `echo -n`, `echo` and a here-doc all mean the same secret; any other
+/// whitespace is part of the plaintext.
+pub fn read_secret_from_stdin() -> Result<String> {
+    use std::io::Read;
+    let mut secret = String::new();
+    std::io::stdin()
+        .read_to_string(&mut secret)
+        .context("Failed to read secret from stdin")?;
+    // DO NOT log `secret` — plaintext.
+    strip_one_trailing_newline(&mut secret);
+    if secret.is_empty() {
+        return Err(anyhow::anyhow!("Secret cannot be empty"));
+    }
+    Ok(secret)
+}
+
+/// Drop one trailing `\n` (and the `\r` of a `\r\n` pair) in place. One only:
+/// a secret whose last byte is genuinely a newline is written with two.
+fn strip_one_trailing_newline(s: &mut String) {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+}
+
 /// Prompt for a secret on stdin without echo, then echo a redacted
 /// confirmation showing only the first/last two characters. Used by
 /// `vt create` and the `vt secret` admin commands.
@@ -35,7 +66,24 @@ fn mask_secret(secret: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::mask_secret;
+    use super::{mask_secret, strip_one_trailing_newline};
+
+    #[test]
+    fn strips_exactly_one_trailing_newline() {
+        let case = |input: &str| {
+            let mut s = input.to_string();
+            strip_one_trailing_newline(&mut s);
+            s
+        };
+        assert_eq!(case("secret"), "secret");
+        assert_eq!(case("secret\n"), "secret");
+        assert_eq!(case("secret\r\n"), "secret");
+        assert_eq!(case("secret\n\n"), "secret\n");
+        // Interior and leading whitespace is plaintext, not framing.
+        assert_eq!(case("two\nlines\n"), "two\nlines");
+        assert_eq!(case(" pad \n"), " pad ");
+        assert_eq!(case("\n"), "");
+    }
 
     #[test]
     fn masks_short_and_multibyte_without_panic() {

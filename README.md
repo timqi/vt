@@ -87,8 +87,11 @@ binary at another path.
 
 4. Create and read secrets:
    ```bash
-   # Create an encrypted secret (reads from stdin)
+   # Create an encrypted secret (prompts for type, then the value without echo)
    vt create
+
+   # Non-interactive (no terminal): stdin is the plaintext, type from --type
+   printf %s "$SECRET" | vt create --type raw
 
    # Paste a URL printed by `vt create` to decrypt it.
    vt read 'vt://0<your-record>'
@@ -117,7 +120,7 @@ For a persistent setup, put these values in `~/.config/vt/config.toml` using
 | `version` | Show version information |
 | `init` | (macOS) Initialize passcode and passphrase in keychain |
 | `doctor` | Diagnose config sources (env vs config.toml), transport routing, worker reachability, and — via the read-only `diag@vt` extension — how a reachable vt agent classifies this connection for caching and why |
-| `create` | Read plaintext from stdin, output encrypted vt protocol |
+| `create [--type raw\|totp]` | Output an encrypted vt protocol record. On a terminal: prompts for the type, then reads the value without echo. With stdin piped it is fully non-interactive — stdin is the plaintext (one trailing newline stripped), type from `--type` (default `raw`). The plaintext is never a command-line argument |
 | `read <vt>` | Decrypt a vt protocol string |
 | `rewrap [--no-dry-run] [--backup] <file>...` | Re-encrypt legacy `vt://mac/...` URLs in files to the current envelope format (one agent/phone approval per batch) |
 | `inject [-r FILE] -- cmd...` | Transiently decrypt `vt://` in the file / env / argv, then exec the command |

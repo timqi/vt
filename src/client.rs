@@ -5,7 +5,7 @@
 //! VT_PASSKEY_URL + VT_PASSKEY_TOKEN env vars — POST /api/challenge + WS /api/dek.
 
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crate::cf;
 use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
@@ -803,21 +803,46 @@ impl VTClient {
     }
 }
 
-pub async fn create(vt_client: VTClient) -> Result<()> {
-    eprint!("Enter secret type (raw/totp) [default: raw]: ");
-    io::stderr().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    if input.trim().is_empty() {
-        input = "raw".to_string();
-    }
-    debug!("User input for secret type: '{}'", input);
-    let secret_type = SecretType::from_str(&input.trim().to_lowercase());
-    if secret_type == SecretType::UNKNOWN {
-        return Err(anyhow::anyhow!("Invalid secret type: {}", input));
-    }
+pub async fn create(vt_client: VTClient, type_arg: Option<&str>) -> Result<()> {
+    // Non-interactive when stdin is not a terminal: the type comes from
+    // `--type` (default raw) and stdin IS the plaintext. Interactively the two
+    // prompts stay — the type on stdin, the value on /dev/tty without echo. A
+    // piped run cannot answer the tty prompt at all, so a service rotating a
+    // secret has no other way in, and the plaintext must never be an argv flag.
+    let piped = !io::stdin().is_terminal();
+    let secret_type = match type_arg {
+        Some(t) => {
+            let parsed = SecretType::from_str(&t.trim().to_lowercase());
+            if parsed == SecretType::UNKNOWN {
+                return Err(anyhow::anyhow!("Invalid secret type: {}", t));
+            }
+            parsed
+        }
+        None if piped => SecretType::RAW,
+        None => {
+            eprint!("Enter secret type (raw/totp) [default: raw]: ");
+            io::stderr().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            if input.trim().is_empty() {
+                input = "raw".to_string();
+            }
+            debug!("User input for secret type: '{}'", input);
+            let parsed = SecretType::from_str(&input.trim().to_lowercase());
+            if parsed == SecretType::UNKNOWN {
+                // The invalid answer is echoed back, so it must be the type the
+                // user typed and never a plaintext read off a pipe.
+                return Err(anyhow::anyhow!("Invalid secret type: {}", input.trim()));
+            }
+            parsed
+        }
+    };
 
-    let secret = crate::tty::prompt_input_password("Enter secret: ", "Secret entered: ")?;
+    let secret = if piped {
+        crate::tty::read_secret_from_stdin()?
+    } else {
+        crate::tty::prompt_input_password("Enter secret: ", "Secret entered: ")?
+    };
     // DO NOT log `secret` — plaintext the user just typed.
 
     let res = vt_client
@@ -871,7 +896,7 @@ pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Resu
     // starship/p10k clobber partial lines). Piped/redirected: byte-exact
     // output — `$(vt read …)` strips trailing newlines anyway, and
     // `vt read … > file` must not gain a byte.
-    use std::io::{IsTerminal, Write};
+    use std::io::Write;
     let mut stdout = io::stdout().lock();
     stdout.write_all(res[0].result.as_bytes())?;
     if stdout.is_terminal() && !res[0].result.ends_with('\n') {

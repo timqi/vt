@@ -91,8 +91,17 @@ enum Commands {
     /// Read-only: asks a reachable vt agent (via diag@vt) how it classifies
     /// this connection and why it is or isn't cacheable
     Doctor,
-    /// Will read plain text and output encrypted message for you
-    Create,
+    /// Will read plain text and output encrypted message for you.
+    /// With stdin piped (not a terminal) the plaintext is read from stdin —
+    /// one trailing newline stripped — and no prompt is shown
+    Create {
+        #[arg(
+            long = "type",
+            value_name = "raw|totp",
+            help = "Secret type. Required to answer the prompt non-interactively; defaults to raw when stdin is piped"
+        )]
+        secret_type: Option<String>,
+    },
     /// Decrypt an existing vt protocol as plaintext
     Read {
         #[arg(help = "A string in vt protocol format, e.g. vt://mac/0xxxx")]
@@ -565,10 +574,10 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
             Fido2Commands::Remove { short_id } => server_macos::fido2_cli::fido2_remove(short_id),
             Fido2Commands::RemoveAll => server_macos::fido2_cli::fido2_remove_all(),
         },
-        Commands::Create => {
+        Commands::Create { secret_type } => {
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(auth)?;
-            client::create(vt_client).await
+            client::create(vt_client, secret_type.as_deref()).await
         }
         Commands::Read { vt, reason } => {
             let auth = require_auth(&cli.auth)?;
