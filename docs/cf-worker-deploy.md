@@ -15,6 +15,13 @@ phone (PWA) ── approve: WebAuthn + PRF ─▶ derives DEKs, seals to CLI pub
 - Ceremony endpoints live at the root (`/api/challenge`, `/api/dek`, `/api/approve`, `/api/reject`, `/a/:token`), secured by `HMAC(VT_AUTH_CF)` + unguessable tokens + WebAuthn.
 - The admin surface (`/<ADMIN_SEG>/…`, currently `ADMIN_SEG = "kestrel"` in `cf-worker/src/index.ts`) is gated by **Cloudflare Access** at the edge plus `cf-worker/src/access.ts` JWT verification.
 
+Request bodies for `/api/challenge`, `/api/dek-cache`, `/api/approve`, and
+`/api/reject` are limited to 256 KiB; `/api/audit-ingest` retains its 64 KiB
+limit. The Worker bounds streamed reads before HMAC verification or JSON parsing,
+including requests with absent or understated `Content-Length`, and returns
+HTTP 413 for oversized bodies. HMAC verification uses the original bytes, without
+JSON reserialization.
+
 ---
 
 ## Prerequisites

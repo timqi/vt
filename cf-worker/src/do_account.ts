@@ -1244,11 +1244,6 @@ export class AccountDO extends DurableObject<Env> {
       return new Response('assertion verification failed', { status: 401 });
     }
 
-    ch.status = 'approved';
-    ch.sealed_deks_b64u = body.sealed_deks_b64u;
-    ch.pwa_pk_b64u = body.pwa_pk_b64u;
-    ch.binding_tag_b64u = body.binding_tag_b64u;
-    ch.finalized_ms = Date.now();
     // `ch` was read before the (non-storage) crypto/verify awaits, during which
     // the DO input gate is open — so (a) the fire-and-forget feishuSendAndStore
     // may have written feishu_message_id, and (b) a concurrent expiry
@@ -1270,6 +1265,19 @@ export class AccountDO extends DurableObject<Env> {
       }
       return new Response('challenge not pending', { status: 410 });
     }
+    // Verification can cross the TTL without an alarm or another request
+    // finalizing this still-pending record. Check liveness at the write too.
+    const finalizedMs = Date.now();
+    if (isPendingExpired(latest, finalizedMs)) {
+      try { await this.expireChallenge(ch.approve_token, finalizedMs); }
+      catch (e) { logErr('expire.approve_failed', e); }
+      return new Response('challenge expired', { status: 410 });
+    }
+    ch.status = 'approved';
+    ch.sealed_deks_b64u = body.sealed_deks_b64u;
+    ch.pwa_pk_b64u = body.pwa_pk_b64u;
+    ch.binding_tag_b64u = body.binding_tag_b64u;
+    ch.finalized_ms = finalizedMs;
     ch.feishu_message_id = latest.feishu_message_id;
     ch.slackapp = latest.slackapp;
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
@@ -1372,6 +1380,7 @@ export class AccountDO extends DurableObject<Env> {
       catch { reject('cache_sealed_dek malformed'); return; }
       const probe = openToCache(s, this.env.CACHE_SECKEY);
       if (!probe || probe.length !== 32) {
+        probe?.fill(0);
         reject('cache_sealed_dek does not open to CACHE_PUBKEY'); return;
       }
       probe.fill(0);
@@ -1462,37 +1471,32 @@ export class AccountDO extends DurableObject<Env> {
     const now = Date.now();
     const orphaned: string[] = [];
     const dekParts: Uint8Array[] = [];
-    for (const key of keys) {
-      const entry = map.get(key);
-      if (!entry || entry.expires_ms <= now) continue;
-      const dek = openToCache(entry.sealed_to_cache_b64u, this.env.CACHE_SECKEY);
-      if (!dek || dek.length !== 32) {
-        // Undecryptable (e.g. CACHE_SECKEY rotated, M3) — treat as miss and
-        // lazily drop the now-orphaned entry. Never surface a 500.
-        orphaned.push(key);
-        continue;
-      }
-      dekParts.push(dek);
-    }
-    if (orphaned.length) { try { await this.deleteKeysBatched(orphaned); } catch {} }
-
-    // All-or-nothing: a full hit requires one opened DEK per salt. Any miss/
-    // expired/undecryptable entry above simply didn't push, so a short count is
-    // a uniform miss.
-    if (dekParts.length !== salts.length) {
-      return miss();
-    }
-
-    // Full hit: concatenate DEKs in salt order and re-seal to daemon pubkey.
-    // try/finally guarantees the plaintext DEK bytes are wiped even if seal()
-    // throws, so opened DEKs never linger in the Worker heap (S2).
-    const flat = new Uint8Array(dekParts.length * 32);
+    let flat: Uint8Array | undefined;
     let sealedB64u: string;
     try {
-      dekParts.forEach((d, i) => flat.set(d, i * 32));
+      for (const key of keys) {
+        const entry = map.get(key);
+        if (!entry || entry.expires_ms <= now) continue;
+        const dek = openToCache(entry.sealed_to_cache_b64u, this.env.CACHE_SECKEY);
+        if (!dek || dek.length !== 32) {
+          dek?.fill(0);
+          // Undecryptable (e.g. CACHE_SECKEY rotated, M3): uniformly miss and
+          // lazily drop the orphaned entry, never surface a 500.
+          orphaned.push(key);
+          continue;
+        }
+        dekParts.push(dek);
+      }
+      if (orphaned.length) { try { await this.deleteKeysBatched(orphaned); } catch {} }
+
+      // All-or-nothing, including partial hits: every opened DEK is covered
+      // by finally, even when a later salt is missing or opening/sealing fails.
+      if (dekParts.length !== salts.length) return miss();
+      flat = new Uint8Array(dekParts.length * 32);
+      for (let i = 0; i < dekParts.length; i++) flat.set(dekParts[i]!, i * 32);
       sealedB64u = seal(flat, daemonPk);
     } finally {
-      flat.fill(0);
+      flat?.fill(0);
       dekParts.forEach(d => d.fill(0));
     }
 
@@ -1985,16 +1989,23 @@ export class AccountDO extends DurableObject<Env> {
           // ── atomic section: no await until the put ──
           const now = Date.now();
           const writes: Record<string, CacheEntry> = {};
+          let chunkLatest = 0;
           for (const key of chunk) {
             const entry = fresh.get(key);
             if (!entry) { skipped.gone = (skipped.gone ?? 0) + 1; continue; }
             const plan = planExtend(entry, intent.ttl_s, now);
             if (!plan.ok) { skipped[plan.skip] = (skipped[plan.skip] ?? 0) + 1; continue; }
             writes[key] = { ...entry, expires_ms: plan.expires_ms };
-            if (plan.expires_ms > groupLatest) groupLatest = plan.expires_ms;
-            extended++;
+            if (plan.expires_ms > chunkLatest) chunkLatest = plan.expires_ms;
           }
-          if (Object.keys(writes).length > 0) await this.ctx.storage.put(writes);
+          const count = Object.keys(writes).length;
+          if (count > 0) {
+            await this.ctx.storage.put(writes);
+            // Account for effects only after storage acknowledges this batch.
+            // A failed later batch must retain the earlier successful tally.
+            extended += count;
+            if (chunkLatest > groupLatest) groupLatest = chunkLatest;
+          }
           // ── end atomic section ──
         }
       } catch (e) {
