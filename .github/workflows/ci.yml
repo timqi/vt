@@ -31,6 +31,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -38,6 +40,15 @@ jobs:
 
       - name: Test
         run: cargo test --locked --all-targets
+
+      # Runs on both legs on purpose: the ubuntu leg never compiles
+      # `src/server_macos/**`, so macos-latest is the only place that module
+      # is ever linted at all.
+      - name: Clippy (deny warnings)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --check
 
       # Mirror `just check`: host + the x86_64-unknown-linux-gnu boundary that
       # CLAUDE.md requires to stay green. Only meaningful on Linux.

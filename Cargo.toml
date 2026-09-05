@@ -12,7 +12,15 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5.43", features = ["derive", "env"] }
-tokio = { version = "1.47.1", features = ["full"] }
+# Narrowed from `full`. Every feature here backs a direct `tokio::*` use in
+# this crate: rt-multi-thread (`runtime::Builder`, `spawn`), net (agent/relay
+# sockets), time, macros (`#[tokio::main]`-style block_on tests, `select!`,
+# `pin!`), process (`vt ssh connect` execs ssh), sync, signal (the macOS agent's
+# shutdown handler) and fs. `io-util`/`io-std` are dropped: vt uses `std::io`
+# everywhere and only dependencies pull the async IO traits in. `parking_lot`
+# is dropped too — it only swaps tokio's internal mutex impl, and it costs 5
+# crates in the tree.
+tokio = { version = "1.47.1", default-features = false, features = ["rt-multi-thread", "net", "time", "macros", "process", "sync", "signal", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
 aes-gcm = "0.10"

@@ -99,6 +99,12 @@ check:
 test:
     cargo test --all-targets
 
+# On Linux this cannot see `src/server_macos/**`; CI's macos-latest leg can.
+# Lint gates: clippy warning-free + rustfmt a no-op
+lint:
+    cargo clippy --all-targets -- -D warnings
+    cargo fmt --check
+
 # Type-check + unit-test the Cloudflare worker. Installs deps on first run.
 #
 # `--include=dev` is not optional: a shell with NODE_ENV=production makes npm
@@ -117,7 +123,7 @@ check-worker:
     npm test
 
 # Everything the CI gates run, in one shot (Rust + worker)
-ci: check test check-worker
+ci: check lint test check-worker
 
 # Stamp <YYYYMMDD>-<git short hash> into ASSET_VER (cf-worker/src/index.ts).
 # Run after changing anything shipped from cf-worker/pwa/ (css / js / the page
