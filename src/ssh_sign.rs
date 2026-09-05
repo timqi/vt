@@ -9,7 +9,7 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::client::VTClient;
+use crate::client::{single_item_result, VTClient};
 use crate::core::{EncryptItem, SecretType};
 
 /// Default location of the encrypted key record, relative to `$HOME`.
@@ -63,10 +63,7 @@ async fn keygen_unix(
             t: SecretType::RAW,
         }])
         .await?;
-    if !res[0].err_message.is_empty() {
-        bail!("failed to encrypt ssh key: {}", res[0].err_message);
-    }
-    let vt_url = res[0].result.clone();
+    let vt_url = single_item_result(res, "failed to encrypt ssh key")?;
 
     // 3. OpenSSH public-key line (encoding only — no secret material).
     let comment_str = comment.or(label).unwrap_or_default();
@@ -759,15 +756,15 @@ impl ssh_agent_lib::agent::Session for SignerSession {
                     .decrypt(&inner.host, &inner.command, std::slice::from_ref(&vt_url))
                     .await
                     .map_err(|e| sign_err(e.to_string()))?;
-                if res.is_empty() || !res[0].err_message.is_empty() {
-                    let msg = res
-                        .first()
-                        .map(|r| r.err_message.clone())
-                        .unwrap_or_default();
-                    return Err(sign_err(format!("decrypt ssh key failed: {msg}")));
-                }
+                let value = match res.first() {
+                    Some(Ok(value)) => value,
+                    Some(Err(error)) => {
+                        return Err(sign_err(format!("decrypt ssh key failed: {error}")))
+                    }
+                    None => return Err(sign_err("decrypt ssh key failed: ")),
+                };
                 let bytes = BASE64_URL_SAFE_NO_PAD
-                    .decode(res[0].result.trim())
+                    .decode(value.trim())
                     .map_err(|e| sign_err(format!("ssh seed base64: {e}")))?;
                 let arr: [u8; 32] = bytes
                     .try_into()

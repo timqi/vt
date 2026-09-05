@@ -58,14 +58,14 @@ describe('opCacheList — inventory without secrets', () => {
   it('joins the origin approval context the audit tab already shows', async () => {
     const originToken = 'listorigin000001';
     await inDO(h => {
-      h.inst.auditCreate({
+      h.inst.audit.create({
         approve_token: originToken,
         created_ms: Date.now(),
         salts_b64u: ['s'],
         meta: makeMeta({ host: 'listbox', user: 'lister', pwd: '/srv/app' }),
       });
-      h.inst.auditFinalize(originToken, 'approved', 1234);
-      h.inst.auditSetCacheTtl(originToken, 20 * 60, Date.now() + 20 * MIN);
+      h.inst.audit.finalize(originToken, 'approved', 1234);
+      h.inst.audit.setCacheTtl(originToken, 20 * 60, Date.now() + 20 * MIN);
     });
     await inDO(h => seedGroup(h, 1, {
       expires_ms: Date.now() + 20 * MIN, origin_token_id: originToken,

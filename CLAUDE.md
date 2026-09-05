@@ -22,16 +22,18 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
 | Area | Files |
 |---|---|
 | CLI and command routing | `src/main.rs` |
-| Transport selection and client protocol | `src/config.rs`, `src/client.rs`, `src/cf.rs` |
+| Transport selection and client protocol | `src/config.rs`, `src/config/client.rs` (`ResolvedConfig`), `src/client.rs` (`ItemResult`), `src/cf.rs` |
 | `vt://` format and cryptography | `src/core.rs`, `src/core/crypto.rs`, `src/core/wire.rs` |
-| Agent authorization scopes, grants, and revocation | `src/core/authorization.rs`, `src/server_macos/authorization.rs`, `src/server_macos/ssh_agent.rs` |
+| Agent authorization scopes, grants, and revocation | `src/core/authorization.rs`, `src/server_macos/authorization.rs`, `src/server_macos/ssh_agent/scopes.rs`, `src/server_macos/ssh_agent/scopes/process.rs` |
+| Agent protocol dispatch and extension operations | `src/server_macos/ssh_agent.rs` (response encryption and permit commitment), `src/server_macos/ssh_agent/handlers.rs` |
 | SSH identity and `vt ssh connect` | `src/ssh_sign.rs` |
 | macOS Keychain, Touch ID, and SSH agent | `src/server_macos/` |
 | AI-agent command hook | `src/hook.rs`, [`docs/hook.md`](docs/hook.md) |
 | VT.app menu-bar shell and bundle packaging | `app/VTShell.swift`, `app/Info.plist`, `justfile` (`app`, `install-app`), [`docs/app-bundle.md`](docs/app-bundle.md) |
 | Worker routes and admin pages | `cf-worker/src/index.ts`, `cf-worker/src/page.ts`, `cf-worker/pwa/approve.html`, `cf-worker/pwa/admin/` |
 | Worker ceremony/cache lifecycle | `cf-worker/src/do_account.ts` |
-| Worker notification channels | `cf-worker/src/notify.ts`, `pushover.ts`, `slack.ts`, `slack_app.ts`, `feishu.ts` |
+| Worker audit persistence and admin stream projection | `cf-worker/src/account_audit.ts` |
+| Worker notification lifecycle and channels | `cf-worker/src/account_notifications.ts`, `cf-worker/src/notify.ts`, `pushover.ts`, `slack.ts`, `slack_app.ts`, `feishu.ts` |
 
 ## Current behavior that must not drift
 

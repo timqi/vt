@@ -142,6 +142,12 @@ For a persistent setup, put these values in `~/.config/vt/config.toml` using
 | `ssh keygen [-l <label>] [-c <comment>] [--key-file <path>]` | Generate a portable Ed25519 identity stored as a `vt://` record; prints the OpenSSH public key (cross-platform) |
 | `ssh connect [--forward-real-agent] [ssh args...]` | Git SSH driver — `GIT_SSH_COMMAND="vt ssh connect"`; signs with a portable `vt://` identity or a discovered VT-agent key. The flag must precede SSH args. |
 
+`rewrap` preserves the target's POSIX permission bits. Temporary files and optional
+backups are created privately and exclusively; existing `.vt-rewrap-tmp` or
+`.vt-rewrap-backup` paths are refused rather than overwritten. Inspect any leftover
+sidecars before removing them and retrying. Ownership, ACLs, and extended attributes
+are not copied when the target inode is replaced.
+
 ### Inject Command
 
 `inject` temporarily decrypts a config file (and/or env vars and argv) so a
@@ -153,8 +159,8 @@ backup after `--timeout` seconds.
 # ~2s after exec, regardless of when the child finishes.
 vt inject -r config.yaml -- ./run.sh
 
-# Need the plaintext elsewhere? Compose with standard Unix tools — the file
-# stays decrypted for the lifetime of the child:
+# Need the plaintext elsewhere? Compose with standard Unix tools; the command
+# must read the file before the same timeout window closes:
 vt inject -r config.yaml -- cat config.yaml        # decrypt → stdout
 vt inject -r config.yaml -- cp config.yaml /tmp/c  # decrypt → another path
 vt inject -r config.yaml -- jq .api_key config.yaml
@@ -177,6 +183,18 @@ restore supervisor died (crash/reboot), the refusal points at
 `vt inject --recover`. A file containing no `vt://` records is also refused:
 there is nothing to decrypt, which usually means the wrong file — or plaintext
 left behind by a broken exposure.
+
+Injection aborts the entire batch if any record fails to decrypt: no environment
+values or files are changed and the command is not started. Repeated records are
+decrypted once, and a decrypted value containing `vt://` text is inserted literally.
+
+The temporary publication file is reserved empty before the supervisor starts;
+restoration cancels its name before consuming the ciphertext backup. A delayed
+parent cannot recreate that file after restoration. The recovery deadline is
+recorded before supervisor startup, so `--recover` can also cancel a stalled
+startup after the deadline and grace period; that parent's publication then fails.
+The normal restore timer starts in the supervisor. Cancellation or restore errors
+preserve the backup and any existing recovery record for a later retry.
 
 ### SSH Agent
 

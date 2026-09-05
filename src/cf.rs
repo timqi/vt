@@ -3,7 +3,7 @@
 // Called by client.rs when the SSH agent path is unavailable (Linux, or macOS
 // without a running vt ssh agent). The ceremony:
 //
-//   1. Read VT_PASSKEY_URL + VT_PASSKEY_TOKEN from the environment.
+//   1. Use the resolved VT_PASSKEY_URL + VT_PASSKEY_TOKEN snapshot.
 //   2. Generate ephemeral X25519 keypair and per-DEK salts (16 B each).
 //   3. POST /api/challenge  →  approve_url, poll_token, worker_nonce.
 //   4. Print approve_url to stderr.
@@ -45,30 +45,9 @@ pub fn random_salts(n: usize) -> Vec<[u8; 16]> {
 
 // ── Config ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
-pub struct CfConfig {
-    pub worker_url: String,
-    pub worker_auth: String,
-}
-
-/// Read the CF worker URL + HMAC token from the environment.
-///
-/// Both vars are required: there is no file fallback and no implicit default,
-/// so a misconfigured host fails fast rather than silently calling the wrong
-/// worker.
-pub fn load_config() -> Result<CfConfig> {
-    let worker_url = std::env::var("VT_PASSKEY_URL").context("VT_PASSKEY_URL not set")?;
-    let worker_auth = std::env::var("VT_PASSKEY_TOKEN").context("VT_PASSKEY_TOKEN not set")?;
-    if worker_url.trim().is_empty() {
-        bail!("VT_PASSKEY_URL is empty");
-    }
-    if worker_auth.trim().is_empty() {
-        bail!("VT_PASSKEY_TOKEN is empty");
-    }
-    Ok(CfConfig {
-        worker_url,
-        worker_auth,
-    })
+pub struct CfConfig<'a> {
+    pub worker_url: &'a str,
+    pub worker_auth: &'a str,
 }
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
@@ -383,7 +362,7 @@ pub(crate) async fn cf_post_with_timeout(
 /// fresh random salts for encrypt, empty for auth-only. The browser derives
 /// `DEK[i] = HKDF(master_key, salt[i])` and seals `[DEK...]` back.
 pub async fn get_deks(
-    config: &CfConfig,
+    config: &CfConfig<'_>,
     salts: &[[u8; 16]],
     meta: ChallengeMeta,
 ) -> Result<Vec<Zeroizing<[u8; 32]>>> {
@@ -409,7 +388,7 @@ pub async fn get_deks(
         meta,
     })?;
 
-    let auth_header = hmac_auth_header(&config.worker_auth, &req_body);
+    let auth_header = hmac_auth_header(config.worker_auth, &req_body);
     let resp = cf_post(&challenge_url, &auth_header, &req_body)
         .await
         .context("POST /api/challenge")?;
@@ -529,7 +508,7 @@ pub async fn get_deks(
 /// still rests on the sealed_box being sealed to our fresh ephemeral pubkey
 /// (only we can open it) plus TLS.
 pub async fn try_cache(
-    config: &CfConfig,
+    config: &CfConfig<'_>,
     salts: &[[u8; 16]],
     meta: &ChallengeMeta,
 ) -> Result<Option<Vec<Zeroizing<[u8; 32]>>>> {
@@ -559,7 +538,7 @@ pub async fn try_cache(
     };
 
     let url = format!("{}/api/dek-cache", config.worker_url);
-    let auth_header = hmac_auth_header(&config.worker_auth, &req_body);
+    let auth_header = hmac_auth_header(config.worker_auth, &req_body);
     // Same IPv4-pinned client as the challenge POST so CF-Connecting-IP (half the
     // cache ctx) is stable across the two processes. Any transport/HTTP failure →
     // fall back to the ceremony rather than abort.

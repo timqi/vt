@@ -315,17 +315,8 @@ app.post(`/${ADMIN_SEG}/api/clear-audit`, async (c) => {
 // POST /api/challenge — daemon creates a challenge
 app.post('/api/challenge', async (c) => {
   // 1. HMAC auth
-  const auth = c.req.header('Authorization') ?? '';
-  const prefix = 'VT-HMAC ';
-  if (!auth.startsWith(prefix)) return c.text('missing auth', 401);
-  let providedHmac: Uint8Array;
-  try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
-  catch { return c.text('hmac length', 401); }
-
-  const rawBody = await c.req.arrayBuffer();
-  const keyBytes = new TextEncoder().encode(c.env.VT_AUTH_CF);
-  const expected = await hmacSha256(keyBytes, new Uint8Array(rawBody));
-  if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
+  const rawBody = await readAuthenticatedDaemonBody(c);
+  if (rawBody instanceof Response) return rawBody;
 
   // 2. Parse body
   let body: ChallengeRequest;
@@ -433,17 +424,8 @@ app.get('/api/dek', async (c) => {
 // forms half of the cache binding context; the ppid (client-reported) is the
 // advisory half. See docs/dek-cache.md §2.5.
 app.post('/api/dek-cache', async (c) => {
-  const auth = c.req.header('Authorization') ?? '';
-  const prefix = 'VT-HMAC ';
-  if (!auth.startsWith(prefix)) return c.text('missing auth', 401);
-  let providedHmac: Uint8Array;
-  try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
-  catch { return c.text('hmac length', 401); }
-
-  const rawBody = await c.req.arrayBuffer();
-  const keyBytes = new TextEncoder().encode(c.env.VT_AUTH_CF);
-  const expected = await hmacSha256(keyBytes, new Uint8Array(rawBody));
-  if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
+  const rawBody = await readAuthenticatedDaemonBody(c);
+  if (rawBody instanceof Response) return rawBody;
 
   let body: DekCacheRequest;
   try { body = JSON.parse(new TextDecoder().decode(rawBody)); }
@@ -475,9 +457,8 @@ app.post('/api/dek-cache', async (c) => {
 // request is negligible; the 64 KB cap + 401-on-bad-HMAC bound abuse.
 const AUDIT_INGEST_MAX_BYTES = 64 * 1024;
 app.post('/api/audit-ingest', async (c) => {
-  // 0. Reject oversized bodies before reading/parsing (cheap Content-Length
-  //    check first; the arrayBuffer length is re-checked below in case the
-  //    header lied).
+  // 0. Reject a declared oversized body before parsing the auth header;
+  //    readCappedBody also enforces the limit while streaming below.
   const clen = c.req.header('Content-Length');
   if (clen && Number(clen) > AUDIT_INGEST_MAX_BYTES) return c.text('body too large', 413);
 
@@ -488,9 +469,8 @@ app.post('/api/audit-ingest', async (c) => {
   try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
   catch { return c.text('hmac length', 401); }
 
-  const rawBuf = await c.req.arrayBuffer();
-  if (rawBuf.byteLength > AUDIT_INGEST_MAX_BYTES) return c.text('body too large', 413);
-  const rawBody = new Uint8Array(rawBuf);
+  const rawBody = await readCappedBody(c, AUDIT_INGEST_MAX_BYTES);
+  if (!rawBody) return c.text('body too large', 413);
 
   // 1. Parse the body to get agent_id (UNVERIFIED — it only selects the key).
   let body: AgentAuditIngestRequest;
@@ -562,17 +542,59 @@ app.post('/api/audit-ingest', async (c) => {
   });
 });
 
-// Cap on the (unauthenticated) approve/reject bodies. The dominant fields are
-// the sealed-DEK blobs; 256 KB covers thousands of records while bounding the
-// CPU/parse/DO-storage cost of an oversized POST to these public endpoints.
+// Shared cap for challenge/cache probes and approve/reject bodies. Bound reads
+// before HMAC/JSON work, even when Content-Length is absent or understated.
 const CEREMONY_POST_MAX_BYTES = 256 * 1024;
 
-async function readCappedBody(c: Context): Promise<Uint8Array | null> {
+async function readCappedBody(c: Context, maxBytes = CEREMONY_POST_MAX_BYTES): Promise<Uint8Array | null> {
   const clen = c.req.header('Content-Length');
-  if (clen && Number(clen) > CEREMONY_POST_MAX_BYTES) return null;
-  const buf = await c.req.arrayBuffer();
-  if (buf.byteLength > CEREMONY_POST_MAX_BYTES) return null;
-  return new Uint8Array(buf);
+  if (clen && Number(clen) > maxBytes) return null;
+  const reader = c.req.raw.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength === 0) continue;
+      if (value.byteLength > maxBytes - length) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+      length += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+// Only daemon challenge/cache requests use this key; audit ingestion derives
+// a per-agent key and deliberately retains its own validation order.
+async function readAuthenticatedDaemonBody(
+  c: Context<{ Bindings: Env; Variables: AccessVars }>,
+): Promise<Uint8Array | Response> {
+  const auth = c.req.header('Authorization') ?? '';
+  const prefix = 'VT-HMAC ';
+  if (!auth.startsWith(prefix)) return c.text('missing auth', 401);
+  let providedHmac: Uint8Array;
+  try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
+  catch { return c.text('hmac length', 401); }
+
+  const rawBody = await readCappedBody(c);
+  if (!rawBody) return c.text('body too large', 413);
+  const keyBytes = new TextEncoder().encode(c.env.VT_AUTH_CF);
+  const expected = await hmacSha256(keyBytes, rawBody);
+  if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
+  return rawBody;
 }
 
 // POST /api/approve — PWA submits sealed DEKs after WebAuthn

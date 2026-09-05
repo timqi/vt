@@ -158,15 +158,17 @@ VT_AUTH can already exercise decrypts, so this adds no new capability.
 
 Sections, in order; never hard-fails — reports and lints:
 
-1. **Config** — each `VT_*` knob: effective value (secrets redacted to
-   `set(…8 chars)`), source `env` / `config.toml` / `unset`. Source tracking:
-   `hydrate_env_from_file` returns the list of keys it populated, threaded
-   into the doctor as a plain parameter (no global state); anything set but
-   not in that list is `env`. Re-lint config file permissions (same check as
-   loading, but visible on demand).
-2. **Routing** — replicate `VTClient::new` validation + the `VT_BACKEND`
-   table: "this host would try agent first, then fall back to passkey" /
-   errors the constructor would raise.
+1. **Config** — each `VT_*` knob: effective value (bearer secrets redacted to
+   `set (len N)`), source `env` / `config.toml` / `unset`. After hydration and
+   clap's auth precedence, `ResolvedConfig` captures the effective settings,
+   socket path, and the list of file-populated keys. Doctor and client
+   transports use that snapshot; anything set but not in the source list is
+   `env`. Re-lint config file permissions on demand.
+2. **Routing** — describe the same `ResolvedConfig::route` result consumed by
+   `VTClient::new`, rather than reconstructing its validation. Worker URL/token
+   presence is diagnostic; their nonempty checks remain deferred until a Worker
+   operation. An invalid or incomplete configuration never prevents doctor or
+   unauthenticated commands from running.
 3. **Agent** — socket path used (`$SSH_AUTH_SOCK` vs `~/.ssh/vt.sock`),
    connectable?, then `diag@vt` via a **dedicated helper** (not the generic
    `try_agent_extension` contract — review R4, the two failure shapes are
@@ -202,7 +204,8 @@ Exit code 0 always in v1 (diagnostic, not a health gate).
 | `src/core/authorization.rs` | operation/subject-scoped live grant counts |
 | `src/server_macos/ssh_agent.rs` | EXT_DIAG, classification refactor, handle_diag |
 | `src/ssh_sign.rs` | relay `diag@vt` + tests |
-| `src/client.rs` | doctor body (config/routing/agent/worker sections) |
+| `src/client/doctor.rs` | doctor body (config/routing/agent/worker sections) |
+| `src/config/client.rs` | resolved snapshot and shared routing policy |
 | `src/config.rs` | hydrate returns populated keys |
 | `src/main.rs` | `vt doctor` subcommand |
 | `README.md`, `docs/README.md` | command row / map row |

@@ -59,12 +59,17 @@ TTL, a caller can decrypt the approved records without another phone tap.
   `vt-dek-ctx-v4`; entries written under the v3 (literal-`pwd`) derivation are
   unreachable and simply lapse or can be cleared from the admin tab.
 - Reads are all-or-nothing for a batch of salts. A partial or expired batch is
-  a miss and falls back to the normal phone ceremony.
+  a miss and falls back to the normal phone ceremony. Opened DEK buffers are wiped
+  on full hits, partial misses, and failure exits; this minimizes their lifetime,
+  but does not protect against a compromised Worker or guarantee erasure of
+  JavaScript-engine copies.
 - A hit re-seals the DEKs to the current CLI request's ephemeral public key.
   The Worker never sends a cached DEK in the form stored at rest.
 - Cache hits, write failures, and approved extensions are recorded in the
   unified `audit` table. Routine misses are logged and then followed by the
-  normal ceremony audit.
+  normal ceremony audit. Extension effect counts and projected expiry reflect
+  only storage batches whose writes succeeded. A failed later batch leaves
+  earlier successful extensions recorded, without claiming the failed batch.
 - Each write mints one `cache_group_id` (all entries from one approval under one
   binding ctx) and stamps an immutable `created_ms`. The group id is the handle
   the admin surface lists, clears, and extends by.
@@ -136,7 +141,8 @@ until a Passkey approves it, and every one of these holds:
 1. **Passkey required.** The intent (group ids, TTL, requester) is written onto
    the challenge at request time and never mutated, so the approval finalizes
    exactly what was proposed. The ceremony is single-use, expires in 5 minutes if
-   untouched, and is **not pushed to any notification channel** — the flow is
+   untouched, and rechecks that deadline after assertion verification, immediately
+   before approval commits. It is **not pushed to any notification channel** — the flow is
    console-resident (select groups on the DEK 缓存 tab, approve in the modal that
    opens on the same page), so a card would only notify the person already watching
    the result. Observability stays where it belongs: the audit tab receives the

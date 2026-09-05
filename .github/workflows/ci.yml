@@ -2,6 +2,7 @@ name: CI
 
 # Default-triggers on every PR (all base branches) plus pushes to main.
 on:
+  workflow_call:
   pull_request:
   push:
     branches: [main]
@@ -59,6 +60,22 @@ jobs:
           cargo check --locked
           cargo check --locked --target x86_64-unknown-linux-gnu
 
+      - name: Test native agent lifecycle (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          TEST_BIN="$RUNNER_TEMP/vt-lifecycle-tests"
+          swiftc -D VT_LIFECYCLE_TEST app/VTShell.swift -o "$TEST_BIN"
+          "$TEST_BIN"
+
+      - name: Package and verify VT.app (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install just
+          just app
+          codesign --verify --deep --strict build/VT.app
+          build/VT.app/Contents/MacOS/vt version
+          build/VT.app/Contents/MacOS/vt --help
+
   # The cf-worker is half the system (it verifies every ceremony) but ships via
   # `wrangler deploy` with no compile gate of its own. Type-check it on every PR
   # so a TS error in the DO / WebAuthn / Access path can't reach production.
@@ -76,11 +93,11 @@ jobs:
 
       - name: Install deps
         working-directory: cf-worker
-        run: npm ci
+        run: npm ci --include=dev
 
       - name: Type-check (tsc --noEmit)
         working-directory: cf-worker
-        run: npx tsc --noEmit
+        run: node_modules/.bin/tsc --noEmit
 
       - name: Unit tests (vitest)
         working-directory: cf-worker
@@ -107,7 +124,17 @@ jobs:
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      # CC lets ring (via rustls) compile its C/asm for musl; do NOT set a musl
-      # LINKER — rustc's self-contained musl link already bundles the CRT.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Use the same compiler flags and lockfile policy as release packaging.
       - name: Build (musl-static)
-        run: CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --bin vt --target x86_64-unknown-linux-musl
+        run: just build-musl
+
+      - name: Smoke-test shipping binary (including TLS)
+        run: node .github/scripts/smoke-binary.mjs target/x86_64-unknown-linux-musl/release/vt

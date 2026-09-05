@@ -13,17 +13,19 @@ pub use doctor::doctor;
 pub use inject::{inject, inject_recover, supervisor_main, SUPERVISOR_SUBCOMMAND};
 
 use crate::cf;
+use crate::config::{ClientRoute, ResolvedConfig};
 use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
 use crate::core::wire::{ErrKind, WIRE_VERSION};
 use crate::core::{
-    client_decrypt_v2, client_encrypt_v2, AuthReq, AuthRes, CryptoResItem, DecryptInput,
-    DecryptReq, DecryptResItem, EncryptItem, EncryptReq, EncryptResItem, RunReq, RunRes,
-    SecretType, SignReq, SignRes, VtUrl, SALT_LEN,
+    client_decrypt_v2, client_encrypt_v2, AuthReq, AuthRes, DecryptInput, DecryptReq,
+    DecryptResItem, EncryptItem, EncryptReq, EncryptResItem, RunReq, RunRes, SecretType, SignReq,
+    SignRes, VtUrl, SALT_LEN,
 };
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use ssh_agent_lib::proto::{Extension, Unparsed};
+use std::sync::Arc;
 use tracing::debug;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -101,8 +103,8 @@ struct ParsedEnvelope<'a> {
     detail: Option<String>,
 }
 
-/// Policy for the `auto` backend mode (currently the only mode): when an
-/// SSH agent call fails, may we silently retry via the CF passkey path?
+/// Policy for the `auto` backend mode: when an SSH agent call fails, may we
+/// silently retry via the CF passkey path?
 ///
 /// Falls back for:
 /// - Transport failures (socket talk, envelope parse, version mismatch,
@@ -160,45 +162,59 @@ fn parse_envelope(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     }
 }
 
+/// Per-record failures stay typed inside the client; wire structs remain
+/// unchanged and are converted at the transport boundary.
+#[derive(Debug)]
+pub struct ItemError(String);
+
+impl std::fmt::Display for ItemError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ItemError {}
+
+impl From<anyhow::Error> for ItemError {
+    fn from(error: anyhow::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+pub type ItemResult = std::result::Result<String, ItemError>;
+
+pub(crate) fn single_item_result(
+    mut results: Vec<ItemResult>,
+    error_prefix: &str,
+) -> Result<String> {
+    ensure!(results.len() == 1, "Expected exactly one item in response");
+    results
+        .remove(0)
+        .map_err(|error| anyhow::anyhow!("{error_prefix}: {error}"))
+}
+
+fn legacy_item_result(result: String, err_message: String) -> ItemResult {
+    if err_message.is_empty() {
+        Ok(result)
+    } else {
+        Err(ItemError(err_message))
+    }
+}
+
 #[derive(Clone)]
 pub struct VTClient {
-    auth_token: String,
-    backend: crate::config::Backend,
+    config: Arc<ResolvedConfig>,
+    route: ClientRoute,
 }
 
 impl VTClient {
-    /// Build a client and verify that at least one decryption path is
-    /// configured. Each path is opt-in by its own env vars:
-    ///
-    /// - SSH agent path: `VT_AUTH` (passed in as `auth_token`)
-    /// - CF passkey path: `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN`
-    ///
-    /// `VT_BACKEND` (auto | agent | passkey) pins the routing; its
-    /// requirements are validated here too, so the user sees a single
-    /// actionable error rather than a failure deep inside the routing code.
-    pub fn new(auth_token: String) -> Result<Self> {
-        let backend = crate::config::Backend::from_env()?;
-        match backend {
-            crate::config::Backend::Agent if auth_token.is_empty() => {
-                anyhow::bail!("VT_BACKEND=agent requires VT_AUTH for the SSH agent path");
-            }
-            crate::config::Backend::Passkey if std::env::var("VT_PASSKEY_URL").is_err() => {
-                anyhow::bail!(
-                    "VT_BACKEND=passkey requires VT_PASSKEY_URL + VT_PASSKEY_TOKEN \
-                     for the phone passkey ceremony"
-                );
-            }
-            _ => {}
-        }
-        if auth_token.is_empty() && std::env::var("VT_PASSKEY_URL").is_err() {
-            anyhow::bail!(
-                "no decryption path configured — set VT_AUTH for the SSH agent path, \
-                 or VT_PASSKEY_URL + VT_PASSKEY_TOKEN for the phone passkey ceremony"
-            );
-        }
-        Ok(VTClient {
-            auth_token,
-            backend,
+    /// Validate only when a command needs a client. Doctor uses the same
+    /// captured config without requiring a usable authentication route.
+    pub fn new(config: ResolvedConfig) -> Result<Self> {
+        let route = config.route()?;
+        Ok(Self {
+            config: Arc::new(config),
+            route,
         })
     }
 
@@ -207,7 +223,7 @@ impl VTClient {
     /// `vt ssh connect`: `sign@vt` needs this key, so discovery only makes
     /// sense when the agent path is in play.
     pub(crate) fn has_auth_token(&self) -> bool {
-        !self.auth_token.is_empty() && self.backend != crate::config::Backend::Passkey
+        self.route.uses_agent()
     }
 
     /// Try to send an extension request via the SSH agent socket.
@@ -229,7 +245,7 @@ impl VTClient {
     ///   for why those stay unstructured).
     #[cfg(unix)]
     fn try_agent_extension(
-        auth_token: &str,
+        config: &ResolvedConfig,
         name: &str,
         payload: &[u8],
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
@@ -237,11 +253,12 @@ impl VTClient {
         // and let agent_call_or_fallback route to the CF passkey ceremony.
         // This also avoids decoding an empty auth token when $SSH_AUTH_SOCK
         // happens to point at an unrelated ssh-agent (common on Linux).
+        let auth_token = config.auth_token();
         if auth_token.is_empty() {
             return Ok(None);
         }
 
-        let stream = match Self::connect_agent_socket()? {
+        let stream = match Self::connect_agent_socket(config)? {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -287,15 +304,11 @@ impl VTClient {
     /// running) so callers can degrade gracefully; other IO errors propagate.
     /// Shared by `try_agent_extension` and `list_agent_identities`.
     #[cfg(unix)]
-    fn connect_agent_socket() -> Result<Option<std::os::unix::net::UnixStream>> {
+    fn connect_agent_socket(
+        config: &ResolvedConfig,
+    ) -> Result<Option<std::os::unix::net::UnixStream>> {
         use std::os::unix::net::UnixStream;
-        let socket_path = if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
-            std::path::PathBuf::from(sock)
-        } else {
-            let home =
-                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
-            home.join(".ssh").join("vt.sock")
-        };
+        let socket_path = config.socket_path()?;
         match UnixStream::connect(&socket_path) {
             Ok(s) => Ok(Some(s)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -322,7 +335,7 @@ impl VTClient {
     /// `resolve_identities` does) or the keys will fail at sign time.
     #[cfg(unix)]
     pub(crate) fn list_agent_identities(&self) -> Result<Vec<ssh_agent_lib::proto::Identity>> {
-        let stream = match Self::connect_agent_socket()? {
+        let stream = match Self::connect_agent_socket(&self.config)? {
             Some(s) => s,
             None => return Ok(Vec::new()),
         };
@@ -345,28 +358,26 @@ impl VTClient {
     ///   propagate.
     #[cfg(unix)]
     async fn agent_call_or_fallback(
-        auth_token: String,
-        backend: crate::config::Backend,
+        &self,
         name: &'static str,
         payload: Vec<u8>,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        use crate::config::Backend;
-        if backend == Backend::Passkey {
+        if !self.route.uses_agent() {
             return Ok(None);
         }
-        let result = tokio::task::spawn_blocking(move || {
-            Self::try_agent_extension(&auth_token, name, &payload)
-        })
-        .await?;
+        let config = self.config.clone();
+        let result =
+            tokio::task::spawn_blocking(move || Self::try_agent_extension(&config, name, &payload))
+                .await?;
         match result {
             Ok(Some(bytes)) => Ok(Some(bytes)),
-            Ok(None) if backend == Backend::Agent => Err(anyhow::anyhow!(
+            Ok(None) if self.route == ClientRoute::Agent => Err(anyhow::anyhow!(
                 "SSH agent socket unavailable and VT_BACKEND=agent forbids the \
                  passkey fallback — is the vt agent running / forwarded?"
             )),
             Ok(None) => Ok(None),
             Err(e) => {
-                if backend != Backend::Agent && should_fallback_to_cf(&e) {
+                if self.route.allows_passkey_fallback() && should_fallback_to_cf(&e) {
                     // Keep the raw error out of default output (it reads as a
                     // scary internal failure); the CF path prints a clean,
                     // user-facing fallback line. `RUST_LOG=debug` still surfaces
@@ -385,20 +396,17 @@ impl VTClient {
     /// process), then locally AEAD-encrypts each plaintext under its DEK and
     /// formats the resulting `vt://{type}{b64(salt||ct)}` URL. DEKs are
     /// zeroized after use.
-    pub async fn encrypt(&self, items: &[EncryptItem]) -> Result<Vec<CryptoResItem>> {
+    pub async fn encrypt(&self, items: &[EncryptItem]) -> Result<Vec<ItemResult>> {
         #[cfg(unix)]
         {
             let req = EncryptReq {
                 types: items.iter().map(|i| i.t).collect(),
             };
             let payload = serde_json::to_vec(&req)?;
-            let auth_token = self.auth_token.clone();
-            let result =
-                Self::agent_call_or_fallback(auth_token, self.backend, "encrypt@vt", payload)
-                    .await?;
+            let result = self.agent_call_or_fallback("encrypt@vt", payload).await?;
             let bytes = match result {
                 Some(b) => b,
-                None => return Self::cf_encrypt(items, &get_hostname()).await,
+                None => return self.cf_encrypt(items).await,
             };
             let mut allocs: Vec<EncryptResItem> = serde_json::from_slice(&bytes)?;
             ensure!(
@@ -409,31 +417,14 @@ impl VTClient {
             );
             let mut out = Vec::with_capacity(items.len());
             for (item, alloc) in items.iter().zip(allocs.iter_mut()) {
-                if !alloc.err_message.is_empty() {
-                    out.push(CryptoResItem {
-                        result: String::new(),
-                        err_message: alloc.err_message.clone(),
-                    });
-                    alloc.dek.zeroize();
-                    continue;
-                }
-                let res = match client_encrypt_v2(
-                    item.t,
-                    &alloc.salt,
-                    &alloc.dek,
-                    item.plaintext.as_bytes(),
-                ) {
-                    Ok(url) => CryptoResItem {
-                        result: url,
-                        err_message: String::new(),
-                    },
-                    Err(e) => CryptoResItem {
-                        result: String::new(),
-                        err_message: e.to_string(),
-                    },
+                let result = if alloc.err_message.is_empty() {
+                    client_encrypt_v2(item.t, &alloc.salt, &alloc.dek, item.plaintext.as_bytes())
+                        .map_err(ItemError::from)
+                } else {
+                    Err(ItemError(std::mem::take(&mut alloc.err_message)))
                 };
                 alloc.dek.zeroize();
-                out.push(res);
+                out.push(result);
             }
             // `bytes` is `Zeroizing<Vec<u8>>` — wiped on drop at end of scope.
             Ok(out)
@@ -457,7 +448,7 @@ impl VTClient {
         host: &str,
         command: &str,
         urls: &[String],
-    ) -> Result<Vec<CryptoResItem>> {
+    ) -> Result<Vec<ItemResult>> {
         // Don't bother the user for an empty batch — the agent would still
         // prompt Touch ID for "0 items" otherwise.
         if urls.is_empty() {
@@ -512,13 +503,10 @@ impl VTClient {
                 meta: cf::collect_client_meta(),
             };
             let payload = serde_json::to_vec(&wire)?;
-            let auth_token = self.auth_token.clone();
-            let result =
-                Self::agent_call_or_fallback(auth_token, self.backend, "decrypt@vt", payload)
-                    .await?;
+            let result = self.agent_call_or_fallback("decrypt@vt", payload).await?;
             let bytes = match result {
                 Some(b) => b,
-                None => return Self::cf_decrypt(host, command, urls).await,
+                None => return self.cf_decrypt(command, urls).await,
             };
             let mut wire_results: Vec<DecryptResItem> = serde_json::from_slice(&bytes)?;
             ensure!(
@@ -531,31 +519,15 @@ impl VTClient {
             let mut out = Vec::with_capacity(locals.len());
             for (local, wire_res) in locals.into_iter().zip(wire_results.iter_mut()) {
                 let item = match (local, wire_res) {
-                    (Local::ParseErr(e), _) => CryptoResItem {
-                        result: String::new(),
-                        err_message: e,
-                    },
+                    (Local::ParseErr(e), _) => Err(ItemError(e)),
                     (Local::V2 { t, salt, inner_ct }, DecryptResItem::V2 { dek, err_message }) => {
-                        if !err_message.is_empty() {
-                            let msg = std::mem::take(err_message);
-                            dek.zeroize();
-                            CryptoResItem {
-                                result: String::new(),
-                                err_message: msg,
-                            }
+                        let dek_copy: Zeroizing<[u8; 32]> = Zeroizing::new(*dek);
+                        dek.zeroize();
+                        if err_message.is_empty() {
+                            client_decrypt_v2(t, &dek_copy, &salt, &inner_ct)
+                                .map_err(ItemError::from)
                         } else {
-                            let dek_copy: Zeroizing<[u8; 32]> = Zeroizing::new(*dek);
-                            dek.zeroize();
-                            match client_decrypt_v2(t, &dek_copy, &salt, &inner_ct) {
-                                Ok(pt) => CryptoResItem {
-                                    result: pt,
-                                    err_message: String::new(),
-                                },
-                                Err(e) => CryptoResItem {
-                                    result: String::new(),
-                                    err_message: e.to_string(),
-                                },
-                            }
+                            Err(ItemError(std::mem::take(err_message)))
                         }
                     }
                     (
@@ -564,17 +536,13 @@ impl VTClient {
                             result,
                             err_message,
                         },
-                    ) => CryptoResItem {
-                        result: std::mem::take(result),
-                        err_message: std::mem::take(err_message),
-                    },
+                    ) => legacy_item_result(std::mem::take(result), std::mem::take(err_message)),
                     // Mismatched variants — agent returned the wrong shape for
                     // this index. Should not happen unless the agent and
                     // client disagree on protocol.
-                    _ => CryptoResItem {
-                        result: String::new(),
-                        err_message: "agent returned mismatched response variant".to_string(),
-                    },
+                    _ => Err(ItemError(
+                        "agent returned mismatched response variant".into(),
+                    )),
                 };
                 out.push(item);
             }
@@ -583,7 +551,7 @@ impl VTClient {
         }
         #[cfg(not(unix))]
         {
-            let _ = req;
+            let _ = (host, command, urls);
             Err(anyhow::anyhow!(
                 "vt decrypt requires Unix (SSH agent socket)"
             ))
@@ -619,22 +587,19 @@ impl VTClient {
             flags,
             meta: cf::collect_client_meta(),
         };
-        // VT_BACKEND=passkey pins routing away from the agent: skip the socket
-        // probe and return the "fall back" signal — the caller's
-        // decrypt-then-sign fallback routes its decrypt through this client
-        // again, which then takes the passkey ceremony. `agent` mode is NOT
-        // special-cased here for the same reason: the fallback's decrypt still
-        // honors the agent-only pin.
-        if self.backend == crate::config::Backend::Passkey {
+        // Without VT_AUTH, or with a passkey pin, skip the agent socket and
+        // return the fallback signal. Decrypt-then-sign routes through this
+        // same client, so it also preserves an agent-only pin.
+        if !self.route.uses_agent() {
             return Ok(None);
         }
         let payload = serde_json::to_vec(&req)?;
-        let auth_token = self.auth_token.clone();
+        let config = self.config.clone();
         // Same blocking + classification as `agent_call_or_fallback`, but
         // WITHOUT the "falling back to phone passkey" eprintln: our fallback is
         // local decrypt-then-sign, not necessarily the CF ceremony.
         let result = tokio::task::spawn_blocking(move || {
-            Self::try_agent_extension(&auth_token, "sign@vt", &payload)
+            Self::try_agent_extension(&config, "sign@vt", &payload)
         })
         .await?;
         match result {
@@ -650,25 +615,20 @@ impl VTClient {
 
     // ── CF ceremony fallbacks ──────────────────────────────────────────────
 
-    async fn cf_encrypt(items: &[EncryptItem], _host: &str) -> Result<Vec<CryptoResItem>> {
-        let config =
-            cf::load_config().context("SSH agent unavailable; CF passkey env not configured")?;
+    async fn cf_encrypt(&self, items: &[EncryptItem]) -> Result<Vec<ItemResult>> {
+        let config = self
+            .config
+            .passkey_config()
+            .context("SSH agent unavailable; CF passkey env not configured")?;
         let mut salts = cf::random_salts(items.len());
         let meta = cf::collect_meta("encrypt", "", "");
         let deks = cf::get_deks(&config, &salts, meta).await?;
         let mut out = Vec::with_capacity(items.len());
         for ((item, salt), dek) in items.iter().zip(salts.iter()).zip(deks.iter()) {
-            let res = match client_encrypt_v2(item.t, salt, dek, item.plaintext.as_bytes()) {
-                Ok(url) => CryptoResItem {
-                    result: url,
-                    err_message: String::new(),
-                },
-                Err(e) => CryptoResItem {
-                    result: String::new(),
-                    err_message: e.to_string(),
-                },
-            };
-            out.push(res);
+            out.push(
+                client_encrypt_v2(item.t, salt, dek, item.plaintext.as_bytes())
+                    .map_err(ItemError::from),
+            );
         }
         salts
             .iter_mut()
@@ -676,9 +636,11 @@ impl VTClient {
         Ok(out)
     }
 
-    async fn cf_decrypt(_host: &str, command: &str, urls: &[String]) -> Result<Vec<CryptoResItem>> {
-        let config =
-            cf::load_config().context("SSH agent unavailable; CF passkey env not configured")?;
+    async fn cf_decrypt(&self, command: &str, urls: &[String]) -> Result<Vec<ItemResult>> {
+        let config = self
+            .config
+            .passkey_config()
+            .context("SSH agent unavailable; CF passkey env not configured")?;
 
         // Parse URLs; collect v2 salts in order
         struct Item {
@@ -716,10 +678,7 @@ impl VTClient {
         let mut dek_idx = 0usize;
         for item_res in items {
             match item_res {
-                Err(e) => out.push(CryptoResItem {
-                    result: String::new(),
-                    err_message: e,
-                }),
+                Err(e) => out.push(Err(ItemError(e))),
                 Ok(Item { t, salt, inner_ct }) => {
                     // Bounds-guard rather than index: open_sealed_deks already
                     // enforces deks.len() == salts.len(), but never let a short
@@ -728,26 +687,18 @@ impl VTClient {
                         anyhow::anyhow!("internal: fewer DEKs returned than v2 records")
                     })?;
                     dek_idx += 1;
-                    let res = match client_decrypt_v2(t, dek, &salt, &inner_ct) {
-                        Ok(pt) => CryptoResItem {
-                            result: pt,
-                            err_message: String::new(),
-                        },
-                        Err(e) => CryptoResItem {
-                            result: String::new(),
-                            err_message: e.to_string(),
-                        },
-                    };
-                    out.push(res);
+                    out.push(client_decrypt_v2(t, dek, &salt, &inner_ct).map_err(ItemError::from));
                 }
             }
         }
         Ok(out)
     }
 
-    async fn cf_auth(reason: &str) -> Result<()> {
-        let config =
-            cf::load_config().context("SSH agent unavailable; CF passkey env not configured")?;
+    async fn cf_auth(&self, reason: &str) -> Result<()> {
+        let config = self
+            .config
+            .passkey_config()
+            .context("SSH agent unavailable; CF passkey env not configured")?;
         let meta = cf::collect_meta("auth", "", reason);
         cf::get_deks(&config, &[], meta).await?;
         Ok(())
@@ -761,14 +712,14 @@ impl VTClient {
     pub async fn run(&self, argv: Vec<String>, reason: Option<&str>) -> Result<()> {
         #[cfg(unix)]
         {
-            if self.auth_token.is_empty() {
+            if self.config.auth_token().is_empty() {
                 anyhow::bail!(
                     "vt run requires the SSH-agent path (set VT_AUTH and ensure \
                      SSH_AUTH_SOCK / ~/.ssh/vt.sock points at a vt agent — there \
                      is no phone-passkey fallback for run@vt)"
                 );
             }
-            if self.backend == crate::config::Backend::Passkey {
+            if !self.route.uses_agent() {
                 anyhow::bail!(
                     "vt run is agent-only, but VT_BACKEND=passkey disables the agent path"
                 );
@@ -783,9 +734,7 @@ impl VTClient {
                 meta: cf::collect_client_meta(),
             };
             let payload = serde_json::to_vec(&req)?;
-            let auth_token = self.auth_token.clone();
-            let result =
-                Self::agent_call_or_fallback(auth_token, self.backend, "run@vt", payload).await?;
+            let result = self.agent_call_or_fallback("run@vt", payload).await?;
             match result {
                 Some(bytes) => {
                     let res: RunRes =
@@ -814,9 +763,7 @@ impl VTClient {
                 meta: cf::collect_client_meta(),
             };
             let payload = serde_json::to_vec(&req)?;
-            let auth_token = self.auth_token.clone();
-            let result =
-                Self::agent_call_or_fallback(auth_token, self.backend, "auth@vt", payload).await?;
+            let result = self.agent_call_or_fallback("auth@vt", payload).await?;
 
             match result {
                 Some(bytes) => {
@@ -824,7 +771,7 @@ impl VTClient {
                         serde_json::from_slice(&bytes).context("Failed to parse auth response")?;
                     Ok(())
                 }
-                None => Self::cf_auth(reason).await,
+                None => self.cf_auth(reason).await,
             }
         }
 
@@ -847,6 +794,124 @@ mod tests {
     use super::*;
 
     use crate::core::wire::wrap_ok_envelope;
+
+    #[test]
+    fn single_item_result_rejects_wrong_counts_before_item_errors() {
+        for items in [
+            vec![],
+            vec![Ok("first-secret".into()), Ok("second-secret".into())],
+            vec![
+                Err(ItemError("item failure".into())),
+                Ok("second-secret".into()),
+            ],
+            vec![
+                Ok("first-secret".into()),
+                Err(ItemError("item failure".into())),
+            ],
+        ] {
+            let error = single_item_result(items, "operation").unwrap_err();
+            assert_eq!(error.to_string(), "Expected exactly one item in response");
+            let diagnostic = format!("{error:?}");
+            assert!(!diagnostic.contains("secret"));
+            assert!(!diagnostic.contains("item failure"));
+        }
+    }
+
+    #[test]
+    fn single_item_result_preserves_success_bytes_including_empty_values() {
+        for value in ["", "plaintext", "vt://0record", "\0raw\n"] {
+            assert_eq!(
+                single_item_result(vec![Ok(value.into())], "operation").unwrap(),
+                value,
+            );
+        }
+    }
+
+    #[test]
+    fn single_item_result_preserves_operation_error_messages() {
+        for prefix in [
+            "Failed to create secret",
+            "Error decrypting item",
+            "failed to encrypt ssh key",
+        ] {
+            let error =
+                single_item_result(vec![Err(ItemError("synthetic failure".into()))], prefix)
+                    .unwrap_err();
+            assert_eq!(error.to_string(), format!("{prefix}: synthetic failure"));
+            assert_eq!(format!("{error:#}"), format!("{prefix}: synthetic failure"));
+            assert_eq!(error.chain().count(), 1);
+        }
+    }
+
+    #[test]
+    fn legacy_wire_items_become_typed_results_without_retaining_failed_values() {
+        for (value, message) in [
+            ("", ""),
+            ("plaintext", ""),
+            ("discarded-secret", "decrypt failed"),
+        ] {
+            let json = serde_json::json!({"Legacy": {"result": value, "err_message": message}});
+            let item: DecryptResItem = serde_json::from_value(json).unwrap();
+            let DecryptResItem::Legacy {
+                result,
+                err_message,
+            } = item
+            else {
+                unreachable!()
+            };
+            match legacy_item_result(result, err_message) {
+                Ok(result) => {
+                    assert!(message.is_empty());
+                    assert_eq!(result, value);
+                }
+                Err(error) => {
+                    assert_eq!(error.to_string(), message);
+                    assert!(!format!("{error:?}").contains(value));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_routes_control_agent_probes_and_fallbacks() {
+        for (backend, auth, route) in [
+            ("agent", "AA", ClientRoute::Agent),
+            ("auto", "AA", ClientRoute::AutoAgent),
+            ("auto", "", ClientRoute::AutoPasskey),
+            ("passkey", "AA", ClientRoute::Passkey),
+        ] {
+            let config = ResolvedConfig::resolve(
+                Some(auth.into()),
+                Vec::new(),
+                |key| match key {
+                    "VT_BACKEND" => Some(backend.into()),
+                    "VT_PASSKEY_URL" => Some(String::new()),
+                    // Invalid before any connection: an accidental probe is
+                    // observable without contacting a real agent.
+                    "SSH_AUTH_SOCK" => Some("\0".into()),
+                    _ => None,
+                },
+                None,
+                None,
+            );
+            let client = VTClient::new(config).unwrap();
+            assert_eq!(client.route, route);
+            assert_eq!(client.has_auth_token(), route.uses_agent());
+            assert!(
+                client.config.passkey_config().is_err(),
+                "worker validation stays lazy"
+            );
+            let result = client.agent_call_or_fallback("auth@vt", Vec::new()).await;
+            if route == ClientRoute::Agent {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+            if !route.uses_agent() {
+                assert!(client.run(vec!["unused".into()], None).await.is_err());
+            }
+        }
+    }
 
     /// Reproduces the agent's `ErrEnvelope` serialization shape.
     fn fake_err_envelope(kind: &str, detail: Option<&str>) -> Vec<u8> {

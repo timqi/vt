@@ -9,11 +9,7 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     name: 'node',
-    include: [
-      'test/cache_policy.test.ts',
-      'test/credentials.test.ts',
-      'test/crypto.test.ts',
-      'test/notify.test.ts',
-    ],
+    include: ['test/**/*.test.ts'],
+    exclude: ['test/do_account.*.test.ts'],
   },
 });
