@@ -57,22 +57,22 @@ pub struct CfConfig {
 /// so a misconfigured host fails fast rather than silently calling the wrong
 /// worker.
 pub fn load_config() -> Result<CfConfig> {
-    let worker_url = std::env::var("VT_PASSKEY_URL")
-        .context("VT_PASSKEY_URL not set")?;
-    let worker_auth = std::env::var("VT_PASSKEY_TOKEN")
-        .context("VT_PASSKEY_TOKEN not set")?;
+    let worker_url = std::env::var("VT_PASSKEY_URL").context("VT_PASSKEY_URL not set")?;
+    let worker_auth = std::env::var("VT_PASSKEY_TOKEN").context("VT_PASSKEY_TOKEN not set")?;
     if worker_url.trim().is_empty() {
         bail!("VT_PASSKEY_URL is empty");
     }
     if worker_auth.trim().is_empty() {
         bail!("VT_PASSKEY_TOKEN is empty");
     }
-    Ok(CfConfig { worker_url, worker_auth })
+    Ok(CfConfig {
+        worker_url,
+        worker_auth,
+    })
 }
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .expect("HMAC accepts any key length");
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().into()
 }
@@ -90,9 +90,11 @@ fn hmac_auth_header(worker_auth: &str, body: &[u8]) -> String {
 }
 
 fn decode_b64u_exact<const N: usize>(b64u: &str, what: &str) -> Result<[u8; N]> {
-    let v = URL_SAFE_NO_PAD.decode(b64u)
+    let v = URL_SAFE_NO_PAD
+        .decode(b64u)
         .with_context(|| format!("{what}: b64u decode"))?;
-    v.as_slice().try_into()
+    v.as_slice()
+        .try_into()
         .map_err(|_| anyhow!("{what}: wrong length (expected {N})"))
 }
 
@@ -138,10 +140,16 @@ pub struct ChallengeMeta {
 #[cfg(unix)]
 pub fn current_ppid() -> u32 {
     let p = unsafe { libc::getppid() };
-    if p > 0 { p as u32 } else { 0 }
+    if p > 0 {
+        p as u32
+    } else {
+        0
+    }
 }
 #[cfg(not(unix))]
-pub fn current_ppid() -> u32 { 0 }
+pub fn current_ppid() -> u32 {
+    0
+}
 
 /// Build a `ChallengeMeta` by collecting local context from the running
 /// process: hostname, $USER, cwd, controlling TTY, parent process command
@@ -200,7 +208,9 @@ fn tty_name() -> String {
     }
 }
 #[cfg(not(unix))]
-fn tty_name() -> String { String::new() }
+fn tty_name() -> String {
+    String::new()
+}
 
 /// Shorten a parent command line to `basename(argv[0]) + args`. A long
 /// absolute argv[0] (`/opt/homebrew/Cellar/…/bin/zsh -c …`) drowned the
@@ -252,7 +262,9 @@ fn parent_cmd() -> String {
     String::new()
 }
 #[cfg(not(unix))]
-fn parent_cmd() -> String { String::new() }
+fn parent_cmd() -> String {
+    String::new()
+}
 
 fn ssh_client_env() -> String {
     std::env::var("SSH_CLIENT")
@@ -312,7 +324,11 @@ struct DekCacheResp {
 /// records, so IPv4 connects whenever the host has any IPv4 egress; on an
 /// IPv6-only host the IPv4 connect fails and we retry without the pin (both
 /// requests then consistently use IPv6).
-pub(crate) async fn cf_post(url: &str, auth_header: &str, body: &[u8]) -> Result<reqwest::Response> {
+pub(crate) async fn cf_post(
+    url: &str,
+    auth_header: &str,
+    body: &[u8],
+) -> Result<reqwest::Response> {
     cf_post_with_timeout(url, auth_header, body, 30).await
 }
 
@@ -326,9 +342,12 @@ pub(crate) async fn cf_post_with_timeout(
     body: &[u8],
     secs: u64,
 ) -> Result<reqwest::Response> {
-    async fn send_once(client: reqwest::Client, url: &str, auth_header: &str, body: &[u8])
-        -> reqwest::Result<reqwest::Response>
-    {
+    async fn send_once(
+        client: reqwest::Client,
+        url: &str,
+        auth_header: &str,
+        body: &[u8],
+    ) -> reqwest::Result<reqwest::Response> {
         client
             .post(url)
             .header("Authorization", auth_header)
@@ -405,14 +424,16 @@ pub async fn get_deks(
     let ch: ChallengeResp = serde_json::from_slice(&body).context("challenge response parse")?;
 
     let worker_nonce: [u8; 16] = decode_b64u_exact(&ch.worker_nonce_b64u, "worker_nonce")?;
-    let approve_challenge_hash =
-        compute_approve_challenge_hash(&pk, &worker_nonce, ts_ms, salts);
+    let approve_challenge_hash = compute_approve_challenge_hash(&pk, &worker_nonce, ts_ms, salts);
 
     // poll_token is worker-controlled and interpolated into the WS query string;
     // restrict it to the b64url alphabet so a compromised worker can't inject
     // extra URL/query/fragment structure into the connect target.
     if ch.poll_token.is_empty()
-        || !ch.poll_token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || !ch
+            .poll_token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         bail!("challenge: malformed poll_token");
     }
@@ -425,7 +446,9 @@ pub async fn get_deks(
 
     let ws_url = format!(
         "{}/api/dek?poll_token={}",
-        config.worker_url.replacen("https://", "wss://", 1)
+        config
+            .worker_url
+            .replacen("https://", "wss://", 1)
             .replacen("http://", "ws://", 1),
         ch.poll_token
     );
@@ -445,21 +468,23 @@ pub async fn get_deks(
 
         match msg {
             Message::Text(text) => {
-                let ws: WsMsg = serde_json::from_str(&text)
-                    .context("WS message parse")?;
+                let ws: WsMsg = serde_json::from_str(&text).context("WS message parse")?;
                 match ws.status.as_str() {
                     "waiting" => continue,
                     "approved" => {
                         let sealed_b64u = ws.sealed_deks_b64u.as_deref()
                             .ok_or_else(|| anyhow!("approved message missing required binding fields: sealed_deks_b64u"))?;
-                        let pwa_pk_b64u = ws.pwa_pk_b64u.as_deref()
-                            .ok_or_else(|| anyhow!("approved message missing required binding fields: pwa_pk_b64u"))?;
+                        let pwa_pk_b64u = ws.pwa_pk_b64u.as_deref().ok_or_else(|| {
+                            anyhow!("approved message missing required binding fields: pwa_pk_b64u")
+                        })?;
                         let binding_tag_b64u = ws.binding_tag_b64u.as_deref()
                             .ok_or_else(|| anyhow!("approved message missing required binding fields: binding_tag_b64u"))?;
 
                         let pwa_pk: [u8; 32] = decode_b64u_exact(pwa_pk_b64u, "pwa_pk")?;
-                        let binding_tag: [u8; 32] = decode_b64u_exact(binding_tag_b64u, "binding_tag")?;
-                        let sealed_deks_bytes = URL_SAFE_NO_PAD.decode(sealed_b64u)
+                        let binding_tag: [u8; 32] =
+                            decode_b64u_exact(binding_tag_b64u, "binding_tag")?;
+                        let sealed_deks_bytes = URL_SAFE_NO_PAD
+                            .decode(sealed_b64u)
                             .context("sealed_deks b64u decode")?;
 
                         verify_binding(
@@ -477,7 +502,7 @@ pub async fn get_deks(
                         return open_sealed_deks(&sealed_deks_bytes, &pk, &sk, n_deks);
                     }
                     "rejected" => bail!("approval rejected by user"),
-                    "expired"  => bail!("approval request expired"),
+                    "expired" => bail!("approval request expired"),
                     other => bail!("unexpected WS status: {other}"),
                 }
             }
@@ -564,7 +589,9 @@ pub async fn try_cache(
 
     // Cache hit: open the sealed box sealed to our ephemeral pubkey. No binding
     // verification on this path (see SECURITY note above).
-    let ct = URL_SAFE_NO_PAD.decode(&sealed).context("sealed_deks b64u decode")?;
+    let ct = URL_SAFE_NO_PAD
+        .decode(&sealed)
+        .context("sealed_deks b64u decode")?;
     let deks = open_sealed_deks(&ct, &pk, &sk, salts.len())?;
     Ok(Some(deks))
 }
@@ -580,7 +607,11 @@ fn open_sealed_deks(
     let n = n_deks.max(1);
     let expected_len = n * 32 + 48;
     if ct.len() != expected_len {
-        bail!("sealed_box length {} != expected {}", ct.len(), expected_len);
+        bail!(
+            "sealed_box length {} != expected {}",
+            ct.len(),
+            expected_len
+        );
     }
 
     let mut pt = vec![0u8; n * 32];
@@ -655,7 +686,8 @@ fn verify_binding(
     let mut mac = Hmac::<Sha256>::new_from_slice(&*binding_key)
         .map_err(|_| anyhow!("binding: HMAC key init failed"))?;
     mac.update(&transcript);
-    mac.verify_slice(received_tag).map_err(|_| anyhow!("binding: tag mismatch"))?;
+    mac.verify_slice(received_tag)
+        .map_err(|_| anyhow!("binding: tag mismatch"))?;
     Ok(())
 }
 
@@ -666,7 +698,9 @@ mod tests {
 
     fn hex_encode(bytes: &[u8]) -> String {
         let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes { s.push_str(&format!("{:02x}", b)); }
+        for b in bytes {
+            s.push_str(&format!("{:02x}", b));
+        }
         s
     }
 
@@ -726,18 +760,22 @@ mod tests {
     /// hits will silently fail to decrypt.
     #[test]
     fn worker_sealed_box_opens_with_dryoc() {
-        let sk: [u8; 32] = decode_b64u_exact(
-            "ERERERERERERERERERERERERERERERERERERERERERE", "sk").unwrap();
-        let pk: [u8; 32] = decode_b64u_exact(
-            "e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM", "pk").unwrap();
+        let sk: [u8; 32] =
+            decode_b64u_exact("ERERERERERERERERERERERERERERERERERERERERERE", "sk").unwrap();
+        let pk: [u8; 32] =
+            decode_b64u_exact("e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM", "pk").unwrap();
         let expected: Vec<u8> = (0u8..32).collect();
         let sealed = "JEYfUWAkbFlSTgjZD-GXcSHkANGFWCT637UiLWtBRUu-uQjaKW_GFnZplKkhLMm3h0-ch65fczHafJozQnVbdv4F-eyFxUbJuJoIzb9Anvw";
 
         let ct = URL_SAFE_NO_PAD.decode(sealed).unwrap();
-        let deks = open_sealed_deks(&ct, &pk, &sk, 1)
-            .expect("worker-sealed box must open with dryoc");
+        let deks =
+            open_sealed_deks(&ct, &pk, &sk, 1).expect("worker-sealed box must open with dryoc");
         assert_eq!(deks.len(), 1);
-        assert_eq!(&deks[0][..], &expected[..], "decrypted DEK mismatch — wire incompatibility");
+        assert_eq!(
+            &deks[0][..],
+            &expected[..],
+            "decrypted DEK mismatch — wire incompatibility"
+        );
     }
 
     #[test]
@@ -783,7 +821,10 @@ mod tests {
 
         let err = verify_binding(&daemon_pk, &daemon_sk, &pwa_pk, &ach, &sealed, &tag)
             .expect_err("flipped tag must fail");
-        assert!(err.to_string().contains("tag mismatch"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("tag mismatch"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
@@ -798,6 +839,9 @@ mod tests {
         tampered[40] ^= 0x01;
         let err = verify_binding(&daemon_pk, &daemon_sk, &pwa_pk, &ach, &tampered, &tag)
             .expect_err("tampered sealed_deks must fail");
-        assert!(err.to_string().contains("tag mismatch"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("tag mismatch"),
+            "unexpected: {err}"
+        );
     }
 }

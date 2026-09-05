@@ -749,7 +749,9 @@ fn find_sidecar_for_backup(
 fn retire_stale_sidecars_for(backup: &std::path::Path, state_dir: Option<&std::path::Path>) {
     let Some(dir) = state_dir else { return };
     let want = absolutize(backup);
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -843,7 +845,10 @@ pub fn inject_recover() -> Result<()> {
         let sc: InjectSidecar = match read_sidecar_bounded(&path) {
             Some(sc) => sc,
             None => {
-                eprintln!("vt inject --recover: skipping unreadable sidecar {}", path.display());
+                eprintln!(
+                    "vt inject --recover: skipping unreadable sidecar {}",
+                    path.display()
+                );
                 continue;
             }
         };
@@ -1151,7 +1156,10 @@ mod tests {
         // At the deadline but within the grace window: still hands-off, so a
         // supervisor firing at exactly the deadline isn't raced.
         assert_eq!(plan_recovery(deadline, true, deadline), None);
-        assert_eq!(plan_recovery(deadline, true, deadline + RECOVER_GRACE_MS - 1), None);
+        assert_eq!(
+            plan_recovery(deadline, true, deadline + RECOVER_GRACE_MS - 1),
+            None
+        );
         // Past deadline + grace with a surviving backup → supervisor is dead.
         assert_eq!(
             plan_recovery(deadline, true, deadline + RECOVER_GRACE_MS),
@@ -1461,14 +1469,26 @@ mod tests {
             deadline_ms: 0,
             backup_id: None,
         };
-        std::fs::write(state.join("stale.json"), serde_json::to_vec(&mk(&backup)).unwrap())
-            .unwrap();
-        std::fs::write(state.join("other.json"), serde_json::to_vec(&mk(&other)).unwrap())
-            .unwrap();
+        std::fs::write(
+            state.join("stale.json"),
+            serde_json::to_vec(&mk(&backup)).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            state.join("other.json"),
+            serde_json::to_vec(&mk(&other)).unwrap(),
+        )
+        .unwrap();
 
         retire_stale_sidecars_for(&backup, Some(&state));
-        assert!(!state.join("stale.json").exists(), "stale record must be retired");
-        assert!(state.join("other.json").exists(), "unrelated record must survive");
+        assert!(
+            !state.join("stale.json").exists(),
+            "stale record must be retired"
+        );
+        assert!(
+            state.join("other.json").exists(),
+            "unrelated record must survive"
+        );
         // No resolvable state dir → quietly a no-op.
         retire_stale_sidecars_for(&backup, None);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1509,7 +1529,13 @@ mod tests {
         std::fs::write(&target, b"plaintext-B").unwrap();
         std::fs::write(&backup, b"ciphertext-B").unwrap();
         std::fs::write(&sidecar, b"{}").unwrap();
-        restore_exposure(&tmp, &backup, &target, &sidecar, mismatched_backup_id(&backup));
+        restore_exposure(
+            &tmp,
+            &backup,
+            &target,
+            &sidecar,
+            mismatched_backup_id(&backup),
+        );
         assert_eq!(
             std::fs::read(&target).unwrap(),
             b"plaintext-B",
@@ -1661,7 +1687,10 @@ mod tests {
         )
         .unwrap();
         let err = exposure_conflict_refusal(target_str, &backup, Some(&state));
-        assert!(err.to_string().contains("found leftover backup"), "got: {err}");
+        assert!(
+            err.to_string().contains("found leftover backup"),
+            "got: {err}"
+        );
         assert!(!err.to_string().contains("--recover"), "got: {err}");
 
         // A live sidecar (far-future deadline) → retry guidance.
@@ -1691,7 +1720,9 @@ mod tests {
     fn no_vt_records_means_nothing_to_decrypt() {
         // The -r guard: zero vt:// records refuses the exposure protocol
         // (either the wrong file, or plaintext left by a broken exposure).
-        assert!(iter_vt_urls("plain: text\nno records here").next().is_none());
+        assert!(iter_vt_urls("plain: text\nno records here")
+            .next()
+            .is_none());
         assert!(iter_vt_urls("key: vt://0abc").next().is_some());
     }
 }

@@ -1,12 +1,12 @@
 //! macOS-only admin command bodies: `init`, `secret
 //! export/import/rotate-passcode/rebind`.
 
-use crate::core::crypto::AesGcmCrypto;
 use super::security::{
     create_and_save_passcode_passphrase, derive_passcode_ciphers, local_authentication,
     rewrap_passphrase,
 };
 use super::store::{KeychainStore, WRAP_V1, WRAP_V2};
+use crate::core::crypto::AesGcmCrypto;
 use anyhow::{Context, Result};
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -64,7 +64,8 @@ pub async fn import_secret() -> Result<()> {
         ))?;
         std::process::exit(1);
     }
-    let master_secret = crate::tty::prompt_input_password("Enter master secret: ", "Master secret entered: ")?;
+    let master_secret =
+        crate::tty::prompt_input_password("Enter master secret: ", "Master secret entered: ")?;
     let encrypted_passphrase_bytes = BASE64_URL_SAFE_NO_PAD.decode(master_secret)?;
 
     let master_secret_passphrase = crate::tty::prompt_input_password(
@@ -98,9 +99,9 @@ pub async fn rotate_passcode() -> Result<()> {
     let store = KeychainStore::load()?;
     let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
     let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
-    let decrypted_passphrase = passphrase_cipher
-        .decrypt(&encrypted_passphrase)
-        .context("Failed to decrypt passphrase. Run `vt secret rebind` first if the binary moved.")?;
+    let decrypted_passphrase = passphrase_cipher.decrypt(&encrypted_passphrase).context(
+        "Failed to decrypt passphrase. Run `vt secret rebind` first if the binary moved.",
+    )?;
     let passphrase_array: [u8; 32] = decrypted_passphrase
         .try_into()
         .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;
@@ -131,7 +132,11 @@ pub async fn rebind(old_bin_path: Option<String>, to_v1: bool) -> Result<()> {
     })?;
     eprintln!(
         "Master key wrap: v{from_wrap} -> v{target}{}. If `vt ssh agent` is running, restart it.",
-        if to_v1 { " (bound to this binary's current path)" } else { " (path-independent)" }
+        if to_v1 {
+            " (bound to this binary's current path)"
+        } else {
+            " (path-independent)"
+        }
     );
     Ok(())
 }

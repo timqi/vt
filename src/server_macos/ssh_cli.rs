@@ -25,8 +25,8 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
         }
     };
 
-    let mut privkey = PrivateKey::from_openssh(key_data.as_bytes())
-        .context("Failed to parse SSH private key")?;
+    let mut privkey =
+        PrivateKey::from_openssh(key_data.as_bytes()).context("Failed to parse SSH private key")?;
 
     // If encrypted, prompt for passphrase
     if privkey.is_encrypted() {

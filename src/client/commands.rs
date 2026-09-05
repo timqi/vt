@@ -81,9 +81,7 @@ pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Resu
         command.push_str("\nreason: ");
         command.push_str(&sanitize_for_display(r, 200));
     }
-    let res = vt_client
-        .decrypt(&get_hostname(), &command, &[vt])
-        .await?;
+    let res = vt_client.decrypt(&get_hostname(), &command, &[vt]).await?;
     ensure!(res.len() == 1, "Expected exactly one item in response");
     ensure!(
         res[0].err_message.is_empty(),
@@ -346,7 +344,10 @@ pub async fn rewrap(
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(path)
                 .with_context(|| {
-                    format!("Failed to open (refuses symlinks): {}", std::path::Path::new(path).display())
+                    format!(
+                        "Failed to open (refuses symlinks): {}",
+                        std::path::Path::new(path).display()
+                    )
                 })?;
             file.write_all(data).with_context(|| {
                 format!("Failed to write: {}", std::path::Path::new(path).display())
@@ -361,9 +362,8 @@ pub async fn rewrap(
         let mut tmp_path = f.clone().into_os_string();
         tmp_path.push(".vt-rewrap-tmp");
         nofollow_write(&tmp_path, new_text.as_bytes())?;
-        std::fs::rename(&tmp_path, f).with_context(|| {
-            format!("Failed to atomically replace: {}", f.display())
-        })?;
+        std::fs::rename(&tmp_path, f)
+            .with_context(|| format!("Failed to atomically replace: {}", f.display()))?;
         if backup {
             println!(
                 "  {}: {} substitution(s); backup at {}.vt-rewrap-backup",
@@ -473,7 +473,7 @@ mod tests {
         assert!(env_var_in_scope("GH_TOKEN", v, Some(&allow)));
         assert!(!env_var_in_scope("ANTHROPIC_API_KEY", v, Some(&allow))); // vt:// but not named → excluded
         assert!(!env_var_in_scope("GH_TOKEN", plain, Some(&allow))); // named but not vt:// → excluded
-        // Empty allow-list excludes everything.
+                                                                     // Empty allow-list excludes everything.
         assert!(!env_var_in_scope("GH_TOKEN", v, Some(&[])));
     }
 }

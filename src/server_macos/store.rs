@@ -82,10 +82,12 @@ impl KeychainStore {
     /// distinctly from "parse failure" by inspecting the error message if
     /// they need to.
     pub fn load() -> Result<Self> {
-        let raw = get_keychain(STORE_NAME)
-            .context("failed to read rusty.vault.store from keychain (run `vt init` or `vt secret import`)")?;
-        let store: KeychainStore = serde_json::from_slice(&raw)
-            .context("rusty.vault.store payload is not valid JSON — keychain item may be corrupted")?;
+        let raw = get_keychain(STORE_NAME).context(
+            "failed to read rusty.vault.store from keychain (run `vt init` or `vt secret import`)",
+        )?;
+        let store: KeychainStore = serde_json::from_slice(&raw).context(
+            "rusty.vault.store payload is not valid JSON — keychain item may be corrupted",
+        )?;
         ensure!(
             store.v == STORE_SCHEMA_VERSION,
             "rusty.vault.store has schema version {}, this binary supports {}",
@@ -234,7 +236,10 @@ mod tests {
         let json = serde_json::to_vec(&store).unwrap();
         let parsed: KeychainStore = serde_json::from_slice(&json).unwrap();
         assert_eq!(parsed.v, STORE_SCHEMA_VERSION);
-        assert_eq!(parsed.passcode_and_auth_token_bytes().unwrap(), vec![0u8; 64]);
+        assert_eq!(
+            parsed.passcode_and_auth_token_bytes().unwrap(),
+            vec![0u8; 64]
+        );
         assert_eq!(parsed.encrypted_passphrase_bytes().unwrap(), vec![1u8; 60]);
         assert!(parsed.encrypted_ssh_keys.is_none());
         assert!(parsed.encrypted_fido2.is_none());
@@ -247,7 +252,10 @@ mod tests {
         store.set_encrypted_fido2(&[5u8; 50]);
         let json = serde_json::to_vec(&store).unwrap();
         let parsed: KeychainStore = serde_json::from_slice(&json).unwrap();
-        assert_eq!(parsed.encrypted_ssh_keys_bytes().unwrap(), Some(vec![4u8; 100]));
+        assert_eq!(
+            parsed.encrypted_ssh_keys_bytes().unwrap(),
+            Some(vec![4u8; 100])
+        );
         assert_eq!(parsed.encrypted_fido2_bytes().unwrap(), Some(vec![5u8; 50]));
     }
 

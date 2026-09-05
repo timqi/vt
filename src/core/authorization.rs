@@ -239,12 +239,7 @@ impl GrantScope {
     }
 
     /// Parent-app decrypt scope. Same rules as [`Self::sign_app`].
-    pub fn decrypt_app(
-        subject: SubjectId,
-        parent_exe: &str,
-        secret_type: u8,
-        salt: &[u8],
-    ) -> Self {
+    pub fn decrypt_app(subject: SubjectId, parent_exe: &str, secret_type: u8, salt: &[u8]) -> Self {
         let mut h = Sha256::new();
         h.update(b"vt-authz-decrypt-app-v1");
         hash_field(&mut h, parent_exe.as_bytes());
@@ -259,12 +254,7 @@ impl GrantScope {
     }
 
     /// Cwd-fallback decrypt scope. Same rules as [`Self::sign_cwd`].
-    pub fn decrypt_cwd(
-        subject: SubjectId,
-        root_path: &str,
-        secret_type: u8,
-        salt: &[u8],
-    ) -> Self {
+    pub fn decrypt_cwd(subject: SubjectId, root_path: &str, secret_type: u8, salt: &[u8]) -> Self {
         let mut h = Sha256::new();
         h.update(b"vt-authz-decrypt-cwd-v1");
         hash_field(&mut h, root_path.as_bytes());
@@ -474,10 +464,7 @@ impl CacheExpiry {
     /// clock has passed. Display-only companion to [`Self::is_valid_at`].
     fn remaining_at(self, now_mono: Instant, now_wall: SystemTime) -> Duration {
         let mono_left = self.mono.saturating_duration_since(now_mono);
-        let wall_left = self
-            .wall
-            .duration_since(now_wall)
-            .unwrap_or(Duration::ZERO);
+        let wall_left = self.wall.duration_since(now_wall).unwrap_or(Duration::ZERO);
         mono_left.min(wall_left)
     }
 }
@@ -1411,12 +1398,20 @@ mod tests {
 
         // Destination scope partitions on host key and key fingerprint.
         assert_ne!(
-            GrantScope::sign_destination(b"hostkey-a", "fp").key.unwrap(),
-            GrantScope::sign_destination(b"hostkey-b", "fp").key.unwrap()
+            GrantScope::sign_destination(b"hostkey-a", "fp")
+                .key
+                .unwrap(),
+            GrantScope::sign_destination(b"hostkey-b", "fp")
+                .key
+                .unwrap()
         );
         assert_ne!(
-            GrantScope::sign_destination(b"hostkey-a", "fp-a").key.unwrap(),
-            GrantScope::sign_destination(b"hostkey-a", "fp-b").key.unwrap()
+            GrantScope::sign_destination(b"hostkey-a", "fp-a")
+                .key
+                .unwrap(),
+            GrantScope::sign_destination(b"hostkey-a", "fp-b")
+                .key
+                .unwrap()
         );
         // Workspace scope partitions on root path.
         assert_ne!(
@@ -1598,9 +1593,24 @@ mod tests {
             .await
             .unwrap();
         permit.commit().await.unwrap();
-        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 1);
-        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (2, 2)).await, 0);
-        assert_eq!(engine.live_len(Operation::Decrypt, ScopeFamily::Connection, (1, 2)).await, 0);
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                .await,
+            1
+        );
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (2, 2))
+                .await,
+            0
+        );
+        assert_eq!(
+            engine
+                .live_len(Operation::Decrypt, ScopeFamily::Connection, (1, 2))
+                .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1646,7 +1656,12 @@ mod tests {
             });
             let engine = AuthorizationEngine::new(auth, AllowValidator::allowed());
             assert!(engine.authorize(sign_request((1, 2), "fp")).await.is_err());
-            assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
+            assert_eq!(
+                engine
+                    .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                    .await,
+                0
+            );
         }
     }
 
@@ -1694,7 +1709,12 @@ mod tests {
             failure.decision(),
             Decision::Unavailable(UnavailableReason::NotInteractive)
         );
-        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                .await,
+            0
+        );
 
         let retry = engine
             .authorize(sign_request((1, 2), "cached"))
@@ -1758,7 +1778,11 @@ mod tests {
         auth.release.notify_one();
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await != 0 {
+            while engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                .await
+                != 0
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -1798,7 +1822,12 @@ mod tests {
             permit.commit().await.unwrap();
         }
         assert_eq!(auth.calls.load(Ordering::Acquire), 2);
-        assert_eq!(engine.live_len(Operation::Auth, ScopeFamily::Connection, (1, 2)).await, 0);
+        assert_eq!(
+            engine
+                .live_len(Operation::Auth, ScopeFamily::Connection, (1, 2))
+                .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1819,7 +1848,12 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(auth.calls.load(Ordering::Acquire), 2);
-        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1987,7 +2021,12 @@ mod tests {
         for request in requests {
             request.await.unwrap();
         }
-        assert_eq!(engine.live_len(Operation::Run, ScopeFamily::Connection, (1, 2)).await, 0);
+        assert_eq!(
+            engine
+                .live_len(Operation::Run, ScopeFamily::Connection, (1, 2))
+                .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -2011,7 +2050,12 @@ mod tests {
             .err()
             .expect("in-flight prompt must be revoked");
         assert_eq!(failure.decision(), Decision::Invalidated);
-        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -2065,7 +2109,12 @@ mod tests {
             .err()
             .expect("post-prompt live validation must fail");
         assert_eq!(failure.decision(), Decision::Invalidated);
-        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                .await,
+            0
+        );
     }
 
     struct ConcurrentInvalidValidator {
@@ -2129,7 +2178,12 @@ mod tests {
         }
         assert_eq!(validator.calls.load(Ordering::Acquire), 2);
         assert_eq!(validator.completions.load(Ordering::Acquire), 1);
-        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                .await,
+            0
+        );
 
         let retry = engine
             .authorize(sign_request((1, 2), "cached"))
@@ -2264,7 +2318,11 @@ mod tests {
         validator.allowed.store(true, Ordering::Release);
         active.commit().await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await != 0 {
+            while engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                .await
+                != 0
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -2330,7 +2388,12 @@ mod tests {
         assert!(!invalidate.is_finished());
         permit.commit().await.unwrap();
         assert_eq!(invalidate.await.unwrap(), 1);
-        assert_eq!(engine.live_len(Operation::Sign, ScopeFamily::Connection, (1, 2)).await, 0);
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -2419,6 +2482,11 @@ mod tests {
             .err()
             .expect("second prompt is rejected");
         assert_eq!(failure.decision(), Decision::Rejected);
-        assert_eq!(engine.live_len(Operation::Decrypt, ScopeFamily::Connection, (1, 2)).await, 1);
+        assert_eq!(
+            engine
+                .live_len(Operation::Decrypt, ScopeFamily::Connection, (1, 2))
+                .await,
+            1
+        );
     }
 }

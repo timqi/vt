@@ -89,8 +89,14 @@ async fn keygen_unix(
     // 5. Echo result + usage guidance.
     println!("{pub_line}");
     println!();
-    println!("public key   -> {} (add this to GitHub)", pub_path.display());
-    println!("vt:// record -> {} (mode 0600, ciphertext)", key_path.display());
+    println!(
+        "public key   -> {} (add this to GitHub)",
+        pub_path.display()
+    );
+    println!(
+        "vt:// record -> {} (mode 0600, ciphertext)",
+        key_path.display()
+    );
     println!("vt url       : {vt_url}");
     println!();
     println!("On each host that runs `git push`:");
@@ -157,8 +163,7 @@ async fn load_default_key_file() -> Result<Option<String>> {
     match tokio::fs::read_to_string(&key_path).await {
         Ok(s) => Ok(Some(s.trim().to_string())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow::Error::new(e)
-            .context(format!("read {}", key_path.display()))),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("read {}", key_path.display()))),
     }
 }
 
@@ -222,7 +227,11 @@ fn write_new_file(path: &std::path::Path, contents: &[u8], mode: u32) -> Result<
 /// filtering extension relay to the UPSTREAM real vt agent and is forwarded to
 /// the remote via standard agent forwarding — see `route_extension` and
 /// `docs/ssh-vt-design.md` §11.
-pub async fn connect(vt_client: VTClient, args: Vec<String>, forward_real_agent: bool) -> Result<()> {
+pub async fn connect(
+    vt_client: VTClient,
+    args: Vec<String>,
+    forward_real_agent: bool,
+) -> Result<()> {
     #[cfg(unix)]
     {
         connect_unix(vt_client, args, forward_real_agent).await
@@ -235,7 +244,11 @@ pub async fn connect(vt_client: VTClient, args: Vec<String>, forward_real_agent:
 }
 
 #[cfg(unix)]
-async fn connect_unix(vt_client: VTClient, args: Vec<String>, forward_real_agent: bool) -> Result<()> {
+async fn connect_unix(
+    vt_client: VTClient,
+    args: Vec<String>,
+    forward_real_agent: bool,
+) -> Result<()> {
     // 1. Resolve which identity/identities to advertise. An explicit pubkey
     //    (VT_GIT_SSH_PUB / ~/.config/vt/git-ssh.pub) takes precedence and may
     //    carry a vt:// record for the decrypt-then-sign fallback; otherwise, with
@@ -366,8 +379,10 @@ async fn load_pubkey_line_opt() -> Result<Option<String>> {
     match tokio::fs::read_to_string(&pub_path).await {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow::Error::new(e)
-            .context(format!("read {} (or set VT_GIT_SSH_PUB)", pub_path.display()))),
+        Err(e) => Err(anyhow::Error::new(e).context(format!(
+            "read {} (or set VT_GIT_SSH_PUB)",
+            pub_path.display()
+        ))),
     }
 }
 
@@ -480,7 +495,11 @@ fn make_temp_dir_0700() -> Result<std::path::PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     let mut buf = [0u8; 9];
     rand::thread_rng().fill_bytes(&mut buf);
-    let name = format!("vt-ssh-{}-{}", std::process::id(), BASE64_URL_SAFE_NO_PAD.encode(buf));
+    let name = format!(
+        "vt-ssh-{}-{}",
+        std::process::id(),
+        BASE64_URL_SAFE_NO_PAD.encode(buf)
+    );
     let dir = std::env::temp_dir().join(name);
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -724,18 +743,14 @@ impl ssh_agent_lib::agent::Session for SignerSession {
             }
             SignRoute::Fail(msg) => return Err(sign_err(msg)),
             // Fallback implies `vt_url.is_some()`, so this unwrap always yields Some.
-            SignRoute::Fallback => {
-                vt_url_opt.expect("Fallback route requires a vt:// record")
-            }
+            SignRoute::Fallback => vt_url_opt.expect("Fallback route requires a vt:// record"),
         };
 
         // 2. Fallback path: decrypt-then-sign locally with the vt:// record.
         // Decrypt the seed once (get_or_try_init: errors are NOT cached, so a
         // rejected Touch ID / passkey can be retried on a later request).
         // `&OnceCell` borrowed across the await is fine (OnceCell: Send+Sync).
-        let seed = self
-            .inner
-            .identities[idx]
+        let seed = self.inner.identities[idx]
             .key
             .get_or_try_init(|| async {
                 let inner = &self.inner;
@@ -745,7 +760,10 @@ impl ssh_agent_lib::agent::Session for SignerSession {
                     .await
                     .map_err(|e| sign_err(e.to_string()))?;
                 if res.is_empty() || !res[0].err_message.is_empty() {
-                    let msg = res.first().map(|r| r.err_message.clone()).unwrap_or_default();
+                    let msg = res
+                        .first()
+                        .map(|r| r.err_message.clone())
+                        .unwrap_or_default();
                     return Err(sign_err(format!("decrypt ssh key failed: {msg}")));
                 }
                 let bytes = BASE64_URL_SAFE_NO_PAD
@@ -979,14 +997,19 @@ mod relay_detection_tests {
 
     #[test]
     fn rejects_connect_without_flag() {
-        assert!(!is_vt_relay_invocation(&v(&["vt", "ssh", "connect", "host"])));
+        assert!(!is_vt_relay_invocation(&v(&[
+            "vt", "ssh", "connect", "host"
+        ])));
     }
 
     #[test]
     fn rejects_non_connect_subcommands() {
         assert!(!is_vt_relay_invocation(&v(&["vt", "read", "vt://0abc"])));
         assert!(!is_vt_relay_invocation(&v(&[
-            "vt", "ssh", "agent", "--forward-real-agent"
+            "vt",
+            "ssh",
+            "agent",
+            "--forward-real-agent"
         ])));
         assert!(!is_vt_relay_invocation(&v(&["vt", "ssh", "keygen"])));
     }
@@ -1066,7 +1089,10 @@ mod relay_detection_tests {
             &["PATH=/usr/bin", "HOME=/Users/x"],
         );
         let argv = parse_procargs2(&buf).expect("parse");
-        assert_eq!(argv, vec!["vt", "ssh", "connect", "--forward-real-agent", "host"]);
+        assert_eq!(
+            argv,
+            vec!["vt", "ssh", "connect", "--forward-real-agent", "host"]
+        );
         assert!(is_vt_relay_invocation(&argv));
     }
 
@@ -1106,7 +1132,11 @@ mod tests {
         let pub1 = sk.verifying_key().to_bytes();
 
         let enc = BASE64_URL_SAFE_NO_PAD.encode(seed);
-        assert_eq!(enc.len(), 43, "32-byte seed must encode to 43 url-safe no-pad chars");
+        assert_eq!(
+            enc.len(),
+            43,
+            "32-byte seed must encode to 43 url-safe no-pad chars"
+        );
 
         let dec = BASE64_URL_SAFE_NO_PAD.decode(&enc).unwrap();
         let seed2: [u8; 32] = dec.try_into().expect("decoded seed must be 32 bytes");
@@ -1194,7 +1224,10 @@ mod tests {
     // run@vt spawns processes on the local machine — NEVER over the relay.
     #[test]
     fn relay_filter_refuses_run_vt() {
-        assert_eq!(super::route_extension("run@vt"), super::ExtensionRoute::Refuse);
+        assert_eq!(
+            super::route_extension("run@vt"),
+            super::ExtensionRoute::Refuse
+        );
     }
 
     // Unknown / out-of-scope extensions are refused: OpenSSH's own

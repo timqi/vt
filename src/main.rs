@@ -458,9 +458,10 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
             SecretCommands::Export => server_macos::admin::export_secret().await,
             SecretCommands::Import => server_macos::admin::import_secret().await,
             SecretCommands::RotatePasscode => server_macos::admin::rotate_passcode().await,
-            SecretCommands::Rebind { old_bin_path, to_v1 } => {
-                server_macos::admin::rebind(old_bin_path.clone(), *to_v1).await
-            }
+            SecretCommands::Rebind {
+                old_bin_path,
+                to_v1,
+            } => server_macos::admin::rebind(old_bin_path.clone(), *to_v1).await,
         },
         Commands::Ssh(ssh_command) => match ssh_command {
             SshCommands::Keygen {
@@ -494,15 +495,11 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
                 ui_token_fd,
             } => {
                 use server_macos::ssh_agent::{AuthCacheTtls, RunAllowlist};
-                let audit_push =
-                    build_audit_push_config(audit_url, audit_key, *no_audit_push);
+                let audit_push = build_audit_push_config(audit_url, audit_key, *no_audit_push);
                 // flag > config.toml [agent] > built-in default
                 // (docs/app-bundle.md §4).
                 let file_cfg = config::load_agent_file_config();
-                let run_allow_spec = run_allow
-                    .clone()
-                    .or(file_cfg.run_allow)
-                    .unwrap_or_default();
+                let run_allow_spec = run_allow.clone().or(file_cfg.run_allow).unwrap_or_default();
                 let run_allow = RunAllowlist::parse(&run_allow_spec)
                     .map_err(|e| anyhow::anyhow!("run-allow: {}", e))?;
                 // Floor the idle timeout at 60s: unlike the cache durations,
@@ -552,7 +549,9 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
                 .await
             }
             #[cfg(target_os = "macos")]
-            SshCommands::Add { file, comment } => server_macos::ssh_cli::ssh_add(file.clone(), comment.clone()),
+            SshCommands::Add { file, comment } => {
+                server_macos::ssh_cli::ssh_add(file.clone(), comment.clone())
+            }
             #[cfg(target_os = "macos")]
             SshCommands::List => server_macos::ssh_cli::ssh_list(),
             #[cfg(target_os = "macos")]
@@ -569,7 +568,9 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
         },
         #[cfg(target_os = "macos")]
         Commands::Fido2(cmd) => match cmd {
-            Fido2Commands::Register { label } => server_macos::fido2_cli::fido2_register(label.clone()),
+            Fido2Commands::Register { label } => {
+                server_macos::fido2_cli::fido2_register(label.clone())
+            }
             Fido2Commands::List => server_macos::fido2_cli::fido2_list(),
             Fido2Commands::Remove { short_id } => server_macos::fido2_cli::fido2_remove(short_id),
             Fido2Commands::RemoveAll => server_macos::fido2_cli::fido2_remove_all(),
@@ -729,7 +730,14 @@ mod tests {
     #[test]
     fn connect_forward_flag_parses_before_trailing_args() {
         let (fwd, args) = parse_connect(&[
-            "vt", "ssh", "connect", "--forward-real-agent", "-p", "2222", "host", "cmd",
+            "vt",
+            "ssh",
+            "connect",
+            "--forward-real-agent",
+            "-p",
+            "2222",
+            "host",
+            "cmd",
         ]);
         assert!(fwd);
         assert_eq!(args, vec!["-p", "2222", "host", "cmd"]);

@@ -209,7 +209,11 @@ pub fn decide(
     // Block takes precedence over inject, regardless of rule order: a more
     // specific deny (e.g. `gh auth token`) must win over a broad inject rule
     // for the same program (e.g. all of `gh`). So scan deny rules first.
-    if let Some(rule) = cfg.rules.iter().find(|r| r.block && rule_matches(r, prog, args)) {
+    if let Some(rule) = cfg
+        .rules
+        .iter()
+        .find(|r| r.block && rule_matches(r, prog, args))
+    {
         return Decision::Deny(
             rule.reason
                 .clone()
@@ -217,7 +221,11 @@ pub fn decide(
         );
     }
 
-    let rule = match cfg.rules.iter().find(|r| !r.block && rule_matches(r, prog, args)) {
+    let rule = match cfg
+        .rules
+        .iter()
+        .find(|r| !r.block && rule_matches(r, prog, args))
+    {
         Some(r) => r,
         None => return Decision::Allow, // default policy: accept
     };
@@ -377,8 +385,8 @@ fn run_exec(cfg: &HookConfig, vt_bin: &str, argv: &[String]) -> Result<()> {
 
     // Find the program + its args for matching; the original argv is still
     // what gets exec'd.
-    let (prog, args) = effective_invocation(argv)
-        .unwrap_or_else(|| (basename(arg0), rest.to_vec()));
+    let (prog, args) =
+        effective_invocation(argv).unwrap_or_else(|| (basename(arg0), rest.to_vec()));
 
     // Recursion guard: a bare `vt …` (or renamed VT_HOOK_BIN) runs as-is.
     if prog == "vt" || prog == basename(vt_bin) {
@@ -425,7 +433,11 @@ fn run_exec(cfg: &HookConfig, vt_bin: &str, argv: &[String]) -> Result<()> {
 /// `exec()` the given program (never returns on success).
 fn exec_real(prog: &str, args: &[String]) -> Result<()> {
     let err = exec::Command::new(prog).args(args).exec();
-    Err(anyhow::anyhow!("vt hook exec: failed to run {}: {}", prog, err))
+    Err(anyhow::anyhow!(
+        "vt hook exec: failed to run {}: {}",
+        prog,
+        err
+    ))
 }
 
 /// Resolve a bare command name to an absolute path via `$PATH`, skipping any
@@ -479,7 +491,9 @@ fn resolve_in_paths(arg0: &str, paths: &[PathBuf], self_exe: Option<&Path>) -> R
             continue;
         }
         let is_self = match self_exe {
-            Some(me) => std::fs::canonicalize(&cand).map(|c| c == me).unwrap_or(false),
+            Some(me) => std::fs::canonicalize(&cand)
+                .map(|c| c == me)
+                .unwrap_or(false),
             None => false,
         };
         if is_self {
@@ -560,7 +574,11 @@ fn install_shims(cfg: &HookConfig, vt_bin: &str, dir: Option<&str>) -> Result<()
         names.len(),
         dir_abs.display(),
         target.display(),
-        names.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
+        names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     println!(
         "add to the FRONT of your PATH (e.g. in ~/.zshrc):\n  export PATH=\"{}:$PATH\"",
@@ -861,7 +879,10 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
     fn cfg(rules: Vec<HookRule>) -> HookConfig {
-        HookConfig { rules, ..Default::default() }
+        HookConfig {
+            rules,
+            ..Default::default()
+        }
     }
     fn rule(command: &str, env_vars: &[&str], block: bool) -> HookRule {
         HookRule {
@@ -916,7 +937,10 @@ mod tests {
             parse_invocation("X=1 Y=2 /usr/bin/python a.py"),
             Some(("python".into(), argv("a.py")))
         );
-        assert_eq!(parse_invocation("./node x"), Some(("node".into(), argv("x"))));
+        assert_eq!(
+            parse_invocation("./node x"),
+            Some(("node".into(), argv("x")))
+        );
         assert_eq!(
             parse_invocation("gh auth token"),
             Some(("gh".into(), argv("auth token")))
@@ -1104,7 +1128,10 @@ mod tests {
             Resolved::Real(link.join("shim").join("gh").to_string_lossy().into_owned())
         );
         // Missing command → NotFound.
-        assert_eq!(resolve_in_paths("nope", &paths, Some(&vt_canon)), Resolved::NotFound);
+        assert_eq!(
+            resolve_in_paths("nope", &paths, Some(&vt_canon)),
+            Resolved::NotFound
+        );
         // Shim is the ONLY candidate → OnlyShims (a hard error upstream): exec'ing
         // the bare name would execvp straight back into the shim and loop.
         let shim_only = vec![link.join("shim")];
@@ -1131,7 +1158,10 @@ mod tests {
         match decide("gh", &argv("pr list"), "/x", &c, &no_env) {
             Decision::Inject(plan) => {
                 assert_eq!(plan.only_env, vec!["GH_TOKEN".to_string()]);
-                assert_eq!(plan.set_vars, vec![("GH_TOKEN".to_string(), "vt://0cfg".to_string())]);
+                assert_eq!(
+                    plan.set_vars,
+                    vec![("GH_TOKEN".to_string(), "vt://0cfg".to_string())]
+                );
                 assert!(plan.needs_inject());
             }
             other => panic!("expected inject, got {other:?}"),
@@ -1164,18 +1194,15 @@ mod tests {
             )],
             env,
         );
-        match decide(
-            "logcli",
-            &argv("query '{app=\"x\"}'"),
-            "/x",
-            &c,
-            &no_env,
-        ) {
+        match decide("logcli", &argv("query '{app=\"x\"}'"), "/x", &c, &no_env) {
             Decision::Inject(plan) => {
                 // all four supplied
                 assert_eq!(plan.set_vars.len(), 4, "{:?}", plan.set_vars);
                 // only the two vt:// ones decrypted
-                assert_eq!(plan.only_env, vec!["LOKI_ADDR".to_string(), "LOKI_PASSWORD".to_string()]);
+                assert_eq!(
+                    plan.only_env,
+                    vec!["LOKI_ADDR".to_string(), "LOKI_PASSWORD".to_string()]
+                );
             }
             other => panic!("expected inject, got {other:?}"),
         }
@@ -1184,7 +1211,10 @@ mod tests {
             Action::Rewrite(cmd) => {
                 assert!(cmd.contains("LOKI_ORG_ID='f2pool'"), "{cmd}");
                 assert!(cmd.contains("LOKI_USERNAME='loki-readonly'"), "{cmd}");
-                assert!(cmd.contains("--only-env 'LOKI_ADDR,LOKI_PASSWORD'"), "{cmd}");
+                assert!(
+                    cmd.contains("--only-env 'LOKI_ADDR,LOKI_PASSWORD'"),
+                    "{cmd}"
+                );
             }
             other => panic!("expected rewrite, got {other:?}"),
         }
@@ -1246,26 +1276,50 @@ mod tests {
         assert_eq!(inv("/usr/bin/gh pr"), Some(("gh".into(), argv("pr"))));
         // no launcher peeling: the leading program is taken as-is.
         assert_eq!(inv("mise exec gh"), Some(("mise".into(), argv("exec gh"))));
-        assert_eq!(inv("env FOO=bar gh pr"), Some(("env".into(), argv("FOO=bar gh pr"))));
+        assert_eq!(
+            inv("env FOO=bar gh pr"),
+            Some(("env".into(), argv("FOO=bar gh pr")))
+        );
     }
 
     #[test]
     fn split_segments_respects_quotes_redirects_and_operators() {
-        assert_eq!(split_segments("gh pr list | grep x"), vec!["gh pr list", "grep x"]);
-        assert_eq!(split_segments("cd /r && gh pr create"), vec!["cd /r", "gh pr create"]);
+        assert_eq!(
+            split_segments("gh pr list | grep x"),
+            vec!["gh pr list", "grep x"]
+        );
+        assert_eq!(
+            split_segments("cd /r && gh pr create"),
+            vec!["cd /r", "gh pr create"]
+        );
         assert_eq!(split_segments("a; b ; c"), vec!["a", "b", "c"]);
         assert_eq!(split_segments("a || b"), vec!["a", "b"]);
         // quoted operators don't split
-        assert_eq!(split_segments("gh x --title 'a && b'"), vec!["gh x --title 'a && b'"]);
-        assert_eq!(split_segments("gh x --title \"a | b\""), vec!["gh x --title \"a | b\""]);
+        assert_eq!(
+            split_segments("gh x --title 'a && b'"),
+            vec!["gh x --title 'a && b'"]
+        );
+        assert_eq!(
+            split_segments("gh x --title \"a | b\""),
+            vec!["gh x --title \"a | b\""]
+        );
         // single & (redirect 2>&1) does NOT split
         assert_eq!(split_segments("echo x 2>&1"), vec!["echo x 2>&1"]);
         // $(...) interior kept together (documented limitation)
-        assert_eq!(split_segments("echo $(gh pr view | cat)"), vec!["echo $(gh pr view | cat)"]);
+        assert_eq!(
+            split_segments("echo $(gh pr view | cat)"),
+            vec!["echo $(gh pr view | cat)"]
+        );
         // a `(` inside a quote/backtick must NOT leak `depth` and hide a later
         // segment (that would bypass a block rule on the tail).
-        assert_eq!(split_segments("`( echo hi`; rm x"), vec!["`( echo hi`", "rm x"]);
-        assert_eq!(split_segments("echo \"(\" ; rm x"), vec!["echo \"(\"", "rm x"]);
+        assert_eq!(
+            split_segments("`( echo hi`; rm x"),
+            vec!["`( echo hi`", "rm x"]
+        );
+        assert_eq!(
+            split_segments("echo \"(\" ; rm x"),
+            vec!["echo \"(\"", "rm x"]
+        );
         assert_eq!(split_segments("echo '(' ; rm x"), vec!["echo '('", "rm x"]);
     }
 
@@ -1291,7 +1345,10 @@ mod tests {
         match evaluate("cd /repo && gh pr create", "/x", &c, no_env, "vt") {
             Action::Rewrite(cmd) => {
                 assert!(cmd.contains("--only-env 'GH_TOKEN'"), "{cmd}");
-                assert!(cmd.contains("-- bash -c 'cd /repo && gh pr create'"), "{cmd}");
+                assert!(
+                    cmd.contains("-- bash -c 'cd /repo && gh pr create'"),
+                    "{cmd}"
+                );
             }
             o => panic!("expected rewrite, got {o:?}"),
         }
@@ -1303,7 +1360,10 @@ mod tests {
         // two targets in one compound → union of env vars, one rewrite
         match evaluate("gh pr list && glab mr list", "/x", &c, no_env, "vt") {
             Action::Rewrite(cmd) => {
-                assert!(cmd.contains("--only-env 'GH_TOKEN,GITLAB_TOKEN,GITLAB_HOST'"), "{cmd}");
+                assert!(
+                    cmd.contains("--only-env 'GH_TOKEN,GITLAB_TOKEN,GITLAB_HOST'"),
+                    "{cmd}"
+                );
             }
             o => panic!("expected rewrite, got {o:?}"),
         }
@@ -1355,12 +1415,11 @@ mod tests {
     fn dir_override_picks_longest_prefix() {
         let mut dirs = BTreeMap::new();
         dirs.insert("/home/me/work".to_string(), map(&[("K", "broad")]));
-        dirs.insert(
-            "/home/me/work/projA".to_string(),
-            map(&[("K", "specific")]),
-        );
+        dirs.insert("/home/me/work/projA".to_string(), map(&[("K", "specific")]));
         assert_eq!(
-            dir_override(&dirs, "/home/me/work/projA/sub").unwrap().get("K"),
+            dir_override(&dirs, "/home/me/work/projA/sub")
+                .unwrap()
+                .get("K"),
             Some(&"specific".to_string())
         );
         assert_eq!(
@@ -1380,7 +1439,9 @@ mod tests {
         dirs.insert("~/work/projA".to_string(), map(&[("K", "tilde")]));
         // a real cwd under $HOME/work/projA hits the tilde key
         assert_eq!(
-            dir_override(&dirs, &format!("{home}/work/projA/sub")).unwrap().get("K"),
+            dir_override(&dirs, &format!("{home}/work/projA/sub"))
+                .unwrap()
+                .get("K"),
             Some(&"tilde".to_string())
         );
         // exact match on the expanded home dir
@@ -1443,9 +1504,15 @@ mod tests {
         let proc_env = |_: &str| Some("vt://0env".to_string());
         match evaluate("gh pr list", "/x", &c, proc_env, "vt") {
             Action::Rewrite(cmd) => {
-                assert!(cmd.starts_with("GH_TOKEN='vt://0cfg' "), "config should win: {cmd}");
+                assert!(
+                    cmd.starts_with("GH_TOKEN='vt://0cfg' "),
+                    "config should win: {cmd}"
+                );
                 assert!(cmd.contains("--only-env 'GH_TOKEN'"), "{cmd}");
-                assert!(!cmd.contains("vt://0env"), "env value must not be used: {cmd}");
+                assert!(
+                    !cmd.contains("vt://0env"),
+                    "env value must not be used: {cmd}"
+                );
             }
             other => panic!("expected rewrite, got {other:?}"),
         }
@@ -1464,7 +1531,10 @@ mod tests {
         let proc_env = |_: &str| Some("ghp_plaintext".to_string());
         match evaluate("gh pr list", "/x", &c, proc_env, "vt") {
             Action::Rewrite(cmd) => {
-                assert!(cmd.starts_with("GH_TOKEN='vt://0cfg' "), "config should win: {cmd}");
+                assert!(
+                    cmd.starts_with("GH_TOKEN='vt://0cfg' "),
+                    "config should win: {cmd}"
+                );
                 assert!(cmd.contains("--only-env 'GH_TOKEN'"), "{cmd}");
             }
             other => panic!("expected rewrite, got {other:?}"),
@@ -1479,7 +1549,10 @@ mod tests {
         let proc_env = |_: &str| Some("vt://0env".to_string());
         match evaluate("gh pr list", "/x", &c, proc_env, "vt") {
             Action::Rewrite(cmd) => {
-                assert!(cmd.starts_with("'vt'"), "should not prepend an assignment: {cmd}");
+                assert!(
+                    cmd.starts_with("'vt'"),
+                    "should not prepend an assignment: {cmd}"
+                );
                 assert!(cmd.contains("--only-env 'GH_TOKEN'"), "{cmd}");
             }
             other => panic!("expected rewrite, got {other:?}"),

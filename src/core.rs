@@ -215,10 +215,7 @@ pub struct EncryptResItem {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum DecryptInput {
     /// v2: `vt://{type}{b64(salt||ct)}` — agent only sees the salt.
-    V2 {
-        t: SecretType,
-        salt: [u8; SALT_LEN],
-    },
+    V2 { t: SecretType, salt: [u8; SALT_LEN] },
     /// Legacy v0/v1: `vt://mac/{type}{b64(ct)}` — agent decrypts and may run
     /// TOTP server-side (legacy behavior).
     Legacy { url: String },
@@ -236,15 +233,9 @@ pub struct DecryptReq {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum DecryptResItem {
     /// Per-record DEK; client uses it to decrypt the inner ciphertext locally.
-    V2 {
-        dek: [u8; 32],
-        err_message: String,
-    },
+    V2 { dek: [u8; 32], err_message: String },
     /// Plaintext or legacy-side-computed TOTP code.
-    Legacy {
-        result: String,
-        err_message: String,
-    },
+    Legacy { result: String, err_message: String },
 }
 
 /// Request from a (typically remote) client → local agent for `run@vt`.
@@ -443,9 +434,7 @@ impl ContextBasis {
                 "destination-bound: reuses one approval per (key, server) \
                  across all local callers within the TTL"
             }
-            ContextBasis::Forwarding => {
-                "connection carries forwarded agent traffic — never cached"
-            }
+            ContextBasis::Forwarding => "connection carries forwarded agent traffic — never cached",
             ContextBasis::Tainted => {
                 "a session-bind failed verification on this connection — never \
                  cached until reconnect"
@@ -558,9 +547,9 @@ impl VtUrl {
             let t = SecretType::from_str(std::str::from_utf8(&type_buf).unwrap());
             let body_b64 = rest[1..].to_string();
             ensure!(
-                body_b64.bytes().all(|b| {
-                    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
-                }),
+                body_b64
+                    .bytes()
+                    .all(|b| { b.is_ascii_alphanumeric() || b == b'-' || b == b'_' }),
                 "legacy vt body must be base64url-no-pad"
             );
             return Ok(VtUrl::Legacy { t, body_b64 });
@@ -705,18 +694,14 @@ pub fn legacy_decrypt(mac_cipher: &AesGcmCrypto, url: &str) -> CryptoResItem {
         let parsed = VtUrl::parse(url)?;
         let (t, body_b64) = match parsed {
             VtUrl::Legacy { t, body_b64 } => (t, body_b64),
-            VtUrl::V2 { .. } => {
-                return Err(anyhow::anyhow!(
-                    "legacy_decrypt called on a v2 URL"
-                ))
-            }
+            VtUrl::V2 { .. } => return Err(anyhow::anyhow!("legacy_decrypt called on a v2 URL")),
         };
         let raw = BASE64_URL_SAFE_NO_PAD
             .decode(body_b64.as_bytes())
             .map_err(|e| anyhow::anyhow!("base64 decode error: {}", e))?;
         let plaintext = mac_cipher.decrypt(&raw)?;
-        let plaintext_str = String::from_utf8(plaintext)
-            .map_err(|e| anyhow::anyhow!("decryption error: {}", e))?;
+        let plaintext_str =
+            String::from_utf8(plaintext).map_err(|e| anyhow::anyhow!("decryption error: {}", e))?;
         match t {
             SecretType::RAW => Ok(plaintext_str),
             SecretType::TOTP => {
@@ -864,10 +849,7 @@ mod tests {
         assert_eq!(ContextBasis::Disabled.as_wire(), "disabled");
         assert_eq!(ContextBasis::SessionBind.as_wire(), "session-bind");
         assert_eq!(ContextBasis::Workspace.as_wire(), "workspace");
-        assert_eq!(
-            ContextBasis::RelayConnection.as_wire(),
-            "relay-connection"
-        );
+        assert_eq!(ContextBasis::RelayConnection.as_wire(), "relay-connection");
     }
 
     #[test]
@@ -896,7 +878,10 @@ mod tests {
         assert_eq!(parsed.flags, 0);
         assert!(parsed.meta.user.is_empty());
 
-        let res = SignRes { algorithm: "ssh-ed25519".into(), signature: vec![7u8; 64] };
+        let res = SignRes {
+            algorithm: "ssh-ed25519".into(),
+            signature: vec![7u8; 64],
+        };
         let rb = serde_json::to_vec(&res).unwrap();
         let rback: SignRes = serde_json::from_slice(&rb).unwrap();
         assert_eq!(rback.algorithm, "ssh-ed25519");
@@ -934,7 +919,11 @@ mod tests {
 
         let parsed = VtUrl::parse(&url).unwrap();
         match parsed {
-            VtUrl::V2 { t, salt: s, inner_ct } => {
+            VtUrl::V2 {
+                t,
+                salt: s,
+                inner_ct,
+            } => {
                 assert_eq!(t, SecretType::RAW);
                 assert_eq!(s, salt);
                 let pt = client_decrypt_v2(t, &dek, &s, &inner_ct).unwrap();
@@ -994,10 +983,7 @@ mod tests {
     #[test]
     fn parse_rejects_short_v2_blob() {
         // 12 bytes is shorter than V2_MIN_BLOB_LEN (32).
-        let bad = format!(
-            "vt://0{}",
-            BASE64_URL_SAFE_NO_PAD.encode([0u8; 12])
-        );
+        let bad = format!("vt://0{}", BASE64_URL_SAFE_NO_PAD.encode([0u8; 12]));
         assert!(VtUrl::parse(&bad).is_err());
     }
 
@@ -1059,10 +1045,7 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_v2_type() {
         // Type byte `_` is reserved for UNKNOWN; v2 must reject.
-        let bad = format!(
-            "vt://_{}",
-            BASE64_URL_SAFE_NO_PAD.encode([0u8; 32])
-        );
+        let bad = format!("vt://_{}", BASE64_URL_SAFE_NO_PAD.encode([0u8; 32]));
         assert!(VtUrl::parse(&bad).is_err());
     }
 
@@ -1113,7 +1096,8 @@ mod tests {
     fn decrypt_req_deserializes_when_meta_is_missing() {
         // Same forward-compat property for DecryptReq.
         let json = br#"{"host":"alpha","command":"[read]","items":[]}"#;
-        let req: DecryptReq = serde_json::from_slice(json).expect("must parse old-shape DecryptReq");
+        let req: DecryptReq =
+            serde_json::from_slice(json).expect("must parse old-shape DecryptReq");
         assert_eq!(req.host, "alpha");
         assert_eq!(req.command, "[read]");
         assert!(req.items.is_empty());
@@ -1180,7 +1164,10 @@ mod tests {
 
     #[test]
     fn scan_mac_variant() {
-        assert_eq!(collect_urls("vt://mac/abc_def-ghi"), vec!["vt://mac/abc_def-ghi"]);
+        assert_eq!(
+            collect_urls("vt://mac/abc_def-ghi"),
+            vec!["vt://mac/abc_def-ghi"]
+        );
     }
 
     #[test]

@@ -207,7 +207,10 @@ pub fn spawn_push(cfg: Arc<AuditPushConfig>, entry: AgentAuditEntry) {
     });
 }
 
-async fn push_once_with_retry(cfg: &AuditPushConfig, entry: &AgentAuditEntry) -> anyhow::Result<()> {
+async fn push_once_with_retry(
+    cfg: &AuditPushConfig,
+    entry: &AgentAuditEntry,
+) -> anyhow::Result<()> {
     let body = serde_json::to_vec(&IngestBody {
         timestamp_ms: entry.ts_ms,
         agent_id: &cfg.agent_id,
@@ -303,13 +306,27 @@ mod tests {
         );
         let v = serde_json::to_value(&entry).unwrap();
 
-        for k in ["op_kind", "outcome", "salts", "latency_ms", "ts_ms", "token_id", "meta"] {
+        for k in [
+            "op_kind",
+            "outcome",
+            "salts",
+            "latency_ms",
+            "ts_ms",
+            "token_id",
+            "meta",
+        ] {
             assert!(v.get(k).is_some(), "missing sibling field {k}");
         }
         // The agent-authoritative context must flatten to TOP-LEVEL siblings —
         // the Worker's opAuditIngest reads them beside `meta`, never inside it.
         for k in [
-            "peer_exe", "key_fp", "dest", "scope_family", "scope_label", "grant_ttl_s", "relayed",
+            "peer_exe",
+            "key_fp",
+            "dest",
+            "scope_family",
+            "scope_label",
+            "grant_ttl_s",
+            "relayed",
         ] {
             assert!(v.get(k).is_some(), "missing flattened agent field {k}");
         }
@@ -319,7 +336,15 @@ mod tests {
         assert_eq!(v["relayed"].as_bool().unwrap(), false);
         let m = v.get("meta").unwrap();
         for k in [
-            "op_kind", "command", "host", "user", "pwd", "tty", "ppid_cmd", "ppid", "ssh_client",
+            "op_kind",
+            "command",
+            "host",
+            "user",
+            "pwd",
+            "tty",
+            "ppid_cmd",
+            "ppid",
+            "ssh_client",
             "reason",
         ] {
             assert!(m.get(k).is_some(), "missing meta field {k}");
@@ -356,18 +381,22 @@ mod tests {
     /// Config validation: a non-https URL disables; https enables.
     #[test]
     fn config_rejects_non_https() {
-        assert!(!AuditPushConfig::new(
-            "http://insecure.example".into(),
-            Zeroizing::new([1u8; 32]),
-            "host".into()
-        )
-        .enabled);
-        assert!(AuditPushConfig::new(
-            "https://ok.example".into(),
-            Zeroizing::new([1u8; 32]),
-            "host".into()
-        )
-        .enabled);
+        assert!(
+            !AuditPushConfig::new(
+                "http://insecure.example".into(),
+                Zeroizing::new([1u8; 32]),
+                "host".into()
+            )
+            .enabled
+        );
+        assert!(
+            AuditPushConfig::new(
+                "https://ok.example".into(),
+                Zeroizing::new([1u8; 32]),
+                "host".into()
+            )
+            .enabled
+        );
     }
 
     /// token_id keeps its random suffix even for a very long hostname, so the
@@ -389,7 +418,11 @@ mod tests {
             AgentAuditContext::default(),
         );
         // "a_" + 60 + "_" + 11 = 74, comfortably under the Worker's 80-char cap.
-        assert!(entry.token_id.len() <= 74, "token_id too long: {}", entry.token_id.len());
+        assert!(
+            entry.token_id.len() <= 74,
+            "token_id too long: {}",
+            entry.token_id.len()
+        );
         assert!(entry.token_id.starts_with("a_hhhhh"));
     }
 }

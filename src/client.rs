@@ -120,10 +120,9 @@ struct ParsedEnvelope<'a> {
 ///   second failure on a different path.
 fn should_fallback_to_cf(err: &anyhow::Error) -> bool {
     match err.downcast_ref::<VtClientError>() {
-        Some(VtClientError::Agent(kind, _)) => !matches!(
-            kind,
-            ErrKind::AuthRejected | ErrKind::BadRequest
-        ),
+        Some(VtClientError::Agent(kind, _)) => {
+            !matches!(kind, ErrKind::AuthRejected | ErrKind::BadRequest)
+        }
         Some(VtClientError::Transport(_)) => true,
         None => false,
     }
@@ -197,7 +196,10 @@ impl VTClient {
                  or VT_PASSKEY_URL + VT_PASSKEY_TOKEN for the phone passkey ceremony"
             );
         }
-        Ok(VTClient { auth_token, backend })
+        Ok(VTClient {
+            auth_token,
+            backend,
+        })
     }
 
     /// True when the SSH-agent path is usable: `VT_AUTH` set and not pinned
@@ -268,7 +270,9 @@ impl VTClient {
                 // in Zeroizing so any inner DEK bytes are wiped on drop
                 // once we've extracted the `data` body.
                 let envelope_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
-                    auth_cipher.decrypt(resp.details.as_ref()).map_err(transport)?,
+                    auth_cipher
+                        .decrypt(resp.details.as_ref())
+                        .map_err(transport)?,
                 );
                 Ok(Some(parse_envelope(&envelope_bytes)?))
             }
@@ -288,7 +292,8 @@ impl VTClient {
         let socket_path = if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
             std::path::PathBuf::from(sock)
         } else {
-            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
+            let home =
+                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
             home.join(".ssh").join("vt.sock")
         };
         match UnixStream::connect(&socket_path) {
@@ -389,7 +394,8 @@ impl VTClient {
             let payload = serde_json::to_vec(&req)?;
             let auth_token = self.auth_token.clone();
             let result =
-                Self::agent_call_or_fallback(auth_token, self.backend, "encrypt@vt", payload).await?;
+                Self::agent_call_or_fallback(auth_token, self.backend, "encrypt@vt", payload)
+                    .await?;
             let bytes = match result {
                 Some(b) => b,
                 None => return Self::cf_encrypt(items, &get_hostname()).await,
@@ -435,7 +441,9 @@ impl VTClient {
         #[cfg(not(unix))]
         {
             let _ = items;
-            Err(anyhow::anyhow!("vt encrypt requires Unix (SSH agent socket)"))
+            Err(anyhow::anyhow!(
+                "vt encrypt requires Unix (SSH agent socket)"
+            ))
         }
     }
 
@@ -506,7 +514,8 @@ impl VTClient {
             let payload = serde_json::to_vec(&wire)?;
             let auth_token = self.auth_token.clone();
             let result =
-                Self::agent_call_or_fallback(auth_token, self.backend, "decrypt@vt", payload).await?;
+                Self::agent_call_or_fallback(auth_token, self.backend, "decrypt@vt", payload)
+                    .await?;
             let bytes = match result {
                 Some(b) => b,
                 None => return Self::cf_decrypt(host, command, urls).await,
@@ -575,7 +584,9 @@ impl VTClient {
         #[cfg(not(unix))]
         {
             let _ = req;
-            Err(anyhow::anyhow!("vt decrypt requires Unix (SSH agent socket)"))
+            Err(anyhow::anyhow!(
+                "vt decrypt requires Unix (SSH agent socket)"
+            ))
         }
     }
 
@@ -640,26 +651,34 @@ impl VTClient {
     // ── CF ceremony fallbacks ──────────────────────────────────────────────
 
     async fn cf_encrypt(items: &[EncryptItem], _host: &str) -> Result<Vec<CryptoResItem>> {
-        let config = cf::load_config()
-            .context("SSH agent unavailable; CF passkey env not configured")?;
+        let config =
+            cf::load_config().context("SSH agent unavailable; CF passkey env not configured")?;
         let mut salts = cf::random_salts(items.len());
         let meta = cf::collect_meta("encrypt", "", "");
         let deks = cf::get_deks(&config, &salts, meta).await?;
         let mut out = Vec::with_capacity(items.len());
         for ((item, salt), dek) in items.iter().zip(salts.iter()).zip(deks.iter()) {
             let res = match client_encrypt_v2(item.t, salt, dek, item.plaintext.as_bytes()) {
-                Ok(url) => CryptoResItem { result: url, err_message: String::new() },
-                Err(e)  => CryptoResItem { result: String::new(), err_message: e.to_string() },
+                Ok(url) => CryptoResItem {
+                    result: url,
+                    err_message: String::new(),
+                },
+                Err(e) => CryptoResItem {
+                    result: String::new(),
+                    err_message: e.to_string(),
+                },
             };
             out.push(res);
         }
-        salts.iter_mut().for_each(|s| s.iter_mut().for_each(|b| *b = 0));
+        salts
+            .iter_mut()
+            .for_each(|s| s.iter_mut().for_each(|b| *b = 0));
         Ok(out)
     }
 
     async fn cf_decrypt(_host: &str, command: &str, urls: &[String]) -> Result<Vec<CryptoResItem>> {
-        let config = cf::load_config()
-            .context("SSH agent unavailable; CF passkey env not configured")?;
+        let config =
+            cf::load_config().context("SSH agent unavailable; CF passkey env not configured")?;
 
         // Parse URLs; collect v2 salts in order
         struct Item {
@@ -697,7 +716,10 @@ impl VTClient {
         let mut dek_idx = 0usize;
         for item_res in items {
             match item_res {
-                Err(e) => out.push(CryptoResItem { result: String::new(), err_message: e }),
+                Err(e) => out.push(CryptoResItem {
+                    result: String::new(),
+                    err_message: e,
+                }),
                 Ok(Item { t, salt, inner_ct }) => {
                     // Bounds-guard rather than index: open_sealed_deks already
                     // enforces deks.len() == salts.len(), but never let a short
@@ -707,8 +729,14 @@ impl VTClient {
                     })?;
                     dek_idx += 1;
                     let res = match client_decrypt_v2(t, dek, &salt, &inner_ct) {
-                        Ok(pt) => CryptoResItem { result: pt, err_message: String::new() },
-                        Err(e) => CryptoResItem { result: String::new(), err_message: e.to_string() },
+                        Ok(pt) => CryptoResItem {
+                            result: pt,
+                            err_message: String::new(),
+                        },
+                        Err(e) => CryptoResItem {
+                            result: String::new(),
+                            err_message: e.to_string(),
+                        },
                     };
                     out.push(res);
                 }
@@ -718,8 +746,8 @@ impl VTClient {
     }
 
     async fn cf_auth(reason: &str) -> Result<()> {
-        let config = cf::load_config()
-            .context("SSH agent unavailable; CF passkey env not configured")?;
+        let config =
+            cf::load_config().context("SSH agent unavailable; CF passkey env not configured")?;
         let meta = cf::collect_meta("auth", "", reason);
         cf::get_deks(&config, &[], meta).await?;
         Ok(())
@@ -760,8 +788,8 @@ impl VTClient {
                 Self::agent_call_or_fallback(auth_token, self.backend, "run@vt", payload).await?;
             match result {
                 Some(bytes) => {
-                    let res: RunRes = serde_json::from_slice(&bytes)
-                        .context("Failed to parse run response")?;
+                    let res: RunRes =
+                        serde_json::from_slice(&bytes).context("Failed to parse run response")?;
                     tracing::debug!("vt run: spawned pid={}", res.pid);
                     Ok(())
                 }
@@ -964,8 +992,7 @@ mod tests {
 
     #[test]
     fn fallback_policy_transport_falls_back() {
-        let e: anyhow::Error =
-            VtClientError::Transport(anyhow::anyhow!("socket closed")).into();
+        let e: anyhow::Error = VtClientError::Transport(anyhow::anyhow!("socket closed")).into();
         assert!(should_fallback_to_cf(&e));
     }
 

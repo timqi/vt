@@ -68,7 +68,12 @@ fn derive_passphrase_secret_with_term(passcode: &[u8; 32], term: &str) -> Result
     // master secret; keep them in scrubbed memory so they don't linger on the
     // heap after the SHA-256 collapse.
     let passcode = Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(passcode));
-    let derived_str = Zeroizing::new(format!("{}:{}:{}", passcode.as_str(), env::var("USER")?, term));
+    let derived_str = Zeroizing::new(format!(
+        "{}:{}:{}",
+        passcode.as_str(),
+        env::var("USER")?,
+        term
+    ));
     let hash = Sha256::digest(Sha256::digest(derived_str.as_bytes()));
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash[..32]);
@@ -152,7 +157,13 @@ impl AesGcmCrypto {
         let nonce = Nonce::from_slice(nonce);
         let ct = self
             .cipher
-            .encrypt(nonce, Payload { msg: plaintext, aad })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|e| anyhow::anyhow!("Encryption error: {e}"))?;
         Ok(ct)
     }
@@ -168,7 +179,13 @@ impl AesGcmCrypto {
         let nonce = Nonce::from_slice(nonce);
         let pt = self
             .cipher
-            .decrypt(nonce, Payload { msg: ct_and_tag, aad })
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ct_and_tag,
+                    aad,
+                },
+            )
             .map_err(|e| anyhow::anyhow!("Decryption error: {e}"))?;
         Ok(Zeroizing::new(pt))
     }
@@ -306,9 +323,7 @@ mod tests {
         // Output is ct || tag, no nonce prefix.
         assert_eq!(ct.len(), plaintext.len() + 16);
 
-        let pt = crypto
-            .decrypt_with_nonce_and_aad(&nonce, &ct, aad)
-            .unwrap();
+        let pt = crypto.decrypt_with_nonce_and_aad(&nonce, &ct, aad).unwrap();
         assert_eq!(&pt[..], plaintext);
     }
 

@@ -222,24 +222,27 @@ pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<
                 println!("  VT_BACKEND=passkey: phone ceremony only, agent never probed");
             }
         }
-        Ok(crate::config::Backend::Auto) => match (has_auth, has_passkey_url && has_passkey_token)
-        {
-            (true, true) => println!(
-                "  auto: try SSH agent first, fall back to phone passkey on \
+        Ok(crate::config::Backend::Auto) => {
+            match (has_auth, has_passkey_url && has_passkey_token) {
+                (true, true) => println!(
+                    "  auto: try SSH agent first, fall back to phone passkey on \
                  recoverable errors"
-            ),
-            (true, false) => println!(
-                "  auto: SSH agent first; recoverable agent errors still fall back \
+                ),
+                (true, false) => println!(
+                    "  auto: SSH agent first; recoverable agent errors still fall back \
                  to the passkey path, which is {} and will error there",
-                passkey_state
-            ),
-            (false, true) => println!("  auto: phone passkey only (VT_AUTH unset — agent skipped)"),
-            (false, false) => println!(
-                "  ⚠ no usable path: VT_AUTH unset and passkey {} — vt commands \
+                    passkey_state
+                ),
+                (false, true) => {
+                    println!("  auto: phone passkey only (VT_AUTH unset — agent skipped)")
+                }
+                (false, false) => println!(
+                    "  ⚠ no usable path: VT_AUTH unset and passkey {} — vt commands \
                  needing auth will fail",
-                passkey_state
-            ),
-        },
+                    passkey_state
+                ),
+            }
+        }
     }
 
     // ── 3. Agent (diag@vt) ────────────────────────────────────────────────

@@ -57,12 +57,7 @@ fn notify_throttle_should_fire(kind: NotifyKind) -> bool {
     static THROTTLE: OnceLock<Mutex<HashMap<NotifyKind, Instant>>> = OnceLock::new();
     let mu = THROTTLE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = mu.lock().unwrap();
-    throttle_check(
-        &mut guard,
-        kind,
-        Instant::now(),
-        Duration::from_secs(30),
-    )
+    throttle_check(&mut guard, kind, Instant::now(), Duration::from_secs(30))
 }
 
 mod cgsession {
@@ -199,7 +194,11 @@ fn first_line(s: &str) -> &str {
 /// (and thus the security read gate) is live — and is itself fire-and-forget
 /// via `notify_macos`'s reaper thread. Throttled per kind so a burst
 /// (multi-sign `git push`) notifies once per 30 s window.
-pub(super) fn notify_cache_hit(operation: &str, scope_display: &str, remaining: Option<std::time::Duration>) {
+pub(super) fn notify_cache_hit(
+    operation: &str,
+    scope_display: &str,
+    remaining: Option<std::time::Duration>,
+) {
     if !notify_throttle_should_fire(NotifyKind::CacheHit) {
         tracing::debug!("cache-hit notification suppressed (throttled)");
         return;
@@ -464,9 +463,7 @@ pub fn authenticate(reason: &str) -> AuthOutcome {
 
     match la::evaluate(la::Policy::DeviceOwner, reason) {
         EvalOutcome::Success => AuthOutcome::Success(AuthMethod::Password),
-        EvalOutcome::NotInteractive => {
-            AuthOutcome::Unavailable(UnavailableReason::NotInteractive)
-        }
+        EvalOutcome::NotInteractive => AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
         EvalOutcome::Rejected | EvalOutcome::TryFallback => AuthOutcome::Rejected,
     }
 }
@@ -537,8 +534,7 @@ fn load_mac_key(
     passphrase_cipher: &AesGcmCrypto,
 ) -> Result<Zeroizing<[u8; 32]>> {
     let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
-    let decrypted_passphrase =
-        Zeroizing::new(passphrase_cipher.decrypt(&encrypted_passphrase)?);
+    let decrypted_passphrase = Zeroizing::new(passphrase_cipher.decrypt(&encrypted_passphrase)?);
     let mut key = Zeroizing::new([0u8; 32]);
     let slice: &[u8; 32] = decrypted_passphrase.as_slice().try_into()?;
     key.copy_from_slice(slice);
@@ -638,7 +634,11 @@ pub(super) fn rewrap_passphrase(
             "could not unwrap the master passphrase with the store's recorded wrap \
              (v{}){} — pass --old-bin-path <absolute path of the binary that wrote the store>",
             store.wrap_v,
-            if old_bin_path.is_some() { " or the given --old-bin-path" } else { "" }
+            if old_bin_path.is_some() {
+                " or the given --old-bin-path"
+            } else {
+                ""
+            }
         )
     })?;
 
@@ -672,7 +672,6 @@ pub fn upgrade_wrap_v2_if_needed() -> Result<bool> {
     Ok(upgraded)
 }
 
-
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -704,7 +703,10 @@ mod tests {
         let master = AesGcmCrypto::generate_key();
         let old_path = "/old/install/location/vt";
         let v1_secret = derive_passphrase_secret(&passcode, Some(old_path)).unwrap();
-        let v1_wrapped = AesGcmCrypto::new(&v1_secret).unwrap().encrypt(&master).unwrap();
+        let v1_wrapped = AesGcmCrypto::new(&v1_secret)
+            .unwrap()
+            .encrypt(&master)
+            .unwrap();
 
         let mut store = KeychainStore::new(&passcode_and_auth_token, &v1_wrapped);
         store.set_encrypted_passphrase(&v1_wrapped, WRAP_V1);
@@ -758,7 +760,10 @@ mod tests {
 
         let master = AesGcmCrypto::generate_key();
         let v1_secret = derive_passphrase_secret(&passcode, Some("/gone/vt")).unwrap();
-        let wrapped = AesGcmCrypto::new(&v1_secret).unwrap().encrypt(&master).unwrap();
+        let wrapped = AesGcmCrypto::new(&v1_secret)
+            .unwrap()
+            .encrypt(&master)
+            .unwrap();
         let mut store = KeychainStore::new(&tokens, &wrapped);
         store.set_encrypted_passphrase(&wrapped, WRAP_V1);
 
@@ -766,7 +771,10 @@ mod tests {
         // the supplied old path is wrong.
         let err = rewrap_passphrase(&mut store, Some("/also/wrong/vt"), WRAP_V2).unwrap_err();
         assert!(err.to_string().contains("--old-bin-path"), "{err}");
-        assert_eq!(store.wrap_v, WRAP_V1, "failed rewrap must not mutate the store");
+        assert_eq!(
+            store.wrap_v, WRAP_V1,
+            "failed rewrap must not mutate the store"
+        );
 
         store.wrap_v = 99;
         let err = rewrap_passphrase(&mut store, None, WRAP_V2).unwrap_err();

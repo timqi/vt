@@ -18,26 +18,24 @@ use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
 use tokio::sync::{Mutex, RwLock};
 
+use super::audit::{self, AgentAuditContext, AgentAuditEntry, AuditPushConfig};
+use super::authorization::{new_engine, sleep_diverged};
+use super::security::{derive_passcode_ciphers, load_mac_cipher, validate_mac_key_material};
+use super::store::KeychainStore;
 use crate::core::authorization::{
     AuthorizationEngine, AuthorizationFailure, AuthorizationPermit, AuthorizationRequest,
     CommitError, Decision, GrantScope, Operation, ReusePolicy, ScopeFamily, SubjectId,
 };
 use crate::core::crypto::{derive_dek, AesGcmCrypto};
 use crate::core::session::AuthOutcome;
-use crate::core::wire::{
-    outcome_to_err_strict, wrap_ok_envelope, ErrKind, WIRE_VERSION,
-};
+use crate::core::wire::{outcome_to_err_strict, wrap_ok_envelope, ErrKind, WIRE_VERSION};
 use crate::core::{
     legacy_decrypt, AuthReq, AuthRes, ContextBasis, DecryptInput, DecryptReq, DecryptResItem,
-    DiagCacheReport, DiagPeerReport, DiagReq, DiagRes, EncryptReq, EncryptResItem, RunReq,
-    RunRes, SignReq, SignRes, UiStatusReq, UiStatusRes, SALT_LEN,
+    DiagCacheReport, DiagPeerReport, DiagReq, DiagRes, EncryptReq, EncryptResItem, RunReq, RunRes,
+    SignReq, SignRes, UiStatusReq, UiStatusRes, SALT_LEN,
 };
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
-use super::authorization::{new_engine, sleep_diverged};
-use super::security::{derive_passcode_ciphers, load_mac_cipher, validate_mac_key_material};
-use super::store::KeychainStore;
-use super::audit::{self, AgentAuditContext, AgentAuditEntry, AuditPushConfig};
 
 /// SSH agent extension names used by vt.
 pub const EXT_ENCRYPT: &str = "encrypt@vt";
@@ -71,10 +69,7 @@ pub struct SshKeyEntry {
 
 /// Decode the SSH-keys blob from a loaded store. Returns an empty vec when
 /// the store has no SSH keys yet.
-pub fn decode_ssh_keys(
-    store: &KeychainStore,
-    cipher: &AesGcmCrypto,
-) -> Result<Vec<SshKeyEntry>> {
+pub fn decode_ssh_keys(store: &KeychainStore, cipher: &AesGcmCrypto) -> Result<Vec<SshKeyEntry>> {
     let Some(encrypted) = store.encrypted_ssh_keys_bytes()? else {
         return Ok(Vec::new());
     };
@@ -371,7 +366,6 @@ mod proc_info {
         buf.truncate(size);
         crate::ssh_sign::parse_procargs2(&buf)
     }
-
 }
 
 // --- SSH Agent ---
@@ -390,7 +384,11 @@ const PROMPT_COMMAND_MAX_LINES: usize = 6;
 const PROMPT_COMMAND_MAX_LINE_LEN: usize = 120;
 
 fn plural_secrets(n: usize) -> &'static str {
-    if n == 1 { "secret" } else { "secrets" }
+    if n == 1 {
+        "secret"
+    } else {
+        "secrets"
+    }
 }
 
 /// First line of every Touch ID prompt: `"{verb}"` for old clients that
@@ -412,9 +410,9 @@ fn who_at_host(user: &str, host: &str) -> String {
     let u = sanitize_prompt(user, 40);
     let h = sanitize_prompt(host, 60);
     match (u.is_empty(), h.is_empty()) {
-        (true, true)   => String::new(),
-        (true, false)  => h,
-        (false, true)  => u,
+        (true, true) => String::new(),
+        (true, false) => h,
+        (false, true) => u,
         (false, false) => format!("{}@{}", u, h),
     }
 }
@@ -486,10 +484,7 @@ impl RunAllowlist {
             if item.contains('/') {
                 let p = PathBuf::from(item);
                 if !p.is_absolute() {
-                    return Err(format!(
-                        "run-allow path must be absolute (got {:?})",
-                        item
-                    ));
+                    return Err(format!("run-allow path must be absolute (got {:?})", item));
                 }
                 let canon = std::fs::canonicalize(&p)
                     .map_err(|e| format!("run-allow canonicalize {:?}: {}", p, e))?;
@@ -607,8 +602,8 @@ const MAX_CRYPTO_BATCH: usize = 4096;
 /// new entry here is a security-sensitive decision — see codex review in
 /// PR history.
 const RUN_ENV_PASSTHROUGH: &[&str] = &[
-    "HOME", "USER", "LOGNAME", "PATH", "SHELL", "TERM", "TMPDIR", "LANG",
-    "LC_ALL", "LC_CTYPE", "DISPLAY",
+    "HOME", "USER", "LOGNAME", "PATH", "SHELL", "TERM", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+    "DISPLAY",
 ];
 
 /// Default idle timeout: 2 hours.
@@ -695,7 +690,9 @@ fn sign_data_with_privkey(
             let mp = |m: &ssh_key::Mpint| {
                 m.as_positive_bytes()
                     .map(BigUint::from_bytes_be)
-                    .ok_or_else(|| agent_err(anyhow::anyhow!("RSA component is not a positive integer")))
+                    .ok_or_else(|| {
+                        agent_err(anyhow::anyhow!("RSA component is not a positive integer"))
+                    })
             };
             let private_key = rsa::RsaPrivateKey::from_components(
                 mp(&key.public.n)?,
@@ -707,14 +704,16 @@ fn sign_data_with_privkey(
             let mut rng = rand::thread_rng();
 
             if flags & signature::RSA_SHA2_512 != 0 {
-                let sig = SigningKey::<sha2::Sha512>::new(private_key).sign_with_rng(&mut rng, data);
+                let sig =
+                    SigningKey::<sha2::Sha512>::new(private_key).sign_with_rng(&mut rng, data);
                 Signature::new(
                     Algorithm::new("rsa-sha2-512").map_err(AgentError::other)?,
                     sig.to_bytes().to_vec(),
                 )
                 .map_err(AgentError::other)
             } else if flags & signature::RSA_SHA2_256 != 0 {
-                let sig = SigningKey::<sha2::Sha256>::new(private_key).sign_with_rng(&mut rng, data);
+                let sig =
+                    SigningKey::<sha2::Sha256>::new(private_key).sign_with_rng(&mut rng, data);
                 Signature::new(
                     Algorithm::new("rsa-sha2-256").map_err(AgentError::other)?,
                     sig.to_bytes().to_vec(),
@@ -1033,7 +1032,11 @@ fn darwin_user_temp_dir() -> Option<&'static PathBuf> {
     DIR.get_or_init(|| {
         let mut buf = [0u8; libc::PATH_MAX as usize];
         let len = unsafe {
-            libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len())
+            libc::confstr(
+                libc::_CS_DARWIN_USER_TEMP_DIR,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
         };
         if len == 0 || len > buf.len() {
             return None;
@@ -1288,9 +1291,7 @@ fn decrypt_scope_for_basis(basis: ScopedBasis<'_>, secret_type: u8, salt: &[u8])
         ScopedBasis::Cwd(ws) => {
             GrantScope::decrypt_cwd(ws.subject, ws.root_str(), secret_type, salt)
         }
-        ScopedBasis::App(app) => {
-            GrantScope::decrypt_app(app.subject, &app.exe, secret_type, salt)
-        }
+        ScopedBasis::App(app) => GrantScope::decrypt_app(app.subject, &app.exe, secret_type, salt),
     }
 }
 
@@ -1378,9 +1379,8 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
         // proc-tree state against the request.
         let confined_to_connection = peer_is_vt_relay || peer_is_ssh_client;
         let connection_subject = if confined_to_connection {
-            peer_pid.and_then(|pid| {
-                proc_info::get_start_tvsec(pid).map(|start| (pid as u64, start))
-            })
+            peer_pid
+                .and_then(|pid| proc_info::get_start_tvsec(pid).map(|start| (pid as u64, start)))
         } else {
             None
         };
@@ -1608,12 +1608,12 @@ impl VtSshSession {
     /// degrades to Fresh. The app arm carries no root to check against —
     /// its claimed pwd stays display-only, like the connection arms.
     fn reusable_scope(&self, claimed_pwd: &str) -> Option<ScopedBasis<'_>> {
-        self.workspace_resolution().scoped().filter(|basis| match basis {
-            ScopedBasis::Git(ws) | ScopedBasis::Cwd(ws) => {
-                ws.contains_claimed_pwd(claimed_pwd)
-            }
-            ScopedBasis::App(_) => true,
-        })
+        self.workspace_resolution()
+            .scoped()
+            .filter(|basis| match basis {
+                ScopedBasis::Git(ws) | ScopedBasis::Cwd(ws) => ws.contains_claimed_pwd(claimed_pwd),
+                ScopedBasis::App(_) => true,
+            })
     }
 
     /// Scope for a raw `SIGN_REQUEST`.
@@ -1748,13 +1748,14 @@ impl VtSshSession {
                 ScopeFamily::Destination,
                 crate::core::authorization::DESTINATION_SUBJECT,
             )),
-            ContextBasis::Workspace | ContextBasis::CwdWorkspace | ContextBasis::ParentApp => {
-                self.workspace_resolution().scoped().map(|basis| match basis {
+            ContextBasis::Workspace | ContextBasis::CwdWorkspace | ContextBasis::ParentApp => self
+                .workspace_resolution()
+                .scoped()
+                .map(|basis| match basis {
                     ScopedBasis::Git(ws) => (ScopeFamily::Workspace, ws.subject),
                     ScopedBasis::Cwd(ws) => (ScopeFamily::CwdFallback, ws.subject),
                     ScopedBasis::App(app) => (ScopeFamily::ParentApp, app.subject),
-                })
-            }
+                }),
             ContextBasis::RelayConnection | ContextBasis::SshConnection => self
                 .connection_subject
                 .map(|subject| (ScopeFamily::Connection, subject)),
@@ -1762,7 +1763,9 @@ impl VtSshSession {
         };
         match scoped {
             Some((family, subject)) => {
-                self.authorization.live_len(operation, family, subject).await
+                self.authorization
+                    .live_len(operation, family, subject)
+                    .await
             }
             None => 0,
         }
@@ -2074,11 +2077,8 @@ impl VtSshSession {
 
         let who = who_at_host(&req.meta.user, &req.host);
         let n = req.items.len();
-        let mut local_auth_message = header_with_who(
-            &format!("decrypt {} {}", n, plural_secrets(n)),
-            "on",
-            &who,
-        );
+        let mut local_auth_message =
+            header_with_who(&format!("decrypt {} {}", n, plural_secrets(n)), "on", &who);
         self.append_relay_origin(&mut local_auth_message);
         self.append_caller_line(&mut local_auth_message);
         // Pure-v2 batches use one atomic scope per record and require an all-of
@@ -2094,8 +2094,7 @@ impl VtSshSession {
                 None,
             )
         } else {
-            let (scopes, reuse_label) =
-                self.decrypt_scopes(&v2_inputs, &req.host, &req.meta.pwd);
+            let (scopes, reuse_label) = self.decrypt_scopes(&v2_inputs, &req.host, &req.meta.pwd);
             let display = reuse_label.clone().unwrap_or_default();
             let scopes: Vec<GrantScope> = scopes
                 .into_iter()
@@ -2208,10 +2207,7 @@ impl VtSshSession {
         Ok(HandlerSuccess::authorized(bytes, permit).with_cache_hit_note(note))
     }
 
-    async fn handle_auth(
-        &self,
-        decrypted: &[u8],
-    ) -> Result<HandlerSuccess, WireFailure> {
+    async fn handle_auth(&self, decrypted: &[u8]) -> Result<HandlerSuccess, WireFailure> {
         let req: AuthReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
@@ -2269,9 +2265,10 @@ impl VtSshSession {
         };
 
         let result = AuthRes { approved: true };
-        let bytes = Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
-            (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
-        })?);
+        let bytes = Zeroizing::new(
+            serde_json::to_vec(&result)
+                .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?,
+        );
         Ok(HandlerSuccess::authorized(bytes, permit))
     }
 
@@ -2281,10 +2278,7 @@ impl VtSshSession {
     /// does not reset the idle-activity clock. `live_entries` is scoped to
     /// THIS connection's resolved context; see `docs/diag-design.md` §3.4 for
     /// the accepted disclosure tradeoffs.
-    async fn handle_diag(
-        &self,
-        decrypted: &[u8],
-    ) -> Result<HandlerSuccess, WireFailure> {
+    async fn handle_diag(&self, decrypted: &[u8]) -> Result<HandlerSuccess, WireFailure> {
         let _req: DiagReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
@@ -2347,10 +2341,7 @@ impl VtSshSession {
             serde_json::from_slice(extension.details.as_ref()).map_err(|_| AgentError::Failure)?;
         // Constant-time token compare, same idiom as `unlock()`. A
         // CLI-started agent has no token and refuses every request.
-        let authorized = match (
-            &self.ui_token,
-            BASE64_URL_SAFE_NO_PAD.decode(&req.token),
-        ) {
+        let authorized = match (&self.ui_token, BASE64_URL_SAFE_NO_PAD.decode(&req.token)) {
             (Some(expected), Ok(candidate)) if candidate.len() == 32 => {
                 expected.ct_eq(candidate.as_slice()).into()
             }
@@ -2398,10 +2389,7 @@ impl VtSshSession {
     ///
     /// Returns the structured envelope body for the OK arm (`RunRes`) or an
     /// `(ErrKind, detail)` pair the dispatcher turns into `ExtResponse::Err`.
-    async fn handle_run(
-        &self,
-        decrypted: &[u8],
-    ) -> Result<HandlerSuccess, WireFailure> {
+    async fn handle_run(&self, decrypted: &[u8]) -> Result<HandlerSuccess, WireFailure> {
         let req: RunReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
 
@@ -2535,9 +2523,10 @@ impl VtSshSession {
         );
 
         let result = RunRes { pid };
-        let bytes = Zeroizing::new(serde_json::to_vec(&result).map_err(|_| {
-            (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE))
-        })?);
+        let bytes = Zeroizing::new(
+            serde_json::to_vec(&result)
+                .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?,
+        );
         Ok(HandlerSuccess::authorized(bytes, permit))
     }
 
@@ -2552,10 +2541,7 @@ impl VtSshSession {
     /// covers a same-project multi-host fan-out); relay callers stay confined
     /// to their connection. Duration `0` (the default) keeps per-request
     /// prompts. See docs/authorization-scopes-v2.md §3.4.
-    async fn handle_sign_vt(
-        &self,
-        decrypted: &[u8],
-    ) -> Result<HandlerSuccess, WireFailure> {
+    async fn handle_sign_vt(&self, decrypted: &[u8]) -> Result<HandlerSuccess, WireFailure> {
         use ssh_agent_lib::ssh_encoding::Decode;
 
         let req: SignReq = serde_json::from_slice(decrypted)
@@ -2740,7 +2726,10 @@ fn spawn_detached(exe: &std::path::Path, args: &[String]) -> std::io::Result<u32
             // keychain fds, tokio sleeper pipes, etc. don't leak into
             // the child. We cap at the soft RLIMIT_NOFILE so this scales
             // with whatever the agent was started with.
-            let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             let max_fd = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0
                 && rlim.rlim_cur > 0
                 && rlim.rlim_cur < libc::rlim_t::MAX
@@ -2877,7 +2866,9 @@ fn cache_hit_note_for(
     (permit.decision() == Decision::CacheHit).then(|| {
         (
             operation,
-            reuse_label.clone().unwrap_or_else(|| "cached scope".to_string()),
+            reuse_label
+                .clone()
+                .unwrap_or_else(|| "cached scope".to_string()),
         )
     })
 }
@@ -2886,8 +2877,8 @@ fn authorization_failure_wire(failure: &AuthorizationFailure) -> WireFailure {
     match failure.decision() {
         Decision::Rejected => (ErrKind::AuthRejected, Some(DETAIL_AUTH_REJECTED)),
         Decision::Unavailable(reason) => {
-            let kind = outcome_to_err_strict(AuthOutcome::Unavailable(reason))
-                .unwrap_or(ErrKind::Generic);
+            let kind =
+                outcome_to_err_strict(AuthOutcome::Unavailable(reason)).unwrap_or(ErrKind::Generic);
             (kind, auth_outcome_detail(kind))
         }
         Decision::Invalidated => (ErrKind::Transient, Some(DETAIL_AUTH_INVALIDATED)),
@@ -3037,10 +3028,7 @@ impl Session for VtSshSession {
         let signature = sign_data_with_privkey(&privkey, &request.data, request.flags)?;
         let cache_hit_note = cache_hit_note_for(&permit, "sign", &reuse_label);
         let reuse_remaining = permit.reuse_remaining();
-        permit
-            .commit()
-            .await
-            .map_err(|_| AgentError::Failure)?;
+        permit.commit().await.map_err(|_| AgentError::Failure)?;
         self.fire_cache_hit_note(cache_hit_note, reuse_remaining);
         Ok(signature)
     }
@@ -3143,22 +3131,21 @@ impl Session for VtSshSession {
         // never returns `AgentError` for vt-level failures; only true
         // transport-layer failures (e.g. an internal serialize call) bubble
         // up as unstructured.
-        let dispatch: Result<HandlerSuccess, WireFailure> =
-            match extension.name.as_str() {
-                EXT_ENCRYPT => {
-                    self.handle_encrypt(&decrypted, &store, &passphrase_cipher)
-                        .await
-                }
-                EXT_DECRYPT => {
-                    self.handle_decrypt(&decrypted, &store, &passphrase_cipher)
-                        .await
-                }
-                EXT_AUTH => self.handle_auth(&decrypted).await,
-                EXT_RUN => self.handle_run(&decrypted).await,
-                EXT_SIGN => self.handle_sign_vt(&decrypted).await,
-                EXT_DIAG => self.handle_diag(&decrypted).await,
-                _ => unreachable!(),
-            };
+        let dispatch: Result<HandlerSuccess, WireFailure> = match extension.name.as_str() {
+            EXT_ENCRYPT => {
+                self.handle_encrypt(&decrypted, &store, &passphrase_cipher)
+                    .await
+            }
+            EXT_DECRYPT => {
+                self.handle_decrypt(&decrypted, &store, &passphrase_cipher)
+                    .await
+            }
+            EXT_AUTH => self.handle_auth(&decrypted).await,
+            EXT_RUN => self.handle_run(&decrypted).await,
+            EXT_SIGN => self.handle_sign_vt(&decrypted).await,
+            EXT_DIAG => self.handle_diag(&decrypted).await,
+            _ => unreachable!(),
+        };
 
         // Build the envelope. OK responses use a manual concat so the
         // serialized inner body (which carries DEKs for encrypt/decrypt) is
@@ -3689,8 +3676,7 @@ mod tests {
         let transition = Arc::new(Mutex::new(()));
         let guard = Arc::clone(&transition).lock_owned().await;
         let keys = Arc::new(RwLock::new(HashMap::<String, PrivateKey>::new()));
-        let finalizer =
-            spawn_lock_finalizer(guard, keys, Arc::clone(&authorization));
+        let finalizer = spawn_lock_finalizer(guard, keys, Arc::clone(&authorization));
         // Model cancellation of the connection waiting for lock() to finish.
         // Tokio detaches the finalizer, which must retain the owned guard.
         drop(finalizer);
@@ -3947,7 +3933,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         assert!(state.apply(&test_bind(&host, b"sid-1", false)).is_ok());
         let (wire, key) = state.destination().expect("destination-bound");
         assert!(!wire.is_empty());
-        assert_eq!(fingerprint_str(key), fingerprint_str(host.public_key().key_data()));
+        assert_eq!(
+            fingerprint_str(key),
+            fingerprint_str(host.public_key().key_data())
+        );
         // A second session id under the SAME key (re-KEX) keeps the binding.
         assert!(state.apply(&test_bind(&host, b"sid-2", false)).is_ok());
         assert!(state.destination().is_some());
@@ -4012,10 +4001,14 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         let mut state = BindState::Unbound;
         for i in 0..MAX_SESSION_BINDS {
             let sid = format!("sid-{i}");
-            assert!(state.apply(&test_bind(&host, sid.as_bytes(), false)).is_ok());
+            assert!(state
+                .apply(&test_bind(&host, sid.as_bytes(), false))
+                .is_ok());
         }
         // The excess bind is refused but the established binding survives.
-        assert!(state.apply(&test_bind(&host, b"sid-overflow", false)).is_err());
+        assert!(state
+            .apply(&test_bind(&host, b"sid-overflow", false))
+            .is_err());
         assert!(state.destination().is_some());
     }
 
@@ -4032,7 +4025,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         let mut msg = String::from("sign: k");
         s.append_destination_line(&mut msg, false);
         assert!(msg.contains("\ndest: SHA256:"), "missing dest line: {msg}");
-        assert!(!msg.contains("forwarding"), "non-forwarding bind flagged: {msg}");
+        assert!(
+            !msg.contains("forwarding"),
+            "non-forwarding bind flagged: {msg}"
+        );
     }
 
     #[test]
@@ -4043,10 +4039,16 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             .apply(&test_bind(&test_hostkey(), b"sid", false))
             .unwrap();
         let (_, reuse_label) = s.raw_sign_scope("fp");
-        assert!(reuse_label.is_some(), "bound non-forwarding peer must be reusable");
+        assert!(
+            reuse_label.is_some(),
+            "bound non-forwarding peer must be reusable"
+        );
         let mut msg = String::from("sign: k");
         s.append_destination_line(&mut msg, reuse_label.is_some());
-        assert_eq!(msg, "sign: k", "dest line must not duplicate the reuse label: {msg}");
+        assert_eq!(
+            msg, "sign: k",
+            "dest line must not duplicate the reuse label: {msg}"
+        );
     }
 
     #[test]
@@ -4059,8 +4061,14 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             .unwrap();
         let mut msg = String::new();
         s.append_destination_line(&mut msg, false);
-        assert!(msg.contains("\ndest: SHA256:"), "forwarding bind must still name hop one: {msg}");
-        assert!(msg.contains("(forwarding"), "missing forwarding flag: {msg}");
+        assert!(
+            msg.contains("\ndest: SHA256:"),
+            "forwarding bind must still name hop one: {msg}"
+        );
+        assert!(
+            msg.contains("(forwarding"),
+            "missing forwarding flag: {msg}"
+        );
         // Tainted bind: explicit warning, no destination claim.
         let mut s = test_session(0, 0);
         s.bind_state = BindState::Tainted;
@@ -4082,7 +4090,11 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         s.append_caller_line(&mut msg);
         assert!(msg.starts_with("h\ncaller: "), "missing caller line: {msg}");
         // The control character must not survive to inject a fake line.
-        assert_eq!(msg.matches('\n').count(), 1, "unsanitized caller exe: {msg}");
+        assert_eq!(
+            msg.matches('\n').count(),
+            1,
+            "unsanitized caller exe: {msg}"
+        );
         // Unknown peer exe → no line.
         let mut s = test_session(0, 0);
         s.peer_exe = None;
@@ -4100,7 +4112,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
 
     #[test]
     fn contract_home_display_only() {
-        let home = dirs::home_dir().expect("home").to_string_lossy().into_owned();
+        let home = dirs::home_dir()
+            .expect("home")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(contract_home(&format!("{home}/code/vt")), "~/code/vt");
         assert_eq!(contract_home(&home), "~");
         // A sibling path sharing the prefix without a separator must NOT
@@ -4175,10 +4190,7 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
                 let (scope, label) = s.raw_sign_scope("fp");
                 assert_eq!(scope.is_reusable(), label.is_some());
                 let (scopes, label) = s.decrypt_scopes(&inputs, "h", pwd);
-                assert_eq!(
-                    scopes.iter().all(GrantScope::is_reusable),
-                    label.is_some()
-                );
+                assert_eq!(scopes.iter().all(GrantScope::is_reusable), label.is_some());
             }
         }
     }
@@ -4332,7 +4344,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             assert!(!cwd_fallback_acceptable(t, Some(home)));
         }
         // Subdirectories of the shared roots name one activity: acceptable.
-        assert!(cwd_fallback_acceptable(p("/private/tmp/scratch"), Some(home)));
+        assert!(cwd_fallback_acceptable(
+            p("/private/tmp/scratch"),
+            Some(home)
+        ));
         assert!(cwd_fallback_acceptable(p("/Users/x/notes"), Some(home)));
         assert!(cwd_fallback_acceptable(p("/opt/deploy"), Some(home)));
     }
@@ -4491,8 +4506,8 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         let mut session = test_session(300, 0);
         session.peer_is_ssh_client = true;
         let host = test_hostkey();
-        let ext = Extension::new_message(test_bind(&host, b"sid-1", false))
-            .expect("encode session-bind");
+        let ext =
+            Extension::new_message(test_bind(&host, b"sid-1", false)).expect("encode session-bind");
         let reply = session
             .extension(ext)
             .await
@@ -4553,7 +4568,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         session.authorization =
             AuthorizationEngine::new(Arc::new(TestAuthenticator), Arc::new(TestValidator));
         let wrong = BASE64_URL_SAFE_NO_PAD.encode([8u8; 32]);
-        assert!(session.extension(ui_status_req(&wrong, "status")).await.is_err());
+        assert!(session
+            .extension(ui_status_req(&wrong, "status"))
+            .await
+            .is_err());
         // Unknown action: token holder still cannot invoke anything but
         // status/revoke_all.
         assert!(session
@@ -4777,7 +4795,12 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     fn test_watcher_ignores_small_divergence_and_backwards_wall() {
         let mono = Duration::from_secs(5);
         // Small NTP adjustment below the threshold: no clear.
-        assert!(!watcher_should_clear(true, true, mono, Some(Duration::from_secs(20))));
+        assert!(!watcher_should_clear(
+            true,
+            true,
+            mono,
+            Some(Duration::from_secs(20))
+        ));
         // Wall stepped backwards (None): not a sleep signal.
         assert!(!watcher_should_clear(true, true, mono, None));
     }
@@ -4829,7 +4852,6 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         let path = result.unwrap();
         assert!(!path.is_empty(), "Path should not be empty");
     }
-
 
     // ── Touch-ID prompt helpers ────────────────────────────────────────────
 
@@ -4887,8 +4909,8 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             user: "qiqi".into(),
             pwd: "/tmp".into(),
             tty: "/dev/pts/3".into(), // intentionally skipped on prompt
-            ppid_cmd: "".into(),       // empty — must be skipped
-            ssh_client: "".into(),     // empty — must be skipped
+            ppid_cmd: "".into(),      // empty — must be skipped
+            ssh_client: "".into(),    // empty — must be skipped
         };
         let mut msg = String::from("auth: sudo on qiqi@alpha");
         append_meta_lines(&mut msg, &meta);
@@ -4962,7 +4984,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             // bare-name allowlist for the .. rejection check.
             RunAllowlist::parse("zed").unwrap()
         });
-        assert_eq!(a.resolve("/Applications/../etc/passwd"), Err("argv[0] has .. component"));
+        assert_eq!(
+            a.resolve("/Applications/../etc/passwd"),
+            Err("argv[0] has .. component")
+        );
         assert_eq!(a.resolve("/foo/../bar"), Err("argv[0] has .. component"));
     }
 
@@ -5000,7 +5025,11 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         // /bin/sh is essentially always on PATH on macOS dev hosts.
         let a = RunAllowlist::parse("sh").unwrap();
         let resolved = a.resolve("sh").expect("sh should resolve via PATH");
-        assert!(resolved.is_absolute(), "expected absolute path, got {:?}", resolved);
+        assert!(
+            resolved.is_absolute(),
+            "expected absolute path, got {:?}",
+            resolved
+        );
         // basename should be `sh`; on some systems /bin/sh is a symlink so we
         // just sanity-check that the resolved file exists.
         assert!(resolved.exists());
@@ -5057,7 +5086,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         assert_eq!(lines[0], "decrypt 5 secrets on qiqi@xy4");
         assert_eq!(lines[1], "op: inject");
         assert_eq!(lines[2], "file: /Users/qiqi/.config/aux/config.jsonc");
-        assert_eq!(lines[3], "cmd: /bin/cat /Users/qiqi/.config/aux/config.jsonc");
+        assert_eq!(
+            lines[3],
+            "cmd: /bin/cat /Users/qiqi/.config/aux/config.jsonc"
+        );
         assert_eq!(lines[4], "reason: aux config.jsonc");
         assert_eq!(lines[5], "pwd: /");
         assert_eq!(lines[6], "via: /Applications/aux.app/Contents/MacOS/aux");
@@ -5068,8 +5100,12 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     fn decrypt_prompt_caps_hostile_command_line_count() {
         // A malicious peer floods `command` with extra lines trying to push
         // the dialog off-screen — the multiline sanitizer must drop the tail.
-        let huge = (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let body = sanitize_prompt_multiline(&huge, PROMPT_COMMAND_MAX_LINE_LEN, PROMPT_COMMAND_MAX_LINES);
+        let huge = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body =
+            sanitize_prompt_multiline(&huge, PROMPT_COMMAND_MAX_LINE_LEN, PROMPT_COMMAND_MAX_LINES);
         assert_eq!(body.split('\n').count(), PROMPT_COMMAND_MAX_LINES);
     }
 

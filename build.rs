@@ -37,8 +37,14 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
 
     let sha = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
-    let date = git(&["show", "-s", "--format=%cd", "--date=format:%Y-%m-%d", "HEAD"])
-        .unwrap_or_else(|| "unknown".to_string());
+    let date = git(&[
+        "show",
+        "-s",
+        "--format=%cd",
+        "--date=format:%Y-%m-%d",
+        "HEAD",
+    ])
+    .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=VT_VERSION={version}");
     println!("cargo:rustc-env=VT_GIT_SHA={sha}");

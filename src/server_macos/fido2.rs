@@ -20,9 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Assertion;
 
-use crate::core::crypto::AesGcmCrypto;
 use super::security::{derive_passcode_ciphers, load_mac_cipher};
 use super::store::KeychainStore;
+use crate::core::crypto::AesGcmCrypto;
 
 pub const RP_ID: &str = "com.timqi.vt";
 
@@ -55,10 +55,7 @@ impl FidoCredential {
 
 /// Decode the FIDO2 credentials blob from a loaded store. Empty when the
 /// `encrypted_fido2` field is absent.
-fn decode_credentials(
-    store: &KeychainStore,
-    cipher: &AesGcmCrypto,
-) -> Result<Vec<FidoCredential>> {
+fn decode_credentials(store: &KeychainStore, cipher: &AesGcmCrypto) -> Result<Vec<FidoCredential>> {
     let Some(encrypted) = store.encrypted_fido2_bytes()? else {
         return Ok(Vec::new());
     };
@@ -296,9 +293,7 @@ pub fn authenticate(reason: &str) -> FidoOutcome {
         match save_credentials_best_effort(&creds) {
             Ok(true) => {}
             Ok(false) => {
-                tracing::warn!(
-                    "FIDO2: keychain store busy — skipped persisting sign counter"
-                );
+                tracing::warn!("FIDO2: keychain store busy — skipped persisting sign counter");
             }
             Err(e) => tracing::warn!("FIDO2: failed to persist sign counter: {}", e),
         }

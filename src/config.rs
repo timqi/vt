@@ -181,7 +181,11 @@ pub fn load_agent_file_config() -> AgentFileConfig {
     match agent.clone().try_into() {
         Ok(cfg) => cfg,
         Err(e) => {
-            tracing::warn!("ignoring malformed [agent] section in {}: {}", path.display(), e);
+            tracing::warn!(
+                "ignoring malformed [agent] section in {}: {}",
+                path.display(),
+                e
+            );
             AgentFileConfig::default()
         }
     }
@@ -456,9 +460,16 @@ GH_TOKEN = "vt://0projA"
         // rule 2: args_any flag guard
         assert_eq!(cfg.rules[2].args_any, vec!["-t", "--show-token"]);
         // env values
-        assert_eq!(cfg.env.default.get("GH_TOKEN").map(String::as_str), Some("vt://0default"));
         assert_eq!(
-            cfg.env.dirs.get("/work/projA").and_then(|m| m.get("GH_TOKEN")).map(String::as_str),
+            cfg.env.default.get("GH_TOKEN").map(String::as_str),
+            Some("vt://0default")
+        );
+        assert_eq!(
+            cfg.env
+                .dirs
+                .get("/work/projA")
+                .and_then(|m| m.get("GH_TOKEN"))
+                .map(String::as_str),
             Some("vt://0projA")
         );
     }
@@ -470,7 +481,9 @@ GH_TOKEN = "vt://0projA"
         // a rule with only `command` uses defaults for the rest
         let min: HookConfig = toml::from_str("[[rules]]\ncommand = \"gh\"\n").unwrap();
         assert_eq!(min.rules.len(), 1);
-        assert!(min.rules[0].args.is_empty() && !min.rules[0].block && min.rules[0].reason.is_none());
+        assert!(
+            min.rules[0].args.is_empty() && !min.rules[0].block && min.rules[0].reason.is_none()
+        );
     }
 
     #[test]
@@ -500,7 +513,10 @@ GH_TOKEN = "vt://0projA"
         std::env::set_var("VT_CONFIG", &path);
         hydrate_env_from_file();
         // The flat VT_ key loads; the tables are silently skipped (no panic/spam).
-        assert_eq!(std::env::var("VT_HYDRATE_TEST_KEY").ok().as_deref(), Some("value1"));
+        assert_eq!(
+            std::env::var("VT_HYDRATE_TEST_KEY").ok().as_deref(),
+            Some("value1")
+        );
 
         std::env::remove_var("VT_CONFIG");
         std::env::remove_var("VT_HYDRATE_TEST_KEY");

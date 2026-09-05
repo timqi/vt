@@ -167,12 +167,8 @@ pub fn outcome_to_err(outcome: AuthOutcome) -> Option<ErrKind> {
     match outcome {
         AuthOutcome::Success(_) => None,
         AuthOutcome::Rejected => Some(ErrKind::AuthRejected),
-        AuthOutcome::Unavailable(UnavailableReason::NotInteractive) => {
-            Some(ErrKind::SessionLocked)
-        }
-        AuthOutcome::Unavailable(UnavailableReason::NoGuiSession) => {
-            Some(ErrKind::NoGuiSession)
-        }
+        AuthOutcome::Unavailable(UnavailableReason::NotInteractive) => Some(ErrKind::SessionLocked),
+        AuthOutcome::Unavailable(UnavailableReason::NoGuiSession) => Some(ErrKind::NoGuiSession),
     }
 }
 
@@ -298,13 +294,20 @@ mod tests {
             "data": { "n": 42 },
         });
         let env: ExtResponse<Dummy> = serde_json::from_value(raw).unwrap();
-        assert_ne!(env.v, WIRE_VERSION, "client must reject and emit ProtocolVersion");
+        assert_ne!(
+            env.v, WIRE_VERSION,
+            "client must reject and emit ProtocolVersion"
+        );
     }
 
     #[test]
     fn outcome_to_err_strict_never_returns_none_for_failure() {
         // Success path: None (unchanged).
-        for m in [AuthMethod::Biometric, AuthMethod::Fido2, AuthMethod::Password] {
+        for m in [
+            AuthMethod::Biometric,
+            AuthMethod::Fido2,
+            AuthMethod::Password,
+        ] {
             assert_eq!(outcome_to_err_strict(AuthOutcome::Success(m)), None);
         }
         // All non-Success outcomes resolve to Some(_) — the fail-closed
@@ -312,21 +315,30 @@ mod tests {
         // shim guarantees they will continue to be `Some` even if a future
         // variant slips past `outcome_to_err`.
         assert!(outcome_to_err_strict(AuthOutcome::Rejected).is_some());
-        assert!(outcome_to_err_strict(AuthOutcome::Unavailable(
-            UnavailableReason::NotInteractive
-        ))
-        .is_some());
-        assert!(outcome_to_err_strict(AuthOutcome::Unavailable(
-            UnavailableReason::NoGuiSession
-        ))
-        .is_some());
+        assert!(
+            outcome_to_err_strict(AuthOutcome::Unavailable(UnavailableReason::NotInteractive))
+                .is_some()
+        );
+        assert!(
+            outcome_to_err_strict(AuthOutcome::Unavailable(UnavailableReason::NoGuiSession))
+                .is_some()
+        );
     }
 
     #[test]
     fn outcome_to_err_table() {
-        assert_eq!(outcome_to_err(AuthOutcome::Success(AuthMethod::Biometric)), None);
-        assert_eq!(outcome_to_err(AuthOutcome::Success(AuthMethod::Fido2)), None);
-        assert_eq!(outcome_to_err(AuthOutcome::Success(AuthMethod::Password)), None);
+        assert_eq!(
+            outcome_to_err(AuthOutcome::Success(AuthMethod::Biometric)),
+            None
+        );
+        assert_eq!(
+            outcome_to_err(AuthOutcome::Success(AuthMethod::Fido2)),
+            None
+        );
+        assert_eq!(
+            outcome_to_err(AuthOutcome::Success(AuthMethod::Password)),
+            None
+        );
         assert_eq!(
             outcome_to_err(AuthOutcome::Rejected),
             Some(ErrKind::AuthRejected)
@@ -430,7 +442,9 @@ mod tests {
     fn ok_envelope_roundtrip() {
         let env: ExtResponse<Dummy> = ExtResponse {
             v: WIRE_VERSION,
-            body: ExtBody::Ok { data: Dummy { n: 5 } },
+            body: ExtBody::Ok {
+                data: Dummy { n: 5 },
+            },
         };
         let bytes = serde_json::to_vec(&env).unwrap();
         let parsed: ExtResponse<Dummy> = serde_json::from_slice(&bytes).unwrap();

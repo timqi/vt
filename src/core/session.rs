@@ -26,7 +26,10 @@ impl AuthMethod {
     /// biometric, FIDO2 YubiKey touch, and the macOS account password each
     /// require explicit physical or credentialed action per attempt.
     pub fn is_cacheable(self) -> bool {
-        matches!(self, AuthMethod::Biometric | AuthMethod::Fido2 | AuthMethod::Password)
+        matches!(
+            self,
+            AuthMethod::Biometric | AuthMethod::Fido2 | AuthMethod::Password
+        )
     }
 }
 
@@ -101,9 +104,7 @@ pub fn classify_session(flags: Option<SessionFlags>) -> SessionState {
     let Some(f) = flags else {
         return SessionState::NoSession;
     };
-    if f.is_locked == Some(true)
-        || f.is_on_console == Some(false)
-        || f.is_login_done == Some(false)
+    if f.is_locked == Some(true) || f.is_on_console == Some(false) || f.is_login_done == Some(false)
     {
         return SessionState::NotInteractive;
     }
@@ -317,12 +318,7 @@ mod tests {
     fn throttle_re_fires_after_window() {
         let mut map = HashMap::new();
         let now = Instant::now();
-        throttle_check(
-            &mut map,
-            NotifyKind::Locked,
-            now,
-            Duration::from_secs(30),
-        );
+        throttle_check(&mut map, NotifyKind::Locked, now, Duration::from_secs(30));
         // After the window, a new fire is allowed.
         assert!(throttle_check(
             &mut map,
