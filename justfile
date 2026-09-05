@@ -13,7 +13,7 @@ init-linux:
 
 # Release build
 build:
-    cargo build --release --bin vt
+    cargo build --locked --release --bin vt
 
 # CC lets `ring` (via rustls) compile its C/asm for musl. Do NOT override the
 # LINKER to musl-gcc: rustc's self-contained musl linking already bundles the
@@ -22,7 +22,7 @@ build:
 #
 # Static Linux build via musl → target/x86_64-unknown-linux-musl/release/vt
 build-musl:
-    CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --bin vt --target x86_64-unknown-linux-musl
+    CC_x86_64_unknown_linux_musl=musl-gcc cargo build --locked --release --bin vt --target x86_64-unknown-linux-musl
 
 # Build and install vt to ~/.local/bin
 install:

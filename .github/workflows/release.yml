@@ -6,10 +6,14 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: validate
     strategy:
       matrix:
         include:
@@ -40,8 +44,32 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Build (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: just build-musl
+
+      - name: Build (macOS)
+        if: matrix.os == 'macos-latest'
+        run: cargo build --locked --release --bin vt --target ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          node-version: 22
+
+      - name: Smoke-test shipping binary (Linux, including TLS)
+        if: matrix.os == 'ubuntu-latest'
+        run: node .github/scripts/smoke-binary.mjs target/${{ matrix.target }}/release/vt
+
+      - name: Smoke-test shipping binary (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          target/${{ matrix.target }}/release/vt version
+          target/${{ matrix.target }}/release/vt --help
 
       - name: Package binary
         run: |
@@ -62,8 +90,8 @@ jobs:
       - name: Package VT.app (macOS)
         if: matrix.os == 'macos-latest'
         run: |
-          brew install just
           VT_APP_BIN="target/${{ matrix.target }}/release/vt" just app
+          codesign --verify --deep --strict build/VT.app
           COPYFILE_DISABLE=1 tar czf VT-app-darwin-arm64-${{ env.VERSION }}.tar.gz -C build VT.app
 
       - name: Upload VT.app artifact (macOS)
@@ -75,6 +103,8 @@ jobs:
 
   release:
     needs: build
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
 
     steps:
