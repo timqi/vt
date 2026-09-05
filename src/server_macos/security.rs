@@ -15,14 +15,14 @@ use crate::core::session::{
 pub fn set_keychain(name: &str, value: &[u8]) -> Result<()> {
     use security_framework::passwords::set_generic_password;
     let service = "rusty.vault.".to_string() + name;
-    set_generic_password(&service, &"prod".to_string(), value)?;
+    set_generic_password(&service, "prod", value)?;
     Ok(())
 }
 
 pub fn get_keychain(name: &str) -> Result<Vec<u8>> {
     use security_framework::passwords::get_generic_password;
     let service = "rusty.vault.".to_string() + name;
-    get_generic_password(&service, &"prod".to_string())
+    get_generic_password(&service, "prod")
         .map_err(|e| anyhow::anyhow!("Failed to get keychain {}: {}", name, e))
 }
 
@@ -489,7 +489,7 @@ pub fn create_and_save_passcode_passphrase(real_passphrase: &[u8; 32]) -> Result
     use super::store::KeychainStore;
 
     let origin_auth_token = AesGcmCrypto::generate_key();
-    let hash = Sha256::digest(&Sha256::digest(origin_auth_token));
+    let hash = Sha256::digest(Sha256::digest(origin_auth_token));
     let mut auth_token = [0u8; 32];
     auth_token.copy_from_slice(&hash[..32]);
 
@@ -795,7 +795,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_biometric_authentication() {
-        assert!(local_authentication(&"test biometric authentication"));
+        assert!(local_authentication("test biometric authentication"));
     }
 
     // ---- classify_la_error -----------------------------------------------

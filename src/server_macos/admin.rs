@@ -40,7 +40,7 @@ pub async fn export_secret() -> Result<()> {
         "Enter master secret passphrase: ",
         "Master secret passphrase entered: ",
     )?;
-    let hash = Sha256::digest(&Sha256::digest(master_secret_passphrase.as_bytes()));
+    let hash = Sha256::digest(Sha256::digest(master_secret_passphrase.as_bytes()));
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash[..32]);
     let export_cipher =
@@ -72,7 +72,7 @@ pub async fn import_secret() -> Result<()> {
         "Enter master secret passphrase: ",
         "Master secret passphrase entered: ",
     )?;
-    let hash = Sha256::digest(&Sha256::digest(master_secret_passphrase.as_bytes()));
+    let hash = Sha256::digest(Sha256::digest(master_secret_passphrase.as_bytes()));
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash[..32]);
     let import_cipher =

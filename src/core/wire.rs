@@ -35,6 +35,15 @@ pub const WIRE_VERSION: u16 = 1;
 
 /// Structured response envelope. `T` is the success payload type, which the
 /// client deserializes only on `status: ok` arms.
+///
+/// This is the declarative definition of the wire shape, not the production
+/// serializer: the agent emits OK envelopes through [`wrap_ok_envelope`] (see
+/// its DEK-copy rationale) and error envelopes through hand-built JSON, while
+/// the client parses into its own narrower types. The tests below and in
+/// `client::inject` round-trip against this type so those hand-built forms
+/// cannot drift from the declared shape — hence `dead_code` in a build that
+/// compiles no tests.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtResponse<T> {
     pub v: u16,
@@ -42,6 +51,8 @@ pub struct ExtResponse<T> {
     pub body: ExtBody<T>,
 }
 
+/// Body half of [`ExtResponse`]; see its note on why this is test-only.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ExtBody<T> {

@@ -42,8 +42,8 @@ pub fn fido2_list() -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<17} {:<20} {:<10} {:<10} {}",
-        "SHORT-ID", "LABEL", "ALG", "COUNTER", "CREATED"
+        "{:<17} {:<20} {:<10} {:<10} CREATED",
+        "SHORT-ID", "LABEL", "ALG", "COUNTER"
     );
     for c in &creds {
         println!(

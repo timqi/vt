@@ -333,7 +333,7 @@ mod tests {
         assert_eq!(v["peer_exe"].as_str().unwrap(), "git");
         assert_eq!(v["scope_family"].as_str().unwrap(), "workspace");
         assert_eq!(v["grant_ttl_s"].as_u64().unwrap(), 3600);
-        assert_eq!(v["relayed"].as_bool().unwrap(), false);
+        assert!(!v["relayed"].as_bool().unwrap());
         let m = v.get("meta").unwrap();
         for k in [
             "op_kind",

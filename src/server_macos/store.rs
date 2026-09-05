@@ -195,6 +195,9 @@ impl StoreLock {
     fn open_lock_file() -> Result<std::fs::File> {
         OpenOptions::new()
             .create(true)
+            // The lock file's contents are never used; keeping any existing
+            // bytes avoids a needless write to a file two processes share.
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path())

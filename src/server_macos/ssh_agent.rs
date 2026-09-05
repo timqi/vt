@@ -24,12 +24,12 @@ use super::security::{derive_passcode_ciphers, load_mac_cipher};
 use super::store::KeychainStore;
 use crate::core::authorization::{
     AuthorizationEngine, AuthorizationFailure, AuthorizationPermit, AuthorizationRequest,
-    CommitError, Decision, GrantScope, Operation, ReusePolicy, SubjectId,
+    CommitError, Decision, ReusePolicy, SubjectId,
 };
 use crate::core::crypto::AesGcmCrypto;
 use crate::core::session::AuthOutcome;
 use crate::core::wire::{outcome_to_err_strict, wrap_ok_envelope, ErrKind, WIRE_VERSION};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 mod handlers;
 mod scopes;
@@ -52,10 +52,7 @@ pub const EXT_DIAG: &str = "diag@vt";
 pub const EXT_UI_STATUS: &str = "ui-status@vt";
 
 fn agent_err(e: anyhow::Error) -> AgentError {
-    AgentError::Other(Box::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        e.to_string(),
-    )))
+    AgentError::Other(Box::new(std::io::Error::other(e.to_string())))
 }
 
 // --- Key storage (lives in `encrypted_ssh_keys` field of rusty.vault.store) ---
@@ -97,9 +94,9 @@ pub fn encode_ssh_keys_into(
 
 /// Human-readable duration for the prompt reuse line ("8h", "90m", "45s").
 fn reuse_ttl_label(secs: u64) -> String {
-    if secs % 3600 == 0 {
+    if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{}s", secs)
@@ -556,6 +553,7 @@ pub struct VtSshAgentFactory {
 }
 
 impl VtSshAgentFactory {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         keys: HashMap<String, PrivateKey>,
         cache_ttls: AuthCacheTtls,
@@ -1514,6 +1512,7 @@ impl Session for VtSshSession {
 /// Run the SSH agent on `~/.ssh/vt.sock`.
 /// Loads the cipher from keychain to decrypt stored keys, then drops it.
 /// When `print_env` is true, prints `export SSH_AUTH_SOCK=...` for eval.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ssh_agent(
     print_env: bool,
     idle_timeout_secs: u64,
@@ -1730,7 +1729,8 @@ pub async fn start_ssh_agent(
 mod tests {
     use super::*;
     use crate::core::authorization::{
-        AuthorizationAuthenticator, AuthorizationValidator, ScopeFamily, ValidationError,
+        AuthorizationAuthenticator, AuthorizationValidator, GrantScope, Operation, ScopeFamily,
+        ValidationError,
     };
     use crate::core::session::AuthMethod;
     use crate::core::{ContextBasis, UiStatusReq, UiStatusRes};
