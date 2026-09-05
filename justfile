@@ -100,12 +100,20 @@ test:
     cargo test --all-targets
 
 # Type-check + unit-test the Cloudflare worker. Installs deps on first run.
+#
+# `--include=dev` is not optional: a shell with NODE_ENV=production makes npm
+# skip devDependencies, so `npm ci` would install neither typescript nor vitest
+# and both gates below would be running on nothing. The guard tests for the
+# binaries rather than the directory for the same reason — a partial install
+# leaves node_modules/ present but unusable. `node_modules/.bin/tsc` rather than
+# `npx tsc`: with typescript missing, npx silently fetches the unrelated
+# `tsc@2.0.4` package from the registry and "passes".
 [working-directory: 'cf-worker']
 check-worker:
     #!/usr/bin/env bash
     set -euo pipefail
-    [ -d node_modules ] || npm ci
-    npx tsc --noEmit
+    [ -x node_modules/.bin/tsc ] && [ -x node_modules/.bin/vitest ] || npm ci --include=dev
+    node_modules/.bin/tsc --noEmit
     npm test
 
 # Everything the CI gates run, in one shot (Rust + worker)
