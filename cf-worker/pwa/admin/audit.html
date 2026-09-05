@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>VT 审计</title>
+  {{FAVICON_TAGS}}
+  <link rel="stylesheet" href="{{ADMIN_BASE}}/pwa/admin.css?v={{ASSET_VER}}">
+</head>
+<body>
+  <main>
+    {{ADMIN_TABS}}
+    <p class="hint">每个挑战一行（pending / approved / rejected / expired）。「缓存」列显示该次审批授予的 DEK 缓存时长；带有效缓存的行可在「操作」列单独清除。点击行查看完整详情。保留 90 天。</p>
+    <section id="filters">
+      <label>状态 <select id="f-status">
+        <option value="">全部</option>
+        <option value="pending">pending</option>
+        <option value="approved">approved</option>
+        <option value="rejected">rejected</option>
+        <option value="expired">expired</option>
+        <option value="cache">带缓存的记录</option>
+      </select></label>
+      <label>主机 <input id="f-host" type="text" placeholder="host"></label>
+      <button id="apply" type="button">查询</button>
+      <button id="filter-cache" type="button" class="ghost">带缓存</button>
+      <span class="filter-spacer"></span>
+      <div class="filter-danger">
+        <button id="clear-all-cache" type="button" class="danger">清除 DEK 缓存</button>
+        <button id="clear-audit" type="button" class="danger">清空审计</button>
+      </div>
+    </section>
+    <div id="table-wrap"><table id="audit"><thead><tr>
+      <th>时间</th><th>状态</th><th>主机</th><th>命令</th><th>IP</th><th>DEK</th><th>缓存</th><th>操作</th>
+    </tr></thead><tbody id="rows"></tbody></table></div>
+    <section id="actions">
+      <button id="more" type="button">加载更多</button>
+      <span id="status" role="status" aria-live="polite"></span>
+    </section>
+  </main>
+  <div id="detail-backdrop" hidden><div id="detail-card" role="dialog" aria-modal="true">
+    <button id="detail-close" type="button" aria-label="关闭">×</button>
+    <dl id="detail-dl"></dl>
+    <!-- Inline approval ceremony for pending rows, built by the SAME
+         vt.mountApprove() the standalone /a/:token page uses. -->
+    <div id="detail-approve"></div>
+  </div></div>
+  <!-- Passkey ceremony deps (root /pwa/*, public) — reused so approve/reject
+       happen in this modal instead of a new tab. -->
+  <script src="/pwa/libsodium.js"></script>
+  <script src="/pwa/common.js"></script>
+  <script src="/pwa/approve.js?v={{ASSET_VER}}"></script>
+  <script src="{{ADMIN_BASE}}/pwa/audit.js?v={{ASSET_VER}}"></script>
+</body>
+</html>

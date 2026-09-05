@@ -19,6 +19,10 @@ import { parseFeishuConfig } from './feishu';
 import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp } from './types';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess, type AccessVars } from './access';
+import {
+  escapeJsonForHtml, renderTemplate, isAdminAssetPath,
+  pageVars, adminVars, channelVars, type AdminTab, type PageChrome,
+} from './page';
 
 export { AccountDO } from './do_account';
 
@@ -47,18 +51,10 @@ const ADMIN_SEG = 'kestrel';
 // change to a shipped .css/.js so browsers fetch the new file instead of a
 // stale far-future-cached copy. (Workers Assets serves static files with a
 // cacheable response; without a versioned URL a changed audit.js can refresh
-// while admin.css stays stale, which desyncs markup from styles.)
+// while admin.css stays stale, which desyncs markup from styles. The .html
+// page shells need no token — the Worker reads them server-side per request.)
+// Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
 const ASSET_VER = '20260729-6';
-
-// Escape a JSON string for safe embedding in a <script type="application/json"> block.
-function escapeJsonForHtml(obj: unknown): string {
-  return JSON.stringify(obj)
-    .replace(/</g, "\\u003c")
-    .replace(/>/g, "\\u003e")
-    .replace(/&/g, "\\u0026")
-    .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029");
-}
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
@@ -131,9 +127,16 @@ app.get('/healthz', c => c.text('ok'));
 
 // Static PWA assets. Strip "/pwa" so ASSETS resolves against the pwa/ root:
 // /pwa/libsodium.js → /libsodium.js → pwa/libsodium.js
+//
+// This route is UNAUTHENTICATED (the approval page's ceremony scripts have to
+// load for anyone holding an approve token), so it must never resolve into the
+// admin asset folder — which now holds the admin page shells as well as
+// admin.css and the per-tab .js. Those are served only by the Access-gated
+// /{ADMIN_SEG}/pwa/* mount below.
 app.get('/pwa/*', async (c) => {
   const url = new URL(c.req.url);
   url.pathname = url.pathname.slice('/pwa'.length) || '/';
+  if (isAdminAssetPath(url.pathname)) return c.text('Not found', 404);
   return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
 });
 
@@ -159,29 +162,24 @@ app.get(`/${ADMIN_SEG}/pwa/*`, async (c) => {
 app.get(`/${ADMIN_SEG}`, (c) => c.redirect(`/${ADMIN_SEG}/audit`, 302));
 
 // Audit page (HTML shell; data fetched from the JSON API below).
-app.get(`/${ADMIN_SEG}/audit`, (c) => {
-  const resp = c.html(buildAuditPage());
-  resp.headers.set('Content-Security-Policy', STRICT_CSP);
-  return resp;
-});
+app.get(`/${ADMIN_SEG}/audit`, (c) => servePage(c, '/admin/audit', adminShellVars('audit')));
 
 // DEK-cache page (HTML shell; data from /api/cache-list).
-app.get(`/${ADMIN_SEG}/cache`, (c) => {
-  const resp = c.html(buildCachePage());
-  resp.headers.set('Content-Security-Policy', STRICT_CSP);
-  return resp;
-});
+app.get(`/${ADMIN_SEG}/cache`, (c) => servePage(c, '/admin/cache', adminShellVars('cache')));
 
 // Setup page (client-side CREDENTIALS_JSON generator). The current
 // CREDENTIALS_JSON secret is injected into the page so add/revoke read it
 // directly from the env binding (no manual paste). It carries only wrapped
 // (encrypted) master-key material and public credential data, and the route is
 // Cloudflare-Access gated, so embedding it for the admin is acceptable.
-app.get(`/${ADMIN_SEG}/setup`, (c) => {
-  const resp = c.html(buildSetupPage(c.env.RP_ID, c.env.CREDENTIALS_JSON ?? ''));
-  resp.headers.set('Content-Security-Policy', STRICT_CSP);
-  return resp;
-});
+app.get(`/${ADMIN_SEG}/setup`, (c) => servePage(c, '/admin/setup', {
+  ...adminShellVars('setup'),
+  // `credentials` is the raw CREDENTIALS_JSON secret (or '' on very first
+  // setup). The page parses it client-side for add/revoke; bootstrap ignores
+  // it. Only wrapped (encrypted) key material is exposed — never a plaintext
+  // master.
+  VT_DATA: escapeJsonForHtml({ rp_id: c.env.RP_ID, credentials: c.env.CREDENTIALS_JSON ?? '' }),
+}));
 
 // Channels page (client-side notification-secret generator). Unlike Passkey,
 // the live PUSHOVER_JSON / SLACK_JSON secrets are plaintext credentials and are
@@ -196,9 +194,17 @@ app.get(`/${ADMIN_SEG}/channels`, (c) => {
   const slackSet = parseSlackConfig(c.env.SLACK_JSON).config !== null;
   const slackAppSet = parseSlackAppConfig(c.env.SLACK_APP_JSON).config !== null;
   const feishuSet = parseFeishuConfig(c.env.FEISHU_JSON).config !== null;
-  const resp = c.html(buildChannelsPage(pushoverSet, slackSet, slackAppSet, feishuSet));
-  resp.headers.set('Content-Security-Policy', STRICT_CSP);
-  return resp;
+  return servePage(c, '/admin/channels', {
+    ...adminShellVars('channels'),
+    VT_DATA: escapeJsonForHtml({
+      pushover_set: pushoverSet, slack_set: slackSet,
+      slackapp_set: slackAppSet, feishu_set: feishuSet,
+    }),
+    ...channelVars('PUSHOVER', pushoverSet),
+    ...channelVars('SLACK', slackSet),
+    ...channelVars('SLACKAPP', slackAppSet),
+    ...channelVars('FEISHU', feishuSet),
+  });
 });
 
 // Audit data API — forwards a read-only cursor query to the DO.
@@ -621,13 +627,14 @@ app.get('/a/:approve_token', async (c) => {
   if (!res.ok) {
     return c.text(res.status === 410 ? 'Request already handled or expired' : 'Not found', res.status);
   }
-  // Inject page data into HTML template
-  const resp = c.html(buildApprovePage(res.data));
-  // Tight CSP for the approval page. <script type="application/json"> is
+  // Inject page data into the HTML shell (pwa/approve.html).
+  // servePage sets the tight CSP: <script type="application/json"> is
   // non-executable and exempt from script-src; same-origin /pwa/* scripts and
   // styles match 'self'; fetch() to /api/* is same-origin.
-  resp.headers.set('Content-Security-Policy', STRICT_CSP);
-  return resp;
+  return servePage(c, '/approve', {
+    ...pageVars(CHROME),
+    VT_DATA: escapeJsonForHtml(res.data),
+  });
 });
 
 // GET /api/page/:approve_token — same ApprovePageData as /a/:token but as JSON,
@@ -641,435 +648,55 @@ app.get('/api/page/:approve_token', async (c) => {
   return c.json(res.data);
 });
 
-// ── HTML template ─────────────────────────────────────────────────────────
+// ── Page shells (static assets + placeholder substitution) ────────────────
+//
+// The shells are real files under pwa/ (approve.html) and pwa/admin/ (one per
+// admin tab). They are read through the ASSETS binding from INSIDE the route
+// handler, so the admin ones inherit the Cloudflare Access gate registered on
+// /${ADMIN_SEG} and /${ADMIN_SEG}/* above; the public /pwa/* route refuses the
+// admin folder outright (isAdminAssetPath).
 
-function buildApprovePage(data: ApprovePageData): string {
-  const dataJson = escapeJsonForHtml(data);
-  const base = `/pwa`;
-  return `<!doctype html>
-<html lang="zh">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>VT 审批请求</title>
-  ${FAVICON_TAGS}
-  <link rel="stylesheet" href="${base}/approve.css?v=${ASSET_VER}">
-</head>
-<body>
-  <script type="application/json" id="vt-data">${dataJson}</script>
-  <main>
-    <header>
-      <h1>VT 审批请求</h1>
-      <p class="hint">请用 Passkey（iCloud / 1Password / YubiKey）确认下列操作。</p>
-    </header>
-    <!-- The ceremony UI (meta / cache selector / approve+reject / status) is
-         built by approve.js's vt.mountApprove(), the single source shared with
-         the admin audit page's inline approval modal. -->
-    <div id="vt-approve-root"></div>
-  </main>
-  <script src="${base}/libsodium.js"></script>
-  <script src="${base}/common.js?v=${ASSET_VER}"></script>
-  <script src="${base}/approve.js?v=${ASSET_VER}"></script>
-</body>
-</html>`;
+// Read a page shell out of the ASSETS binding.
+//
+// Two deliberate details:
+//  • The request is built fresh instead of forwarding c.req.raw. A conditional
+//    request (If-None-Match from the browser) would come back 304 with an empty
+//    body, and we need the bytes to substitute into.
+//  • Path, then path + ".html". With the default assets `html_handling`
+//    ("auto-trailing-slash") a fetch of "/admin/audit.html" answers 307 →
+//    "/admin/audit", so the extensionless form is the one that returns the file;
+//    with html_handling = "none" it is the other way round. Trying both keeps
+//    the pages working under either setting without a build step.
+async function fetchShell(c: Context<{ Bindings: Env; Variables: AccessVars }>, path: string): Promise<string> {
+  const origin = new URL(c.req.url).origin;
+  const get = (p: string) => c.env.ASSETS.fetch(new Request(origin + p, { method: 'GET' }));
+  let resp = await get(path);
+  if (!resp.ok) resp = await get(`${path}.html`);
+  if (!resp.ok) throw new Error(`page shell ${path}: ${resp.status}`);
+  return resp.text();
 }
 
-// ── Admin HTML templates ──────────────────────────────────────────────────
-
-// Tab bar shared by all admin pages. Every tab carries equal weight; `active`
-// marks the current one.
-type AdminTab = 'audit' | 'cache' | 'setup' | 'channels';
-function adminTabs(active: AdminTab): string {
-  const tab = (href: string, key: AdminTab, label: string) =>
-    `<a class="tab${key === active ? ' active' : ''}" href="${href}"${key === active ? ' aria-current="page"' : ''}>${label}</a>`;
-  return `<nav class="tabs">${tab(`/${ADMIN_SEG}/audit`, 'audit', '审计')}${tab(`/${ADMIN_SEG}/cache`, 'cache', 'DEK 缓存')}${tab(`/${ADMIN_SEG}/setup`, 'setup', 'Passkey')}${tab(`/${ADMIN_SEG}/channels`, 'channels', '推送渠道')}</nav>`;
+// Serve a page shell with the substituted values and the page security headers.
+// A fresh Response is built (ASSETS responses have immutable headers), and the
+// global middleware then rebuilds it again to add HSTS / nosniff /
+// Referrer-Policy — so every page carries the full set.
+async function servePage(
+  c: Context<{ Bindings: Env; Variables: AccessVars }>,
+  path: string,
+  vars: Record<string, string>,
+): Promise<Response> {
+  const html = renderTemplate(await fetchShell(c, path), vars);
+  return new Response(html, {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy': STRICT_CSP,
+    },
+  });
 }
 
-function buildAuditPage(): string {
-  const base = `/${ADMIN_SEG}`;
-  return `<!doctype html>
-<html lang="zh">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>VT 审计</title>
-  ${FAVICON_TAGS}
-  <link rel="stylesheet" href="${base}/pwa/admin.css?v=${ASSET_VER}">
-</head>
-<body>
-  <main>
-    ${adminTabs('audit')}
-    <p class="hint">每个挑战一行（pending / approved / rejected / expired）。「缓存」列显示该次审批授予的 DEK 缓存时长；带有效缓存的行可在「操作」列单独清除。点击行查看完整详情。保留 90 天。</p>
-    <section id="filters">
-      <label>状态 <select id="f-status">
-        <option value="">全部</option>
-        <option value="pending">pending</option>
-        <option value="approved">approved</option>
-        <option value="rejected">rejected</option>
-        <option value="expired">expired</option>
-        <option value="cache">带缓存的记录</option>
-      </select></label>
-      <label>主机 <input id="f-host" type="text" placeholder="host"></label>
-      <button id="apply" type="button">查询</button>
-      <button id="filter-cache" type="button" class="ghost">带缓存</button>
-      <span class="filter-spacer"></span>
-      <div class="filter-danger">
-        <button id="clear-all-cache" type="button" class="danger">清除 DEK 缓存</button>
-        <button id="clear-audit" type="button" class="danger">清空审计</button>
-      </div>
-    </section>
-    <div id="table-wrap"><table id="audit"><thead><tr>
-      <th>时间</th><th>状态</th><th>主机</th><th>命令</th><th>IP</th><th>DEK</th><th>缓存</th><th>操作</th>
-    </tr></thead><tbody id="rows"></tbody></table></div>
-    <section id="actions">
-      <button id="more" type="button">加载更多</button>
-      <span id="status" role="status" aria-live="polite"></span>
-    </section>
-  </main>
-  <div id="detail-backdrop" hidden><div id="detail-card" role="dialog" aria-modal="true">
-    <button id="detail-close" type="button" aria-label="关闭">×</button>
-    <dl id="detail-dl"></dl>
-    <!-- Inline approval ceremony for pending rows, built by the SAME
-         vt.mountApprove() the standalone /a/:token page uses. -->
-    <div id="detail-approve"></div>
-  </div></div>
-  <!-- Passkey ceremony deps (root /pwa/*, public) — reused so approve/reject
-       happen in this modal instead of a new tab. -->
-  <script src="/pwa/libsodium.js"></script>
-  <script src="/pwa/common.js"></script>
-  <script src="/pwa/approve.js?v=${ASSET_VER}"></script>
-  <script src="${base}/pwa/audit.js?v=${ASSET_VER}"></script>
-</body>
-</html>`;
-}
-
-// DEK-cache inventory page. Lists what is cached right now (grouped by the
-// approval that armed it), with per-group and bulk clear, and — when
-// CACHE_ADMIN_EXTEND is on — an extension request that opens a Passkey ceremony
-// inline. The ceremony deps are the SAME /pwa/* scripts the approval page and the
-// audit tab's inline modal use; no forked ceremony logic.
-function buildCachePage(): string {
-  const base = `/${ADMIN_SEG}`;
-  return `<!doctype html>
-<html lang="zh">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>VT — DEK 缓存</title>
-  ${FAVICON_TAGS}
-  <link rel="stylesheet" href="${base}/pwa/admin.css?v=${ASSET_VER}">
-</head>
-<body>
-  <main>
-    ${adminTabs('cache')}
-    <p class="hint">当前<strong>真实存在</strong>的 DEK 缓存（按授予它的那次审批分组）。在有效期内，持有 <code>VT_PASSKEY_TOKEN</code> 且来源 IP 与工作目录一致的调用者可<strong>免手机审批</strong>解密这些记录，所以此处的每一行都是一份仍然生效的授权。清除立即生效；<strong>延长必须经手机 Passkey 重新批准</strong>，每次延长把有效期重设为「批准时刻 + 所选时长」，可反复续期，但<strong>已过期的缓存无法续期</strong>——只能重新审批。</p>
-    <section id="filters">
-      <label>状态 <select id="f-live">
-        <option value="live">仅有效</option>
-        <option value="">全部（含已过期未清理）</option>
-      </select></label>
-      <label>主机 <input id="f-host" type="text" placeholder="host"></label>
-      <button id="refresh" type="button">刷新</button>
-      <span class="filter-spacer"></span>
-      <div class="filter-danger">
-        <button id="clear-selected" type="button" class="danger">清除选中</button>
-        <button id="clear-all-cache" type="button" class="danger">清除全部</button>
-      </div>
-    </section>
-    <section id="bulkbar" hidden>
-      <span id="bulk-count" class="badge"></span>
-      <label id="extend-ttl-label">延长时长 <select id="extend-ttl"></select></label>
-      <button id="extend-selected" type="button">申请延长（需 Passkey）</button>
-      <span id="extend-note" class="hint"></span>
-    </section>
-    <!-- Six columns, two lines per cell: the previous nine columns pushed the
-         action buttons (and the "why not extendable" reason) off-screen at
-         1280px, so the page silently hid the one thing an operator needs. -->
-    <div id="table-wrap"><table id="cache"><thead><tr>
-      <th class="col-pick"><input id="pick-all" type="checkbox" aria-label="全选"></th>
-      <th>目标 / 用户 · 目录</th><th>命令 / IP</th><th class="col-num">条目</th>
-      <th>剩余 / 到期时间</th><th>操作</th>
-    </tr></thead><tbody id="rows"></tbody></table></div>
-    <section id="actions">
-      <span id="status" role="status" aria-live="polite"></span>
-    </section>
-  </main>
-  <div id="detail-backdrop" hidden><div id="detail-card" role="dialog" aria-modal="true">
-    <button id="detail-close" type="button" aria-label="关闭">×</button>
-    <h2>延长 DEK 缓存</h2>
-    <dl id="detail-dl"></dl>
-    <p class="warn">⚠️ 批准即延长这些缓存的免审批解密窗口。请确认上面的主机、IP 与条目数符合预期。</p>
-    <div id="detail-approve"></div>
-  </div></div>
-  <!-- Passkey ceremony deps (root /pwa/*, public), identical to the audit tab. -->
-  <script src="/pwa/libsodium.js"></script>
-  <script src="/pwa/common.js"></script>
-  <script src="/pwa/approve.js?v=${ASSET_VER}"></script>
-  <script src="${base}/pwa/cache.js?v=${ASSET_VER}"></script>
-</body>
-</html>`;
-}
-
-function buildSetupPage(rpId: string, credentialsJson: string): string {
-  const adminBase = `/${ADMIN_SEG}`;
-  const pwaBase = `/pwa`;
-  // `credentials` is the raw CREDENTIALS_JSON secret (or '' on very first
-  // setup). The page parses it client-side for add/revoke; bootstrap ignores
-  // it. Only wrapped (encrypted) key material is exposed — never a plaintext
-  // master.
-  const dataJson = escapeJsonForHtml({ rp_id: rpId, credentials: credentialsJson });
-  return `<!doctype html>
-<html lang="zh">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>VT — Passkey 管理</title>
-  ${FAVICON_TAGS}
-  <link rel="stylesheet" href="${adminBase}/pwa/admin.css?v=${ASSET_VER}">
-</head>
-<body>
-  <script type="application/json" id="vt-data">${dataJson}</script>
-  <main>
-    ${adminTabs('setup')}
-    <header class="page-head">
-      <h1>Passkey</h1>
-      <p class="hint">管理 phone 审批 ceremony 用的 Passkey（<code>CREDENTIALS_JSON</code>）。首个 Passkey 的 master 必须等于 macOS <code>mac_key</code>；新增 / 吊销自动读取当前环境变量。生成后手动 <code>wrangler secret put CREDENTIALS_JSON</code> 并 <code>deploy</code>。</p>
-    </header>
-
-    <section id="current-section" class="card">
-      <div class="card-head">
-        <h2>当前 Passkey</h2>
-        <span id="current-meta" class="badge"></span>
-      </div>
-      <ul id="current-list" class="cred-list"></ul>
-    </section>
-
-    <div id="modes" role="tablist" aria-label="操作模式">
-      <label><input type="radio" name="mode" value="bootstrap" checked><span>首个（bootstrap）</span></label>
-      <label><input type="radio" name="mode" value="add"><span>新增</span></label>
-      <label><input type="radio" name="mode" value="revoke"><span>吊销</span></label>
-    </div>
-
-    <section id="bootstrap-section" class="card">
-      <div class="card-head"><h2>从 macOS Master Key 引导</h2></div>
-      <p class="hint">浏览器无法独立完成这一步：master 必须取自 Mac keychain 的 <code>mac_key</code>。在 <strong>Mac 本机</strong> 执行（Touch ID 门控），按提示设置一个一次性导出口令：</p>
-      <pre class="cmd"><code>vt secret export</code></pre>
-      <p class="hint">把输出的 base64 与导出口令填入下方——解密只在本浏览器进行，<code>mac_key</code> 不上传。建议直接在 Mac 的浏览器里完成本页，避免跨设备复制。</p>
-      <div class="field">
-        <label for="master-blob">导出串（base64）</label>
-        <textarea id="master-blob" rows="3" placeholder="vt secret export 的输出，60 字节 base64url"></textarea>
-      </div>
-      <div class="field">
-        <label for="master-pass">导出口令</label>
-        <input id="master-pass" type="password" placeholder="export 时设置的一次性口令">
-      </div>
-    </section>
-
-    <section id="existing-section" class="card" hidden>
-      <div class="card-head">
-        <h2>现有 CREDENTIALS_JSON</h2>
-        <span class="badge">自动读取自环境变量</span>
-      </div>
-      <p class="hint">已从环境变量预填，通常无需改动；为空时可手动粘贴。</p>
-      <textarea id="existing" rows="6" placeholder="环境变量 CREDENTIALS_JSON 为空；如需可手动粘贴"></textarea>
-    </section>
-
-    <section id="label-section" class="field">
-      <label for="label">标签</label>
-      <input id="label" type="text" placeholder="便于识别，如 iphone-icloud">
-    </section>
-
-    <section id="revoke-section" class="card" hidden>
-      <div class="field">
-        <label for="revoke-pick">吊销条目</label>
-        <select id="revoke-pick"></select>
-      </div>
-      <p class="warn">⚠️ 吊销 ≠ 密钥轮换：仅从允许列表移除，master_key 不变。若该 Passkey 的密文与 PRF 曾泄露，仍可离线解出同一 master_key。</p>
-    </section>
-
-    <section id="actions">
-      <button id="run" type="button">生成</button>
-      <button id="selfcheck" type="button" class="ghost" hidden>自检（逐条验证）</button>
-    </section>
-    <p id="status" role="status" aria-live="polite"></p>
-
-    <section id="output-section" class="card" hidden>
-      <div class="card-head">
-        <h2>输出</h2>
-        <button id="copy" type="button" class="ghost">复制</button>
-      </div>
-      <textarea id="output" rows="10" readonly></textarea>
-      <p class="hint">复制后执行 <code>wrangler secret put CREDENTIALS_JSON</code> 再 <code>wrangler deploy</code> 生效。</p>
-    </section>
-  </main>
-  <script src="${pwaBase}/common.js"></script>
-  <script src="${adminBase}/pwa/cbor.js?v=${ASSET_VER}"></script>
-  <script src="${adminBase}/pwa/setup.js?v=${ASSET_VER}"></script>
-</body>
-</html>`;
-}
-
-// Notification-channel generator page. Pure client-side: the operator ticks the
-// channels they want, fills the fields, and the page emits the JSON secret(s) to
-// paste into `wrangler secret put`. Nothing is POSTed back to the Worker.
-function buildChannelsPage(pushoverSet: boolean, slackSet: boolean, slackAppSet: boolean, feishuSet: boolean): string {
-  const adminBase = `/${ADMIN_SEG}`;
-  const pwaBase = `/pwa`;
-  const dataJson = escapeJsonForHtml({ pushover_set: pushoverSet, slack_set: slackSet, slackapp_set: slackAppSet, feishu_set: feishuSet });
-  const badge = (set: boolean) =>
-    set ? `<span class="badge badge-approved">已配置</span>` : `<span class="badge">未配置</span>`;
-  return `<!doctype html>
-<html lang="zh">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>VT — 推送渠道</title>
-  ${FAVICON_TAGS}
-  <link rel="stylesheet" href="${adminBase}/pwa/admin.css?v=${ASSET_VER}">
-</head>
-<body>
-  <script type="application/json" id="vt-data">${dataJson}</script>
-  <main>
-    ${adminTabs('channels')}
-    <header class="page-head">
-      <h1>推送渠道</h1>
-      <p class="hint">审批请求会推送到此处<strong>启用并配置</strong>的所有渠道——两个渠道相互独立，可只用其一，也可同时启用。每个卡片右上角的开关控制是否启用，启用后展开填写。本页只在浏览器内生成 JSON：填好字段点「生成」，再把结果 <code>wrangler secret put</code> 成对应的环境变量。<strong>现有 secret 的明文不会回显到本页</strong>。</p>
-    </header>
-
-    <section id="pushover-card" class="card channel">
-      <div class="card-head">
-        <h2>Pushover</h2>
-        <div class="channel-ctrl">
-          ${badge(pushoverSet)}
-          <label class="switch" title="启用 Pushover"><input type="checkbox" id="chk-pushover"${pushoverSet ? ' checked' : ''}><span class="slider"></span></label>
-        </div>
-      </div>
-      <div class="channel-body" id="pushover-body"${pushoverSet ? '' : ' hidden'}>
-        ${pushoverSet ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : ''}
-        <p class="hint">在 <a href="https://pushover.net" target="_blank" rel="noopener">pushover.net</a> 登录后：① 主页顶部的 <strong>Your User Key</strong> 即 <code>user_key</code>；② 在 <strong>Create an Application/API Token</strong> 新建一个应用，拿到 <strong>API Token</strong> 作为 <code>app_token</code>。手机装 Pushover App 并登录同一账号即可收推送。</p>
-        <div class="field">
-          <label for="po-app">API Token（app_token）</label>
-          <input id="po-app" type="text" placeholder="axxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="field">
-          <label for="po-user">User Key（user_key）</label>
-          <input id="po-user" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false">
-        </div>
-      </div>
-    </section>
-
-    <section id="slack-card" class="card channel">
-      <div class="card-head">
-        <h2>Slack</h2>
-        <div class="channel-ctrl">
-          ${badge(slackSet)}
-          <label class="switch" title="启用 Slack"><input type="checkbox" id="chk-slack"${slackSet ? ' checked' : ''}><span class="slider"></span></label>
-        </div>
-      </div>
-      <div class="channel-body" id="slack-body"${slackSet ? '' : ' hidden'}>
-        ${slackSet ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : ''}
-        <p class="hint warn">⚠️ Slack 走 Incoming Webhook，是<strong>单向通知</strong>：<strong>不支持</strong>审批通过/拒绝后回改原消息，也不 @ 人。审批结果只会在审批页与审计页更新。需要「@相关人 + 决策后回改消息」请用下方的 <strong>Slack App</strong>（Bot token）或<strong>飞书 / Lark</strong> 通道。</p>
-        <p class="hint">用 <strong>Incoming Webhook</strong> 方式——这是单向通知（真正的「同意」仍在审批页用 Passkey 完成），所以只需一个 Webhook URL，无需 bot、无需把机器人拉进频道：</p>
-        <ol class="steps">
-          <li>打开 <a href="https://api.slack.com/apps" target="_blank" rel="noopener">api.slack.com/apps</a> → <strong>Create New App</strong> → <strong>From scratch</strong>，填个名字（如 <code>vt-approval</code>）并选择目标 workspace。</li>
-          <li>左侧 <strong>Incoming Webhooks</strong> → 打开 <strong>Activate Incoming Webhooks</strong> 开关。</li>
-          <li>页面底部 <strong>Add New Webhook to Workspace</strong> → 选择接收审批通知的频道（如 <code>#vt-approvals</code>）→ <strong>Allow</strong>。</li>
-          <li>复制生成的 <strong>Webhook URL</strong>（形如 <code>https://hooks.slack.com/services/T…/B…/…</code>），粘贴到下方。</li>
-        </ol>
-        <p class="hint">所需「权限」就是激活 Incoming Webhooks 时自动添加的 <code>incoming-webhook</code> scope，仅能向你授权的那个频道发消息，无其它权限。换频道就重做第 3 步再换 URL 即可。</p>
-        <div class="field">
-          <label for="sl-webhook">Webhook URL（webhook_url）</label>
-          <input id="sl-webhook" type="text" placeholder="https://hooks.slack.com/services/T…/B…/…" autocomplete="off" spellcheck="false">
-        </div>
-      </div>
-    </section>
-
-    <section id="slackapp-card" class="card channel">
-      <div class="card-head">
-        <h2>Slack App</h2>
-        <div class="channel-ctrl">
-          ${badge(slackAppSet)}
-          <label class="switch" title="启用 Slack App"><input type="checkbox" id="chk-slackapp"${slackAppSet ? ' checked' : ''}><span class="slider"></span></label>
-        </div>
-      </div>
-      <div class="channel-body" id="slackapp-body"${slackAppSet ? '' : ' hidden'}>
-        ${slackAppSet ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : ''}
-        <p class="hint">用<strong>自建应用（Bot token）</strong>方式——这是 Slack 侧唯一能<strong>@相关人</strong>并在审批后<strong>回改原消息填结果</strong>的通道（上面的 Incoming Webhook 做不到）。完整步骤见 <code>docs/slack-app.md</code>：创建 App → 加 Bot Token Scopes（<code>chat:write</code>，如按频道名发送另加 <code>chat:write.public</code>）→ 安装到 workspace 取 <strong>Bot User OAuth Token</strong>（<code>xoxb-…</code>）→ 把 Bot 拉进目标频道 → 取频道 ID（<code>C…</code>）与要 @ 的人的成员 ID（<code>U…</code>）。</p>
-        <div class="field">
-          <label for="sa-bot-token">Bot Token（bot_token）</label>
-          <input id="sa-bot-token" type="text" placeholder="xoxb-…（Bot 凭证，勿泄露）" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="field">
-          <label for="sa-channel">频道 ID（channel）</label>
-          <input id="sa-channel" type="text" placeholder="C0123456789（频道 ID，或私聊的 D…/用户 U…）" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="field">
-          <label for="sa-mention">审批时 @ 的人（成员 ID，每行一个，可留空）</label>
-          <textarea id="sa-mention" rows="3" placeholder="U01ABCDEF&#10;U02GHIJKL" autocomplete="off" spellcheck="false"></textarea>
-        </div>
-        <p class="hint">免审批（缓存命中）通知会精简为一两行、不 @ 任何人；审批请求才会 @ 上面列出的人，并带「去审批」按钮。</p>
-      </div>
-    </section>
-
-    <section id="feishu-card" class="card channel">
-      <div class="card-head">
-        <h2>飞书 / Lark</h2>
-        <div class="channel-ctrl">
-          ${badge(feishuSet)}
-          <label class="switch" title="启用 飞书"><input type="checkbox" id="chk-feishu"${feishuSet ? ' checked' : ''}><span class="slider"></span></label>
-        </div>
-      </div>
-      <div class="channel-body" id="feishu-body"${feishuSet ? '' : ' hidden'}>
-        ${feishuSet ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : ''}
-        <p class="hint">用<strong>自建应用（机器人）</strong>方式——这是唯一能<strong>@相关人</strong>并在审批后<strong>回改原卡片填结果</strong>的通道（飞书自定义机器人 webhook 做不到）。完整步骤见 <code>docs/feishu.md</code>：创建自建应用 → 开启机器人 → 授予 <code>im:message</code> / <code>im:message:send_as_bot</code> → 发布 → 把机器人拉进目标群 → 取 <code>chat_id</code> 与要 @ 的人的 <code>open_id</code>。</p>
-        <div class="field">
-          <label for="fs-app-id">App ID（app_id）</label>
-          <input id="fs-app-id" type="text" placeholder="cli_xxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="field">
-          <label for="fs-app-secret">App Secret（app_secret）</label>
-          <input id="fs-app-secret" type="text" placeholder="机器人凭证，勿泄露" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="field">
-          <label for="fs-receive-id">目标 ID（receive_id）</label>
-          <input id="fs-receive-id" type="text" placeholder="oc_… (群 chat_id) 或 ou_… (私聊 open_id)" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="field">
-          <label for="fs-receive-id-type">目标类型（receive_id_type）</label>
-          <select id="fs-receive-id-type">
-            <option value="chat_id" selected>chat_id（群）</option>
-            <option value="open_id">open_id</option>
-            <option value="user_id">user_id</option>
-            <option value="email">email</option>
-          </select>
-        </div>
-        <div class="field">
-          <label for="fs-mention">审批时 @ 的人（open_id，每行一个，可留空）</label>
-          <textarea id="fs-mention" rows="3" placeholder="ou_aaaaaaaa&#10;ou_bbbbbbbb" autocomplete="off" spellcheck="false"></textarea>
-        </div>
-        <div class="field">
-          <label for="fs-base">域名（base）</label>
-          <select id="fs-base">
-            <option value="feishu" selected>feishu（open.feishu.cn，中国版飞书）</option>
-            <option value="larksuite">larksuite（open.larksuite.com，国际版 Lark）</option>
-          </select>
-        </div>
-        <p class="hint">免审批（缓存命中）通知会精简为一两行、不 @ 任何人；审批请求才会 @ 上面列出的人，并带「去审批」按钮。</p>
-      </div>
-    </section>
-
-    <section id="actions">
-      <button id="run" type="button">生成</button>
-    </section>
-    <p id="status" role="status" aria-live="polite"></p>
-
-    <section id="output-section" hidden></section>
-  </main>
-  <script src="${pwaBase}/common.js"></script>
-  <script src="${adminBase}/pwa/channels.js?v=${ASSET_VER}"></script>
-</body>
-</html>`;
-}
+// The Worker-owned values every shell interpolates.
+const CHROME: PageChrome = { adminSeg: ADMIN_SEG, assetVer: ASSET_VER, faviconTags: FAVICON_TAGS };
+const adminShellVars = (active: AdminTab) => adminVars(CHROME, active);
 
 // Unhandled exceptions → one structured error event + opaque 500 to caller.
 app.onError((err, c) => {

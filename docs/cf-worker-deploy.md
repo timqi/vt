@@ -181,6 +181,9 @@ npm run dev        # wrangler dev — local Worker + DO
 ## Updates & rotation
 
 - **Redeploy code/PWA:** `just deploy-worker`.
+- **After editing anything in `cf-worker/pwa/`:** `just bump-assets` stamps
+  `<YYYYMMDD>-<git short hash>` into `ASSET_VER` (cache-busts the `?v=` asset
+  URLs), then redeploy.
 - **Rotate the CLI token:** `wrangler secret put VT_AUTH_CF`, then update
   `VT_PASSKEY_TOKEN` on all hosts.
 - **Invalidate all cached DEKs:** rotate `CACHE_SECKEY` (or use the admin

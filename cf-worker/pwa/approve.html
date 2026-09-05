@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>VT 审批请求</title>
+  {{FAVICON_TAGS}}
+  <link rel="stylesheet" href="/pwa/approve.css?v={{ASSET_VER}}">
+</head>
+<body>
+  <script type="application/json" id="vt-data">{{VT_DATA}}</script>
+  <main>
+    <header>
+      <h1>VT 审批请求</h1>
+      <p class="hint">请用 Passkey（iCloud / 1Password / YubiKey）确认下列操作。</p>
+    </header>
+    <!-- The ceremony UI (meta / cache selector / approve+reject / status) is
+         built by approve.js's vt.mountApprove(), the single source shared with
+         the admin audit page's inline approval modal. -->
+    <div id="vt-approve-root"></div>
+  </main>
+  <script src="/pwa/libsodium.js"></script>
+  <script src="/pwa/common.js?v={{ASSET_VER}}"></script>
+  <script src="/pwa/approve.js?v={{ASSET_VER}}"></script>
+</body>
+</html>

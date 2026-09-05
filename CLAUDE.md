@@ -29,7 +29,7 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
 | macOS Keychain, Touch ID, and SSH agent | `src/server_macos/` |
 | AI-agent command hook | `src/hook.rs`, [`docs/hook.md`](docs/hook.md) |
 | VT.app menu-bar shell and bundle packaging | `app/VTShell.swift`, `app/Info.plist`, `justfile` (`app`, `install-app`), [`docs/app-bundle.md`](docs/app-bundle.md) |
-| Worker routes and admin pages | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/` |
+| Worker routes and admin pages | `cf-worker/src/index.ts`, `cf-worker/src/page.ts`, `cf-worker/pwa/approve.html`, `cf-worker/pwa/admin/` |
 | Worker ceremony/cache lifecycle | `cf-worker/src/do_account.ts` |
 | Worker notification channels | `cf-worker/src/notify.ts`, `pushover.ts`, `slack.ts`, `slack_app.ts`, `feishu.ts` |
 
@@ -213,6 +213,17 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   Cloudflare Access gate and Worker JWT verification. Secrets in
   `wrangler.toml` examples are placeholders; real secrets belong in Wrangler
   secret storage.
+- Admin/approval page shells are static files under `cf-worker/pwa/` served
+  through the `ASSETS` binding from INSIDE the gated handler, with server data
+  substituted into `{{NAME}}` placeholders by `renderTemplate`
+  (`cf-worker/src/page.ts`). Every page response must keep `STRICT_CSP`,
+  `text/html; charset=utf-8`, and the global security headers — build a fresh
+  `Response`, since `ASSETS.fetch` headers are immutable. JSON injected into a
+  page goes through `escapeJsonForHtml`, never raw. The unauthenticated
+  `/pwa/*` route must keep refusing anything that resolves into `pwa/admin/`
+  (`isAdminAssetPath`, percent-decoding included) — that folder is reachable
+  only via the Access-gated `/${ADMIN_SEG}/pwa/*` mount. `ASSET_VER` is
+  stamped by `just bump-assets`; there is deliberately no build/bundling step.
 
 ## Editing workflow
 

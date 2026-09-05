@@ -37,10 +37,15 @@ head_sampling_rate = 1.0
 
 [assets]
 directory = "pwa"
-# Static PWA assets (CSS, JS, libsodium.js) are reached only via
-# ASSETS.fetch() from the worker at /pwa/* and /<ADMIN_SEG>/pwa/*.
+# Static PWA assets (CSS, JS, libsodium.js) and the HTML page shells are reached
+# only via ASSETS.fetch() from the worker at /pwa/* and /<ADMIN_SEG>/pwa/*.
 # run_worker_first disables Cloudflare's default static-first routing so all
-# requests hit the worker (admin assets stay behind Cloudflare Access).
+# requests hit the worker (admin assets stay behind Cloudflare Access), and the
+# public /pwa/* route additionally refuses to resolve into pwa/admin/ — that
+# folder (admin.css, the per-tab .js, and the admin page shells) is served ONLY
+# by the Access-gated /<ADMIN_SEG>/pwa/* mount. Leave html_handling at its
+# default; src/index.ts reads a shell by both its extensionless and its .html
+# path, so either setting works.
 # pwa/libsodium.js is vendored/committed (ISC); see pwa/libsodium.README to refresh it.
 binding = "ASSETS"
 run_worker_first = true

@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>VT — Passkey 管理</title>
+  {{FAVICON_TAGS}}
+  <link rel="stylesheet" href="{{ADMIN_BASE}}/pwa/admin.css?v={{ASSET_VER}}">
+</head>
+<body>
+  <script type="application/json" id="vt-data">{{VT_DATA}}</script>
+  <main>
+    {{ADMIN_TABS}}
+    <header class="page-head">
+      <h1>Passkey</h1>
+      <p class="hint">管理 phone 审批 ceremony 用的 Passkey（<code>CREDENTIALS_JSON</code>）。首个 Passkey 的 master 必须等于 macOS <code>mac_key</code>；新增 / 吊销自动读取当前环境变量。生成后手动 <code>wrangler secret put CREDENTIALS_JSON</code> 并 <code>deploy</code>。</p>
+    </header>
+
+    <section id="current-section" class="card">
+      <div class="card-head">
+        <h2>当前 Passkey</h2>
+        <span id="current-meta" class="badge"></span>
+      </div>
+      <ul id="current-list" class="cred-list"></ul>
+    </section>
+
+    <div id="modes" role="tablist" aria-label="操作模式">
+      <label><input type="radio" name="mode" value="bootstrap" checked><span>首个（bootstrap）</span></label>
+      <label><input type="radio" name="mode" value="add"><span>新增</span></label>
+      <label><input type="radio" name="mode" value="revoke"><span>吊销</span></label>
+    </div>
+
+    <section id="bootstrap-section" class="card">
+      <div class="card-head"><h2>从 macOS Master Key 引导</h2></div>
+      <p class="hint">浏览器无法独立完成这一步：master 必须取自 Mac keychain 的 <code>mac_key</code>。在 <strong>Mac 本机</strong> 执行（Touch ID 门控），按提示设置一个一次性导出口令：</p>
+      <pre class="cmd"><code>vt secret export</code></pre>
+      <p class="hint">把输出的 base64 与导出口令填入下方——解密只在本浏览器进行，<code>mac_key</code> 不上传。建议直接在 Mac 的浏览器里完成本页，避免跨设备复制。</p>
+      <div class="field">
+        <label for="master-blob">导出串（base64）</label>
+        <textarea id="master-blob" rows="3" placeholder="vt secret export 的输出，60 字节 base64url"></textarea>
+      </div>
+      <div class="field">
+        <label for="master-pass">导出口令</label>
+        <input id="master-pass" type="password" placeholder="export 时设置的一次性口令">
+      </div>
+    </section>
+
+    <section id="existing-section" class="card" hidden>
+      <div class="card-head">
+        <h2>现有 CREDENTIALS_JSON</h2>
+        <span class="badge">自动读取自环境变量</span>
+      </div>
+      <p class="hint">已从环境变量预填，通常无需改动；为空时可手动粘贴。</p>
+      <textarea id="existing" rows="6" placeholder="环境变量 CREDENTIALS_JSON 为空；如需可手动粘贴"></textarea>
+    </section>
+
+    <section id="label-section" class="field">
+      <label for="label">标签</label>
+      <input id="label" type="text" placeholder="便于识别，如 iphone-icloud">
+    </section>
+
+    <section id="revoke-section" class="card" hidden>
+      <div class="field">
+        <label for="revoke-pick">吊销条目</label>
+        <select id="revoke-pick"></select>
+      </div>
+      <p class="warn">⚠️ 吊销 ≠ 密钥轮换：仅从允许列表移除，master_key 不变。若该 Passkey 的密文与 PRF 曾泄露，仍可离线解出同一 master_key。</p>
+    </section>
+
+    <section id="actions">
+      <button id="run" type="button">生成</button>
+      <button id="selfcheck" type="button" class="ghost" hidden>自检（逐条验证）</button>
+    </section>
+    <p id="status" role="status" aria-live="polite"></p>
+
+    <section id="output-section" class="card" hidden>
+      <div class="card-head">
+        <h2>输出</h2>
+        <button id="copy" type="button" class="ghost">复制</button>
+      </div>
+      <textarea id="output" rows="10" readonly></textarea>
+      <p class="hint">复制后执行 <code>wrangler secret put CREDENTIALS_JSON</code> 再 <code>wrangler deploy</code> 生效。</p>
+    </section>
+  </main>
+  <script src="/pwa/common.js"></script>
+  <script src="{{ADMIN_BASE}}/pwa/cbor.js?v={{ASSET_VER}}"></script>
+  <script src="{{ADMIN_BASE}}/pwa/setup.js?v={{ASSET_VER}}"></script>
+</body>
+</html>

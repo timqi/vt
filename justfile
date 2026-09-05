@@ -119,6 +119,21 @@ check-worker:
 # Everything the CI gates run, in one shot (Rust + worker)
 ci: check test check-worker
 
+# Stamp <YYYYMMDD>-<git short hash> into ASSET_VER (cf-worker/src/index.ts).
+# Run after changing anything shipped from cf-worker/pwa/ (css / js / the page
+# shells) so browsers refetch it instead of a stale far-future-cached copy;
+# then `just deploy-worker`. Replaces hand-editing the constant.
+bump-assets:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ver="$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+    file=cf-worker/src/index.ts
+    sed "s/^const ASSET_VER = '.*';\$/const ASSET_VER = '${ver}';/" "$file" > "$file.new"
+    mv "$file.new" "$file"
+    # Fail loudly rather than silently no-op if the constant ever moves/renames.
+    grep -q "^const ASSET_VER = '${ver}';\$" "$file"
+    echo "ASSET_VER = ${ver}"
+
 # Deploy the Cloudflare worker (requires wrangler on PATH)
 [working-directory: 'cf-worker']
 deploy-worker:
