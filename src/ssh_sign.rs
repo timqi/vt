@@ -7,9 +7,9 @@
 //!
 //! See `docs/ssh-vt-design.md` for the full design and security boundary.
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, Context, Result};
 
-use crate::client::VTClient;
+use crate::client::{single_item_result, VTClient};
 use crate::core::{EncryptItem, SecretType};
 
 /// Default location of the encrypted key record, relative to `$HOME`.
@@ -57,16 +57,13 @@ async fn keygen_unix(
     let seed_b64 = Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(seed));
     seed.zeroize();
     drop(signing);
-    let mut res = vt_client
+    let res = vt_client
         .encrypt(&[EncryptItem {
             plaintext: seed_b64.to_string(),
             t: SecretType::RAW,
         }])
         .await?;
-    ensure!(res.len() == 1, "Expected exactly one item in response");
-    let vt_url = res
-        .remove(0)
-        .map_err(|e| anyhow::anyhow!("failed to encrypt ssh key: {e}"))?;
+    let vt_url = single_item_result(res, "failed to encrypt ssh key")?;
 
     // 3. OpenSSH public-key line (encoding only — no secret material).
     let comment_str = comment.or(label).unwrap_or_default();

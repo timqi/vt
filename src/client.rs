@@ -183,6 +183,16 @@ impl From<anyhow::Error> for ItemError {
 
 pub type ItemResult = std::result::Result<String, ItemError>;
 
+pub(crate) fn single_item_result(
+    mut results: Vec<ItemResult>,
+    error_prefix: &str,
+) -> Result<String> {
+    ensure!(results.len() == 1, "Expected exactly one item in response");
+    results
+        .remove(0)
+        .map_err(|error| anyhow::anyhow!("{error_prefix}: {error}"))
+}
+
 fn legacy_item_result(result: String, err_message: String) -> ItemResult {
     if err_message.is_empty() {
         Ok(result)
@@ -784,6 +794,54 @@ mod tests {
     use super::*;
 
     use crate::core::wire::wrap_ok_envelope;
+
+    #[test]
+    fn single_item_result_rejects_wrong_counts_before_item_errors() {
+        for items in [
+            vec![],
+            vec![Ok("first-secret".into()), Ok("second-secret".into())],
+            vec![
+                Err(ItemError("item failure".into())),
+                Ok("second-secret".into()),
+            ],
+            vec![
+                Ok("first-secret".into()),
+                Err(ItemError("item failure".into())),
+            ],
+        ] {
+            let error = single_item_result(items, "operation").unwrap_err();
+            assert_eq!(error.to_string(), "Expected exactly one item in response");
+            let diagnostic = format!("{error:?}");
+            assert!(!diagnostic.contains("secret"));
+            assert!(!diagnostic.contains("item failure"));
+        }
+    }
+
+    #[test]
+    fn single_item_result_preserves_success_bytes_including_empty_values() {
+        for value in ["", "plaintext", "vt://0record", "\0raw\n"] {
+            assert_eq!(
+                single_item_result(vec![Ok(value.into())], "operation").unwrap(),
+                value,
+            );
+        }
+    }
+
+    #[test]
+    fn single_item_result_preserves_operation_error_messages() {
+        for prefix in [
+            "Failed to create secret",
+            "Error decrypting item",
+            "failed to encrypt ssh key",
+        ] {
+            let error =
+                single_item_result(vec![Err(ItemError("synthetic failure".into()))], prefix)
+                    .unwrap_err();
+            assert_eq!(error.to_string(), format!("{prefix}: synthetic failure"));
+            assert_eq!(format!("{error:#}"), format!("{prefix}: synthetic failure"));
+            assert_eq!(error.chain().count(), 1);
+        }
+    }
 
     #[test]
     fn legacy_wire_items_become_typed_results_without_retaining_failed_values() {

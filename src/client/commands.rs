@@ -4,7 +4,7 @@
 
 use std::io::{self, IsTerminal, Write};
 
-use super::{get_hostname, ItemResult, VTClient};
+use super::{get_hostname, single_item_result, ItemResult, VTClient};
 use crate::core::{has_vt_url, iter_vt_urls, sanitize_for_display, EncryptItem, SecretType};
 use anyhow::{ensure, Context, Result};
 use tracing::debug;
@@ -51,18 +51,13 @@ pub async fn create(vt_client: VTClient, type_arg: Option<&str>) -> Result<()> {
     };
     // DO NOT log `secret` — plaintext the user just typed.
 
-    let mut res = vt_client
+    let res = vt_client
         .encrypt(&[EncryptItem {
             plaintext: secret.to_string(),
             t: secret_type,
         }])
         .await?;
-    ensure!(res.len() == 1, "Expected exactly one item in response");
-    println!(
-        "{}",
-        res.remove(0)
-            .map_err(|e| anyhow::anyhow!("Failed to create secret: {e}"))?
-    );
+    println!("{}", single_item_result(res, "Failed to create secret")?);
     Ok(())
 }
 
@@ -80,11 +75,8 @@ pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Resu
         command.push_str("\nreason: ");
         command.push_str(&sanitize_for_display(r, 200));
     }
-    let mut res = vt_client.decrypt(&get_hostname(), &command, &[vt]).await?;
-    ensure!(res.len() == 1, "Expected exactly one item in response");
-    let value = res
-        .remove(0)
-        .map_err(|e| anyhow::anyhow!("Error decrypting item: {e}"))?;
+    let res = vt_client.decrypt(&get_hostname(), &command, &[vt]).await?;
+    let value = single_item_result(res, "Error decrypting item")?;
     // Interactive terminal: end the line so the shell prompt doesn't overwrite
     // or obscure a plaintext with no trailing newline (redrawing prompts like
     // starship/p10k clobber partial lines). Piped/redirected: byte-exact
