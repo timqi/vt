@@ -26,7 +26,7 @@ it('expires a still-pending challenge when valid verification crosses its TTL', 
     ch.created_ms = start - TTL_MS + 1;
     await state.storage.put(`ch:${ch.approve_token}`, ch);
     await state.storage.put(`pt:${ch.poll_token}`, ch.approve_token);
-    inst.auditCreate(ch);
+    inst.audit.create(ch);
     const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
     const verify = crypto.subtle.verify.bind(crypto.subtle);
     const verification = vi.spyOn(crypto.subtle, 'verify').mockImplementation(async (...args) => {
@@ -121,8 +121,8 @@ describe('extension storage failures', () => {
     await inDO(async ({ inst, state }) => {
       const expiry = Date.now() + 60_000;
       const origin = makeChallenge();
-      inst.auditCreate(origin);
-      inst.auditSetCacheTtl(origin.approve_token, 20 * 60, expiry);
+      inst.audit.create(origin);
+      inst.audit.setCacheTtl(origin.approve_token, 20 * 60, expiry);
       const keys = await seedGroup({ inst, state }, 150, {
         origin_token_id: origin.approve_token, expires_ms: expiry,
       });

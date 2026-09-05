@@ -1,4 +1,5 @@
-// AccountDO — singleton Durable Object managing all in-flight challenges.
+// AccountDO — singleton ceremony and DEK-cache state machine. Audit persistence
+// and channel delivery are owned by AccountAudit and AccountNotifications.
 //
 // Storage keys:
 //   ch:{approve_token}        →  Challenge JSON
@@ -15,7 +16,7 @@
 // same DO — no extra locking is needed.
 
 import { DurableObject } from 'cloudflare:workers';
-import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, AuditRow, AuditQueryResponse, CacheEntry, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse } from './types';
+import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, CacheEntry, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse } from './types';
 import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, sha256, randomBytes, challengeHash } from './crypto';
 import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
@@ -25,37 +26,14 @@ import {
   isAllowedApproveTtl, isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
   groupIdOf, isExtendableGroupId, cacheScopePwd,
 } from './cache_policy';
-import { notifyCacheHit } from './notify';
-import { parseFeishuConfig, sendApprovalCard, editCard, sendCacheHitNotice, FeishuConfig, FeishuState, Kv as FeishuKv } from './feishu';
-import {
-  parseSlackAppConfig,
-  sendApprovalCard as sendSlackAppCard,
-  editCard as editSlackAppCard,
-  sendCacheHitNotice as sendSlackAppCacheHitNotice,
-  SlackAppConfig, SlackAppState, SlackAppMsgRef,
-} from './slack_app';
 import { log, logErr, tokenPrefix } from './log';
+import { AccountAudit, auditKey } from './account_audit';
+import { AccountNotifications, NotificationChannels } from './account_notifications';
 
 const TTL_MS = 5 * 60 * 1000;
 const RETENTION_MS = 10 * 60 * 1000;
-// Audit rows (ceremony + cache events) are kept 90 days, then swept by the alarm.
-const AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
-// Agent Touch-ID-cache hits inside a TTL window can arrive many times a minute
-// (orchestrated callers); notify at most once per key per this interval. The
-// audit table still records every hit — the notice is a heads-up, not a ledger.
-const AGENT_CACHE_NOTIFY_MIN_INTERVAL_MS = 60 * 1000;
-
-// Cache-hit 免审批 notices are opt-in and OFF by default — they fire on every
-// no-human-in-the-loop decrypt and bury the approval messages that do need a
-// tap. Set CACHE_HIT_NOTIFY = "1" | "true" | "on" | "yes" in wrangler.toml
-// [vars] to restore the push. The audit row is written either way.
-function cacheHitNotifyEnabled(env: Env): boolean {
-  const v = (env.CACHE_HIT_NOTIFY ?? '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'on' || v === 'yes';
-}
-
 // The TTL whitelist and the extension arithmetic live in cache_policy.ts (pure +
-// unit-tested); this module owns the storage, audit, and ceremony plumbing.
+// unit-tested); this module owns cache storage and ceremony transitions.
 
 // Admin-requested cache extension is a KILL SWITCH, not an authorization: even
 // when enabled, an extension requires a fresh phone Passkey ceremony. Off by
@@ -83,21 +61,6 @@ const CACHE_EXTEND_MAX_GROUPS = 32;
 // past the cap is refused (the client retries with backoff). Admin is a single
 // operator, so this is generous.
 const MAX_ADMIN_SOCKETS = 8;
-
-// Column projection shared by opAuditQuery and the real-time broadcast, so a
-// pushed row is byte-for-byte the same shape the REST query returns (no field
-// can leak into the stream that the query itself does not already expose).
-// Decrypt batch size of a ceremony — worker-derived (from the salts array the
-// DEKs are minted for), not client-claimed meta. Joins the notification head
-// line as `user@host · N 条`.
-const chSalts = (ch: Challenge): number =>
-  Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0;
-
-const AUDIT_SELECT_COLS =
-  `id, token_id, created_ms, finalized_ms, status, op_kind, command, reason,
-   host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms,
-   verify_failures, cache_ttl_s, cache_expires_ms, ppid, source, seq,
-   peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed`;
 
 // DEK cache entry key. ctx binds the entry to (a) the requester's worker-derived
 // IP (CF-Connecting-IP — unspoofable by the client, the hard boundary) AND (b)
@@ -218,15 +181,6 @@ function extendOutcomeSummary(
   return parts.join(' · ');
 }
 
-// Audit row key. approve_token is a 12-byte (16-char) capability, so this is
-// effectively the whole token. Deliberately accepted: the token is only "live"
-// during the ~5-min pending TTL, the audit surface is behind Cloudflare Access
-// (admin = the owner), and approval still requires a server-verified WebAuthn
-// assertion — so a stored token grants nothing on its own.
-function auditKey(approveToken: string): string {
-  return approveToken.slice(0, 16);
-}
-
 // A challenge is effectively expired once TTL_MS has elapsed since creation,
 // EVEN IF the alarm sweep has not yet flipped its stored status to 'expired'.
 // The alarm (every TTL_MS) is best-effort cleanup + notification (WS close,
@@ -241,379 +195,19 @@ function isPendingExpired(ch: Challenge, now: number): boolean {
 
 export class AccountDO extends DurableObject<Env> {
   private readonly expectedOrigin: string;
-  // Monotonic audit change counter. Seeded from MAX(seq) in the constructor so
-  // it survives DO eviction (every write persists seq), then ++'d per write.
-  private seqCounter = 0;
-  // Last agent-cache-hit notice per `${op_kind}|${host}` (epoch ms). In-memory
-  // only: resets on DO eviction/hibernation — worst case one extra notice.
-  private agentCacheNotifyMs = new Map<string, number>();
+  private readonly audit: AccountAudit;
+  private readonly notifications: AccountNotifications;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
     this.expectedOrigin = new URL(env.WORKER_ORIGIN).origin;
-    // Create the audit table before any request/alarm can be dispatched, so a
-    // ceremony write never races ahead of table creation.
-    this.ctx.blockConcurrencyWhile(async () => {
-      // Migrate away from any pre-existing per-event audit schema (older builds
-      // of this branch used audit(ts_ms,event,token_prefix,...)). Audit data is
-      // non-critical and per-event rows can't be faithfully converted to
-      // per-challenge rows, so drop & rebuild rather than ALTER.
-      const cols = this.ctx.storage.sql
-        .exec<{ name: string }>(`PRAGMA table_info(audit)`)
-        .toArray();
-      if (cols.length > 0 && !cols.some(c => c.name === 'token_id')) {
-        this.ctx.storage.sql.exec(`DROP TABLE audit`);
-      }
-      // One row per challenge (keyed by token_id). The lifecycle events
-      // (created → approved/rejected/expired, plus verify_failures) are stages
-      // of the SAME challenge, so the params are stored ONCE on create and the
-      // terminal state is updated in place — no duplication, no second table.
-      this.ctx.storage.sql.exec(
-        `CREATE TABLE IF NOT EXISTS audit (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           token_id TEXT UNIQUE NOT NULL,
-           created_ms INTEGER NOT NULL,
-           finalized_ms INTEGER,
-           status TEXT NOT NULL,
-           op_kind TEXT,
-           command TEXT,
-           reason TEXT,
-           host TEXT,
-           user TEXT,
-           pwd TEXT,
-           tty TEXT,
-           ppid_cmd TEXT,
-           ssh_client TEXT,
-           ip TEXT,
-           salts INTEGER,
-           latency_ms INTEGER,
-           verify_failures INTEGER NOT NULL DEFAULT 0,
-           cache_ttl_s INTEGER,
-           cache_expires_ms INTEGER,
-           ppid INTEGER,
-           source TEXT NOT NULL DEFAULT 'ceremony',
-           seq INTEGER,
-           peer_exe TEXT,
-           key_fp TEXT,
-           dest TEXT,
-           scope_family TEXT,
-           scope_label TEXT,
-           grant_ttl_s INTEGER,
-           relayed INTEGER
-         )`,
-      );
-      // Additive migrations for older audit tables (token_id present but newer
-      // columns missing): ALTER preserves existing rows, unlike the drop/rebuild
-      // above which only fires for the pre-token_id schema. DEK-cache events
-      // (hit/miss/clear) live in THIS same table — marked op_kind='cache' — so
-      // there is one unified audit surface, no second table.
-      const auditCols = this.ctx.storage.sql
-        .exec<{ name: string }>(`PRAGMA table_info(audit)`)
-        .toArray();
-      const hasCol = (n: string) => auditCols.some(c => c.name === n);
-      if (auditCols.length > 0 && !hasCol('cache_ttl_s')) {
-        this.ctx.storage.sql.exec(`ALTER TABLE audit ADD COLUMN cache_ttl_s INTEGER`);
-      }
-      if (auditCols.length > 0 && !hasCol('ppid')) {
-        this.ctx.storage.sql.exec(`ALTER TABLE audit ADD COLUMN ppid INTEGER`);
-      }
-      // `source` distinguishes ceremony / cache / agent rows. SQLite DOES allow
-      // a NOT NULL DEFAULT <literal> on ALTER ADD COLUMN — the literal backfills
-      // existing rows (which are all ceremony rows), so no separate UPDATE is
-      // needed. (Surprises people; hence this note.) This reuses the `auditCols`/
-      // `hasCol` snapshot taken once above — fine because it is the LAST ALTER in
-      // this block. If a future migration is appended after it, re-run
-      // `PRAGMA table_info(audit)` rather than trusting this now-stale snapshot.
-      if (auditCols.length > 0 && !hasCol('source')) {
-        this.ctx.storage.sql.exec(
-          `ALTER TABLE audit ADD COLUMN source TEXT NOT NULL DEFAULT 'ceremony'`);
-      }
-      // seq: monotonic per-row change counter for the real-time admin stream's
-      // reconnect catch-up. Re-snapshot table_info first — the `source` ALTER
-      // above invalidated the `auditCols` snapshot (per the note there). Backfill
-      // existing rows with seq = id (a valid monotonic ordering) so no row has a
-      // NULL seq and `after_seq` catch-up covers historical rows uniformly.
-      const colsAfterSource = this.ctx.storage.sql
-        .exec<{ name: string }>(`PRAGMA table_info(audit)`)
-        .toArray();
-      if (colsAfterSource.length > 0 && !colsAfterSource.some(c => c.name === 'seq')) {
-        this.ctx.storage.sql.exec(`ALTER TABLE audit ADD COLUMN seq INTEGER`);
-        this.ctx.storage.sql.exec(`UPDATE audit SET seq = id WHERE seq IS NULL`);
-      }
-      // Agent-authoritative audit context (docs/approval-transparency.md §B).
-      // Re-snapshot table_info — the `source`/`seq` ALTERs above invalidated
-      // the earlier snapshots (per the note on the `source` migration). All
-      // seven are plain nullable adds: NULL on pre-migration rows means "the
-      // agent never sent the field", which is exactly the ingest convention.
-      const colsForAgentCtx = this.ctx.storage.sql
-        .exec<{ name: string }>(`PRAGMA table_info(audit)`)
-        .toArray();
-      if (colsForAgentCtx.length > 0 && !colsForAgentCtx.some(c => c.name === 'peer_exe')) {
-        for (const col of ['peer_exe TEXT', 'key_fp TEXT', 'dest TEXT',
-                           'scope_family TEXT', 'scope_label TEXT',
-                           'grant_ttl_s INTEGER', 'relayed INTEGER']) {
-          this.ctx.storage.sql.exec(`ALTER TABLE audit ADD COLUMN ${col}`);
-        }
-      }
-      // cache_expires_ms: absolute expiry of the row's cache entries, so the
-      // admin UI reads real liveness instead of inferring it from
-      // finalized_ms + cache_ttl_s (an inference an approved extension makes
-      // false). Re-snapshot table_info — the ALTERs above invalidated the
-      // earlier snapshots. Deliberately NOT backfilled: a pre-migration row's
-      // true expiry is unknown, and NULL means "fall back to the old
-      // inference", which is exactly right for entries written before this
-      // column existed (they can't have been extended either).
-      const colsForCacheExpiry = this.ctx.storage.sql
-        .exec<{ name: string }>(`PRAGMA table_info(audit)`)
-        .toArray();
-      if (colsForCacheExpiry.length > 0
-          && !colsForCacheExpiry.some(c => c.name === 'cache_expires_ms')) {
-        this.ctx.storage.sql.exec(`ALTER TABLE audit ADD COLUMN cache_expires_ms INTEGER`);
-      }
-      // Drop the short-lived standalone cache_audit table from an earlier build
-      // of this branch — its events now live in the unified audit table.
-      this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS cache_audit`);
-      // idx_audit_created serves the retention DELETE (created_ms range); the
-      // /<ADMIN_SEG>/api/audit cursor query uses the implicit primary-key (id) index.
-      this.ctx.storage.sql.exec(
-        `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit(created_ms)`,
-      );
-      // idx_audit_seq serves the reconnect catch-up query (seq > ? ORDER BY seq).
-      this.ctx.storage.sql.exec(
-        `CREATE INDEX IF NOT EXISTS idx_audit_seq ON audit(seq)`,
-      );
-      // Seed the in-memory counter from the durable high-water mark so a restart
-      // never re-issues a seq (which would let a reconnecting client skip a row).
-      const seqRow = this.ctx.storage.sql
-        .exec<{ m: number }>(`SELECT COALESCE(MAX(seq), 0) AS m FROM audit`)
-        .toArray()[0];
-      this.seqCounter = seqRow?.m ?? 0;
-    });
+    this.audit = new AccountAudit(this.ctx.storage.sql, () => this.ctx.getWebSockets('admin'));
+    this.notifications = new AccountNotifications(this.ctx, this.env);
+    this.ctx.blockConcurrencyWhile(async () => this.audit.initialize());
     // Schedule initial alarm if none set (alarm() re-arms itself thereafter).
     this.ctx.storage.getAlarm()
       .then(a => { if (a == null) return this.ctx.storage.setAlarm(Date.now() + TTL_MS); })
       .catch(e => logErr('alarm.init_failed', e));
-  }
-
-  // Audit writes are best-effort: a failure must never break the ceremony, so
-  // we swallow and log. All three run inside the DO's single-threaded op.
-
-  // Next monotonic change counter. DO ops (and the alarm) are serialized per
-  // instance, so a plain ++ is race-free — no atomics needed.
-  private nextSeq(): number { return ++this.seqCounter; }
-
-  // Send one message to every connected admin stream. Best-effort and isolated:
-  // a failure here (or a dead socket) must never affect the ceremony or block
-  // delivery to the OTHER sockets, so the whole thing is try/caught and each send
-  // is individually guarded (mirrors the pt: broadcast pattern).
-  private broadcastAdmin(msg: AdminWsMessage): void {
-    try {
-      const wss = this.ctx.getWebSockets('admin');
-      if (wss.length === 0) return;   // nobody listening
-      const text = JSON.stringify(msg);
-      for (const ws of wss) {
-        try { ws.send(text); } catch { /* dead socket; skip, don't block others */ }
-      }
-    } catch (e) {
-      logErr('audit.broadcast_failed', e);
-    }
-  }
-
-  // Push one audit row to every admin stream. The re-SELECT uses the shared
-  // projection, so the pushed row cannot expose any field the REST audit query
-  // does not. Skips the SELECT entirely when no admin sockets are connected.
-  private broadcastRow(tokenId: string, event: 'insert' | 'update'): void {
-    try {
-      if (this.ctx.getWebSockets('admin').length === 0) return;
-      const rows = this.ctx.storage.sql
-        .exec(`SELECT ${AUDIT_SELECT_COLS} FROM audit WHERE token_id = ?`, tokenId)
-        .toArray() as unknown as AuditRow[];
-      const row = rows[0];
-      if (!row) return;
-      this.broadcastAdmin({ kind: 'audit', event, row });
-    } catch (e) {
-      logErr('audit.broadcast_failed', e);
-    }
-  }
-
-  // INSERT the full challenge params once, at creation (status=pending). Returns
-  // true only if a row was actually written (false on an ON CONFLICT no-op), so
-  // the caller can skip a wasted broadcast on an idempotent re-create.
-  private auditCreate(ch: Challenge): boolean {
-    const m = ch.meta ?? ({} as Challenge['meta']);
-    try {
-      // source='ceremony' set explicitly (not relying on the column default) so
-      // a future schema change can never silently mis-categorize these rows.
-      const cursor = this.ctx.storage.sql.exec(
-        `INSERT INTO audit
-           (token_id, created_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source, seq)
-         VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ceremony', ?)
-         ON CONFLICT(token_id) DO NOTHING`,
-        auditKey(ch.approve_token),
-        ch.created_ms ?? Date.now(),
-        m.op_kind ?? null,
-        m.command ?? null,
-        m.reason ?? null,
-        m.host ?? null,
-        m.user ?? null,
-        m.pwd ?? null,
-        m.tty ?? null,
-        m.ppid_cmd ?? null,
-        m.ssh_client ?? null,
-        m.ip ?? null,
-        Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0,
-        typeof m.ppid === 'number' ? m.ppid : null,
-        this.nextSeq(),
-      );
-      return cursor.rowsWritten > 0;
-    } catch (e) {
-      logErr('audit.create_failed', e);
-      return false;
-    }
-  }
-
-  // UPDATE the terminal state in place (approved | rejected | expired).
-  private auditFinalize(approveToken: string, status: string, latencyMs: number): void {
-    try {
-      this.ctx.storage.sql.exec(
-        `UPDATE audit SET status = ?, finalized_ms = ?, latency_ms = ?, seq = ? WHERE token_id = ?`,
-        status,
-        Date.now(),
-        latencyMs,
-        this.nextSeq(),
-        auditKey(approveToken),
-      );
-    } catch (e) {
-      logErr('audit.finalize_failed', e, { status });
-    }
-  }
-
-  // Increment the failed-verification counter for this challenge.
-  private auditVerifyFailure(approveToken: string): void {
-    try {
-      this.ctx.storage.sql.exec(
-        `UPDATE audit SET verify_failures = verify_failures + 1, seq = ? WHERE token_id = ?`,
-        this.nextSeq(),
-        auditKey(approveToken),
-      );
-      this.broadcastRow(auditKey(approveToken), 'update');
-    } catch (e) {
-      logErr('audit.verifyfail_failed', e);
-    }
-  }
-
-  // Record the cache TTL the approver chose (0 / null = not cached) together with
-  // the absolute expiry it produced. cache_ttl_s is the DECISION and is never
-  // rewritten afterwards; cache_expires_ms is the live state and IS updated by an
-  // approved extension (auditBumpCacheExpiry).
-  private auditSetCacheTtl(approveToken: string, ttlS: number, expiresMs: number): void {
-    try {
-      this.ctx.storage.sql.exec(
-        `UPDATE audit SET cache_ttl_s = ?, cache_expires_ms = ?, seq = ? WHERE token_id = ?`,
-        ttlS,
-        expiresMs,
-        this.nextSeq(),
-        auditKey(approveToken),
-      );
-      // No broadcast here: this runs inside the approve flow, which emits a
-      // single 'update' after writeCache so the pushed row already carries the
-      // final cache_ttl_s (avoids a duplicate mid-approve broadcast).
-    } catch (e) {
-      logErr('audit.cachettl_failed', e);
-    }
-  }
-
-  // Move an origin approval's recorded cache expiry forward after an approved
-  // extension. MAX() in SQL so a concurrent/older commit can never pull a row's
-  // recorded expiry backwards, and so the column tracks the LATEST expiry across
-  // the group (which is what "is this still live" needs). Broadcast is left to
-  // the caller (one push per commit, not one per group).
-  private auditBumpCacheExpiry(originTokenId: string, expiresMs: number): void {
-    try {
-      this.ctx.storage.sql.exec(
-        `UPDATE audit
-            SET cache_expires_ms = MAX(COALESCE(cache_expires_ms, 0), ?), seq = ?
-          WHERE token_id = ?`,
-        expiresMs,
-        this.nextSeq(),
-        originTokenId,
-      );
-    } catch (e) {
-      logErr('audit.cacheexpiry_failed', e);
-    }
-  }
-
-  // Record a DEK-cache event in the UNIFIED audit table (op_kind='cache') so it
-  // shows up alongside ceremony rows. We deliberately do NOT record misses (a
-  // routine fallback whose ceremony is audited anyway); only meaningful events:
-  // 'approved' = cache hit (DEK delivered without a phone tap) — the key
-  // forensic trace; 'write_failed' = approved-with-TTL but the entry couldn't be
-  // written (misconfig); 'cleared' = admin flush.
-  // `meta` carries the same display fields as a ceremony row (host/user/command/
-  // …), so a cache hit's detail is as rich as a normal decrypt. Only meaningful
-  // events are recorded: 'approved' = cache hit (DEK delivered without a phone
-  // tap — the key forensic trace); 'write_failed' = approved-with-TTL but the
-  // entry couldn't be written. Cache clears are NOT recorded (benign admin
-  // actions, logged to CF logs only).
-  // 'extended' is the fourth kind: the EFFECT of an approved extension ceremony
-  // (how many entries actually moved, and to when). The ceremony's own row records
-  // the authorization; this one records what it did to the cache. Unlike a clear
-  // (authority-reducing, CF-logs only), an extension prolongs plaintext-DEK
-  // availability, so it must land in the durable audit table.
-  private auditCacheEvent(
-    meta: Partial<ChallengeMeta>, salts: number,
-    status: 'approved' | 'write_failed' | 'extended',
-  ): void {
-    try {
-      const now = Date.now();
-      // Synthetic unique token_id (no approve_token exists for cache events).
-      const tokenId = 'c_' + b64uEnc(crypto.getRandomValues(new Uint8Array(9)));
-      this.ctx.storage.sql.exec(
-        `INSERT INTO audit
-           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source, seq)
-         VALUES (?, ?, ?, ?, 'cache', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cache', ?)
-         ON CONFLICT(token_id) DO NOTHING`,
-        tokenId, now, now, status,
-        meta.command ?? null, meta.reason ?? null, meta.host ?? null, meta.user ?? null,
-        meta.pwd ?? null, meta.tty ?? null, meta.ppid_cmd ?? null, meta.ssh_client ?? null,
-        meta.ip ?? null, salts, typeof meta.ppid === 'number' ? meta.ppid : null,
-        this.nextSeq(),
-      );
-      this.broadcastRow(tokenId, 'insert');
-    } catch (e) {
-      logErr('audit.cacheevent_failed', e);
-    }
-  }
-
-  // Insert one SSH-agent decision row (source='agent'). The event is atomic —
-  // created_ms == finalized_ms == ts_ms. `ON CONFLICT(token_id) DO NOTHING`
-  // makes the agent's 1-retry idempotent. Best-effort: swallow + log.
-  private auditAgent(op: DoAuditIngestOp): void {
-    const m = op.meta;
-    try {
-      const cursor = this.ctx.storage.sql.exec(
-        `INSERT INTO audit
-           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, ppid, source, seq,
-            peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(token_id) DO NOTHING`,
-        op.token_id, op.ts_ms, op.ts_ms, op.outcome,
-        m.op_kind ?? null, m.command ?? null, m.reason ?? null, m.host ?? null,
-        m.user ?? null, m.pwd ?? null, m.tty ?? null, m.ppid_cmd ?? null,
-        m.ssh_client ?? null, m.ip ?? null, op.salts, op.latency_ms,
-        typeof m.ppid === 'number' ? m.ppid : null,
-        this.nextSeq(),
-        // Agent-authoritative context: the ingest already normalized these to
-        // string/number/null — `?? null` only guards a malformed internal op.
-        op.peer_exe ?? null, op.key_fp ?? null, op.dest ?? null,
-        op.scope_family ?? null, op.scope_label ?? null,
-        op.grant_ttl_s ?? null, op.relayed ?? null,
-      );
-      // Skip the broadcast on an idempotent-retry no-op (agent's 1-retry).
-      if (cursor.rowsWritten > 0) this.broadcastRow(op.token_id, 'insert');
-    } catch (e) {
-      logErr('audit.agent_failed', e);
-    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -830,19 +424,17 @@ export class AccountDO extends DurableObject<Env> {
       // Parse the Feishu + Slack App configs ONCE for the whole sweep (they
       // can't change mid-sweep) — avoids re-parsing the secrets and re-logging
       // any config error per expiring challenge.
-      const feishuSweepCfg = this.feishuCfg();
-      const slackAppSweepCfg = this.slackAppCfg();
+      const channels = this.notifications.channels();
       for (const [key, ch] of list) {
         const ptKey = `pt:${ch.poll_token}`;
         if (ch.status === 'pending' && now - ch.created_ms >= TTL_MS) {
           // `ch` is a stale snapshot from list() at sweep start; a decision may
           // have committed after it. expireChallenge re-reads atomically and is a
           // no-op if no longer pending, so it can't clobber a terminal status,
-          // double-finalize the audit row, or emit a ⌛ card edit that conflicts
-          // with the decision's ✅/❌. It drops the pt: key itself; feishuEdit /
-          // slackAppEdit fire via waitUntil, so a burst of expiries doesn't
-          // stretch the sweep.
-          await this.expireChallenge(ch.approve_token, now, feishuSweepCfg, slackAppSweepCfg);
+          // double-finalize the audit row, or emit a card edit that conflicts
+          // with the decision. It drops the pt: key itself; notifications.edit
+          // fires via waitUntil, so a burst of expiries doesn't stretch the sweep.
+          await this.expireChallenge(ch.approve_token, now, channels);
         } else if (
           ch.status !== 'pending'
           && ch.finalized_ms != null
@@ -866,11 +458,7 @@ export class AccountDO extends DurableObject<Env> {
 
     // 3. Audit rows past 90-day retention (cheap: bound param + idx_audit_created).
     // Ceremony + cache events share this table, so one DELETE covers everything.
-    try {
-      this.ctx.storage.sql.exec(`DELETE FROM audit WHERE created_ms < ?`, now - AUDIT_RETENTION_MS);
-    } catch (e) {
-      logErr('audit.sweep_failed', e);
-    }
+    this.audit.sweep(now);
 
     // 4. Admin audit-stream sockets: close any whose Access-JWT `exp` has passed,
     // so a hibernating stream cannot outlive the admin's authenticated session.
@@ -906,128 +494,6 @@ export class AccountDO extends DurableObject<Env> {
 
   // ── HTTP ops ──────────────────────────────────────────────────────────
 
-  // ── Feishu channel (stateful: token cache + editable card) ──────────────────
-  // Parsed lazily per use; a malformed FEISHU_JSON is logged once and treated as
-  // "channel off" (best-effort, never breaks the ceremony).
-  private feishuCfg(): FeishuConfig | null {
-    const { config, error } = parseFeishuConfig(this.env.FEISHU_JSON);
-    if (error) logErr('feishu.config_error', error);
-    return config;
-  }
-
-  // DO storage as the token cache backing store for feishu.ts.
-  private feishuKv(): FeishuKv {
-    return {
-      get: <T>(k: string) => this.ctx.storage.get<T>(k),
-      put: (k: string, v: unknown) => this.ctx.storage.put(k, v),
-    };
-  }
-
-  // Fire the pending approval card (off the ceremony path) and write the
-  // resulting message_id back onto the challenge so a later approve/reject/expire
-  // can edit it. If the decision raced ahead of the send (challenge already
-  // terminal), edit the card straight to its final state instead — the only
-  // failure mode of the race is a card that never leaves "⏳", which this closes.
-  private async feishuSendAndStore(cfg: FeishuConfig, ch: Challenge, approveUrl: string): Promise<void> {
-    try {
-      const id = await sendApprovalCard(
-        cfg, this.feishuKv(), Date.now(), ch.meta.op_kind, ch.meta, approveUrl, chSalts(ch));
-      if (!id) { logErr('feishu.send_failed', 'no message_id'); return; }
-      const cur = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
-      if (!cur) return; // expired + swept before the send returned
-      cur.feishu_message_id = id;
-      await this.ctx.storage.put(`ch:${ch.approve_token}`, cur);
-      if (cur.status !== 'pending') {
-        // Decision landed first. Edit to the terminal state now that we have the
-        // id. Approver label is unavailable on this path (opApprove already ran
-        // without an id) — degrade to latency-only; this race is rare + cosmetic.
-        const latencyMs = cur.finalized_ms != null ? cur.finalized_ms - cur.created_ms : undefined;
-        const w = await editCard(
-          cfg, this.feishuKv(), Date.now(), id, cur.status as FeishuState,
-          cur.meta.op_kind, cur.meta, { latencyMs }, chSalts(cur));
-        if (w) logErr('feishu.edit_failed', w);
-      }
-    } catch (e) { logErr('feishu.send_failed', e); }
-  }
-
-  // Edit an already-sent card to a terminal state (off the decision path).
-  // `cfgHint` lets a caller (the alarm sweep) pass a config parsed ONCE for the
-  // whole batch, instead of this method re-parsing FEISHU_JSON — and re-logging
-  // any config error — for every challenge in a loop. Omit it (undefined) for
-  // the one-shot approve/reject paths, which parse on demand.
-  private feishuEdit(
-    ch: Challenge,
-    state: FeishuState,
-    extra: { approverLabel?: string; latencyMs?: number },
-    cfgHint?: FeishuConfig | null,
-  ): void {
-    const cfg = cfgHint !== undefined ? cfgHint : this.feishuCfg();
-    if (!cfg || !ch.feishu_message_id) return;
-    const mid = ch.feishu_message_id;
-    const meta = ch.meta;
-    this.ctx.waitUntil(
-      editCard(cfg, this.feishuKv(), Date.now(), mid, state, meta.op_kind, meta, extra, chSalts(ch))
-        .then((w) => { if (w) logErr('feishu.edit_failed', w); })
-        .catch((e) => logErr('feishu.edit_failed', e)),
-    );
-  }
-
-  // ── Slack App channel (stateful: bot token + editable message) ───────────────
-  // Structurally identical to the Feishu channel above (send → store ref → edit
-  // on decision), minus the token cache: a Slack bot token is long-lived, so
-  // there is no KV. A malformed SLACK_APP_JSON is logged once and treated as
-  // "channel off" (best-effort, never breaks the ceremony).
-  private slackAppCfg(): SlackAppConfig | null {
-    const { config, error } = parseSlackAppConfig(this.env.SLACK_APP_JSON);
-    if (error) logErr('slackapp.config_error', error);
-    return config;
-  }
-
-  // Fire the pending approval message (off the ceremony path) and write the
-  // resulting {channel, ts} back onto the challenge so a later approve/reject/
-  // expire can edit it. Mirrors feishuSendAndStore, including the send-vs-decision
-  // race: if the decision landed first, edit straight to the terminal state.
-  private async slackAppSendAndStore(cfg: SlackAppConfig, ch: Challenge, approveUrl: string): Promise<void> {
-    try {
-      const ref = await sendSlackAppCard(cfg, ch.meta.op_kind, ch.meta, approveUrl, chSalts(ch));
-      if (!ref) { logErr('slackapp.send_failed', 'no ts'); return; }
-      const cur = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
-      if (!cur) return; // expired + swept before the send returned
-      cur.slackapp = ref;
-      await this.ctx.storage.put(`ch:${ch.approve_token}`, cur);
-      if (cur.status !== 'pending') {
-        // Decision landed first — edit to the terminal state now that we have the
-        // ref. Approver label is unavailable on this path (opApprove already ran
-        // without a ref) — degrade to latency-only; this race is rare + cosmetic.
-        const latencyMs = cur.finalized_ms != null ? cur.finalized_ms - cur.created_ms : undefined;
-        const w = await editSlackAppCard(
-          cfg, ref, cur.status as SlackAppState, cur.meta.op_kind, cur.meta,
-          { latencyMs }, chSalts(cur));
-        if (w) logErr('slackapp.edit_failed', w);
-      }
-    } catch (e) { logErr('slackapp.send_failed', e); }
-  }
-
-  // Edit an already-sent message to a terminal state (off the decision path).
-  // `cfgHint` mirrors feishuEdit: the alarm sweep passes a config parsed ONCE for
-  // the whole batch; the one-shot approve/reject paths omit it (parse on demand).
-  private slackAppEdit(
-    ch: Challenge,
-    state: SlackAppState,
-    extra: { approverLabel?: string; latencyMs?: number },
-    cfgHint?: SlackAppConfig | null,
-  ): void {
-    const cfg = cfgHint !== undefined ? cfgHint : this.slackAppCfg();
-    if (!cfg || !ch.slackapp) return;
-    const ref: SlackAppMsgRef = ch.slackapp;
-    const meta = ch.meta;
-    this.ctx.waitUntil(
-      editSlackAppCard(cfg, ref, state, meta.op_kind, meta, extra, chSalts(ch))
-        .then((w) => { if (w) logErr('slackapp.edit_failed', w); })
-        .catch((e) => logErr('slackapp.edit_failed', e)),
-    );
-  }
-
   // Atomically expire ONE past-TTL pending challenge and fire all the terminal
   // side-effects: flip status→expired, notify the polling WS, finalize the audit
   // row, broadcast to admin streams, edit the Feishu card, and drop the pt:
@@ -1038,14 +504,12 @@ export class AccountDO extends DurableObject<Env> {
   // (opPageData / opApprove / opReject), so a stale challenge is fully finalized
   // the moment anyone touches it — the audit row and Feishu card update even when
   // the alarm is not running, instead of waiting on (or depending on) the sweep.
-  // Pass cfgHint / slackCfgHint to reuse a once-parsed Feishu / Slack App config
-  // (the batch sweep); omit them on the one-shot read paths so they parse on
-  // demand.
+  // The alarm passes once-parsed channel configs for the whole sweep.
+  // One-shot expiry paths let notifications parse on demand.
   private async expireChallenge(
     approveToken: string,
     now: number,
-    cfgHint?: FeishuConfig | null,
-    slackCfgHint?: SlackAppConfig | null,
+    channels?: NotificationChannels,
   ): Promise<void> {
     const key = `ch:${approveToken}`;
     const fresh = await this.ctx.storage.get<Challenge>(key);
@@ -1072,10 +536,9 @@ export class AccountDO extends DurableObject<Env> {
       tty: fresh.meta.tty,
       age_ms: now - fresh.created_ms,
     });
-    this.auditFinalize(fresh.approve_token, 'expired', now - fresh.created_ms);
-    this.broadcastRow(auditKey(fresh.approve_token), 'update');
-    this.feishuEdit(fresh, 'expired', {}, cfgHint);
-    this.slackAppEdit(fresh, 'expired', {}, slackCfgHint);
+    this.audit.finalize(fresh.approve_token, 'expired', now - fresh.created_ms);
+    this.audit.broadcastRow(auditKey(fresh.approve_token), 'update');
+    this.notifications.edit(fresh, 'expired', {}, channels);
     // Retain `ch:` for RETENTION_MS so an in-flight WS reconnect still sees the
     // terminal status; drop only the routing key now (a later RETENTION sweep
     // drops `ch:`).
@@ -1094,12 +557,9 @@ export class AccountDO extends DurableObject<Env> {
     return new Response('ok');
   }
 
-  // Persist a new pending challenge and fire its announcement side-effects:
-  // routing key, alarm re-arm, audit row + admin broadcast, and the editable
-  // Feishu / Slack App approval cards. Shared by the daemon ceremony (opCreate)
-  // and the admin-requested cache-extension ceremony (opCacheExtendCreate) so both
-  // are swept, audited, and pushed by exactly the same code — an extension request
-  // is therefore as visible on the notification channels as a decrypt request.
+  // Persist a pending challenge and its routing key, re-arm the alarm, then
+  // record and broadcast its audit row. Both daemon and extension ceremonies
+  // use this path; notifications keeps extension requests console-only.
   private async storeAndAnnounce(challenge: Challenge): Promise<void> {
     await this.ctx.storage.put({
       [`ch:${challenge.approve_token}`]: challenge,
@@ -1117,38 +577,11 @@ export class AccountDO extends DurableObject<Env> {
     } catch (e) {
       logErr('alarm.rearm_on_create_failed', e);
     }
-    if (this.auditCreate(challenge)) {
-      this.broadcastRow(auditKey(challenge.approve_token), 'insert');
+    if (this.audit.create(challenge)) {
+      this.audit.broadcastRow(auditKey(challenge.approve_token), 'insert');
     }
 
-    // A cache-extension ceremony is NOT pushed to any channel. Its entire flow is
-    // console-resident: the operator picks the groups on the admin DEK 缓存 tab and
-    // the Passkey ceremony mounts inline on that same page, so a card would notify
-    // the person already watching the result. Observability is preserved where it
-    // belongs — the audit tab receives the request row (op_kind='cache-extend') and
-    // the effect row (status='extended') over its real-time stream.
-    if (challenge.extend) return;
-
-    // Feishu approval card — fire-and-forget (waitUntil), NOT awaited: this keeps
-    // a third-party API's latency out of the singleton DO's serialized op path.
-    // Pushover/Slack are sent separately from index.ts (stateless). See feishu.ts.
-    const cfg = this.feishuCfg();
-    const slackCfg = this.slackAppCfg();
-    if (cfg || slackCfg) {
-      const approveUrl = `${this.env.WORKER_ORIGIN}/a/${challenge.approve_token}`;
-      // Both feishuSendAndStore and slackAppSendAndStore do a read-modify-write of
-      // the SAME `ch:` record, each writing only its own ref field
-      // (feishu_message_id / slackapp). As independent waitUntil tasks their
-      // `await get`s can both read the pre-write snapshot, so the later `put`
-      // clobbers the sibling's ref — a lost update that strands that channel's
-      // message at ⏳ with no error logged. Run them SEQUENTIALLY inside one
-      // waitUntil so the second reads the first's committed write. Client latency
-      // is unaffected: opCreate already returns before these settle.
-      this.ctx.waitUntil((async () => {
-        if (cfg) await this.feishuSendAndStore(cfg, challenge, approveUrl);
-        if (slackCfg) await this.slackAppSendAndStore(slackCfg, challenge, approveUrl);
-      })());
-    }
+    this.notifications.approval(challenge);
   }
 
   private async opApprove(request: Request): Promise<Response> {
@@ -1210,7 +643,7 @@ export class AccountDO extends DurableObject<Env> {
     const credId = b64uDec(body.credential_id_b64u);
     const entry = await lookupByCredentialId(creds, credId);
     if (!entry) {
-      this.auditVerifyFailure(ch.approve_token);
+      this.audit.verifyFailure(ch.approve_token);
       return new Response('unknown credential', { status: 401 });
     }
 
@@ -1240,7 +673,7 @@ export class AccountDO extends DurableObject<Env> {
       });
     } catch (e) {
       logErr('webauthn.verify_failed', e, { at: tokenPrefix(ch.approve_token) });
-      this.auditVerifyFailure(ch.approve_token);
+      this.audit.verifyFailure(ch.approve_token);
       return new Response('assertion verification failed', { status: 401 });
     }
 
@@ -1290,11 +723,10 @@ export class AccountDO extends DurableObject<Env> {
       tty: ch.meta.tty,
       latency_ms: ch.finalized_ms - ch.created_ms,
     });
-    this.auditFinalize(ch.approve_token, 'approved', ch.finalized_ms - ch.created_ms);
+    this.audit.finalize(ch.approve_token, 'approved', ch.finalized_ms - ch.created_ms);
 
     // Edit the Feishu / Slack App message to ✅ 已批准, naming the Passkey that approved.
-    this.feishuEdit(ch, 'approved', { approverLabel: entry.l, latencyMs: ch.finalized_ms - ch.created_ms });
-    this.slackAppEdit(ch, 'approved', { approverLabel: entry.l, latencyMs: ch.finalized_ms - ch.created_ms });
+    this.notifications.edit(ch, 'approved', { approverLabel: entry.l, latencyMs: ch.finalized_ms - ch.created_ms });
 
     // Opt-in DEK cache write. Best-effort: a failure here must never break the
     // approval (the daemon already has its sealed DEKs via the WS path below).
@@ -1318,8 +750,8 @@ export class AccountDO extends DurableObject<Env> {
 
     // One admin broadcast for the whole approval — AFTER writeCache, so the
     // pushed row already carries the final cache_ttl_s (writeCache's
-    // auditSetCacheTtl deliberately does not broadcast to avoid a duplicate).
-    this.broadcastRow(auditKey(ch.approve_token), 'update');
+    // audit.setCacheTtl deliberately does not broadcast to avoid a duplicate).
+    this.audit.broadcastRow(auditKey(ch.approve_token), 'update');
 
     // Wake waiting WS clients
     const wss = this.ctx.getWebSockets(`pt:${ch.poll_token}`);
@@ -1352,7 +784,7 @@ export class AccountDO extends DurableObject<Env> {
     // the admin page, not just buried in Worker logs.
     const reject = (reason: string): void => {
       logErr('cache.write_rejected', new Error(reason));
-      this.auditCacheEvent(
+      this.audit.cacheEvent(
         ch.meta,
         Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0,
         'write_failed',
@@ -1418,7 +850,7 @@ export class AccountDO extends DurableObject<Env> {
     for (let i = 0; i < entries.length; i += STORAGE_BATCH) {
       await this.ctx.storage.put(Object.fromEntries(entries.slice(i, i + STORAGE_BATCH)));
     }
-    this.auditSetCacheTtl(ch.approve_token, ttlS, expires);
+    this.audit.setCacheTtl(ch.approve_token, ttlS, expires);
     log('cache.written', {
       at: tokenPrefix(ch.approve_token), ttl_s: ttlS, n: salts.length, group: groupId,
     });
@@ -1502,63 +934,21 @@ export class AccountDO extends DurableObject<Env> {
 
     // Audit the hit with the requester's full meta (host/user/command/…), so the
     // detail dialog is as rich as a ceremony decrypt.
-    this.auditCacheEvent(meta, salts.length, 'approved');
+    this.audit.cacheEvent(meta, salts.length, 'approved');
     log('cache.hit', { n: salts.length, ip, ppid });
 
     // Real-time notice: a cache hit serves a decrypt with NO phone in the loop,
     // so push the same opt-in channels used for approvals. Fire-and-forget —
     // delivery is best-effort and must never delay or fail the DEK response
     // (the audit row above is the durable record).
-    this.pushCacheHitNotices(meta, salts.length, undefined, 'cachehit_failed');
+    this.notifications.cacheHit(meta, salts.length);
     return Response.json({ source: 'cache', sealed_deks_b64u: sealedB64u } satisfies DekCacheResponse);
-  }
-
-  // Fan a cache-hit notice out to every configured channel (stateless
-  // Pushover/Slack-webhook fanOut + Feishu + Slack App), each via waitUntil —
-  // compact, no @, no edit lifecycle (terminal FYI). Shared by the Worker
-  // DEK-cache hit (opDekCache) and the agent Touch-ID-cache hit
-  // (notifyAgentCacheHit); `note` names the skipped factor when it isn't the
-  // default phone approval, `errTag` distinguishes the two sources in logs.
-  //
-  // Push is OPT-IN (CACHE_HIT_NOTIFY=1): a busy host hits the cache many times
-  // a minute and the resulting stream drowns the approval messages that
-  // actually need a human. Silence here only drops the real-time FYI — the
-  // audit row (auditCacheEvent / auditAgent) is written unconditionally and
-  // stays the durable record, visible on the admin audit page.
-  private pushCacheHitNotices(
-    meta: ChallengeMeta,
-    salts: number,
-    note: string | undefined,
-    errTag: string,
-  ): void {
-    if (!cacheHitNotifyEnabled(this.env)) return;
-    this.ctx.waitUntil(
-      notifyCacheHit(this.env, meta, salts, note)
-        .then((w) => { if (w) logErr(`notify.${errTag}`, w); })
-        .catch((e) => logErr(`notify.${errTag}`, e)),
-    );
-    const feishu = this.feishuCfg();
-    if (feishu) {
-      this.ctx.waitUntil(
-        sendCacheHitNotice(feishu, this.feishuKv(), Date.now(), meta, salts, note)
-          .then((w) => { if (w) logErr(`feishu.${errTag}`, w); })
-          .catch((e) => logErr(`feishu.${errTag}`, e)),
-      );
-    }
-    const slackApp = this.slackAppCfg();
-    if (slackApp) {
-      this.ctx.waitUntil(
-        sendSlackAppCacheHitNotice(slackApp, meta, salts, note)
-          .then((w) => { if (w) logErr(`slackapp.${errTag}`, w); })
-          .catch((e) => logErr(`slackapp.${errTag}`, e)),
-      );
-    }
   }
 
   // Ingest one SSH-agent audit record. The Worker has already verified the
   // per-agent HMAC, capped `meta`, and bounded the scalars; we just insert.
   // Return 200 on success so the agent's 1-retry stops (a non-2xx would make it
-  // retry a row that already landed). Best-effort — auditAgent swallows DB errors.
+  // retry a row that already landed). Best-effort: audit.agent swallows DB errors.
   private async opAuditIngest(request: Request): Promise<Response> {
     let op: DoAuditIngestOp;
     try { op = await request.json() as DoAuditIngestOp; }
@@ -1567,27 +957,12 @@ export class AccountDO extends DurableObject<Env> {
         || !op.meta || typeof op.meta !== 'object') {
       return badRequest('invalid audit op');
     }
-    this.auditAgent(op);
+    this.audit.agent(op);
     // An agent cache hit (sign / decrypt@vt served from the Touch ID auth
     // cache) had no human in the loop, so surface it on the same channels as
     // the Worker DEK-cache 免审批 notice. Throttled; fire-and-forget.
-    if (op.outcome === 'cache_hit') this.notifyAgentCacheHit(op);
+    if (op.outcome === 'cache_hit') this.notifications.agentCacheHit(op);
     return Response.json({ ok: true });
-  }
-
-  // Throttled 免审批 notice for an agent-side cache hit; the actual dispatch
-  // is the shared pushCacheHitNotices. The note names the skipped factor —
-  // Touch ID here, not a phone approval.
-  private notifyAgentCacheHit(op: DoAuditIngestOp): void {
-    const key = `${op.meta.op_kind}|${op.meta.host}`;
-    const now = Date.now();
-    if (now - (this.agentCacheNotifyMs.get(key) ?? 0) < AGENT_CACHE_NOTIFY_MIN_INTERVAL_MS) return;
-    // Bound the map: keys are (op_kind, host) pairs, so growth needs a hostile
-    // agent minting hostnames — cheap to cap anyway.
-    if (this.agentCacheNotifyMs.size > 256) this.agentCacheNotifyMs.clear();
-    this.agentCacheNotifyMs.set(key, now);
-
-    this.pushCacheHitNotices(op.meta, op.salts, '缓存命中，免 Touch ID', 'agent_cachehit_failed');
   }
 
   // Admin: clear the cached DEKs written by ONE approval, identified by its
@@ -1701,31 +1076,6 @@ export class AccountDO extends DurableObject<Env> {
     return { groups, scanned, truncated };
   }
 
-  // Join the origin approvals' display context (the same fields the audit tab
-  // already renders behind the same Access gate). Chunked so the IN list stays
-  // small; a missing row (retention-swept origin) simply yields no context.
-  private auditContextFor(tokenIds: string[]): Map<string, AuditRow> {
-    const out = new Map<string, AuditRow>();
-    const ids = tokenIds.filter(t => typeof t === 'string' && t.length > 0);
-    for (let i = 0; i < ids.length; i += 100) {
-      const chunk = ids.slice(i, i + 100);
-      const placeholders = chunk.map(() => '?').join(',');
-      try {
-        const rows = this.ctx.storage.sql
-          .exec(
-            `SELECT token_id, host, user, pwd, command, finalized_ms, cache_ttl_s
-               FROM audit WHERE token_id IN (${placeholders})`,
-            ...chunk,
-          )
-          .toArray() as unknown as AuditRow[];
-        for (const r of rows) out.set(r.token_id, r);
-      } catch (e) {
-        logErr('cache.list_join_failed', e);
-      }
-    }
-    return out;
-  }
-
   // Admin: inventory of what is actually cached right now, grouped by the approval
   // that armed it. Read-only. Returns NO secret material (no sealed blob, no ctx,
   // no salts) — see the note on scanCacheGroups.
@@ -1738,7 +1088,7 @@ export class AccountDO extends DurableObject<Env> {
       logErr('cache.list_failed', e);
       return new Response('cache list failed', { status: 500 });
     }
-    const ctxRows = this.auditContextFor([...scan.groups.values()].map(g => g.origin_token_id));
+    const ctxRows = this.audit.contextFor([...scan.groups.values()].map(g => g.origin_token_id));
     const groups: CacheGroupSummary[] = [];
     for (const g of scan.groups.values()) {
       const row = ctxRows.get(g.origin_token_id);
@@ -1855,7 +1205,7 @@ export class AccountDO extends DurableObject<Env> {
     const now = Date.now();
     const scan = await this.scanCacheGroups(now, { want: new Set(requested) });
     const targets: CacheExtendPreview[] = [];
-    const ctxRows = this.auditContextFor([...scan.groups.values()].map(g => g.origin_token_id));
+    const ctxRows = this.audit.contextFor([...scan.groups.values()].map(g => g.origin_token_id));
     for (const gid of requested) {
       const agg = scan.groups.get(gid);
       if (!agg) { rejected.push({ group_id: gid, reason: 'gone' }); continue; }
@@ -2015,15 +1365,15 @@ export class AccountDO extends DurableObject<Env> {
       totalExtended += extended;
       if (groupLatest > latest) latest = groupLatest;
       if (extended > 0 && g.origin_token_id) {
-        this.auditBumpCacheExpiry(g.origin_token_id, groupLatest);
-        this.broadcastRow(g.origin_token_id, 'update');
+        this.audit.bumpCacheExpiry(g.origin_token_id, groupLatest);
+        this.audit.broadcastRow(g.origin_token_id, 'update');
       }
     }
 
     // Durable record of the EFFECT (the ceremony row records the authorization).
     // Written even when nothing moved: "an extension was approved and changed
     // nothing" is exactly as interesting as one that did.
-    this.auditCacheEvent(
+    this.audit.cacheEvent(
       {
         ...ch.meta,
         command: extendSummary(intent),
@@ -2045,15 +1395,11 @@ export class AccountDO extends DurableObject<Env> {
   // Cloudflare-Access gated at the edge.
   private async opClearAudit(): Promise<Response> {
     try {
-      this.ctx.storage.sql.exec(`DELETE FROM audit`);
+      this.audit.clear();
     } catch (e) {
       logErr('audit.clear_failed', e);
       return new Response('clear failed', { status: 500 });
     }
-    // Notify every connected admin tab (not just the one that clicked) so none
-    // keeps showing now-deleted rows. seqCounter is intentionally NOT reset —
-    // staying monotonic means a reconnecting client's cursor never regresses.
-    this.broadcastAdmin({ kind: 'clear' });
     log('audit.cleared', {});
     return Response.json({ ok: true });
   }
@@ -2104,7 +1450,7 @@ export class AccountDO extends DurableObject<Env> {
     const credId = b64uDec(body.credential_id_b64u);
     const entry = await lookupByCredentialId(creds, credId);
     if (!entry) {
-      this.auditVerifyFailure(ch.approve_token);
+      this.audit.verifyFailure(ch.approve_token);
       return new Response('unknown credential', { status: 401 });
     }
 
@@ -2120,7 +1466,7 @@ export class AccountDO extends DurableObject<Env> {
       });
     } catch (e) {
       logErr('webauthn.verify_failed', e, { at: tokenPrefix(ch.approve_token) });
-      this.auditVerifyFailure(ch.approve_token);
+      this.audit.verifyFailure(ch.approve_token);
       return new Response('assertion verification failed', { status: 401 });
     }
 
@@ -2151,12 +1497,11 @@ export class AccountDO extends DurableObject<Env> {
       tty: ch.meta.tty,
       latency_ms: ch.finalized_ms - ch.created_ms,
     });
-    this.auditFinalize(ch.approve_token, 'rejected', ch.finalized_ms - ch.created_ms);
-    this.broadcastRow(auditKey(ch.approve_token), 'update');
+    this.audit.finalize(ch.approve_token, 'rejected', ch.finalized_ms - ch.created_ms);
+    this.audit.broadcastRow(auditKey(ch.approve_token), 'update');
 
     // Edit the Feishu / Slack App message to ❌ 已拒绝.
-    this.feishuEdit(ch, 'rejected', {});
-    this.slackAppEdit(ch, 'rejected', {});
+    this.notifications.edit(ch, 'rejected', {});
 
     return new Response('ok');
   }
@@ -2232,50 +1577,8 @@ export class AccountDO extends DurableObject<Env> {
 
   // Read-only audit query for the admin page. Cursor pagination by id DESC.
   private async opAuditQuery(url: URL): Promise<Response> {
-    const q = url.searchParams;
-    const limRaw = parseInt(q.get('limit') ?? '100', 10);
-    const limit = Math.min(Math.max(Number.isFinite(limRaw) ? limRaw : 100, 1), 500);
-
-    const conds: string[] = [];
-    const binds: (string | number)[] = [];
-    const beforeId = q.get('before_id');
-    if (beforeId && /^\d+$/.test(beforeId)) { conds.push('id < ?'); binds.push(parseInt(beforeId, 10)); }
-    // after_seq: reconnect catch-up. Selects rows whose seq advanced past the
-    // client's high-water mark — an id cursor cannot do this because a lifecycle
-    // UPDATE bumps seq but not id. When present, order ASC by seq (chronological
-    // replay) instead of the default id DESC (newest-first list).
-    const afterSeqRaw = q.get('after_seq');
-    const useAfterSeq = afterSeqRaw != null && /^\d+$/.test(afterSeqRaw);
-    if (useAfterSeq) { conds.push('seq > ?'); binds.push(parseInt(afterSeqRaw!, 10)); }
-    const status = q.get('status');
-    // 'cache' is a pseudo-filter selecting records that ARMED a DEK cache (the
-    // approvals where a TTL was chosen → cache_ttl_s set). It deliberately
-    // EXCLUDES cache-event rows (hits/cleared/write_failed, op_kind='cache',
-    // cache_ttl_s NULL) — those are consumption logs, not "records with a cache".
-    if (status === 'cache') { conds.push(`cache_ttl_s IS NOT NULL`); }
-    else if (status) { conds.push('status = ?'); binds.push(status); }
-    const host = q.get('host');
-    if (host) { conds.push('host = ?'); binds.push(host); }
-    // Filter by row origin (ceremony / cache / agent). Independent of `status`.
-    const source = q.get('source');
-    if (source) { conds.push('source = ?'); binds.push(source); }
-
-    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
-    const order = useAfterSeq ? 'ORDER BY seq ASC' : 'ORDER BY id DESC';
-    const sql =
-      `SELECT ${AUDIT_SELECT_COLS}
-       FROM audit ${where} ${order} LIMIT ?`;
-    binds.push(limit);
-
     try {
-      const rows = this.ctx.storage.sql.exec(sql, ...binds).toArray() as unknown as AuditRow[];
-      // Current high-water mark, so the client can set its reconnect cursor even
-      // when this page returns no rows (e.g. an empty initial load).
-      const snapRow = this.ctx.storage.sql
-        .exec<{ m: number }>(`SELECT COALESCE(MAX(seq), 0) AS m FROM audit`)
-        .toArray()[0];
-      const resp: AuditQueryResponse = { rows, snapshot_seq: snapRow?.m ?? 0 };
-      return Response.json(resp);
+      return Response.json(this.audit.query(url.searchParams));
     } catch (e) {
       logErr('audit.query_failed', e);
       return new Response('audit query failed', { status: 500 });
