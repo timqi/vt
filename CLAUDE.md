@@ -122,8 +122,11 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   `truncated`-capped `scanCacheGroups`, and reports the count storage actually
   removed. A revoke that answers `200 {"cleared":0}` for entries it never reached
   is read as a completed revocation; if a clear cannot finish it must fail loudly.
-  Batched storage deletes must stay chunked to the platform's 128-key limit — an
-  over-long `delete()` throws and removes NOTHING. The real-time 免审批 push (Pushover / Slack / Slack App / Feishu)
+  EVERY multi-key storage call must stay chunked to the platform's 128-key limit
+  — `get()`, `put()` and `delete()` all throw on a longer array, and a ceremony
+  may carry up to 256 salts: an over-long `delete()` removes NOTHING while its
+  caller reports success, and an over-long `get()` turns a routine cache miss
+  into a 500 on the decrypt hot path. The real-time 免审批 push (Pushover / Slack / Slack App / Feishu)
   is separately opt-in via the `CACHE_HIT_NOTIFY` var and off by default —
   it is too noisy on busy hosts. Never make the audit row conditional on it.
 - `auth@vt` and `run@vt` always require a fresh approval. Do not add them to

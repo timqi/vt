@@ -746,6 +746,22 @@ export class AccountDO extends DurableObject<Env> {
     return deleted;
   }
 
+  // Read an arbitrary number of keys, in the batches the platform accepts.
+  //
+  // Same STORAGE_BATCH cap as delete()/put(): a longer array THROWS, which on
+  // the cache-read path turns a clean `{miss:true}` into a 500. The chunk
+  // boundaries depend only on keys.length, never on which key is present, so
+  // this keeps the batched-lookup property the caller relies on — response
+  // timing must not leak the position of the first miss.
+  private async getKeysBatched(keys: string[]): Promise<Map<string, CacheEntry>> {
+    const out = new Map<string, CacheEntry>();
+    for (let i = 0; i < keys.length; i += STORAGE_BATCH) {
+      const part = await this.ctx.storage.get<CacheEntry>(keys.slice(i, i + STORAGE_BATCH));
+      for (const [k, v] of part) out.set(k, v);
+    }
+    return out;
+  }
+
   // Delete every `dek:` entry `pick` selects, paging the prefix to its END.
   //
   // This is the REVOKE direction, so completeness is the contract. Unlike
@@ -1436,10 +1452,12 @@ export class AccountDO extends DurableObject<Env> {
     for (const s of salts) { if (!isB64uString(s)) return miss(); }
 
     const ctx = await cacheCtx(ip, pwd);
-    // Batch the lookups (M2): one storage.get over all keys, so response timing
-    // does not leak the position of the first miss.
+    // Batch the lookups (M2): the whole key set is read before anything is
+    // decided, so response timing does not leak the position of the first miss.
+    // Batched via getKeysBatched because salts may run to 256, twice the
+    // STORAGE_BATCH cap a single get() accepts.
     const keys = salts.map(s => cacheKey(ctx, s));
-    const map = await this.ctx.storage.get<CacheEntry>(keys);
+    const map = await this.getKeysBatched(keys);
 
     const now = Date.now();
     const orphaned: string[] = [];
