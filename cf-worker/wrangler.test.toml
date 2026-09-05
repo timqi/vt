@@ -1,0 +1,61 @@
+# wrangler.test.toml — Worker config used ONLY by the vitest Workers pool.
+#
+# The real `wrangler.toml` is gitignored (it carries account/Access ids), so the
+# Durable Object tests cannot depend on it being present. This file is the
+# committed, deterministic equivalent: same entrypoint, same DO binding, same
+# SQLite migration as `wrangler.toml.example`, with fixture values for the vars.
+#
+# EVERY secret-shaped value here is an obviously-fake, throwaway test fixture. It
+# authorizes nothing anywhere: CACHE_SECKEY is a counting pattern, and the single
+# enrolled credential's private half lives in `test/do_helpers.ts` (a keypair
+# generated for this test suite alone, so a full WebAuthn ceremony can be driven
+# end-to-end offline). Never point this file at a real deployment.
+
+name = "vt-passkey-test"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Same binding name + class the production config uses, so the DO under test is
+# reached exactly the way index.ts reaches it (env.ACCOUNT).
+[[durable_objects.bindings]]
+name = "ACCOUNT"
+class_name = "AccountDO"
+
+# SQLite-backed DO: AccountDO's audit table lives in ctx.storage.sql.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AccountDO"]
+
+[vars]
+WORKER_ORIGIN = "https://vt.test.invalid"
+RP_ID = "vt.test.invalid"
+
+# Cloudflare Access is left UNCONFIGURED on purpose: empty values make the admin
+# surface fail closed (403), which is itself an invariant worth exercising.
+ACCESS_TEAM_DOMAIN = ""
+ACCESS_AUD = ""
+
+VT_AUTH_CF = ""
+
+# Fake 32-byte X25519 secret (bytes 0x01..0x20, b64u) — a counting pattern, not a
+# key anyone generated for use. The tests derive the matching public key from it
+# at runtime via cachePublicKey(), exactly as the Worker does.
+CACHE_SECKEY = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
+
+# One enrolled test credential. `p` is the COSE public key of the throwaway
+# P-256 keypair in test/do_helpers.ts; `k` is filler (the wrapped master key is
+# never touched by the Worker). No real authenticator ever produced this.
+CREDENTIALS_JSON = '{"v":1,"epoch":1,"c":[{"h":"L0JnHXnwlzt3HXjLqjzbrgit2WcsVKLQIAFOIdeGB3s","i":"dnQtdGVzdC1jcmVkZW50aWFs","k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","p":"pQECAyYgASFYIIM-1_8pVqW7YUwLEF1aZb4dIBZimOydM-fAJpdQX9N8IlggIcsGbg-NW_rShPt68QxCXmBA7dV9v8NEw2B2OqvOW_4","l":"test-passkey","t":1716105600}]}'
+
+# Channels off — the DO must never need a third party to run its cache logic.
+PUSHOVER_JSON = ""
+SLACK_JSON = ""
+SLACK_APP_JSON = ""
+FEISHU_JSON = ""
+
+# Both cache toggles OFF by default: the tests that need them on set them
+# explicitly, which is the point (a kill switch must be observable in both
+# positions).
+CACHE_HIT_NOTIFY = "0"
+CACHE_ADMIN_EXTEND = "0"
