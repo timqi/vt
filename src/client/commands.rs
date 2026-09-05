@@ -5,7 +5,9 @@
 use std::io::{self, IsTerminal, Write};
 
 use super::{get_hostname, VTClient};
-use crate::core::{has_vt_url, iter_vt_urls, sanitize_for_display, EncryptItem, SecretType};
+use crate::core::{
+    has_vt_url, iter_vt_urls, sanitize_for_display, CryptoResItem, EncryptItem, SecretType,
+};
 use anyhow::{ensure, Context, Result};
 use tracing::debug;
 
@@ -180,8 +182,7 @@ pub async fn rewrap(
     let mut pairs: Vec<(std::path::PathBuf, String)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for f in &files {
-        let text = std::fs::read_to_string(f)
-            .with_context(|| format!("Failed to read file: {}", f.display()))?;
+        let (text, _) = read_rewrap_file(f)?;
         for (s, e) in find_legacy_urls(&text) {
             let url = text[s..e].to_string();
             if seen.insert(url.clone()) {
@@ -318,8 +319,7 @@ pub async fn rewrap(
 
     let mut total: usize = 0;
     for f in &files {
-        let text = std::fs::read_to_string(f)
-            .with_context(|| format!("Failed to read file: {}", f.display()))?;
+        let (text, mode) = read_rewrap_file(f)?;
         let mut count: usize = 0;
         for old in url_map.keys() {
             count += text.matches(old.as_str()).count();
@@ -331,39 +331,7 @@ pub async fn rewrap(
         for (old, new) in &url_map {
             new_text = new_text.replace(old.as_str(), new.as_str());
         }
-        // Write sidecars with O_NOFOLLOW so a pre-planted symlink at the
-        // backup/tmp path can't redirect the write to overwrite an arbitrary
-        // target. create+truncate keeps rewrap re-runnable for a regular file.
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let nofollow_write = |path: &std::ffi::OsStr, data: &[u8]| -> Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(path)
-                .with_context(|| {
-                    format!(
-                        "Failed to open (refuses symlinks): {}",
-                        std::path::Path::new(path).display()
-                    )
-                })?;
-            file.write_all(data).with_context(|| {
-                format!("Failed to write: {}", std::path::Path::new(path).display())
-            })?;
-            Ok(())
-        };
-        if backup {
-            let mut backup_path = f.clone().into_os_string();
-            backup_path.push(".vt-rewrap-backup");
-            nofollow_write(&backup_path, text.as_bytes())?;
-        }
-        let mut tmp_path = f.clone().into_os_string();
-        tmp_path.push(".vt-rewrap-tmp");
-        nofollow_write(&tmp_path, new_text.as_bytes())?;
-        std::fs::rename(&tmp_path, f)
-            .with_context(|| format!("Failed to atomically replace: {}", f.display()))?;
+        write_rewrapped_file(f, text.as_bytes(), new_text.as_bytes(), mode, backup)?;
         if backup {
             println!(
                 "  {}: {} substitution(s); backup at {}.vt-rewrap-backup",
@@ -392,60 +360,160 @@ pub async fn rewrap(
     Ok(())
 }
 
+/// Read content and mode through the same no-follow descriptor. Rewrap must
+/// not replace a private config using the process's default creation mode.
+fn read_rewrap_file(path: &std::path::Path) -> Result<(String, u32)> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("Failed to open (refuses symlinks): {}", path.display()))?;
+    let md = f.metadata()?;
+    ensure!(md.is_file(), "Not a regular file: {}", path.display());
+    let mut text = String::new();
+    f.read_to_string(&mut text)
+        .with_context(|| format!("Failed to read file: {}", path.display()))?;
+    Ok((text, md.mode() & 0o7777))
+}
+
+fn write_new_private_file(path: &std::path::Path, data: &[u8]) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("Failed to create exclusive sidecar: {}", path.display()))?;
+    if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
+        let _ = std::fs::remove_file(path);
+        return Err(e).with_context(|| format!("Failed to write sidecar: {}", path.display()));
+    }
+    Ok(f)
+}
+
+fn write_rewrapped_file(
+    target: &std::path::Path,
+    original: &[u8],
+    replacement: &[u8],
+    mode: u32,
+    backup: bool,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut tmp_path = target.as_os_str().to_os_string();
+    tmp_path.push(".vt-rewrap-tmp");
+    let tmp_path = std::path::Path::new(&tmp_path);
+    let tmp = write_new_private_file(tmp_path, replacement)?;
+    let result = (|| -> Result<()> {
+        if backup {
+            let mut backup_path = target.as_os_str().to_os_string();
+            backup_path.push(".vt-rewrap-backup");
+            write_new_private_file(std::path::Path::new(&backup_path), original)?;
+        }
+        // fchmod after filling defeats umask without a world-readable creation
+        // window. Backups remain private: the config can contain other secrets.
+        tmp.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        tmp.sync_all()?;
+        std::fs::rename(tmp_path, target)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp_path);
+    }
+    result.with_context(|| format!("Failed to atomically replace: {}", target.display()))
+}
+
 pub(super) async fn decrypt_from_multi_str(
     vt_client: VTClient,
     original_str_vec: Vec<String>,
     command: String,
 ) -> Result<Vec<String>> {
-    let mut encrypted_vec = Vec::<String>::new();
-    // Extract `vt://...` patterns. Matches both v2 (`vt://0...`) and legacy
-    // (`vt://mac/0...`) shapes; the optional `mac/` segment lets new and old
-    // URLs coexist during migration. Body chars are base64url-no-pad.
-    for item in &original_str_vec {
-        for url in iter_vt_urls(item) {
-            debug!("Found encrypted item: {}", url);
-            encrypted_vec.push(url.to_string());
-        }
-    }
-
+    let plan = SubstitutionPlan::new(original_str_vec);
     let res = vt_client
-        .decrypt(&get_hostname(), &command, &encrypted_vec)
+        .decrypt(&get_hostname(), &command, &plan.encrypted)
         .await?;
-    ensure!(
-        res.len() == encrypted_vec.len(),
-        "Expected same number of items in response"
-    );
-    let decrypted_vec: Vec<String> = res
-        .into_iter()
-        .map(|item| {
-            if item.err_message.is_empty() {
-                item.result
-            } else {
-                item.err_message
+    plan.apply(res)
+}
+
+/// Only original URL spans can be substituted: plaintext containing another
+/// record is a literal value, never a second request for substitution.
+struct SubstitutionPlan {
+    originals: Vec<String>,
+    encrypted: Vec<String>,
+    spans: Vec<Vec<(std::ops::Range<usize>, usize)>>,
+}
+
+impl SubstitutionPlan {
+    fn new(originals: Vec<String>) -> Self {
+        let mut encrypted = Vec::new();
+        let mut indices = std::collections::HashMap::new();
+        let mut spans = Vec::with_capacity(originals.len());
+        for text in &originals {
+            let mut matches = Vec::new();
+            let mut cursor = 0;
+            for url in iter_vt_urls(text) {
+                let index = *indices.entry(url).or_insert_with(|| {
+                    encrypted.push(url.to_string());
+                    encrypted.len() - 1
+                });
+                // The scanner returns slices in encounter order. Searching
+                // only the remaining suffix keeps total scanning linear.
+                let start = cursor + text[cursor..].find(url).expect("URL came from this suffix");
+                cursor = start + url.len();
+                matches.push((start..cursor, index));
             }
-        })
-        .collect();
-
-    // Create a mapping from encrypted vault items to decrypted values.
-    // DO NOT log `secret_map` — values are decrypted plaintext.
-    let mut secret_map = std::collections::HashMap::new();
-    for (i, encrypted) in encrypted_vec.iter().enumerate() {
-        if i < decrypted_vec.len() {
-            secret_map.insert(encrypted.clone(), decrypted_vec[i].clone());
+            spans.push(matches);
+        }
+        Self {
+            originals,
+            encrypted,
+            spans,
         }
     }
 
-    // Replace encrypted vault items with decrypted values in original strings
-    let mut result_vec = Vec::new();
-    for original_str in original_str_vec {
-        let mut result_str = original_str.clone();
-        for (encrypted_item, decrypted_value) in &secret_map {
-            result_str = result_str.replace(encrypted_item, decrypted_value);
-        }
-        result_vec.push(result_str);
-    }
+    fn apply(self, results: Vec<CryptoResItem>) -> Result<Vec<String>> {
+        ensure!(
+            results.len() == self.encrypted.len(),
+            "Expected same number of items in response"
+        );
+        // Validate the WHOLE batch before returning any file/env/argv values.
+        // A per-item wire error is never a replacement secret.
+        let values = results
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                ensure!(
+                    item.err_message.is_empty(),
+                    "Failed to decrypt record {}: {}",
+                    index + 1,
+                    item.err_message
+                );
+                Ok(item.result)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-    Ok(result_vec)
+        Ok(self
+            .originals
+            .into_iter()
+            .zip(self.spans)
+            .map(|(text, spans)| {
+                if spans.is_empty() {
+                    return text;
+                }
+                let mut out = String::with_capacity(text.len());
+                let mut cursor = 0;
+                for (range, index) in spans {
+                    out.push_str(&text[cursor..range.start]);
+                    out.push_str(&values[index]);
+                    cursor = range.end;
+                }
+                out.push_str(&text[cursor..]);
+                out
+            })
+            .collect())
+    }
 }
 
 /// Whether an environment variable enters the decrypt pipeline: its value must
@@ -459,6 +527,168 @@ pub(super) fn env_var_in_scope(key: &str, value: &str, only_env: Option<&[String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn success(value: &str) -> CryptoResItem {
+        CryptoResItem {
+            result: value.into(),
+            err_message: String::new(),
+        }
+    }
+
+    #[test]
+    fn substitution_deduplicates_records_in_encounter_order() {
+        let plan = SubstitutionPlan::new(vec![
+            "vt://0abc + vt://mac/1def + vt://0abc".into(),
+            "prefix vt://0abcxyz suffix vt://0abc".into(),
+        ]);
+        assert_eq!(
+            plan.encrypted,
+            ["vt://0abc", "vt://mac/1def", "vt://0abcxyz"]
+        );
+        assert_eq!(
+            plan.apply(vec![success("short"), success("code"), success("long")])
+                .unwrap(),
+            ["short + code + short", "prefix long suffix short"],
+        );
+    }
+
+    #[test]
+    fn substitution_never_rescans_inserted_plaintext() {
+        let plan = SubstitutionPlan::new(vec!["前 vt://0abc / vt://0abcdef 后".into()]);
+        assert_eq!(
+            plan.apply(vec![success("literal vt://0abcdef"), success("value")])
+                .unwrap(),
+            ["前 literal vt://0abcdef / value 后"],
+        );
+    }
+
+    #[test]
+    fn substitution_rejects_entire_mixed_batch_without_plaintext_output() {
+        let plan = SubstitutionPlan::new(vec!["vt://0abc vt://0def".into()]);
+        let err = plan
+            .apply(vec![
+                success("decrypted-value"),
+                CryptoResItem {
+                    result: "discarded-value".into(),
+                    err_message: "authentication failed".into(),
+                },
+            ])
+            .unwrap_err();
+        assert!(err.to_string().contains("record 2"));
+        assert!(!err.to_string().contains("decrypted-value"));
+        assert!(!err.to_string().contains("discarded-value"));
+    }
+
+    #[test]
+    fn substitution_checks_response_count_and_preserves_plain_inputs() {
+        assert!(SubstitutionPlan::new(vec!["vt://0abc".into()])
+            .apply(vec![])
+            .is_err());
+        assert!(SubstitutionPlan::new(vec![])
+            .apply(vec![success("unexpected")])
+            .is_err());
+        let originals = vec![String::new(), "no record, just vt://".into()];
+        assert_eq!(
+            SubstitutionPlan::new(originals.clone())
+                .apply(vec![])
+                .unwrap(),
+            originals
+        );
+    }
+
+    fn rewrap_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vt-rewrap-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rewrap_preserves_permissions_even_with_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "VT_TEST_REWRAP_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "client::commands::tests::rewrap_preserves_permissions_even_with_permissive_umask",
+            ])
+            .env(CHILD, "1");
+            // umask is process-global: change it only in a self-exec'd child,
+            // never in the multithreaded test runner.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::umask(0);
+                    Ok(())
+                });
+            }
+            assert!(cmd.status().unwrap().success());
+            return;
+        }
+        for mode in [0o600, 0o640, 0o400] {
+            let dir = rewrap_test_dir(&format!("mode-{mode}"));
+            let target = dir.join("config");
+            std::fs::write(&target, b"unrelated private field; legacy ciphertext").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
+            let (text, captured) = read_rewrap_file(&target).unwrap();
+            write_rewrapped_file(&target, text.as_bytes(), b"rewrapped", captured, true).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"rewrapped");
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+            let backup = dir.join("config.vt-rewrap-backup");
+            assert_eq!(std::fs::read(&backup).unwrap(), text.as_bytes());
+            assert_eq!(
+                std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(!dir.join("config.vt-rewrap-tmp").exists());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn rewrap_refuses_existing_sidecars_without_overwriting_them() {
+        for suffix in [".vt-rewrap-tmp", ".vt-rewrap-backup"] {
+            for kind in ["regular", "symlink", "hardlink"] {
+                let dir = rewrap_test_dir(&format!("existing-{suffix}-{kind}"));
+                let target = dir.join("config");
+                let other = dir.join("other");
+                let sidecar = dir.join(format!("config{suffix}"));
+                std::fs::write(&target, b"original").unwrap();
+                std::fs::write(&other, b"unrelated").unwrap();
+                match kind {
+                    "regular" => std::fs::write(&sidecar, b"unrelated").unwrap(),
+                    "symlink" => std::os::unix::fs::symlink(&other, &sidecar).unwrap(),
+                    _ => std::fs::hard_link(&other, &sidecar).unwrap(),
+                }
+                assert!(
+                    write_rewrapped_file(&target, b"original", b"replacement", 0o600, true)
+                        .is_err()
+                );
+                assert_eq!(std::fs::read(&target).unwrap(), b"original");
+                assert_eq!(std::fs::read(&other).unwrap(), b"unrelated");
+                assert_eq!(std::fs::read(&sidecar).unwrap(), b"unrelated");
+                if suffix.ends_with("backup") {
+                    assert!(!dir.join("config.vt-rewrap-tmp").exists());
+                }
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rewrap_read_refuses_symlinks_and_nonregular_files() {
+        let dir = rewrap_test_dir("read-nofollow");
+        let target = dir.join("config");
+        let link = dir.join("link");
+        std::fs::write(&target, b"original").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_rewrap_file(&link).is_err());
+        assert!(read_rewrap_file(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn only_env_scopes_decryption() {

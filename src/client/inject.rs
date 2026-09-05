@@ -156,6 +156,7 @@ pub async fn inject(
 
     // Plaintext exposure protocol when -r is set:
     //   1. Open target with O_NOFOLLOW, stat to capture mode + reject non-regular.
+    //      Reserve an EMPTY tmp and retain its fd (no plaintext yet).
     //   2. Write a backup file alongside the target (ciphertext copy,
     //      O_CREAT|O_EXCL|O_NOFOLLOW, mode = orig) at the DETERMINISTIC
     //      per-target path `.{name}.vt-backup`. The backup doubles as the
@@ -163,13 +164,18 @@ pub async fn inject(
     //      same target fails EEXIST here instead of snapshotting the exposed
     //      plaintext as its "ciphertext" backup — which its supervisor would
     //      later restore permanently.
-    //   3. Spawn the detached supervisor before any plaintext can hit disk.
-    //      Failure here deletes the backup and aborts — target stays ciphertext.
-    //   4. Write the tmp file (plaintext, same hidden-name rules as backup).
+    //   3. Record recovery, then spawn the detached supervisor before any
+    //      plaintext can hit disk.
+    //   4. Write plaintext through that fd, NEVER reopening the tmp path.
     //   5. rename(tmp, target) — atomic plaintext exposure.
     //   6. Parent execs the user command; supervisor restores after timeout.
     //
-    // Steps 4, 5, and 6 each call `restore_exposure` on failure so the
+    // Every restorer unlinks tmp before consuming the backup. If it wins the
+    // unlink-vs-publish rename race, a delayed parent can only write an unlinked
+    // inode and its rename fails. If publication wins, restoration overwrites
+    // the target. Creating tmp after arming would reopen publication after the
+    // supervisor had already restored and exited.
+    // Steps 3, 4, 5, and 6 each call `restore_exposure` on failure so the
     // observable post-failure state normally collapses to "target =
     // ciphertext, no sidecars" without waiting for the supervisor — under
     // the same generation check the supervisor applies: a parent suspended
@@ -213,6 +219,11 @@ pub async fn inject(
             .map(|d| d.join(format!("{suffix}.json")))
             .unwrap_or_else(|| dir.join(format!(".{}.vt-recover-{}.json", file_name, suffix)));
 
+        // Create the publication path exactly once, while it is still empty.
+        // A collision must not remove a tmp file this exposure did not create.
+        // Reserving it before the backup also makes setup failure cleanup local.
+        let mut tmp_file = create_plaintext_tmp(&tmp_path, orig_mode)?;
+
         // Step 2: write backup from the in-memory ORIGINAL bytes (captured at
         // the single O_NOFOLLOW open above) — NOT a fresh re-read of the target,
         // which would be a TOCTOU window for a directory-writable attacker.
@@ -226,6 +237,7 @@ pub async fn inject(
                 // supervisor left one). The pre-decrypt check already refused
                 // the common case; this is the authoritative race-free gate.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = cancel_publication(&tmp_path);
                     return Err(exposure_conflict_refusal(
                         replace_file_path,
                         &backup_path,
@@ -233,6 +245,7 @@ pub async fn inject(
                     ));
                 }
                 Err(e) => {
+                    let _ = cancel_publication(&tmp_path);
                     return Err(e).with_context(|| {
                         format!("Failed to write backup file: {}", backup_path.display())
                     });
@@ -245,25 +258,10 @@ pub async fn inject(
         // can pair its expired deadline with the backup just created.
         retire_stale_sidecars_for(&backup_path, inject_state_dir().as_deref());
 
-        // Step 3: arm supervisor before any plaintext touches disk.
-        match spawn_restore_supervisor(
-            timeout,
-            &tmp_path,
-            &backup_path,
-            replace_file_path,
-            &sidecar_path,
-            backup_id,
-        ) {
-            Ok(()) => debug!("Restore supervisor armed (timeout={}s)", timeout),
-            Err(e) => {
-                let _ = std::fs::remove_file(&backup_path);
-                return Err(e);
-            }
-        }
-
-        // Step 3b: write the crash-recovery sidecar (before any plaintext hits
-        // disk). Best-effort — losing it only forfeits reboot recovery for this
-        // one injection, so a failure warns rather than aborts.
+        // Record recovery before spawning: a stalled startup is cancellable by
+        // --recover. The deadline bounds startup too; cancellation makes any
+        // subsequent publication fail closed. The supervisor's own timeout
+        // still starts when its detached process begins sleeping.
         let sidecar = InjectSidecar {
             target: absolutize(std::path::Path::new(replace_file_path))
                 .to_string_lossy()
@@ -282,11 +280,22 @@ pub async fn inject(
             );
         }
 
-        // Step 4: write tmp (plaintext). Parent-side cleanup here (and in
-        // steps 5/6) normally leaves no visible sidecar state for the
-        // timeout window; the supervisor later observes ENOENT on the
-        // backup and exits silently.
-        if let Err(e) = write_plaintext_tmp(&tmp_path, orig_mode, &decrypted_file_content) {
+        if let Err(e) = spawn_restore_supervisor(
+            timeout,
+            &tmp_path,
+            &backup_path,
+            replace_file_path,
+            &sidecar_path,
+            backup_id,
+        ) {
+            restore_exposure(&tmp_path, &backup_path, orig_path, &sidecar_path, backup_id);
+            return Err(e);
+        }
+        debug!("Restore supervisor armed (timeout={}s)", timeout);
+
+        // Step 4: only the retained fd can receive plaintext. In particular,
+        // never recreate tmp if a restorer has already unlinked its name.
+        if let Err(e) = write_plaintext_tmp(&mut tmp_file, &decrypted_file_content) {
             restore_exposure(
                 &tmp_path,
                 &backup_path,
@@ -362,20 +371,34 @@ struct ArmedExposure {
     backup_id: (u64, u64),
 }
 
-fn write_plaintext_tmp(tmp: &std::path::Path, mode: u32, content: &str) -> Result<()> {
+fn create_plaintext_tmp(tmp: &std::path::Path, mode: u32) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut tmp_file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .custom_flags(libc::O_NOFOLLOW)
         .mode(mode)
         .open(tmp)
-        .with_context(|| format!("Failed to create temp file: {}", tmp.display()))?;
+        .with_context(|| format!("Failed to create temp file: {}", tmp.display()))
+}
+
+fn write_plaintext_tmp(tmp_file: &mut std::fs::File, content: &str) -> Result<()> {
     tmp_file
         .write_all(content.as_bytes())
-        .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
+        .context("Failed to write temp file")?;
     tmp_file.sync_all().ok();
     Ok(())
+}
+
+/// Cancellation must succeed before any restore consumes the ciphertext
+/// backup. A delayed publisher still holds the tmp fd, but cannot recreate its
+/// name. Other unlink errors leave the backup and recovery record intact.
+fn cancel_publication(tmp: &std::path::Path) -> io::Result<()> {
+    match std::fs::remove_file(tmp) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // ── Crash-recovery sidecar ──────────────────────────────────────────────────
@@ -398,19 +421,20 @@ struct InjectSidecar {
     backup: String,
     /// The plaintext tmp file, removed on recovery if it was orphaned.
     tmp: String,
-    /// Epoch ms after which the supervisor should already have restored; past
-    /// this (plus a grace) a surviving backup means the supervisor died.
+    /// Arm-time wall-clock deadline. Past this plus a grace period, recovery
+    /// may cancel a stalled startup or restore an orphaned exposure even if a
+    /// delayed supervisor has not yet finished its own timeout.
     deadline_ms: u64,
     /// `(st_dev, st_ino)` of the backup at creation — the generation id that
     /// distinguishes THIS exposure's backup from a successor at the same
     /// deterministic path. `None` on records written by builds without the
-    /// id; those keep existence-only matching.
+    /// id; those rely on the backup's mtime ordering bound.
     #[serde(default)]
     backup_id: Option<(u64, u64)>,
 }
 
-/// Wait past the deadline by this much before `--recover` acts, so a
-/// legitimately-still-sleeping supervisor is never raced.
+/// Allow ordinary supervisor startup/scheduling delay before recovery cancels
+/// an exposure. Publication cancellation also makes a late startup safe.
 const RECOVER_GRACE_MS: u64 = 5_000;
 
 /// What `--recover` should do with one sidecar entry.
@@ -852,48 +876,58 @@ pub fn inject_recover() -> Result<()> {
                 continue;
             }
         };
-        let backup_survives = match probe_sidecar_backup(&sc) {
-            BackupProbe::Ours => true,
-            BackupProbe::Gone => false,
-            // Transient stat failure: leave the record for a later sweep —
-            // cleaning it now could orphan exposed plaintext whose backup
-            // still exists behind the error.
-            BackupProbe::Unknown => {
-                eprintln!(
-                    "vt inject --recover: cannot stat backup {}; leaving {} for a later sweep",
-                    sc.backup,
-                    path.display()
-                );
-                active += 1;
-                continue;
-            }
-        };
-        match plan_recovery(sc.deadline_ms, backup_survives, now) {
-            Some(RecoverAction::Restore) => {
-                let _ = std::fs::remove_file(&sc.tmp);
-                if let Err(e) = std::fs::rename(&sc.backup, &sc.target) {
-                    eprintln!(
-                        "vt inject --recover: failed to restore {} from {}: {}",
-                        sc.target, sc.backup, e
-                    );
-                    continue; // leave the sidecar so a later sweep retries
-                }
-                let _ = std::fs::remove_file(&path);
+        match recover_sidecar(&sc, &path, now) {
+            Ok(Some(RecoverAction::Restore)) => {
                 println!("vt inject --recover: restored {}", sc.target);
                 restored += 1;
             }
-            Some(RecoverAction::CleanStale) => {
-                let _ = std::fs::remove_file(&sc.tmp);
-                let _ = std::fs::remove_file(&path);
-                cleaned += 1;
+            Ok(Some(RecoverAction::CleanStale)) => cleaned += 1,
+            Ok(None) => active += 1,
+            Err(e) => {
+                eprintln!(
+                    "vt inject --recover: cannot recover {}: {e:#}; leaving sidecar",
+                    sc.target
+                );
+                active += 1;
             }
-            None => active += 1,
         }
     }
     println!(
         "vt inject --recover: {restored} restored, {cleaned} stale cleaned, {active} still active"
     );
     Ok(())
+}
+
+/// Recovery uses the same publication cancellation as the live supervisor.
+/// Re-probe after cancellation: another restorer may have finished while this
+/// one was suspended, leaving a successor at the deterministic backup path.
+fn recover_sidecar(
+    sc: &InjectSidecar,
+    path: &std::path::Path,
+    now: u64,
+) -> Result<Option<RecoverAction>> {
+    let survives = match probe_sidecar_backup(sc) {
+        BackupProbe::Ours => true,
+        BackupProbe::Gone => false,
+        BackupProbe::Unknown => anyhow::bail!("cannot stat backup {}", sc.backup),
+    };
+    let Some(mut action) = plan_recovery(sc.deadline_ms, survives, now) else {
+        return Ok(None);
+    };
+    cancel_publication(std::path::Path::new(&sc.tmp))
+        .with_context(|| format!("cannot cancel publication at {}", sc.tmp))?;
+    if action == RecoverAction::Restore {
+        match probe_sidecar_backup(sc) {
+            BackupProbe::Ours => {
+                std::fs::rename(&sc.backup, &sc.target)
+                    .with_context(|| format!("cannot restore backup {}", sc.backup))?;
+            }
+            BackupProbe::Gone => action = RecoverAction::CleanStale,
+            BackupProbe::Unknown => anyhow::bail!("cannot stat backup {}", sc.backup),
+        }
+    }
+    let _ = std::fs::remove_file(path);
+    Ok(Some(action))
 }
 
 /// Spawn the restore supervisor as a self-exec'd child. The intermediate
@@ -996,10 +1030,16 @@ fn restore_exposure(
     armed_id: (u64, u64),
 ) {
     use std::os::unix::fs::MetadataExt;
-    // Wipe any orphaned plaintext tmp first. If the parent crashed between
-    // write_plaintext_tmp and rename(tmp,target), this is the only path that
-    // removes it. Random-suffixed per run, so never another run's tmp.
-    let _ = std::fs::remove_file(tmp);
+    // Cancel publication even if the parent has not written plaintext yet.
+    // A real unlink failure must never consume its only restoration source.
+    if let Err(e) = cancel_publication(tmp) {
+        eprintln!(
+            "vt inject: cannot cancel publication at {}: {}; leaving backup and sidecar",
+            tmp.display(),
+            e
+        );
+        return;
+    }
     let ours = match std::fs::symlink_metadata(backup) {
         Ok(md) => md.dev() == armed_id.0 && md.ino() == armed_id.1,
         // Gone: the parent (or --recover) already restored this exposure.
@@ -1714,6 +1754,324 @@ mod tests {
             "got: {err}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct MixedDecryptAgent;
+
+    impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for MixedDecryptAgent {
+        fn new_session(
+            &mut self,
+            _: &tokio::net::UnixStream,
+        ) -> impl ssh_agent_lib::agent::Session {
+            Self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ssh_agent_lib::agent::Session for MixedDecryptAgent {
+        async fn extension(
+            &mut self,
+            extension: ssh_agent_lib::proto::Extension,
+        ) -> std::result::Result<
+            Option<ssh_agent_lib::proto::Extension>,
+            ssh_agent_lib::error::AgentError,
+        > {
+            use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
+            use crate::core::wire::{ExtBody, ExtResponse, WIRE_VERSION};
+            use crate::core::{DecryptInput, DecryptReq, DecryptResItem};
+            assert_eq!(extension.name, "decrypt@vt");
+            let cipher = AesGcmCrypto::new(&decode_auth_cipher_from_b64("AA").unwrap()).unwrap();
+            let request: DecryptReq =
+                serde_json::from_slice(&cipher.decrypt(extension.details.as_ref()).unwrap())
+                    .unwrap();
+            let data: Vec<_> = request
+                .items
+                .into_iter()
+                .map(|item| {
+                    let DecryptInput::Legacy { url } = item else {
+                        panic!("legacy test request expected")
+                    };
+                    if url == "vt://mac/0good" {
+                        DecryptResItem::Legacy {
+                            result: "synthetic plaintext".into(),
+                            err_message: String::new(),
+                        }
+                    } else {
+                        DecryptResItem::Legacy {
+                            result: String::new(),
+                            err_message: "synthetic decrypt failure".into(),
+                        }
+                    }
+                })
+                .collect();
+            let bytes = serde_json::to_vec(&ExtResponse {
+                v: WIRE_VERSION,
+                body: ExtBody::Ok { data },
+            })
+            .unwrap();
+            Ok(Some(ssh_agent_lib::proto::Extension {
+                name: extension.name,
+                details: ssh_agent_lib::proto::Unparsed::from(cipher.encrypt(&bytes).unwrap()),
+            }))
+        }
+    }
+
+    #[test]
+    fn inject_mixed_failure_does_not_mutate_env_file_or_execute() {
+        const CHILD: &str = "VT_TEST_INJECT_MIXED_CHILD";
+        const ENV_SECRET: &str = "VT_TEST_INJECT_VALUE";
+        let Some(dir) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let dir = std::env::temp_dir().join(format!("vt-inject-mixed-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("config");
+            std::fs::write(&target, b"key: vt://mac/0good").unwrap();
+            // Isolate environment mutation and exec(): the unfixed code starts
+            // this shell instead of returning to the test harness.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "client::inject::tests::inject_mixed_failure_does_not_mutate_env_file_or_execute"])
+                .env(CHILD, &dir)
+                .status().unwrap();
+            assert!(status.success());
+            assert!(!dir.join("command-started").exists());
+            assert_eq!(std::fs::read(&target).unwrap(), b"key: vt://mac/0good");
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        };
+        let socket = dir.join("agent.sock");
+        std::env::set_var("SSH_AUTH_SOCK", &socket);
+        std::env::set_var(ENV_SECRET, "vt://mac/0good");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                let server =
+                    tokio::spawn(ssh_agent_lib::agent::listen(listener, MixedDecryptAgent));
+                for replace_file in [
+                    None,
+                    Some(dir.join("config").to_string_lossy().into_owned()),
+                ] {
+                    let client = VTClient {
+                        auth_token: "AA".into(),
+                        backend: crate::config::Backend::Agent,
+                    };
+                    let args = vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "printf ran > \"$1\"".into(),
+                        "sh".into(),
+                        dir.join("command-started").to_string_lossy().into_owned(),
+                        "vt://mac/0bad".into(),
+                    ];
+                    let err = inject(
+                        client,
+                        replace_file,
+                        2,
+                        None,
+                        Some(vec![ENV_SECRET.into()]),
+                        args,
+                    )
+                    .await
+                    .unwrap_err();
+                    assert!(err.to_string().contains("synthetic decrypt failure"));
+                    assert_eq!(std::env::var(ENV_SECRET).unwrap(), "vt://mac/0good");
+                    assert_eq!(
+                        std::fs::read(dir.join("config")).unwrap(),
+                        b"key: vt://mac/0good"
+                    );
+                    assert!(!dir.join(".config.vt-backup").exists());
+                    assert!(!dir.join("command-started").exists());
+                }
+                server.abort();
+                let _ = server.await;
+            });
+    }
+
+    fn prepared_exposure(
+        name: &str,
+    ) -> (
+        std::path::PathBuf,
+        ArmedExposure,
+        std::fs::File,
+        InjectSidecar,
+    ) {
+        let dir = std::env::temp_dir().join(format!("vt-inject-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("f");
+        let backup = dir.join(".f.vt-backup");
+        let tmp = dir.join(".f.vt-tmp-ab");
+        let sidecar = dir.join("sc.json");
+        std::fs::write(&target, b"ciphertext").unwrap();
+        let fd = create_plaintext_tmp(&tmp, 0o600).unwrap();
+        let backup_id = create_exposure_backup(&backup, b"ciphertext", 0o600).unwrap();
+        let sc = InjectSidecar {
+            target: target.to_string_lossy().into_owned(),
+            backup: backup.to_string_lossy().into_owned(),
+            tmp: tmp.to_string_lossy().into_owned(),
+            deadline_ms: now_ms() + 60_000,
+            backup_id: Some(backup_id),
+        };
+        write_inject_sidecar(&sidecar, &sc).unwrap();
+        let armed = ArmedExposure {
+            target: sc.target.clone(),
+            backup,
+            tmp,
+            sidecar,
+            backup_id,
+        };
+        (dir, armed, fd, sc)
+    }
+
+    fn restore_prepared(a: &ArmedExposure, sc: &InjectSidecar, recovery: bool) {
+        if recovery {
+            assert_eq!(
+                recover_sidecar(sc, &a.sidecar, sc.deadline_ms + RECOVER_GRACE_MS).unwrap(),
+                Some(RecoverAction::Restore),
+            );
+        } else {
+            restore_exposure(
+                &a.tmp,
+                &a.backup,
+                std::path::Path::new(&a.target),
+                &a.sidecar,
+                a.backup_id,
+            );
+        }
+    }
+
+    #[test]
+    fn restoration_cancels_publication_before_or_during_plaintext_write() {
+        use std::os::unix::fs::MetadataExt;
+        for recovery in [false, true] {
+            for started_write in [false, true] {
+                let name = format!("cancel-{recovery}-{started_write}");
+                let (dir, a, mut fd, sc) = prepared_exposure(&name);
+                if started_write {
+                    fd.write_all(b"first half").unwrap();
+                }
+                restore_prepared(&a, &sc, recovery);
+                // A suspended parent can still write its open file, but the
+                // inode has no publication name and must never be reopened.
+                write_plaintext_tmp(&mut fd, "late plaintext").unwrap();
+                assert_eq!(fd.metadata().unwrap().nlink(), 0);
+                assert_eq!(
+                    std::fs::rename(&a.tmp, &a.target).unwrap_err().kind(),
+                    io::ErrorKind::NotFound,
+                );
+                assert_eq!(std::fs::read(&a.target).unwrap(), b"ciphertext");
+                assert!(!a.backup.exists() && !a.sidecar.exists());
+                drop(fd);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn restoration_after_publication_restores_ciphertext() {
+        for recovery in [false, true] {
+            let (dir, a, mut fd, sc) = prepared_exposure(&format!("published-{recovery}"));
+            write_plaintext_tmp(&mut fd, "plaintext").unwrap();
+            std::fs::rename(&a.tmp, &a.target).unwrap();
+            assert_eq!(std::fs::read(&a.target).unwrap(), b"plaintext");
+            restore_prepared(&a, &sc, recovery);
+            assert_eq!(std::fs::read(&a.target).unwrap(), b"ciphertext");
+            assert!(!a.tmp.exists() && !a.backup.exists() && !a.sidecar.exists());
+            drop(fd);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn cancellation_failure_keeps_backup_and_recovery_record() {
+        for recovery in [false, true] {
+            let (dir, a, fd, sc) = prepared_exposure(&format!("unlink-failure-{recovery}"));
+            std::fs::write(&a.target, b"plaintext").unwrap();
+            // EISDIR is deterministic even for root, unlike chmod-based faults.
+            std::fs::remove_file(&a.tmp).unwrap();
+            std::fs::create_dir(&a.tmp).unwrap();
+            if recovery {
+                assert!(
+                    recover_sidecar(&sc, &a.sidecar, sc.deadline_ms + RECOVER_GRACE_MS).is_err()
+                );
+            } else {
+                restore_exposure(
+                    &a.tmp,
+                    &a.backup,
+                    std::path::Path::new(&a.target),
+                    &a.sidecar,
+                    a.backup_id,
+                );
+            }
+            assert_eq!(std::fs::read(&a.target).unwrap(), b"plaintext");
+            assert_eq!(std::fs::read(&a.backup).unwrap(), b"ciphertext");
+            assert!(a.sidecar.exists());
+            drop(fd);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_leaves_live_publication_armed_and_retries_failed_restore() {
+        let (dir, a, mut fd, sc) = prepared_exposure("recover-retry");
+        let deadline = sc.deadline_ms + RECOVER_GRACE_MS;
+        assert_eq!(
+            recover_sidecar(&sc, &a.sidecar, deadline - 1).unwrap(),
+            None
+        );
+        assert!(a.tmp.exists() && a.backup.exists() && a.sidecar.exists());
+        // A directory at the destination forces rename to fail on every user,
+        // including root; cancellation must still revoke the publisher's name.
+        std::fs::remove_file(&a.target).unwrap();
+        std::fs::create_dir(&a.target).unwrap();
+        assert!(recover_sidecar(&sc, &a.sidecar, deadline).is_err());
+        assert!(!a.tmp.exists());
+        assert!(a.backup.exists() && a.sidecar.exists());
+        write_plaintext_tmp(&mut fd, "late plaintext").unwrap();
+        assert!(std::fs::rename(&a.tmp, &a.target).is_err());
+        std::fs::remove_dir(&a.target).unwrap();
+        assert_eq!(
+            recover_sidecar(&sc, &a.sidecar, deadline).unwrap(),
+            Some(RecoverAction::Restore)
+        );
+        assert_eq!(std::fs::read(&a.target).unwrap(), b"ciphertext");
+        assert!(!a.backup.exists() && !a.sidecar.exists());
+        drop(fd);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancelled_parent_cannot_publish_over_or_restore_a_successor() {
+        let (dir, a, mut fd, sc) = prepared_exposure("cancel-successor");
+        restore_prepared(&a, &sc, true);
+        let successor = create_exposure_backup(&a.backup, b"ciphertext-B", 0o600).unwrap();
+        assert_ne!(successor, a.backup_id);
+        std::fs::write(&a.target, b"plaintext-B").unwrap();
+        write_plaintext_tmp(&mut fd, "late plaintext-A").unwrap();
+        assert!(std::fs::rename(&a.tmp, &a.target).is_err());
+        // This is also the parent's spawn/write/exec failure cleanup path.
+        restore_exposure(
+            &a.tmp,
+            &a.backup,
+            std::path::Path::new(&a.target),
+            &a.sidecar,
+            a.backup_id,
+        );
+        assert_eq!(std::fs::read(&a.target).unwrap(), b"plaintext-B");
+        assert_eq!(std::fs::read(&a.backup).unwrap(), b"ciphertext-B");
+        drop(fd);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn empty_tmp_is_exclusive_and_closes_on_exec() {
+        use std::os::fd::AsRawFd;
+        let (dir, a, fd, _) = prepared_exposure("tmp-exclusive");
+        assert_eq!(fd.metadata().unwrap().len(), 0);
+        assert!(create_plaintext_tmp(&a.tmp, 0o600).is_err());
+        assert!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC != 0);
+        drop(fd);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
