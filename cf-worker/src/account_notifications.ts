@@ -106,6 +106,19 @@ export class AccountNotifications {
     };
   }
 
+  // Merge only the delivered channel's reference into the latest challenge.
+  // Provider awaits stay outside this get/put pair; a swept record stays gone.
+  private async storeReference<K extends 'feishu_message_id' | 'slackapp'>(
+    approveToken: string, field: K, reference: NonNullable<Challenge[K]>,
+  ): Promise<Challenge | undefined> {
+    const key = `ch:${approveToken}`;
+    const current = await this.ctx.storage.get<Challenge>(key);
+    if (!current) return;
+    current[field] = reference;
+    await this.ctx.storage.put(key, current);
+    return current;
+  }
+
   // Fire the pending approval card (off the ceremony path) and write the
   // resulting message_id back onto the challenge so a later approve/reject/expire
   // can edit it. If the decision raced ahead of the send (challenge already
@@ -116,10 +129,8 @@ export class AccountNotifications {
       const id = await sendApprovalCard(
         cfg, this.feishuKv(), Date.now(), ch.meta.op_kind, ch.meta, approveUrl, chSalts(ch));
       if (!id) { logErr('feishu.send_failed', 'no message_id'); return; }
-      const cur = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
-      if (!cur) return; // expired + swept before the send returned
-      cur.feishu_message_id = id;
-      await this.ctx.storage.put(`ch:${ch.approve_token}`, cur);
+      const cur = await this.storeReference(ch.approve_token, 'feishu_message_id', id);
+      if (!cur) return;
       if (cur.status !== 'pending') {
         // Decision landed first. Edit to the terminal state now that we have the
         // id. Approver label is unavailable on this path (opApprove already ran
@@ -174,10 +185,8 @@ export class AccountNotifications {
     try {
       const ref = await sendSlackAppCard(cfg, ch.meta.op_kind, ch.meta, approveUrl, chSalts(ch));
       if (!ref) { logErr('slackapp.send_failed', 'no ts'); return; }
-      const cur = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
-      if (!cur) return; // expired + swept before the send returned
-      cur.slackapp = ref;
-      await this.ctx.storage.put(`ch:${ch.approve_token}`, cur);
+      const cur = await this.storeReference(ch.approve_token, 'slackapp', ref);
+      if (!cur) return;
       if (cur.status !== 'pending') {
         // Decision landed first — edit to the terminal state now that we have the
         // ref. Approver label is unavailable on this path (opApprove already ran

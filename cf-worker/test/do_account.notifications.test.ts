@@ -80,6 +80,84 @@ describe('AccountNotifications delivery contract', () => {
     });
   });
 
+  it.each(['feishu', 'slackapp'] as const)('merges only the %s reference into the latest terminal challenge', async (channel) => {
+    await withNotifications(async ({ notifications, state, vars, tasks, feishuSend, slackSend, feishuEdit, slackEdit }) => {
+      if (channel === 'feishu') vars.SLACK_APP_JSON = '';
+      else vars.FEISHU_JSON = '';
+      const ch = makeChallenge({
+        feishu_message_id: 'previous-feishu', slackapp: { channel: 'previous-channel', ts: '0.0' },
+      });
+      const key = `ch:${ch.approve_token}`;
+      await state.storage.put(key, ch);
+      let finishSend!: () => void;
+      if (channel === 'feishu') {
+        feishuSend.mockImplementationOnce(() => new Promise(resolve => {
+          finishSend = () => resolve('test-message');
+        }));
+      } else {
+        slackSend.mockImplementationOnce(() => new Promise(resolve => {
+          finishSend = () => resolve({ channel: 'test-channel', ts: '1.0' });
+        }));
+      }
+      notifications.approval(ch);
+      const latest: Challenge = {
+        ...ch, status: 'rejected', finalized_ms: ch.created_ms + 456,
+        meta: { ...ch.meta, command: 'latest command', host: 'latest-host' },
+      };
+      await state.storage.put(key, latest);
+      finishSend();
+      await Promise.all(tasks);
+      const reference = channel === 'feishu'
+        ? { feishu_message_id: 'test-message' }
+        : { slackapp: { channel: 'test-channel', ts: '1.0' } };
+      expect(await state.storage.get(key)).toEqual({ ...latest, ...reference });
+      if (channel === 'feishu') {
+        expect(slackEdit).not.toHaveBeenCalled();
+        expect(feishuEdit).toHaveBeenCalledOnce();
+        expect(feishuEdit.mock.calls[0]!.slice(4)).toEqual([
+          'rejected', latest.meta.op_kind, latest.meta, { latencyMs: 456 }, latest.salts_b64u.length,
+        ]);
+      } else {
+        expect(feishuEdit).not.toHaveBeenCalled();
+        expect(slackEdit).toHaveBeenCalledOnce();
+        expect(slackEdit.mock.calls[0]!.slice(2)).toEqual([
+          'rejected', latest.meta.op_kind, latest.meta, { latencyMs: 456 }, latest.salts_b64u.length,
+        ]);
+      }
+    });
+  });
+
+  it.each([
+    ['feishu', 'get'], ['feishu', 'put'], ['slackapp', 'get'], ['slackapp', 'put'],
+  ] as const)('isolates %s reference %s failures from the sibling channel', async (channel, operation) => {
+    await withNotifications(async ({ notifications, state, tasks, feishuSend, slackSend, feishuEdit, slackEdit }) => {
+      const ch = makeChallenge();
+      const key = `ch:${ch.approve_token}`;
+      await state.storage.put(key, ch);
+      const failReference = () => {
+        vi.spyOn(state.storage, operation).mockRejectedValueOnce(new Error(`synthetic reference ${operation} failure`));
+      };
+      if (channel === 'feishu') {
+        feishuSend.mockImplementationOnce(async () => { failReference(); return 'test-message'; });
+      } else {
+        slackSend.mockImplementationOnce(async () => {
+          failReference();
+          return { channel: 'test-channel', ts: '1.0' };
+        });
+      }
+      notifications.approval(ch);
+      await expect(Promise.all(tasks)).resolves.toBeDefined();
+      expect(feishuSend).toHaveBeenCalledOnce();
+      expect(slackSend).toHaveBeenCalledOnce();
+      const siblingReference = channel === 'feishu'
+        ? { slackapp: { channel: 'test-channel', ts: '1.0' } }
+        : { feishu_message_id: 'test-message' };
+      expect(await state.storage.get(key)).toEqual({ ...ch, ...siblingReference });
+      expect(feishuEdit).not.toHaveBeenCalled();
+      expect(slackEdit).not.toHaveBeenCalled();
+    });
+  });
+
   it('does not block the sibling channel when one send fails', async () => {
     await withNotifications(async ({ notifications, state, tasks, feishuSend, slackSend }) => {
       const ch = makeChallenge();
@@ -94,15 +172,28 @@ describe('AccountNotifications delivery contract', () => {
     });
   });
 
-  it('never recreates a challenge swept while delivery was pending', async () => {
-    await withNotifications(async ({ notifications, state, tasks, feishuSend, feishuEdit, slackEdit }) => {
+  it.each(['feishu', 'slackapp'] as const)('never recreates a challenge swept while %s delivery was pending', async (channel) => {
+    await withNotifications(async ({ notifications, state, tasks, feishuSend, slackSend, feishuEdit, slackEdit }) => {
       const ch = makeChallenge();
       await state.storage.put(`ch:${ch.approve_token}`, ch);
-      let finishSend!: (id: string) => void;
-      feishuSend.mockImplementationOnce(() => new Promise(resolve => { finishSend = resolve; }));
+      let finishSend!: () => void;
+      let markStarted!: () => void;
+      const sendStarted = new Promise<void>(resolve => { markStarted = resolve; });
+      if (channel === 'feishu') {
+        feishuSend.mockImplementationOnce(() => new Promise(resolve => {
+          finishSend = () => resolve('test-message');
+          markStarted();
+        }));
+      } else {
+        slackSend.mockImplementationOnce(() => new Promise(resolve => {
+          finishSend = () => resolve({ channel: 'test-channel', ts: '1.0' });
+          markStarted();
+        }));
+      }
       notifications.approval(ch);
+      await sendStarted;
       await state.storage.delete(`ch:${ch.approve_token}`);
-      finishSend('test-message');
+      finishSend();
       await Promise.all(tasks);
       expect(await state.storage.get(`ch:${ch.approve_token}`)).toBeUndefined();
       expect(feishuEdit).not.toHaveBeenCalled();
