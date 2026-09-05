@@ -464,7 +464,7 @@ pub async fn get_deks(
 
                         verify_binding(
                             &pk,
-                            &*sk,
+                            &sk,
                             &pwa_pk,
                             &approve_challenge_hash,
                             &sealed_deks_bytes,
@@ -474,7 +474,7 @@ pub async fn get_deks(
                         // Open the SAME decoded bytes the binding tag committed
                         // to — never re-decode the b64u string, so the bound and
                         // opened byte sequences are identical by construction.
-                        return open_sealed_deks(&sealed_deks_bytes, &pk, &*sk, n_deks);
+                        return open_sealed_deks(&sealed_deks_bytes, &pk, &sk, n_deks);
                     }
                     "rejected" => bail!("approval rejected by user"),
                     "expired"  => bail!("approval request expired"),
@@ -565,7 +565,7 @@ pub async fn try_cache(
     // Cache hit: open the sealed box sealed to our ephemeral pubkey. No binding
     // verification on this path (see SECURITY note above).
     let ct = URL_SAFE_NO_PAD.decode(&sealed).context("sealed_deks b64u decode")?;
-    let deks = open_sealed_deks(&ct, &pk, &*sk, salts.len())?;
+    let deks = open_sealed_deks(&ct, &pk, &sk, salts.len())?;
     Ok(Some(deks))
 }
 
@@ -634,7 +634,7 @@ fn verify_binding(
     received_tag: &[u8; 32],
 ) -> Result<()> {
     let mut shared = Zeroizing::new([0u8; 32]);
-    crypto_scalarmult(&mut *shared, daemon_sk, pwa_pk);
+    crypto_scalarmult(&mut shared, daemon_sk, pwa_pk);
     // dryoc's crypto_scalarmult does not check for the all-zero output
     if *shared == [0u8; 32] {
         bail!("binding: all-zero shared secret (low-order point)");

@@ -54,7 +54,9 @@ mod tests {
     fn derive_agent_audit_key_golden_vector() {
         // master = "test-master-token", agent_id = "AAAAAAAAAAAAAAAAAAAAAA"
         let key = derive_agent_audit_key(b"test-master-token", "AAAAAAAAAAAAAAAAAAAAAA");
-        let got = URL_SAFE_NO_PAD.encode(&*key);
+        // `as_slice()` (not `*key`) so the derived key is never copied out of
+        // its `Zeroizing` wrapper onto an unscrubbed stack slot.
+        let got = URL_SAFE_NO_PAD.encode(key.as_slice());
         // Cross-validated against an independent HKDF-SHA256 implementation
         // (RFC 5869) over the same ikm/salt/info. Locked so any formula drift
         // (info string, salt source, length) flips this value.

@@ -794,9 +794,9 @@ impl VTClient {
                 Some(bytes) => {
                     let _res: AuthRes =
                         serde_json::from_slice(&bytes).context("Failed to parse auth response")?;
-                    return Ok(());
+                    Ok(())
                 }
-                None => return Self::cf_auth(reason).await,
+                None => Self::cf_auth(reason).await,
             }
         }
 

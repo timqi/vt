@@ -195,10 +195,10 @@ pub enum Decision {
 /// unit-testable without touching the real environment. `cwd` is the working
 /// directory of the command (used to pick per-directory env-value overrides).
 ///
-/// Precedence for each named var: `[env.dirs."<cwd-prefix>"]` (longest prefix)
-/// > `[env.default]` > the process environment (agent config wins; a stray
-/// ambient env var can't override a carefully-configured per-project value).
-/// Block rules win over inject rules.
+/// Precedence for each named var: `[env.dirs."<cwd-prefix>"]` (longest
+/// prefix) > `[env.default]` > the process environment (agent config wins;
+/// a stray ambient env var can't override a carefully-configured per-project
+/// value). Block rules win over inject rules.
 pub fn decide(
     prog: &str,
     args: &[String],
@@ -609,7 +609,7 @@ fn dir_override<'a>(
                 || (cwd_n.len() > dn.len()
                     && cwd_n.starts_with(dn)
                     && cwd_n.as_bytes()[dn.len()] == b'/');
-            hit.then(|| (dn.len(), m))
+            hit.then_some((dn.len(), m))
         })
         .max_by_key(|(len, _)| *len)
         .map(|(_, m)| m)
@@ -1348,7 +1348,7 @@ mod tests {
             .collect()
     }
     fn cfg_env(rules: Vec<HookRule>, env: EnvConfig) -> HookConfig {
-        HookConfig { rules, env, ..Default::default() }
+        HookConfig { rules, env }
     }
 
     #[test]

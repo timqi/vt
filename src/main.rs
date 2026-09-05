@@ -445,7 +445,7 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
         Commands::Version => {
             println!("vt {}", env!("VT_VERSION"));
             println!("commit {} ({})", env!("VT_GIT_SHA"), env!("VT_COMMIT_DATE"));
-            return Ok(());
+            Ok(())
         }
         Commands::Doctor => {
             let auth = require_auth(&cli.auth)?;
@@ -632,43 +632,6 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_connect(argv: &[&str]) -> (bool, Vec<String>) {
-        let cli = Cli::try_parse_from(argv).expect("argv must parse");
-        match cli.command {
-            Commands::Ssh(SshCommands::Connect {
-                forward_real_agent,
-                args,
-            }) => (forward_real_agent, args),
-            _ => panic!("expected ssh connect"),
-        }
-    }
-
-    // `--forward-real-agent` must parse as OUR flag when it precedes the
-    // trailing ssh args (the `git config core.sshCommand "vt ssh connect
-    // --forward-real-agent"` shape), and the hyphenated ssh options after it
-    // must still pass through verbatim.
-    #[test]
-    fn connect_forward_flag_parses_before_trailing_args() {
-        let (fwd, args) = parse_connect(&[
-            "vt", "ssh", "connect", "--forward-real-agent", "-p", "2222", "host", "cmd",
-        ]);
-        assert!(fwd);
-        assert_eq!(args, vec!["-p", "2222", "host", "cmd"]);
-    }
-
-    // Default is OFF and plain usage is unchanged.
-    #[test]
-    fn connect_forward_flag_defaults_off() {
-        let (fwd, args) = parse_connect(&["vt", "ssh", "connect", "host", "git-upload-pack"]);
-        assert!(!fwd);
-        assert_eq!(args, vec!["host", "git-upload-pack"]);
-    }
-}
-
 fn main() {
     // The inject supervisor is dispatched here, *before* tokio / tracing /
     // clap load. It runs in the spawned child of `vt inject -r ...` and only
@@ -741,5 +704,42 @@ fn main() {
         eprintln!("{:#}", e);
         tracing::debug!("error chain: {:?}", e);
         std::process::exit(code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_connect(argv: &[&str]) -> (bool, Vec<String>) {
+        let cli = Cli::try_parse_from(argv).expect("argv must parse");
+        match cli.command {
+            Commands::Ssh(SshCommands::Connect {
+                forward_real_agent,
+                args,
+            }) => (forward_real_agent, args),
+            _ => panic!("expected ssh connect"),
+        }
+    }
+
+    // `--forward-real-agent` must parse as OUR flag when it precedes the
+    // trailing ssh args (the `git config core.sshCommand "vt ssh connect
+    // --forward-real-agent"` shape), and the hyphenated ssh options after it
+    // must still pass through verbatim.
+    #[test]
+    fn connect_forward_flag_parses_before_trailing_args() {
+        let (fwd, args) = parse_connect(&[
+            "vt", "ssh", "connect", "--forward-real-agent", "-p", "2222", "host", "cmd",
+        ]);
+        assert!(fwd);
+        assert_eq!(args, vec!["-p", "2222", "host", "cmd"]);
+    }
+
+    // Default is OFF and plain usage is unchanged.
+    #[test]
+    fn connect_forward_flag_defaults_off() {
+        let (fwd, args) = parse_connect(&["vt", "ssh", "connect", "host", "git-upload-pack"]);
+        assert!(!fwd);
+        assert_eq!(args, vec!["host", "git-upload-pack"]);
     }
 }

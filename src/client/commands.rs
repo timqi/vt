@@ -52,12 +52,12 @@ pub async fn create(vt_client: VTClient, type_arg: Option<&str>) -> Result<()> {
     // DO NOT log `secret` — plaintext the user just typed.
 
     let res = vt_client
-        .encrypt(&vec![EncryptItem {
+        .encrypt(&[EncryptItem {
             plaintext: secret.to_string(),
             t: secret_type,
         }])
         .await?;
-    if res[0].err_message != "" {
+    if !res[0].err_message.is_empty() {
         return Err(anyhow::anyhow!(
             "Failed to create secret: {}",
             res[0].err_message
@@ -237,15 +237,14 @@ pub async fn rewrap(
     // legacy agent emits the raw base32 seed rather than a generated code.
     let flipped: Vec<String> = urls
         .iter()
-        .map(|u| {
-            if u.starts_with("vt://mac/1") {
+        .map(|u| match u.strip_prefix("vt://mac/1") {
+            Some(rest) => {
                 let mut s = String::with_capacity(u.len());
                 s.push_str("vt://mac/0");
-                s.push_str(&u["vt://mac/1".len()..]);
+                s.push_str(rest);
                 s
-            } else {
-                u.clone()
             }
+            None => u.clone(),
         })
         .collect();
 
@@ -418,11 +417,11 @@ pub(super) async fn decrypt_from_multi_str(
     );
     let decrypted_vec: Vec<String> = res
         .into_iter()
-        .filter_map(|item| {
+        .map(|item| {
             if item.err_message.is_empty() {
-                Some(item.result)
+                item.result
             } else {
-                Some(item.err_message)
+                item.err_message
             }
         })
         .collect();
@@ -454,7 +453,7 @@ pub(super) async fn decrypt_from_multi_str(
 /// that allow-list. This is the scoping that keeps `vt hook` from handing a
 /// matched command every vt:// secret in the environment (confused-deputy guard).
 pub(super) fn env_var_in_scope(key: &str, value: &str, only_env: Option<&[String]>) -> bool {
-    has_vt_url(value) && only_env.map_or(true, |allow| allow.iter().any(|a| a == key))
+    has_vt_url(value) && only_env.is_none_or(|allow| allow.iter().any(|a| a == key))
 }
 
 #[cfg(test)]

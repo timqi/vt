@@ -50,14 +50,12 @@ pub struct EncryptItem {
 /// Touch ID prompt, log lines). Truncates with an ellipsis (`…`).
 pub fn sanitize_for_display(s: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity(s.len().min(max_chars).saturating_add(4));
-    let mut n = 0usize;
-    for c in s.chars().filter(|c| !c.is_control()) {
+    for (n, c) in s.chars().filter(|c| !c.is_control()).enumerate() {
         if n == max_chars {
             out.push('…');
             return out;
         }
         out.push(c);
-        n += 1;
     }
     out
 }
@@ -93,14 +91,12 @@ pub fn sanitize_for_display_multiline(
         }
         // Inline a single-pass sanitize per line so the whole multi-line
         // body lands in `out` with one allocation regardless of input size.
-        let mut n = 0usize;
-        for c in line.chars().filter(|c| !c.is_control()) {
+        for (n, c) in line.chars().filter(|c| !c.is_control()).enumerate() {
             if n == max_chars_per_line {
                 out.push('…');
                 break;
             }
             out.push(c);
-            n += 1;
         }
     }
     out
@@ -139,6 +135,10 @@ pub struct CryptoResItem {
     pub err_message: String,
 }
 
+// Variant names ARE the wire tokens: `SecretType` is serde-serialized inside
+// `EncryptReq`/`DecryptInput::V2` on the agent protocol, so renaming them to
+// `Raw`/`Totp`/`Unknown` would break every older client/agent pair.
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecretType {
     RAW,
@@ -996,7 +996,7 @@ mod tests {
         // 12 bytes is shorter than V2_MIN_BLOB_LEN (32).
         let bad = format!(
             "vt://0{}",
-            BASE64_URL_SAFE_NO_PAD.encode(&[0u8; 12])
+            BASE64_URL_SAFE_NO_PAD.encode([0u8; 12])
         );
         assert!(VtUrl::parse(&bad).is_err());
     }
@@ -1061,7 +1061,7 @@ mod tests {
         // Type byte `_` is reserved for UNKNOWN; v2 must reject.
         let bad = format!(
             "vt://_{}",
-            BASE64_URL_SAFE_NO_PAD.encode(&[0u8; 32])
+            BASE64_URL_SAFE_NO_PAD.encode([0u8; 32])
         );
         assert!(VtUrl::parse(&bad).is_err());
     }

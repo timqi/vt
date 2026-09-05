@@ -212,8 +212,8 @@ fn write_new_file(path: &std::path::Path, contents: &[u8], mode: u32) -> Result<
 
 // ── vt ssh connect (git SSH driver) ──────────────────────────────────────────
 
-/// `vt ssh connect`: a `GIT_SSH_COMMAND` driver. Loads the cleartext public key
-/// + the ciphertext `vt://` record from the key file, starts an ephemeral
+/// `vt ssh connect`: a `GIT_SSH_COMMAND` driver. Loads the cleartext public
+/// key + the ciphertext `vt://` record from the key file, starts an ephemeral
 /// in-process SSH-agent that answers `REQUEST_IDENTITIES` from the public key
 /// (no tap) and signs `SIGN_REQUEST` by decrypting the seed on demand via the
 /// existing ceremony, then execs the system `ssh` pointed at that agent.
@@ -1045,9 +1045,7 @@ mod relay_detection_tests {
         b.extend_from_slice(&(argv.len() as i32).to_ne_bytes());
         b.extend_from_slice(exec_path.as_bytes());
         b.push(0);
-        for _ in 0..pad {
-            b.push(0);
-        }
+        b.resize(b.len() + pad, 0);
         for a in argv {
             b.extend_from_slice(a.as_bytes());
             b.push(0);

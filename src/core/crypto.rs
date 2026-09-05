@@ -69,7 +69,7 @@ fn derive_passphrase_secret_with_term(passcode: &[u8; 32], term: &str) -> Result
     // heap after the SHA-256 collapse.
     let passcode = Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(passcode));
     let derived_str = Zeroizing::new(format!("{}:{}:{}", passcode.as_str(), env::var("USER")?, term));
-    let hash = Sha256::digest(&Sha256::digest(derived_str.as_bytes()));
+    let hash = Sha256::digest(Sha256::digest(derived_str.as_bytes()));
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash[..32]);
     Ok(key)
@@ -80,7 +80,7 @@ fn derive_passphrase_secret_with_term(passcode: &[u8; 32], term: &str) -> Result
 pub fn decode_auth_cipher_from_b64(b64_token: &str) -> Result<[u8; 32]> {
     // The decoded bytes are the raw VT_AUTH secret; scrub them after hashing.
     let token_bytes = Zeroizing::new(BASE64_URL_SAFE_NO_PAD.decode(b64_token)?);
-    let hash = Sha256::digest(&Sha256::digest(token_bytes.as_slice()));
+    let hash = Sha256::digest(Sha256::digest(token_bytes.as_slice()));
     let mut token = [0u8; 32];
     token.copy_from_slice(&hash[..32]);
     Ok(token)
