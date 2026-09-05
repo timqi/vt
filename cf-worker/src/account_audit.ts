@@ -222,7 +222,7 @@ export class AccountAudit {
         `INSERT INTO audit
            (token_id, created_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source, seq)
          VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ceremony', ?)
-         ON CONFLICT(token_id) DO NOTHING`,
+         ON CONFLICT(token_id) DO NOTHING RETURNING token_id`,
         auditKey(ch.approve_token),
         ch.created_ms ?? Date.now(),
         m.op_kind ?? null,
@@ -239,7 +239,9 @@ export class AccountAudit {
         typeof m.ppid === 'number' ? m.ppid : null,
         this.nextSeq(),
       );
-      return cursor.rowsWritten > 0;
+      // rowsWritten includes SQLite AUTOINCREMENT bookkeeping on a conflict.
+      // RETURNING names only a row this statement actually inserted.
+      return cursor.toArray().length > 0;
     } catch (e) {
       logErr('audit.create_failed', e);
       return false;
@@ -370,7 +372,7 @@ export class AccountAudit {
            (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, ppid, source, seq,
             peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(token_id) DO NOTHING`,
+         ON CONFLICT(token_id) DO NOTHING RETURNING token_id`,
         op.token_id, op.ts_ms, op.ts_ms, op.outcome,
         m.op_kind ?? null, m.command ?? null, m.reason ?? null, m.host ?? null,
         m.user ?? null, m.pwd ?? null, m.tty ?? null, m.ppid_cmd ?? null,
@@ -384,7 +386,7 @@ export class AccountAudit {
         op.grant_ttl_s ?? null, op.relayed ?? null,
       );
       // Skip the broadcast on an idempotent-retry no-op (agent's 1-retry).
-      if (cursor.rowsWritten > 0) this.broadcastRow(op.token_id, 'insert');
+      if (cursor.toArray().length > 0) this.broadcastRow(op.token_id, 'insert');
     } catch (e) {
       logErr('audit.agent_failed', e);
     }
