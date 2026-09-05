@@ -259,14 +259,28 @@ Single-file AppKit app (`app/VTShell.swift`), no third-party deps.
   - **Never fights an external agent**: `startIfNeeded` defers if something is
     already listening on the socket; it only supervises an agent it spawned.
     An externally-started agent yields a degraded, read-only menu (no token).
+    The Rust agent also takes a nonblocking lifetime `flock` on
+    `~/.ssh/vt.sock.lock` before Keychain work or listener startup. The lock is
+    created mode 600, opened without following symlinks, and never unlinked;
+    do not delete it to restart an agent. Its close-on-exec descriptor is not
+    inherited by launched programs. A live older listener is refused even if
+    it predates the lock, using a nonblocking probe. Only a stale socket is
+    replaced, and shutdown removes only the socket's recorded `(dev, ino)`
+    generation. Remove old binaries when upgrading: an old agent started
+    later does not honor this ownership protocol.
+    Pending exit callbacks retain their process identity; delayed restarts
+    are cancelled by Stop and cannot replace a newer managed process.
   - **Version-skew restart**: after `just install-app` replaces the binary,
     the still-running agent runs old code. The shell compares the running
     `agent_version` to the bundled `vt version`; when they differ *and the
     agent is shell-managed*, the menu offers a one-click "Restart Agent to
     update". A restart is the trigger for the transparent wrap-v2 upgrade
     (§2) to run.
-  - **Start-failure surfacing**: the agent's stderr is captured; a fast
-    (< 3 s) or non-zero exit keeps the last line and shows it in the menu
+  - **Start-failure surfacing**: the agent's stderr is continuously drained
+    without blocking, retaining only its last 64 KiB in memory (no log file).
+    Exit handling snapshots the tail without waiting for EOF from descendants
+    that inherited stderr. A fast (< 3 s) or non-zero exit keeps the last line
+    and shows it in the menu
     with a Doctor shortcut. This is the visible path for the common
     "keychain wrap still bound to the old binary path — run `vt secret
     rebind`" failure (§2), instead of a silent "not running".
@@ -288,7 +302,9 @@ Single-file AppKit app (`app/VTShell.swift`), no third-party deps.
   - agent start-failure hint + reason (when the managed agent won't start)
   - `Grants ▸` one item per grant: `sign · github.com · 4m12s`
     (display-only)
-  - `Revoke All Grants` (⌘L accelerator while menu open) → `revoke_all`
+  - `Revoke All Grants` (⌘L accelerator while menu open) → `revoke_all`;
+    a failed or timed-out request displays "Revocation not confirmed" rather
+    than silently implying that authority was removed.
   - `Cache Duration ▸ Signing / Decrypt ▸ Off / 5 min / 15 min / 1 h / 2 h /
     8 h / Follow config file` (managed agent only; applying restarts the
     agent)
@@ -361,6 +377,22 @@ per-rebuild prompt behavior is unchanged from today.
   Manual verification: notification identity, menu states, agent
   supervision, ACL prompt flow.
 - Gates: `cargo test`, `just check`, `just check-worker` (untouched but run).
+- Socket lifecycle regressions run on Linux and macOS with
+  `cargo test --locked --test agent_socket_owner`: duplicate/live legacy
+  listeners, stale socket recovery, replacement-safe cleanup, unsafe path
+  refusal, persistent lock reuse, and close-on-exec ownership.
+- Native stderr regressions compile the same Swift shell without starting
+  AppKit's event loop:
+
+  ```bash
+  swiftc -D VT_LIFECYCLE_TEST app/VTShell.swift -o /tmp/vt-lifecycle-tests
+  /tmp/vt-lifecycle-tests
+  ```
+
+  The fake child emits 4 MiB of stderr to detect pipe backpressure; a second
+  case retains an extra writer to prove termination never waits for EOF.
+  Real menu interaction, Touch ID, and Keychain behavior still need native
+  verification.
 
 ## 10. Key-wipe on lock + menu-configurable/visible idle timeout (R3)
 

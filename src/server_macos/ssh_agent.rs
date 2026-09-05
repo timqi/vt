@@ -37,6 +37,9 @@ use crate::core::{
 use rand::RngCore;
 use zeroize::{Zeroize, Zeroizing};
 
+#[path = "socket_owner.rs"]
+mod socket_owner;
+
 /// SSH agent extension names used by vt.
 pub const EXT_ENCRYPT: &str = "encrypt@vt";
 pub const EXT_DECRYPT: &str = "decrypt@vt";
@@ -3410,6 +3413,14 @@ pub async fn run_ssh_agent(
     ui_token: Option<[u8; 32]>,
 ) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
+    let socket_path = home.join(".ssh").join("vt.sock");
+    // Acquire ownership before Keychain reads/migration. The guard survives
+    // every exit path and the signal task, and never removes another socket.
+    let (socket_owner, listener) = socket_owner::SocketOwner::bind(&socket_path)?;
+    let socket_owner = Arc::new(socket_owner);
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::UnixListener::from_std(listener)?;
 
     // Transparent wrap v1->v2 upgrade (docs/app-bundle.md §2): flock-guarded,
     // touches only encrypted_passphrase + wrap_v. Failure is non-fatal here —
@@ -3427,20 +3438,6 @@ pub async fn run_ssh_agent(
     // Load keys (cipher is loaded and dropped inside load_all_keys)
     let keys = load_all_keys()?;
     tracing::info!("Loaded {} SSH keys", keys.len());
-
-    // Resolve socket path
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
-    let socket_path = home.join(".ssh").join("vt.sock");
-
-    // Clean stale socket
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
-    }
-
-    // Ensure .ssh dir exists
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
 
     if print_env {
         println!("export SSH_AUTH_SOCK={};", socket_path.to_string_lossy());
@@ -3561,7 +3558,6 @@ pub async fn run_ssh_agent(
         cache_ttls.decrypt_secs,
     );
 
-    let listener = tokio::net::UnixListener::bind(&socket_path)?;
     tracing::info!(
         "SSH agent listening on {} (idle timeout: {} min)",
         socket_path.display(),
@@ -3569,7 +3565,7 @@ pub async fn run_ssh_agent(
     );
 
     // Register signal handler for cleanup
-    let socket_path_clone = socket_path.clone();
+    let signal_owner = Arc::clone(&socket_owner);
     tokio::spawn(async move {
         let mut sigint =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
@@ -3580,7 +3576,9 @@ pub async fn run_ssh_agent(
             _ = sigterm.recv() => {},
         }
         tracing::info!("Cleaning up socket");
-        let _ = std::fs::remove_file(&socket_path_clone);
+        if let Err(error) = signal_owner.cleanup() {
+            tracing::warn!("Could not clean agent socket: {error}");
+        }
         std::process::exit(0);
     });
 
@@ -3589,7 +3587,7 @@ pub async fn run_ssh_agent(
         .map_err(|e| anyhow::anyhow!("Agent error: {}", e))?;
 
     // Cleanup on normal exit
-    let _ = std::fs::remove_file(&socket_path);
+    socket_owner.cleanup()?;
     Ok(())
 }
 
