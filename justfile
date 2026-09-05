@@ -118,7 +118,13 @@ lint:
 check-worker:
     #!/usr/bin/env bash
     set -euo pipefail
-    [ -x node_modules/.bin/tsc ] && [ -x node_modules/.bin/vitest ] || npm ci --include=dev
+    # npm writes node_modules/.package-lock.json on install, so an older stamp
+    # (or a missing binary) means the tree does not match package-lock.json —
+    # e.g. a branch that added a devDependency was just merged in.
+    if [ ! -x node_modules/.bin/tsc ] || [ ! -x node_modules/.bin/vitest ] \
+       || [ package-lock.json -nt node_modules/.package-lock.json ]; then
+      npm ci --include=dev
+    fi
     node_modules/.bin/tsc --noEmit
     npm test
 
