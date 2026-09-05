@@ -409,13 +409,13 @@ describe('extension audit', () => {
     const originToken = 'originrow0000001';
     const armedExpiry = Date.now() + TTL_20M * 1000;
     await inDO(h => {
-      h.inst.auditCreate({
+      h.inst.audit.create({
         approve_token: originToken,
         created_ms: Date.now(),
         salts_b64u: ['s'],
         meta: makeMeta(),
       });
-      h.inst.auditSetCacheTtl(originToken, TTL_20M, armedExpiry);
+      h.inst.audit.setCacheTtl(originToken, TTL_20M, armedExpiry);
     });
 
     await setDoVar('CACHE_ADMIN_EXTEND', '1');
