@@ -112,6 +112,20 @@ Two classes of action, with deliberately different gates:
 | Clear (row / selected / all) | Cloudflare Access | Authority-**reducing**: worst case is "decrypts re-prompt" |
 | Extend | Access **+ a fresh phone Passkey approval** | Authority-**granting**: prolongs no-human-in-the-loop decrypts |
 
+The scan cap above applies to the LISTING only. **A clear is exhaustive**: all
+three clear paths (by group, by origin approval, and 清除全部) stream the `dek:`
+prefix to its end through `sweepCacheEntries` rather than reusing the capped
+`scanCacheGroups`, deleting matches as they are found so memory stays bounded
+without bounding the work. The `cleared` count they return is what storage
+actually removed, not what the request intended to remove, and the UI reports
+that number. This is deliberately asymmetric with the listing: a partial view
+that says `truncated` costs the operator a second look, whereas a partial revoke
+that answers `200 {"cleared":0}` reads as a completed revocation while the DEKs
+stay decryptable with no phone tap. A clear that cannot finish must fail loudly
+(the request's own CPU/wall budget is the only remaining bound) — never quietly.
+Regression cover: `cf-worker/test/do_account.cache_list.test.ts`, "cache clear
+paths — exhaustive by contract".
+
 ### Extension contract
 
 Extension is off by default (`CACHE_ADMIN_EXTEND`, a kill switch — not an

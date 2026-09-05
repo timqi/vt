@@ -116,7 +116,14 @@ pin the transport. See [`config.example.toml`](config.example.toml) and
   `audit.cache_ttl_s` is the TTL the approver CHOSE and is never rewritten;
   `audit.cache_expires_ms` is the live expiry an extension updates. The admin
   per-row clear button must render for every cache-armed row — a wrong liveness
-  projection may cost an extra click, but must never hide the only revoke path. The real-time 免审批 push (Pushover / Slack / Slack App / Feishu)
+  projection may cost an extra click, but must never hide the only revoke path.
+  For the same reason CLEARING is exhaustive where listing may be partial: every
+  clear path streams the whole `dek:` prefix (`sweepCacheEntries`), never the
+  `truncated`-capped `scanCacheGroups`, and reports the count storage actually
+  removed. A revoke that answers `200 {"cleared":0}` for entries it never reached
+  is read as a completed revocation; if a clear cannot finish it must fail loudly.
+  Batched storage deletes must stay chunked to the platform's 128-key limit — an
+  over-long `delete()` throws and removes NOTHING. The real-time 免审批 push (Pushover / Slack / Slack App / Feishu)
   is separately opt-in via the `CACHE_HIT_NOTIFY` var and off by default —
   it is too noisy on busy hosts. Never make the audit row conditional on it.
 - `auth@vt` and `run@vt` always require a fresh approval. Do not add them to

@@ -154,9 +154,9 @@ function badRequest(msg: string): Response {
 }
 
 // One aggregated DEK-cache group, as scanned from storage. `keys` holds the
-// `dek:{ctx}:{salt}` storage keys and is populated ONLY for mutations — it must
-// never reach a response body (the ctx digest plus a known IP would let a reader
-// brute-force the client-reported `pwd` offline).
+// `dek:{ctx}:{salt}` storage keys and is populated ONLY for the extension commit
+// — it must never reach a response body (the ctx digest plus a known IP would let
+// a reader brute-force the client-reported `pwd` offline).
 interface CacheAgg {
   group_id: string;
   keys: string[];
@@ -728,6 +728,74 @@ export class AccountDO extends DurableObject<Env> {
   webSocketClose(_ws: WebSocket, _code: number, _reason: string): void {}
   webSocketError(_ws: WebSocket, _error: unknown): void {}
 
+  // ── Storage helpers ────────────────────────────────────────────────────
+
+  // Delete an arbitrary number of keys, in the batches the platform accepts.
+  //
+  // DO storage takes at most STORAGE_BATCH keys per delete() call — the same
+  // documented cap as get()/put(). Handing it a longer array THROWS, and on a
+  // delete that means the cleanup (or the revocation) removes nothing at all
+  // while its caller happily reports the length it intended to remove. Returns
+  // the count storage actually removed, so a caller can report the truth rather
+  // than its intent.
+  private async deleteKeysBatched(keys: string[]): Promise<number> {
+    let deleted = 0;
+    for (let i = 0; i < keys.length; i += STORAGE_BATCH) {
+      deleted += await this.ctx.storage.delete(keys.slice(i, i + STORAGE_BATCH));
+    }
+    return deleted;
+  }
+
+  // Delete every `dek:` entry `pick` selects, paging the prefix to its END.
+  //
+  // This is the REVOKE direction, so completeness is the contract. Unlike
+  // scanCacheGroups — which stops at CACHE_LIST_SCAN_MAX and makes its caller
+  // surface `truncated` — a clear that stopped early would leave DEKs
+  // decryptable while answering 200 with a count, i.e. a success the operator
+  // cannot tell from a real one. There is deliberately NO cap here; the only
+  // bound left is the request's own CPU/wall budget, and exhausting that fails
+  // LOUDLY instead of under-delivering silently.
+  //
+  // Memory stays O(one page + one delete batch): a matched key is deleted as it
+  // is found and never accumulated, so this is safe on a cache far larger than
+  // an unbounded list() could hold (list() with no options loads the whole
+  // prefix into the isolate's memory).
+  //
+  // Deleting while paging is safe: `startAfter` is a key VALUE, not an index, so
+  // removing keys the cursor already passed cannot make it skip anything.
+  private async sweepCacheEntries(
+    pick: (entry: CacheEntry, key: string) => boolean,
+  ): Promise<{ deleted: number; scanned: number }> {
+    let deleted = 0;
+    let scanned = 0;
+    let startAfter: string | undefined;
+    let batch: string[] = [];
+    for (;;) {
+      const page: Map<string, CacheEntry> = await this.ctx.storage.list<CacheEntry>({
+        prefix: 'dek:',
+        limit: CACHE_LIST_PAGE,
+        ...(startAfter ? { startAfter } : {}),
+      });
+      // Terminate ONLY on an empty page. A short-but-nonempty page does not mean
+      // "end of prefix" (DO storage may cut one below the requested limit to stay
+      // under a response-size cap), and treating it as the end is precisely the
+      // silent partial clear this exists to prevent.
+      if (page.size === 0) break;
+      for (const [key, entry] of page) {
+        startAfter = key;
+        scanned++;
+        if (!entry || typeof entry !== 'object' || !pick(entry, key)) continue;
+        batch.push(key);
+        if (batch.length >= STORAGE_BATCH) {
+          deleted += await this.ctx.storage.delete(batch);
+          batch = [];
+        }
+      }
+    }
+    if (batch.length) deleted += await this.ctx.storage.delete(batch);
+    return { deleted, scanned };
+  }
+
   // ── Alarm — sweep expired + finalized challenges ───────────────────────
 
   async alarm(): Promise<void> {
@@ -767,7 +835,7 @@ export class AccountDO extends DurableObject<Env> {
           toDelete.push(key, ptKey);
         }
       }
-      if (toDelete.length) await this.ctx.storage.delete(toDelete);
+      if (toDelete.length) await this.deleteKeysBatched(toDelete);
     } catch (e) {
       logErr('alarm.challenge_sweep_failed', e);
     }
@@ -775,12 +843,7 @@ export class AccountDO extends DurableObject<Env> {
     // 2. DEK-cache entries: delete past expires_ms. Read-time expiry in
     // opDekCache is the authoritative guard; this just bounds storage growth.
     try {
-      const cacheList = await this.ctx.storage.list<CacheEntry>({ prefix: 'dek:' });
-      const cacheDelete: string[] = [];
-      for (const [key, entry] of cacheList) {
-        if (entry.expires_ms <= now) cacheDelete.push(key);
-      }
-      if (cacheDelete.length) await this.ctx.storage.delete(cacheDelete);
+      await this.sweepCacheEntries(entry => entry.expires_ms <= now);
     } catch (e) {
       logErr('alarm.cache_sweep_failed', e);
     }
@@ -1393,7 +1456,7 @@ export class AccountDO extends DurableObject<Env> {
       }
       dekParts.push(dek);
     }
-    if (orphaned.length) { try { await this.ctx.storage.delete(orphaned); } catch {} }
+    if (orphaned.length) { try { await this.deleteKeysBatched(orphaned); } catch {} }
 
     // All-or-nothing: a full hit requires one opened DEK per salt. Any miss/
     // expired/undecryptable entry above simply didn't push, so a short count is
@@ -1517,16 +1580,11 @@ export class AccountDO extends DurableObject<Env> {
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
-    const list = await this.ctx.storage.list<CacheEntry>({ prefix: 'dek:' });
-    const keys: string[] = [];
-    for (const [key, e] of list) {
-      if (e.origin_token_id === tokenId) keys.push(key);
-    }
-    if (keys.length) await this.ctx.storage.delete(keys);
+    const { deleted, scanned } = await this.sweepCacheEntries(e => e.origin_token_id === tokenId);
     // Clears are benign admin actions (no secret exposure) — logged to CF logs,
     // not the audit table, to keep it focused on DEK-delivery events.
-    log('cache.cleared_by_origin', { at: tokenPrefix(tokenId), n: keys.length });
-    return Response.json({ cleared: keys.length });
+    log('cache.cleared_by_origin', { at: tokenPrefix(tokenId), n: deleted, scanned });
+    return Response.json({ cleared: deleted });
   }
 
   // ── Admin cache inventory + extension ──────────────────────────────────
@@ -1562,6 +1620,12 @@ export class AccountDO extends DurableObject<Env> {
   // Aggregate every `dek:` entry into groups. Paged internally (list() caps what
   // one call should hold in memory) and hard-capped by CACHE_LIST_SCAN_MAX, which
   // the caller must surface as `truncated` rather than pass off as a full view.
+  //
+  // That cap makes this the wrong tool for a REVOKE: a group past it is simply
+  // never seen, so a clear built on this scan reports success for entries it did
+  // not touch. Clearing therefore uses sweepCacheEntries (uncapped, streaming);
+  // what is left here is the listing and the extension commit, where stopping
+  // short only ever under-grants — and is tallied in the extension's audit row.
   //
   // `want` restricts aggregation to specific groups (still a full scan — the group
   // id is inside the value, not the key — but bounds memory to what is needed).
@@ -1717,15 +1781,21 @@ export class AccountDO extends DurableObject<Env> {
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
+    // Deliberately NOT scanCacheGroups: that scan stops at CACHE_LIST_SCAN_MAX
+    // and only the LISTING surfaces the resulting `truncated`. Reusing it here
+    // meant a group sorting past the cap was never seen, never deleted, and the
+    // route still answered 200 {"cleared":0} — a silent partial revocation on
+    // the admin tab's only per-row revoke path. Clearing pages to the end.
     const want = new Set(ids);
-    const scan = await this.scanCacheGroups(Date.now(), { want, collectKeys: true });
-    const keys: string[] = [];
-    for (const g of scan.groups.values()) keys.push(...g.keys);
-    for (let i = 0; i < keys.length; i += STORAGE_BATCH) {
-      await this.ctx.storage.delete(keys.slice(i, i + STORAGE_BATCH));
-    }
-    log('cache.cleared_groups', { groups: scan.groups.size, n: keys.length });
-    return Response.json({ cleared: keys.length, groups: scan.groups.size });
+    const hit = new Set<string>();
+    const { deleted, scanned } = await this.sweepCacheEntries(e => {
+      const gid = groupIdOf(e);
+      if (!want.has(gid)) return false;
+      hit.add(gid);
+      return true;
+    });
+    log('cache.cleared_groups', { groups: hit.size, n: deleted, scanned });
+    return Response.json({ cleared: deleted, groups: hit.size });
   }
 
   // Admin: REQUEST an extension. This mints a pending Passkey ceremony and nothing
@@ -1963,11 +2033,9 @@ export class AccountDO extends DurableObject<Env> {
   // every decrypt falls through to a phone approval until new entries are
   // written. Cloudflare-Access gated at the Worker edge.
   private async opClearCache(): Promise<Response> {
-    const list = await this.ctx.storage.list<CacheEntry>({ prefix: 'dek:' });
-    const keys = [...list.keys()];
-    if (keys.length) await this.ctx.storage.delete(keys);
-    log('cache.cleared', { n: keys.length });
-    return Response.json({ cleared: keys.length });
+    const { deleted } = await this.sweepCacheEntries(() => true);
+    log('cache.cleared', { n: deleted });
+    return Response.json({ cleared: deleted });
   }
 
   private async opReject(request: Request): Promise<Response> {

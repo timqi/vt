@@ -1,16 +1,20 @@
-// AccountDO — the admin cache inventory (opCacheList).
+// AccountDO — the admin cache inventory (opCacheList) and the clear paths.
 //
 // "Cache listings must never expose sealed material, salts, or the binding ctx
 // digest (ctx + a known IP is an offline oracle for the client-reported `pwd`),
 // and must report `truncated` rather than silently showing a partial view."
 // (CLAUDE.md) The listing is also where the UI learns whether a row may be
 // extended, so the reason projection is pinned here too.
+//
+// The listing may be partial as long as it SAYS so. A clear may not: see the
+// second half of this file.
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { CacheEntry, CacheListResponse } from '../src/types';
 import { extendTtlOptions } from '../src/cache_policy';
 import {
   inDO, seedGroup, setDoVar, doGet, doPost, makeEntry, makeMeta, FAKE_CTX, nextSalt,
+  allDekKeys, DoHandle,
 } from './do_helpers';
 
 const MIN = 60_000;
@@ -153,45 +157,112 @@ describe('opCacheList — inventory without secrets', () => {
     expect(body.truncated).toBe(false);
     expect(body.scanned).toBe(5);
   });
+});
 
-  // BUG: opCacheClearGroups shares scanCacheGroups' CACHE_LIST_SCAN_MAX (20000
-  // entries) cap but, unlike opCacheList, never surfaces `truncated`. A group
-  // that sorts past the cap is therefore NOT cleared, and the route answers
-  // `200 {"cleared":0,"groups":0}` — the admin tab reports a successful clear
-  // and reloads, while the DEKs stay decryptable without a phone tap. This is a
-  // silent PARTIAL REVOCATION on the one authority-reducing path the operator is
-  // told to reach for; 清除全部 (opClearCache) and the audit tab's per-row clear
-  // (opCacheClearByOrigin) both use an uncapped list() and still work.
-  //
-  // Left skipped and unfixed on purpose — reported, not patched. Un-skip once
-  // the clear path either pages to completion or reports its truncation.
-  it.skip('BUG: bulk clear silently skips a group that sorts past the scan cap', async () => {
-    const SCAN_MAX = 20000;
-    await inDO(async h => {
-      const filler = makeEntry({ expires_ms: Date.now() + HOUR, cache_group_id: 'g_bulkfiller0000' });
-      for (let i = 0; i < SCAN_MAX; i += 128) {
-        const batch: Record<string, CacheEntry> = {};
-        for (let j = 0; j < 128 && i + j < SCAN_MAX; j++) {
-          // '0…' sorts before the b64u salts below, so the target group is the
-          // part of the prefix the scan never reaches.
-          batch[`dek:${FAKE_CTX}:0${String(i + j).padStart(8, '0')}`] = filler;
-        }
-        await h.state.storage.put(batch);
-      }
-    });
-    const target = await inDO(h => seedGroup(h, 3, {
-      expires_ms: Date.now() + HOUR, cache_group_id: 'g_targetgroup000',
-    }));
+// ── The revoke paths ───────────────────────────────────────────────────────
+//
+// A clear is the authority-REDUCING half of the admin surface and, per CLAUDE.md,
+// "the only revoke path" a row exposes. The contract these pin is therefore
+// completeness, not a flag: a clear pages the `dek:` prefix to its end, and the
+// count it returns is what storage actually removed — never what it intended to.
+//
+// This is where the bug found by the first pass of these tests lived:
+// opCacheClearGroups reused scanCacheGroups, inheriting its CACHE_LIST_SCAN_MAX
+// cap without inheriting the `truncated` the listing surfaces, so a group sorting
+// past the cap was never seen, never deleted, and the route still answered
+// 200 {"cleared":0,"groups":0}.
+
+/** Write `n` entries at fully controlled keys, so a test can decide exactly
+ *  where a group lands in the sorted `dek:` prefix. '0…' sorts before every
+ *  base64url salt; 'z…' sorts after all of them. */
+async function putAt(
+  h: DoHandle, prefix: string, n: number, over: Partial<CacheEntry> = {},
+): Promise<string[]> {
+  const entry = makeEntry({ expires_ms: Date.now() + HOUR, ...over });
+  const keys: string[] = [];
+  for (let i = 0; i < n; i += 128) {
+    const batch: Record<string, CacheEntry> = {};
+    for (let j = 0; j < 128 && i + j < n; j++) {
+      const key = `dek:${FAKE_CTX}:${prefix}${String(i + j).padStart(8, '0')}`;
+      keys.push(key);
+      batch[key] = entry;
+    }
+    await h.state.storage.put(batch);
+  }
+  return keys;
+}
+
+async function present(h: DoHandle, keys: string[]): Promise<number> {
+  let n = 0;
+  for (const k of keys) if (await h.state.storage.get(k)) n++;
+  return n;
+}
+
+/** 20000 entries — CACHE_LIST_SCAN_MAX — parked ahead of everything else in the
+ *  sorted prefix, so anything seeded after them is only reachable by a scan that
+ *  refuses to stop at the cap. */
+const SCAN_MAX = 20000;
+function seedPastTheCap(h: DoHandle) {
+  return putAt(h, '0', SCAN_MAX, { cache_group_id: 'g_bulkfiller0000', origin_token_id: 'fillerorigin0001' });
+}
+
+describe('cache clear paths — exhaustive by contract', () => {
+  it('clears a group that sorts past the listing scan cap', async () => {
+    const filler = await inDO(seedPastTheCap);
+    const target = await inDO(h => putAt(h, 'z', 3, { cache_group_id: 'g_targetgroup000' }));
 
     const res = await doPost('cache-clear-groups', { group_ids: ['g_targetgroup000'] });
     expect(res.status).toBe(200);
-    // Observed: {"cleared":0,"groups":0} — a success the caller cannot tell from
-    // a real one, with all three entries still live.
-    const left = await inDO(async h => {
-      let n = 0;
-      for (const k of target) if (await h.state.storage.get(k)) n++;
-      return n;
-    });
-    expect(left).toBe(0);
+    expect(res.json).toEqual({ cleared: 3, groups: 1 });
+    expect(await inDO(h => present(h, target))).toBe(0);
+    // …and only that group: a clear must not become a wildcard.
+    expect(await inDO(h => present(h, filler.slice(0, 50)))).toBe(50);
+  }, 120_000);
+
+  it('clears every entry of a group larger than one delete batch', async () => {
+    // DO storage takes at most 128 keys per delete(); 300 needs three calls, and
+    // an unchunked array would throw and remove nothing.
+    const target = await inDO(h => putAt(h, 'z', 300, { cache_group_id: 'g_bigsingle00000' }));
+    const res = await doPost('cache-clear-groups', { group_ids: ['g_bigsingle00000'] });
+    expect(res.json).toEqual({ cleared: 300, groups: 1 });
+    expect(await inDO(h => present(h, target))).toBe(0);
+    expect(await inDO(allDekKeys)).toEqual([]);
+  }, 120_000);
+
+  it('reports only what it actually removed', async () => {
+    const keep = await inDO(h => putAt(h, 'z', 4, { cache_group_id: 'g_untouched00000' }));
+    const res = await doPost('cache-clear-groups', { group_ids: ['g_nosuchgroup000'] });
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ cleared: 0, groups: 0 });
+    expect(await inDO(h => present(h, keep))).toBe(4);
+  });
+
+  it('still clears by group when the handle is a legacy: one', async () => {
+    const target = await inDO(h => putAt(h, 'z', 2, {
+      cache_group_id: undefined, origin_token_id: 'legacyorigin0002',
+    }));
+    const res = await doPost('cache-clear-groups', { group_ids: ['legacy:legacyorigin0002'] });
+    expect(res.json).toEqual({ cleared: 2, groups: 1 });
+    expect(await inDO(h => present(h, target))).toBe(0);
+  });
+
+  it('clears by origin past the cap too (the audit tab per-row revoke)', async () => {
+    await inDO(seedPastTheCap);
+    const target = await inDO(h => putAt(h, 'z', 3, { origin_token_id: 'rowremove0000001' }));
+
+    const res = await doPost('cache-clear-origin', { token_id: 'rowremove0000001' });
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ cleared: 3 });
+    expect(await inDO(h => present(h, target))).toBe(0);
+  }, 120_000);
+
+  it('clear-all removes everything, including past the cap', async () => {
+    await inDO(seedPastTheCap);
+    await inDO(h => putAt(h, 'z', 5, { cache_group_id: 'g_tailgroup00000' }));
+
+    const res = await doPost('clear-cache', {});
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ cleared: SCAN_MAX + 5 });
+    expect(await inDO(allDekKeys)).toEqual([]);
   }, 120_000);
 });
