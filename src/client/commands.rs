@@ -4,10 +4,8 @@
 
 use std::io::{self, IsTerminal, Write};
 
-use super::{get_hostname, VTClient};
-use crate::core::{
-    has_vt_url, iter_vt_urls, sanitize_for_display, CryptoResItem, EncryptItem, SecretType,
-};
+use super::{get_hostname, ItemResult, VTClient};
+use crate::core::{has_vt_url, iter_vt_urls, sanitize_for_display, EncryptItem, SecretType};
 use anyhow::{ensure, Context, Result};
 use tracing::debug;
 
@@ -53,19 +51,18 @@ pub async fn create(vt_client: VTClient, type_arg: Option<&str>) -> Result<()> {
     };
     // DO NOT log `secret` — plaintext the user just typed.
 
-    let res = vt_client
+    let mut res = vt_client
         .encrypt(&[EncryptItem {
             plaintext: secret.to_string(),
             t: secret_type,
         }])
         .await?;
-    if !res[0].err_message.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Failed to create secret: {}",
-            res[0].err_message
-        ));
-    }
-    println!("{}", res[0].result);
+    ensure!(res.len() == 1, "Expected exactly one item in response");
+    println!(
+        "{}",
+        res.remove(0)
+            .map_err(|e| anyhow::anyhow!("Failed to create secret: {e}"))?
+    );
     Ok(())
 }
 
@@ -83,13 +80,11 @@ pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Resu
         command.push_str("\nreason: ");
         command.push_str(&sanitize_for_display(r, 200));
     }
-    let res = vt_client.decrypt(&get_hostname(), &command, &[vt]).await?;
+    let mut res = vt_client.decrypt(&get_hostname(), &command, &[vt]).await?;
     ensure!(res.len() == 1, "Expected exactly one item in response");
-    ensure!(
-        res[0].err_message.is_empty(),
-        "Error decrypting item: {}",
-        res[0].err_message
-    );
+    let value = res
+        .remove(0)
+        .map_err(|e| anyhow::anyhow!("Error decrypting item: {e}"))?;
     // Interactive terminal: end the line so the shell prompt doesn't overwrite
     // or obscure a plaintext with no trailing newline (redrawing prompts like
     // starship/p10k clobber partial lines). Piped/redirected: byte-exact
@@ -97,8 +92,8 @@ pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Resu
     // `vt read … > file` must not gain a byte.
     use std::io::Write;
     let mut stdout = io::stdout().lock();
-    stdout.write_all(res[0].result.as_bytes())?;
-    if stdout.is_terminal() && !res[0].result.ends_with('\n') {
+    stdout.write_all(value.as_bytes())?;
+    if stdout.is_terminal() && !value.ends_with('\n') {
         stdout.write_all(b"\n")?;
     }
     stdout.flush()?;
@@ -257,14 +252,11 @@ pub async fn rewrap(
         dec.len(),
         urls.len()
     );
-    for (i, item) in dec.iter().enumerate() {
-        ensure!(
-            item.err_message.is_empty(),
-            "decrypt failed for {}: {}",
-            urls[i],
-            item.err_message
-        );
-    }
+    let dec = dec
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| item.map_err(|e| anyhow::anyhow!("decrypt failed for {}: {}", urls[i], e)))
+        .collect::<Result<Vec<_>>>()?;
 
     println!(
         "re-encrypting {} secret(s) as v2 (no Touch ID needed)...",
@@ -274,7 +266,7 @@ pub async fn rewrap(
         .iter()
         .zip(dec.iter())
         .map(|(u, plain)| EncryptItem {
-            plaintext: plain.result.clone(),
+            plaintext: plain.clone(),
             t: legacy_secret_type(u),
         })
         .collect();
@@ -288,24 +280,19 @@ pub async fn rewrap(
 
     let mut url_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::with_capacity(urls.len());
-    for (i, item) in enc.iter().enumerate() {
+    for (i, item) in enc.into_iter().enumerate() {
+        let value = item.map_err(|e| anyhow::anyhow!("encrypt failed for {}: {}", urls[i], e))?;
         ensure!(
-            item.err_message.is_empty(),
-            "encrypt failed for {}: {}",
-            urls[i],
-            item.err_message
-        );
-        ensure!(
-            item.result.starts_with("vt://") && !item.result.starts_with("vt://mac/"),
+            value.starts_with("vt://") && !value.starts_with("vt://mac/"),
             "vt encrypt did not return a v2 URL: {}",
-            item.result
+            value
         );
         let st_label = match items[i].t {
             SecretType::TOTP => "totp",
             _ => "raw",
         };
         let old_short: String = urls[i].chars().take(24).collect();
-        let new_short: String = item.result.chars().take(24).collect();
+        let new_short: String = value.chars().take(24).collect();
         println!(
             "  [{}/{}] {}: {}... -> {}...",
             i + 1,
@@ -314,7 +301,7 @@ pub async fn rewrap(
             old_short,
             new_short
         );
-        url_map.insert(urls[i].clone(), item.result.clone());
+        url_map.insert(urls[i].clone(), value);
     }
 
     let mut total: usize = 0;
@@ -473,7 +460,7 @@ impl SubstitutionPlan {
         }
     }
 
-    fn apply(self, results: Vec<CryptoResItem>) -> Result<Vec<String>> {
+    fn apply(self, results: Vec<ItemResult>) -> Result<Vec<String>> {
         ensure!(
             results.len() == self.encrypted.len(),
             "Expected same number of items in response"
@@ -484,13 +471,7 @@ impl SubstitutionPlan {
             .into_iter()
             .enumerate()
             .map(|(index, item)| {
-                ensure!(
-                    item.err_message.is_empty(),
-                    "Failed to decrypt record {}: {}",
-                    index + 1,
-                    item.err_message
-                );
-                Ok(item.result)
+                item.map_err(|e| anyhow::anyhow!("Failed to decrypt record {}: {}", index + 1, e))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -528,11 +509,8 @@ pub(super) fn env_var_in_scope(key: &str, value: &str, only_env: Option<&[String
 mod tests {
     use super::*;
 
-    fn success(value: &str) -> CryptoResItem {
-        CryptoResItem {
-            result: value.into(),
-            err_message: String::new(),
-        }
+    fn success(value: &str) -> ItemResult {
+        Ok(value.into())
     }
 
     #[test]
@@ -568,10 +546,7 @@ mod tests {
         let err = plan
             .apply(vec![
                 success("decrypted-value"),
-                CryptoResItem {
-                    result: "discarded-value".into(),
-                    err_message: "authentication failed".into(),
-                },
+                Err(super::super::ItemError("authentication failed".into())),
             ])
             .unwrap_err();
         assert!(err.to_string().contains("record 2"));

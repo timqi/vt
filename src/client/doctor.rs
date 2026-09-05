@@ -1,9 +1,8 @@
 //! `vt doctor` — read-only diagnosis of config, routing, and agent cache
 //! behavior, including the dedicated `diag@vt` round-trip.
 
-use std::env;
-
 use super::{parse_envelope, VTClient};
+use crate::config::{ClientRoute, PasskeyState, ResolvedConfig, RoutingError, CLIENT_CONFIG_KEYS};
 use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
 use crate::core::{sanitize_for_display, ContextBasis};
 use anyhow::Result;
@@ -39,14 +38,14 @@ enum DiagOutcome {
 const DIAG_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(unix)]
-fn call_diag(auth_token: &str) -> Result<DiagOutcome> {
-    let stream = match VTClient::connect_agent_socket()? {
+fn call_diag(config: &ResolvedConfig) -> Result<DiagOutcome> {
+    let stream = match VTClient::connect_agent_socket(config)? {
         Some(s) => s,
         None => return Ok(DiagOutcome::NoSocket),
     };
     stream.set_read_timeout(Some(DIAG_SOCKET_TIMEOUT))?;
     stream.set_write_timeout(Some(DIAG_SOCKET_TIMEOUT))?;
-    let auth_key = decode_auth_cipher_from_b64(auth_token)?;
+    let auth_key = decode_auth_cipher_from_b64(config.auth_token())?;
     let auth_cipher = AesGcmCrypto::new(&auth_key)?;
     let payload = serde_json::to_vec(&crate::core::DiagReq::default())?;
     let ext = Extension {
@@ -118,18 +117,35 @@ fn doctor_redact(key: &str, value: &str) -> String {
     }
 }
 
+fn routing_report(config: &ResolvedConfig) -> String {
+    let passkey_state = config.passkey_state();
+    match config.route() {
+        Err(RoutingError::InvalidBackend(message)) => format!("⚠ {message}"),
+        Err(RoutingError::AgentAuthMissing) => "⚠ VT_BACKEND=agent but VT_AUTH is unset — every call will fail".into(),
+        Err(RoutingError::PasskeyUrlMissing) => "⚠ VT_BACKEND=passkey but VT_PASSKEY_URL is unset — every call will fail".into(),
+        Err(RoutingError::NoPath) => format!("⚠ no usable path: VT_AUTH unset and passkey {passkey_state} — vt commands needing auth will fail"),
+        Ok(ClientRoute::Agent) => "VT_BACKEND=agent: SSH agent only, no passkey fallback".into(),
+        Ok(ClientRoute::AutoAgent) if passkey_state == PasskeyState::Configured => "auto: try SSH agent first, fall back to phone passkey on recoverable errors".into(),
+        Ok(ClientRoute::AutoAgent) => format!("auto: SSH agent first; recoverable agent errors still fall back to the passkey path, which is {passkey_state} and will error there"),
+        Ok(ClientRoute::Passkey) if passkey_state == PasskeyState::MissingToken => "VT_BACKEND=passkey: phone ceremony only — ⚠ VT_PASSKEY_TOKEN unset, ceremonies will fail".into(),
+        Ok(ClientRoute::Passkey) => "VT_BACKEND=passkey: phone ceremony only, agent never probed".into(),
+        Ok(ClientRoute::AutoPasskey) if passkey_state == PasskeyState::Configured => "auto: phone passkey only (VT_AUTH unset — agent skipped)".into(),
+        Ok(ClientRoute::AutoPasskey) => format!("⚠ no usable path: VT_AUTH unset and passkey {passkey_state} — vt commands needing auth will fail"),
+    }
+}
+
 /// `vt doctor`: diagnose config sources, transport routing, and (when an
 /// agent is reachable) cache behavior via `diag@vt`. Read-only, never
 /// hard-fails on findings — always exits 0; see `docs/diag-design.md`.
-pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<()> {
+pub async fn doctor(config: &ResolvedConfig) -> Result<()> {
     println!("vt doctor — vt {}", env!("VT_VERSION"));
 
     // ── 1. Config ─────────────────────────────────────────────────────────
     println!("\nConfig (env beats config.toml):");
-    match crate::config::config_path() {
+    match &config.config_path {
         Some(path) if path.exists() => {
             println!("  file: {}", path.display());
-            if let Some(mode) = crate::config::insecure_config_mode(&path) {
+            if let Some(mode) = crate::config::insecure_config_mode(path) {
                 println!(
                     "  ⚠ file is group/other accessible (mode {:o}); it holds \
                      secrets — run: chmod 600 {}",
@@ -141,19 +157,10 @@ pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<
         Some(path) => println!("  file: {} (absent — env vars only)", path.display()),
         None => println!("  file: none (no home directory and no $VT_CONFIG)"),
     }
-    const DOCTOR_KEYS: &[&str] = &[
-        "VT_BACKEND",
-        "VT_AUTH",
-        "VT_PASSKEY_URL",
-        "VT_PASSKEY_TOKEN",
-        "VT_GIT_SSH_PRIVATE_KEY",
-        "VT_GIT_SSH_PUB",
-        "VT_AGENT_CONFIG",
-    ];
-    for key in DOCTOR_KEYS {
-        match env::var(key) {
-            Ok(v) => {
-                let source = if file_populated_keys.iter().any(|k| k == key) {
+    for key in CLIENT_CONFIG_KEYS {
+        match config.value(key) {
+            Some(v) => {
+                let source = if config.file_populated_keys.iter().any(|k| k == key) {
                     "config.toml"
                 } else {
                     "env"
@@ -161,18 +168,19 @@ pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<
                 if v.is_empty() {
                     println!("  {:24} set but EMPTY ({})", key, source);
                 } else {
-                    println!("  {:24} {} ({})", key, doctor_redact(key, &v), source);
+                    println!("  {:24} {} ({})", key, doctor_redact(key, v), source);
                 }
             }
-            Err(_) => println!("  {:24} unset", key),
+            None => println!("  {:24} unset", key),
         }
     }
     // A typo'd key (VT_PASKEY_URL…) hydrates silently and is the single most
     // likely config bug this command is run to find — surface names only.
-    let unrecognized: Vec<&str> = file_populated_keys
+    let unrecognized: Vec<&str> = config
+        .file_populated_keys
         .iter()
         .map(String::as_str)
-        .filter(|k| !DOCTOR_KEYS.contains(k))
+        .filter(|k| !CLIENT_CONFIG_KEYS.contains(k))
         .collect();
     if !unrecognized.is_empty() {
         println!(
@@ -183,81 +191,21 @@ pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<
     }
 
     // ── 2. Routing ────────────────────────────────────────────────────────
-    // NOTE: mirrors VTClient::new (validation) + agent_call_or_fallback
-    // (fallback gating: recoverable agent errors ALWAYS fall back under
-    // auto, regardless of whether the passkey path is configured). When
-    // changing either, keep this report in lockstep.
     println!("\nRouting:");
-    let has_auth = !auth_token.is_empty();
-    let has_passkey_url = env::var("VT_PASSKEY_URL").is_ok();
-    let has_passkey_token = env::var("VT_PASSKEY_TOKEN").is_ok();
-    let passkey_state = match (has_passkey_url, has_passkey_token) {
-        (true, true) => "configured",
-        (true, false) => "incomplete (VT_PASSKEY_TOKEN unset)",
-        (false, true) => "incomplete (VT_PASSKEY_URL unset)",
-        (false, false) => "unconfigured",
-    };
-    match crate::config::Backend::from_env() {
-        Err(e) => println!("  ⚠ {}", e),
-        Ok(crate::config::Backend::Agent) => {
-            if has_auth {
-                println!("  VT_BACKEND=agent: SSH agent only, no passkey fallback");
-            } else {
-                println!("  ⚠ VT_BACKEND=agent but VT_AUTH is unset — every call will fail");
-            }
-        }
-        Ok(crate::config::Backend::Passkey) => {
-            // Same precondition VTClient::new enforces (URL only) — plus the
-            // token warning it defers to ceremony time.
-            if !has_passkey_url {
-                println!(
-                    "  ⚠ VT_BACKEND=passkey but VT_PASSKEY_URL is unset — every call will fail"
-                );
-            } else if !has_passkey_token {
-                println!(
-                    "  VT_BACKEND=passkey: phone ceremony only — ⚠ VT_PASSKEY_TOKEN unset, \
-                     ceremonies will fail"
-                );
-            } else {
-                println!("  VT_BACKEND=passkey: phone ceremony only, agent never probed");
-            }
-        }
-        Ok(crate::config::Backend::Auto) => {
-            match (has_auth, has_passkey_url && has_passkey_token) {
-                (true, true) => println!(
-                    "  auto: try SSH agent first, fall back to phone passkey on \
-                 recoverable errors"
-                ),
-                (true, false) => println!(
-                    "  auto: SSH agent first; recoverable agent errors still fall back \
-                 to the passkey path, which is {} and will error there",
-                    passkey_state
-                ),
-                (false, true) => {
-                    println!("  auto: phone passkey only (VT_AUTH unset — agent skipped)")
-                }
-                (false, false) => println!(
-                    "  ⚠ no usable path: VT_AUTH unset and passkey {} — vt commands \
-                 needing auth will fail",
-                    passkey_state
-                ),
-            }
-        }
-    }
+    println!("  {}", routing_report(config));
+    let has_auth = !config.auth_token().is_empty();
 
     // ── 3. Agent (diag@vt) ────────────────────────────────────────────────
     println!("\nAgent:");
-    let socket = env::var("SSH_AUTH_SOCK")
-        .unwrap_or_else(|_| "~/.ssh/vt.sock (default; $SSH_AUTH_SOCK unset)".to_string());
-    println!("  socket: {}", socket);
+    println!("  socket: {}", config.socket_label());
     #[cfg(unix)]
     if !has_auth {
         println!("  agent path disabled (VT_AUTH unset) — diag@vt skipped");
     } else {
-        let token = auth_token.to_string();
+        let config = config.clone();
         // Never hard-fail the report (doctor's contract): a panicked probe
         // (outer Err) is itself a finding, printed like any other.
-        match tokio::task::spawn_blocking(move || call_diag(&token))
+        match tokio::task::spawn_blocking(move || call_diag(&config))
             .await
             .map_err(anyhow::Error::from)
             .and_then(|r| r)
@@ -341,23 +289,23 @@ pub async fn doctor(auth_token: &str, file_populated_keys: &[String]) -> Result<
 
     // ── 4. Worker ─────────────────────────────────────────────────────────
     println!("\nWorker:");
-    match env::var("VT_PASSKEY_URL") {
-        Err(_) => println!("  not configured (VT_PASSKEY_URL unset)"),
-        Ok(url) => {
+    match config.value("VT_PASSKEY_URL") {
+        None => println!("  not configured (VT_PASSKEY_URL unset)"),
+        Some(url) => {
             // Doctor never hard-fails: a TLS-init error is reported, not raised.
             match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
             {
                 Err(e) => println!("  ⚠ could not build HTTP client: {}", e),
-                Ok(client) => match client.get(&url).send().await {
+                Ok(client) => match client.get(url).send().await {
                     Ok(resp) => {
                         println!("  {} reachable (HTTP {})", url, resp.status().as_u16())
                     }
                     Err(e) => println!("  ⚠ {} unreachable: {}", url, e),
                 },
             }
-            if env::var("VT_PASSKEY_TOKEN").is_err() {
+            if config.value("VT_PASSKEY_TOKEN").is_none() {
                 println!("  ⚠ VT_PASSKEY_URL set but VT_PASSKEY_TOKEN unset");
             }
         }
@@ -371,6 +319,42 @@ mod tests {
     use super::*;
 
     // ── vt doctor ────────────────────────────────────────────────────────
+
+    #[test]
+    fn routing_report_uses_resolved_policy_without_exposing_tokens() {
+        let cases = [
+            ("auto", Some("secret-auth"), Some("url"), Some("secret-token"), "auto: try SSH agent first, fall back to phone passkey on recoverable errors"),
+            ("agent", Some("secret-auth"), None, None, "VT_BACKEND=agent: SSH agent only, no passkey fallback"),
+            ("agent", None, None, None, "⚠ VT_BACKEND=agent but VT_AUTH is unset — every call will fail"),
+            ("passkey", Some("secret-auth"), None, None, "⚠ VT_BACKEND=passkey but VT_PASSKEY_URL is unset — every call will fail"),
+            ("passkey", None, Some("url"), None, "VT_BACKEND=passkey: phone ceremony only — ⚠ VT_PASSKEY_TOKEN unset, ceremonies will fail"),
+            ("passkey", None, Some(""), Some(""), "VT_BACKEND=passkey: phone ceremony only, agent never probed"),
+            ("auto", None, Some("url"), None, "⚠ no usable path: VT_AUTH unset and passkey incomplete (VT_PASSKEY_TOKEN unset) — vt commands needing auth will fail"),
+            ("auto", None, None, Some("secret-token"), "⚠ no usable path: VT_AUTH unset and passkey incomplete (VT_PASSKEY_URL unset) — vt commands needing auth will fail"),
+            ("auto", None, Some("url"), Some("secret-token"), "auto: phone passkey only (VT_AUTH unset — agent skipped)"),
+        ];
+        for (backend, auth, url, token, expected) in cases {
+            let config = ResolvedConfig::resolve(
+                auth.map(str::to_owned),
+                Vec::new(),
+                |key| {
+                    match key {
+                        "VT_BACKEND" => Some(backend),
+                        "VT_PASSKEY_URL" => url,
+                        "VT_PASSKEY_TOKEN" => token,
+                        _ => None,
+                    }
+                    .map(str::to_owned)
+                },
+                None,
+                None,
+            );
+            let report = routing_report(&config);
+            assert_eq!(report, expected);
+            assert!(!report.contains("secret-auth"));
+            assert!(!report.contains("secret-token"));
+        }
+    }
 
     #[test]
     fn doctor_redact_hides_secrets_and_truncates_on_char_boundaries() {

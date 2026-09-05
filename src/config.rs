@@ -8,13 +8,15 @@
 //! not already set**. Environment variables therefore always win; the file is
 //! pure fallback.
 //!
-//! It works by hydrating `std::env` *before* clap parses and before any
-//! `std::env::var("VT_…")` read happens. That keeps the rest of the codebase
-//! (including clap's `env = "VT_AUTH"`) unchanged — every existing read
-//! transparently picks up the file value when the env var is absent.
+//! It hydrates `std::env` before clap parses or any configuration is read.
+//! Client transports and `vt doctor` then share an immutable `ResolvedConfig`
+//! snapshot; the remaining subsystems retain their existing env interfaces.
 //!
 //! Scope guard: only keys matching `^VT_[A-Z0-9_]+$` are honoured, so the file
 //! cannot inject arbitrary unrelated environment variables.
+
+mod client;
+pub use client::{ClientRoute, PasskeyState, ResolvedConfig, RoutingError, CLIENT_CONFIG_KEYS};
 
 use std::path::{Path, PathBuf};
 
@@ -229,15 +231,6 @@ impl Backend {
                 "invalid VT_BACKEND '{}': expected auto, agent, or passkey",
                 other
             )),
-        }
-    }
-
-    /// Read `VT_BACKEND` from the environment (already hydrated from the
-    /// config file). Unset → `Auto`.
-    pub fn from_env() -> anyhow::Result<Self> {
-        match std::env::var("VT_BACKEND") {
-            Err(_) => Ok(Backend::Auto),
-            Ok(v) => Self::parse(&v).map_err(|e| anyhow::anyhow!(e)),
         }
     }
 }
