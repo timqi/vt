@@ -67,10 +67,18 @@ enum AgentClient {
         (NSHomeDirectory() as NSString).appendingPathComponent(".ssh/vt.sock")
     }
 
-    enum Failure: Error {
+    enum Failure: LocalizedError {
         case noSocket      // connect refused / missing — agent not running
         case refused       // SSH_AGENT_FAILURE — no/wrong token, locked path, etc.
         case proto(String) // framing/decoding surprise
+
+        var errorDescription: String? {
+            switch self {
+            case .noSocket: return "The agent is not reachable."
+            case .refused: return "The agent refused the request."
+            case .proto(let detail): return "Agent response error: \(detail)"
+            }
+        }
     }
 
     static func uiStatus(token: String, action: String) throws -> UiStatusRes {
@@ -198,6 +206,67 @@ func runNotifyMode(_ args: [String]) -> Never {
     exit(ok ? 0 : 1)
 }
 
+// MARK: - bounded, nonblocking agent stderr capture
+
+final class AgentStderrCapture {
+    static let capacity = 64 * 1024
+    private let queue = DispatchQueue(label: "vt.agent-stderr")
+    private let source: DispatchSourceRead
+    private let fd: Int32
+    private var tail = Data()
+    private var stopped = false
+
+    init(pipe: Pipe) throws {
+        fd = pipe.fileHandleForReading.fileDescriptor
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in self?.drain() }
+        let reader = pipe.fileHandleForReading
+        source.setCancelHandler { reader.closeFile() }
+        source.resume()
+    }
+
+    private func drain() {
+        guard !stopped else { return }
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        // Bound each turn so a noisy descendant cannot starve finish().
+        for _ in 0..<16 {
+            let count = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress!, $0.count) }
+            if count > 0 {
+                tail.append(contentsOf: buffer.prefix(count))
+                if tail.count > Self.capacity { tail.removeFirst(tail.count - Self.capacity) }
+            } else if count == 0 {
+                stop()
+                return
+            } else if errno != EINTR {
+                if errno != EAGAIN && errno != EWOULDBLOCK { stop() }
+                return
+            }
+        }
+    }
+
+    private func stop() {
+        guard !stopped else { return }
+        stopped = true
+        source.cancel()
+    }
+
+    func finish(_ completion: @escaping (String) -> Void) {
+        queue.async {
+            self.drain()
+            self.stop()
+            // Never wait for EOF: run@vt/notification descendants may still
+            // hold stderr after the managed process has already exited.
+            completion(String(decoding: self.tail, as: UTF8.self))
+        }
+    }
+
+    deinit { source.cancel() }
+}
+
 // MARK: - managed agent supervisor
 
 final class AgentSupervisor {
@@ -214,19 +283,20 @@ final class AgentSupervisor {
     /// base64url token for ui-status requests; nil = degraded (external agent
     /// or none).
     private(set) var tokenB64: String?
-    /// Last start-failure hint (first stderr line of a fast-failing agent),
+    /// Last start-failure hint (last stderr line of a fast-failing agent),
     /// surfaced in the menu. Cleared on a healthy start.
     private(set) var lastError: String?
     private var process: Process?
     private var intent: ExitIntent = .crash
     private var startedAt: TimeInterval = 0
     private var restartCount = 0
+    private var generation: UInt64 = 0
     var onStateChange: (() -> Void)?
 
     var isManaged: Bool { process?.isRunning == true }
 
     func startIfNeeded() {
-        guard process?.isRunning != true else { return }
+        guard process == nil else { return }
         // Never fight an externally-started agent for the socket.
         if agentListening() { return }
         start()
@@ -236,11 +306,19 @@ final class AgentSupervisor {
     /// (`just install-app` replaced the binary; the running agent still runs
     /// the old code). Bypasses the external-agent guard: we own this one.
     func restart() {
-        guard let proc = process, proc.isRunning else { start(); return }
+        guard let proc = process else { startIfNeeded(); return }
         intent = .restart
         tokenB64 = nil
-        proc.terminate()
+        if proc.isRunning { proc.terminate() }
         onStateChange?()
+    }
+
+    private func scheduleStart(after delay: TimeInterval) {
+        let expected = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.generation == expected, self.process == nil else { return }
+            self.startIfNeeded()
+        }
     }
 
     private func agentListening() -> Bool {
@@ -256,7 +334,9 @@ final class AgentSupervisor {
     }
 
     func start() {
+        guard process == nil else { return }
         guard let vt = Bundle.main.path(forAuxiliaryExecutable: "vt") else { return }
+        generation &+= 1
         var tokenBytes = [UInt8](repeating: 0, count: 32)
         guard SecRandomCopyBytes(kSecRandomDefault, 32, &tokenBytes) == errSecSuccess else { return }
         let token = Data(tokenBytes)
@@ -288,6 +368,14 @@ final class AgentSupervisor {
         // the old binary path — needs `vt secret rebind`) surfaces a reason
         // instead of a silent "not running".
         proc.standardError = errPipe
+        let stderrCapture: AgentStderrCapture
+        do {
+            stderrCapture = try AgentStderrCapture(pipe: errPipe)
+        } catch {
+            lastError = "could not capture agent diagnostics: \(error.localizedDescription)"
+            onStateChange?()
+            return
+        }
         // The wrap derivation needs USER; launchd contexts may lack it.
         var env = ProcessInfo.processInfo.environment
         if env["USER"] == nil { env["USER"] = NSUserName() }
@@ -295,49 +383,47 @@ final class AgentSupervisor {
 
         let startTime = ProcessInfo.processInfo.systemUptime
         proc.terminationHandler = { [weak self] p in
-            let stderr = String(
-                data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.tokenB64 = nil
-                let intent = self.intent
-                self.intent = .crash
-                switch intent {
-                case .stop:
-                    self.process = nil
-                case .restart:
-                    self.process = nil
-                    // Let the OS release the old socket; the new agent also
-                    // self-heals a stale socket file on bind.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.start() }
-                case .crash:
-                    // Fast exit (< 3s) = failed startup, not a long-run crash.
-                    // Keep the reason and stop hammering restart.
-                    let fast = ProcessInfo.processInfo.systemUptime - startTime < 3
-                    if fast || p.terminationStatus != 0 {
-                        self.lastError = stderr
-                            .split(separator: "\n")
-                            .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
-                            .map(String.init)
-                    }
-                    self.process = nil
-                    if self.restartCount < 5 {
-                        self.restartCount += 1
-                        DispatchQueue.main.asyncAfter(deadline: .now() + Double(self.restartCount) * 2) {
-                            self.startIfNeeded()
+            stderrCapture.finish { stderr in
+                DispatchQueue.main.async {
+                    guard let self, self.process === p else { return }
+                    self.tokenB64 = nil
+                    let intent = self.intent
+                    self.intent = .crash
+                    switch intent {
+                    case .stop:
+                        self.process = nil
+                    case .restart:
+                        self.process = nil
+                        self.scheduleStart(after: 0.3)
+                    case .crash:
+                        // Fast exit (< 3s) = failed startup, not a long-run crash.
+                        let fast = ProcessInfo.processInfo.systemUptime - startTime < 3
+                        if fast || p.terminationStatus != 0 {
+                            self.lastError = stderr
+                                .split(separator: "\n")
+                                .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+                                .map(String.init)
+                        }
+                        self.process = nil
+                        if self.restartCount < 5 {
+                            self.restartCount += 1
+                            self.scheduleStart(after: Double(self.restartCount) * 2)
                         }
                     }
+                    self.onStateChange?()
                 }
-                self.onStateChange?()
             }
         }
         do {
             try proc.run()
         } catch {
+            errPipe.fileHandleForWriting.closeFile()
+            stderrCapture.finish { _ in }
             lastError = "could not launch vt: \(error.localizedDescription)"
             onStateChange?()
             return
         }
+        errPipe.fileHandleForWriting.closeFile()
         stdinPipe.fileHandleForWriting.write(token)
         stdinPipe.fileHandleForWriting.closeFile()
         process = proc
@@ -356,10 +442,12 @@ final class AgentSupervisor {
     }
 
     func stop() {
-        guard let proc = process, proc.isRunning else { return }
+        generation &+= 1
         intent = .stop
         tokenB64 = nil
-        proc.terminate() // SIGTERM — the agent removes its socket on exit
+        if let proc = process, proc.isRunning {
+            proc.terminate() // SIGTERM: ownership-checked socket cleanup
+        }
         onStateChange?()
     }
 }
@@ -427,6 +515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastStatus: UiStatusRes?
     private var agentReachable = false
     private var bundledVersion: String = ""
+    private var revokeInFlight = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         bundledVersion = readBundledVtVersion()
@@ -651,12 +740,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func revokeAll() {
-        guard let token = supervisor.tokenB64 else { return }
+        guard let token = supervisor.tokenB64, !revokeInFlight else { return }
+        revokeInFlight = true
         DispatchQueue.global().async {
-            // May wait while a live permit holds the security gate — that is
-            // the engine's linearized revoker semantics, not a hang.
-            _ = try? AgentClient.uiStatus(token: token, action: "revoke_all")
-            DispatchQueue.main.async { self.poll() }
+            // A timeout is not confirmation: the revoker may still be waiting
+            // for a live permit, or this connection may have been interrupted.
+            let result = Result { try AgentClient.uiStatus(token: token, action: "revoke_all") }
+            DispatchQueue.main.async {
+                self.revokeInFlight = false
+                self.poll()
+                if case .failure(let error) = result {
+                    let alert = NSAlert()
+                    alert.messageText = "Revocation not confirmed"
+                    alert.informativeText = error.localizedDescription
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                }
+            }
         }
     }
 
@@ -772,6 +872,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
 // MARK: - entry point
 
+#if VT_LIFECYCLE_TEST
+
+func captureForTest(script: String, keepWriterOpen: Bool = false) throws -> String {
+    let pipe = Pipe()
+    let heldWriter = keepWriterOpen ? dup(pipe.fileHandleForWriting.fileDescriptor) : -1
+    if keepWriterOpen && heldWriter < 0 {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+    defer { if heldWriter >= 0 { close(heldWriter) } }
+    let capture = try AgentStderrCapture(pipe: pipe)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", script]
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = pipe
+    let done = DispatchSemaphore(value: 0)
+    let resultLock = NSLock()
+    var captured = ""
+    process.terminationHandler = { _ in
+        capture.finish { text in
+            resultLock.lock()
+            captured = text
+            resultLock.unlock()
+            done.signal()
+        }
+    }
+    defer {
+        try? pipe.fileHandleForWriting.close()
+        if process.isRunning { process.terminate() }
+    }
+    try process.run()
+    try? pipe.fileHandleForWriting.close()
+    guard done.wait(timeout: .now() + 10) == .success else {
+        throw NSError(domain: "VT lifecycle test timed out", code: 1)
+    }
+    guard process.terminationStatus == 0 else {
+        throw NSError(domain: "VT lifecycle child failed", code: Int(process.terminationStatus))
+    }
+    resultLock.lock()
+    defer { resultLock.unlock() }
+    return captured
+}
+
+do {
+    // More than any pipe capacity: a termination-only reader deadlocks here.
+    let noisy = try captureForTest(script: """
+        i=0
+        while [ "$i" -lt 1024 ]; do
+            printf '%4096s' ''
+            i=$((i+1))
+        done >&2
+        printf '\\nfinished\\n' >&2
+        """)
+    precondition(noisy.utf8.count <= AgentStderrCapture.capacity, "stderr tail is unbounded")
+    precondition(noisy.hasSuffix("finished\n"), "last diagnostics were lost")
+    // Holding another writer is equivalent to a descendant retaining stderr.
+    // Completion must not wait for EOF, which cannot occur until this returns.
+    let held = try captureForTest(script: "printf 'held-writer\\n' >&2", keepWriterOpen: true)
+    precondition(held == "held-writer\n", "termination snapshot lost buffered diagnostics")
+    print("VT lifecycle tests: 2 passed")
+} catch {
+    FileHandle.standardError.write(Data("VT lifecycle test failed: \(error)\n".utf8))
+    exit(1)
+}
+
+#else
+
 let args = Array(CommandLine.arguments.dropFirst())
 if args.first == "notify" {
     runNotifyMode(Array(args.dropFirst()))
@@ -782,3 +950,5 @@ let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()
+
+#endif
