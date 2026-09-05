@@ -9,13 +9,6 @@ use clap::{Parser, Subcommand};
 
 use crate::client::VTClient;
 
-/// VT_AUTH is optional. When set, the CLI tries the SSH-agent path first
-/// (macOS Touch ID). When unset, it skips the agent and goes straight to the
-/// CF passkey ceremony (which itself requires VT_PASSKEY_URL + VT_PASSKEY_TOKEN).
-fn require_auth(auth: &Option<String>) -> Result<String> {
-    Ok(auth.clone().unwrap_or_default())
-}
-
 /// Build the agent's audit-push config from the `--audit-*` flags. Returns a
 /// disabled config (audit push is a no-op) when `--audit-url` is unset,
 /// `--no-audit-push` is given, or `--audit-key` is empty. `agent_id` is the
@@ -440,17 +433,14 @@ pub enum SshCommands {
     },
 }
 
-async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
+async fn run(cli: Cli, config: config::ResolvedConfig) -> Result<()> {
     match &cli.command {
         Commands::Version => {
             println!("vt {}", env!("VT_VERSION"));
             println!("commit {} ({})", env!("VT_GIT_SHA"), env!("VT_COMMIT_DATE"));
             Ok(())
         }
-        Commands::Doctor => {
-            let auth = require_auth(&cli.auth)?;
-            return client::doctor(&auth, &file_populated_keys).await;
-        }
+        Commands::Doctor => return client::doctor(&config).await,
         #[cfg(target_os = "macos")]
         Commands::Init => server_macos::admin::init(),
         #[cfg(target_os = "macos")]
@@ -469,16 +459,14 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
                 comment,
                 key_file,
             } => {
-                let auth = require_auth(&cli.auth)?;
-                let vt_client = VTClient::new(auth)?;
+                let vt_client = VTClient::new(config.clone())?;
                 ssh_sign::keygen(vt_client, label.clone(), comment.clone(), key_file.clone()).await
             }
             SshCommands::Connect {
                 forward_real_agent,
                 args,
             } => {
-                let auth = require_auth(&cli.auth)?;
-                let vt_client = VTClient::new(auth)?;
+                let vt_client = VTClient::new(config.clone())?;
                 ssh_sign::connect(vt_client, args.clone(), *forward_real_agent).await
             }
             #[cfg(target_os = "macos")]
@@ -576,23 +564,19 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
             Fido2Commands::RemoveAll => server_macos::fido2_cli::fido2_remove_all(),
         },
         Commands::Create { secret_type } => {
-            let auth = require_auth(&cli.auth)?;
-            let vt_client = VTClient::new(auth)?;
+            let vt_client = VTClient::new(config.clone())?;
             client::create(vt_client, secret_type.as_deref()).await
         }
         Commands::Read { vt, reason } => {
-            let auth = require_auth(&cli.auth)?;
-            let vt_client = VTClient::new(auth)?;
+            let vt_client = VTClient::new(config.clone())?;
             client::read(vt_client, vt.to_string(), reason.as_deref()).await
         }
         Commands::Auth { reason } => {
-            let auth = require_auth(&cli.auth)?;
-            let vt_client = VTClient::new(auth)?;
+            let vt_client = VTClient::new(config.clone())?;
             client::auth(vt_client, reason.as_deref().unwrap_or("bio auth requested")).await
         }
         Commands::Run { reason, argv } => {
-            let auth = require_auth(&cli.auth)?;
-            let vt_client = VTClient::new(auth)?;
+            let vt_client = VTClient::new(config.clone())?;
             client::run(vt_client, argv.clone(), reason.as_deref()).await
         }
         Commands::Rewrap {
@@ -600,8 +584,7 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
             no_dry_run,
             backup,
         } => {
-            let auth = require_auth(&cli.auth)?;
-            let vt_client = VTClient::new(auth)?;
+            let vt_client = VTClient::new(config.clone())?;
             client::rewrap(vt_client, files.clone(), *no_dry_run, *backup).await
         }
         Commands::Inject {
@@ -617,8 +600,7 @@ async fn run(cli: Cli, file_populated_keys: Vec<String>) -> Result<()> {
             if *recover {
                 return client::inject_recover();
             }
-            let auth = require_auth(&cli.auth)?;
-            let vt_client = VTClient::new(auth)?;
+            let vt_client = VTClient::new(config.clone())?;
             client::inject(
                 vt_client,
                 replace_file.clone(),
@@ -682,12 +664,13 @@ fn main() {
     let file_populated_keys = config::hydrate_env_from_file();
 
     let cli = Cli::parse();
+    let config = config::ResolvedConfig::capture(cli.auth.clone(), file_populated_keys);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    if let Err(e) = rt.block_on(run(cli, file_populated_keys)) {
+    if let Err(e) = rt.block_on(run(cli, config)) {
         // Walk the error chain to find a `VtClientError`. The agent's
         // structured `ErrKind` maps to a stable exit code; transport
         // failures and any other error chain default to exit 1.

@@ -1852,10 +1852,18 @@ mod tests {
                     None,
                     Some(dir.join("config").to_string_lossy().into_owned()),
                 ] {
-                    let client = VTClient {
-                        auth_token: "AA".into(),
-                        backend: crate::config::Backend::Agent,
-                    };
+                    let config = crate::config::ResolvedConfig::resolve(
+                        Some("AA".into()),
+                        Vec::new(),
+                        |key| match key {
+                            "VT_BACKEND" => Some("agent".into()),
+                            "SSH_AUTH_SOCK" => Some(socket.to_string_lossy().into_owned()),
+                            _ => None,
+                        },
+                        None,
+                        None,
+                    );
+                    let client = VTClient::new(config).unwrap();
                     let args = vec![
                         "/bin/sh".into(),
                         "-c".into(),

@@ -7,7 +7,7 @@
 //!
 //! See `docs/ssh-vt-design.md` for the full design and security boundary.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 
 use crate::client::VTClient;
 use crate::core::{EncryptItem, SecretType};
@@ -57,16 +57,16 @@ async fn keygen_unix(
     let seed_b64 = Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(seed));
     seed.zeroize();
     drop(signing);
-    let res = vt_client
+    let mut res = vt_client
         .encrypt(&[EncryptItem {
             plaintext: seed_b64.to_string(),
             t: SecretType::RAW,
         }])
         .await?;
-    if !res[0].err_message.is_empty() {
-        bail!("failed to encrypt ssh key: {}", res[0].err_message);
-    }
-    let vt_url = res[0].result.clone();
+    ensure!(res.len() == 1, "Expected exactly one item in response");
+    let vt_url = res
+        .remove(0)
+        .map_err(|e| anyhow::anyhow!("failed to encrypt ssh key: {e}"))?;
 
     // 3. OpenSSH public-key line (encoding only — no secret material).
     let comment_str = comment.or(label).unwrap_or_default();
@@ -759,15 +759,15 @@ impl ssh_agent_lib::agent::Session for SignerSession {
                     .decrypt(&inner.host, &inner.command, std::slice::from_ref(&vt_url))
                     .await
                     .map_err(|e| sign_err(e.to_string()))?;
-                if res.is_empty() || !res[0].err_message.is_empty() {
-                    let msg = res
-                        .first()
-                        .map(|r| r.err_message.clone())
-                        .unwrap_or_default();
-                    return Err(sign_err(format!("decrypt ssh key failed: {msg}")));
-                }
+                let value = match res.first() {
+                    Some(Ok(value)) => value,
+                    Some(Err(error)) => {
+                        return Err(sign_err(format!("decrypt ssh key failed: {error}")))
+                    }
+                    None => return Err(sign_err("decrypt ssh key failed: ")),
+                };
                 let bytes = BASE64_URL_SAFE_NO_PAD
-                    .decode(res[0].result.trim())
+                    .decode(value.trim())
                     .map_err(|e| sign_err(format!("ssh seed base64: {e}")))?;
                 let arr: [u8; 32] = bytes
                     .try_into()
