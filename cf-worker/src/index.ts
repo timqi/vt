@@ -322,9 +322,10 @@ app.post('/api/challenge', async (c) => {
   try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
   catch { return c.text('hmac length', 401); }
 
-  const rawBody = await c.req.arrayBuffer();
+  const rawBody = await readCappedBody(c);
+  if (!rawBody) return c.text('body too large', 413);
   const keyBytes = new TextEncoder().encode(c.env.VT_AUTH_CF);
-  const expected = await hmacSha256(keyBytes, new Uint8Array(rawBody));
+  const expected = await hmacSha256(keyBytes, rawBody);
   if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
 
   // 2. Parse body
@@ -440,9 +441,10 @@ app.post('/api/dek-cache', async (c) => {
   try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
   catch { return c.text('hmac length', 401); }
 
-  const rawBody = await c.req.arrayBuffer();
+  const rawBody = await readCappedBody(c);
+  if (!rawBody) return c.text('body too large', 413);
   const keyBytes = new TextEncoder().encode(c.env.VT_AUTH_CF);
-  const expected = await hmacSha256(keyBytes, new Uint8Array(rawBody));
+  const expected = await hmacSha256(keyBytes, rawBody);
   if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
 
   let body: DekCacheRequest;
@@ -475,9 +477,8 @@ app.post('/api/dek-cache', async (c) => {
 // request is negligible; the 64 KB cap + 401-on-bad-HMAC bound abuse.
 const AUDIT_INGEST_MAX_BYTES = 64 * 1024;
 app.post('/api/audit-ingest', async (c) => {
-  // 0. Reject oversized bodies before reading/parsing (cheap Content-Length
-  //    check first; the arrayBuffer length is re-checked below in case the
-  //    header lied).
+  // 0. Reject a declared oversized body before parsing the auth header;
+  //    readCappedBody also enforces the limit while streaming below.
   const clen = c.req.header('Content-Length');
   if (clen && Number(clen) > AUDIT_INGEST_MAX_BYTES) return c.text('body too large', 413);
 
@@ -488,9 +489,8 @@ app.post('/api/audit-ingest', async (c) => {
   try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
   catch { return c.text('hmac length', 401); }
 
-  const rawBuf = await c.req.arrayBuffer();
-  if (rawBuf.byteLength > AUDIT_INGEST_MAX_BYTES) return c.text('body too large', 413);
-  const rawBody = new Uint8Array(rawBuf);
+  const rawBody = await readCappedBody(c, AUDIT_INGEST_MAX_BYTES);
+  if (!rawBody) return c.text('body too large', 413);
 
   // 1. Parse the body to get agent_id (UNVERIFIED — it only selects the key).
   let body: AgentAuditIngestRequest;
@@ -562,17 +562,39 @@ app.post('/api/audit-ingest', async (c) => {
   });
 });
 
-// Cap on the (unauthenticated) approve/reject bodies. The dominant fields are
-// the sealed-DEK blobs; 256 KB covers thousands of records while bounding the
-// CPU/parse/DO-storage cost of an oversized POST to these public endpoints.
+// Shared cap for challenge/cache probes and approve/reject bodies. Bound reads
+// before HMAC/JSON work, even when Content-Length is absent or understated.
 const CEREMONY_POST_MAX_BYTES = 256 * 1024;
 
-async function readCappedBody(c: Context): Promise<Uint8Array | null> {
+async function readCappedBody(c: Context, maxBytes = CEREMONY_POST_MAX_BYTES): Promise<Uint8Array | null> {
   const clen = c.req.header('Content-Length');
-  if (clen && Number(clen) > CEREMONY_POST_MAX_BYTES) return null;
-  const buf = await c.req.arrayBuffer();
-  if (buf.byteLength > CEREMONY_POST_MAX_BYTES) return null;
-  return new Uint8Array(buf);
+  if (clen && Number(clen) > maxBytes) return null;
+  const reader = c.req.raw.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength === 0) continue;
+      if (value.byteLength > maxBytes - length) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+      length += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
 }
 
 // POST /api/approve — PWA submits sealed DEKs after WebAuthn
