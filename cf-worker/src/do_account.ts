@@ -29,6 +29,7 @@ import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
 import { AccountNotifications, NotificationChannels } from './account_notifications';
 import { AccountCache } from './account_cache';
+import { deleteKeysBatched } from './storage_batch';
 
 const TTL_MS = 5 * 60 * 1000;
 const RETENTION_MS = 10 * 60 * 1000;
@@ -43,8 +44,6 @@ function cacheAdminExtendEnabled(env: Env): boolean {
   return v === '1' || v === 'true' || v === 'on' || v === 'yes';
 }
 
-// Challenge retention cleanup shares the platform's 128-key delete limit.
-const STORAGE_BATCH = 128;
 // Cap on groups one extension ceremony may target. Keeps the approval page's
 // summary readable (the approver must be able to see what they are signing for)
 // and bounds the commit's read-modify-write work.
@@ -250,24 +249,6 @@ export class AccountDO extends DurableObject<Env> {
   webSocketClose(_ws: WebSocket, _code: number, _reason: string): void {}
   webSocketError(_ws: WebSocket, _error: unknown): void {}
 
-  // ── Storage helpers ────────────────────────────────────────────────────
-
-  // Delete an arbitrary number of keys, in the batches the platform accepts.
-  //
-  // DO storage takes at most STORAGE_BATCH keys per delete() call — the same
-  // documented cap as get()/put(). Handing it a longer array THROWS, and on a
-  // delete that means the cleanup (or the revocation) removes nothing at all
-  // while its caller happily reports the length it intended to remove. Returns
-  // the count storage actually removed, so a caller can report the truth rather
-  // than its intent.
-  private async deleteKeysBatched(keys: string[]): Promise<number> {
-    let deleted = 0;
-    for (let i = 0; i < keys.length; i += STORAGE_BATCH) {
-      deleted += await this.ctx.storage.delete(keys.slice(i, i + STORAGE_BATCH));
-    }
-    return deleted;
-  }
-
   // ── Alarm — sweep expired + finalized challenges ───────────────────────
 
   async alarm(): Promise<void> {
@@ -305,7 +286,7 @@ export class AccountDO extends DurableObject<Env> {
           toDelete.push(key, ptKey);
         }
       }
-      if (toDelete.length) await this.deleteKeysBatched(toDelete);
+      if (toDelete.length) await deleteKeysBatched(this.ctx.storage, toDelete);
     } catch (e) {
       logErr('alarm.challenge_sweep_failed', e);
     }

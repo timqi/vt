@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import nacl from 'tweetnacl';
 import { b64uEnc } from '../src/crypto';
 import { seal, cachePublicKey } from '../src/cache_crypto';
+import { deleteKeysBatched } from '../src/storage_batch';
 import {
   inDO, setDoVar, makeChallenge, makeMeta, signApproval, seedGroup,
   readEntries, auditRows, nextSalt, sealFakeDek, testEnv,
@@ -60,6 +61,30 @@ it('expires a still-pending challenge when valid verification crosses its TTL', 
   });
 });
 
+describe('shared storage deletion', () => {
+  it('does not call storage for an empty key set', async () => {
+    const storage = { delete: vi.fn() };
+    expect(await deleteKeysBatched(storage, [])).toBe(0);
+    expect(storage.delete).not.toHaveBeenCalled();
+  });
+
+  it('chunks at 128 keys and sums actual deletion counts', async () => {
+    const keys = Array.from({ length: 257 }, (_, i) => `key:${i}`);
+    const storage = { delete: vi.fn().mockResolvedValueOnce(100).mockResolvedValueOnce(127).mockResolvedValueOnce(0) };
+    expect(await deleteKeysBatched(storage, keys)).toBe(227);
+    expect(storage.delete.mock.calls).toEqual([
+      [keys.slice(0, 128)], [keys.slice(128, 256)], [keys.slice(256)],
+    ]);
+  });
+
+  it('rejects a partial failure without attempting later batches', async () => {
+    const keys = Array.from({ length: 257 }, (_, i) => `key:${i}`);
+    const storage = { delete: vi.fn().mockResolvedValueOnce(128).mockRejectedValueOnce(new Error('injected delete failure')) };
+    await expect(deleteKeysBatched(storage, keys)).rejects.toThrow('injected delete failure');
+    expect(storage.delete.mock.calls).toEqual([ [keys.slice(0, 128)], [keys.slice(128, 256)] ]);
+  });
+});
+
 describe('cache read plaintext lifetime', () => {
   it.each(['missing', 'malformed', 'cleanup-failure', 'hit', 'seal-failure'])(
     'wipes every opened buffer on %s', async (outcome) => {
@@ -84,7 +109,7 @@ describe('cache read plaintext lifetime', () => {
           return value;
         });
         const cleanup = outcome === 'cleanup-failure'
-          ? vi.spyOn(inst.cache, 'deleteKeysBatched').mockRejectedValue(new Error('injected cleanup failure'))
+          ? vi.spyOn(state.storage, 'delete').mockRejectedValue(new Error('injected cleanup failure'))
           : undefined;
         const sealing = outcome === 'seal-failure'
           ? vi.spyOn(nacl.box, 'keyPair').mockImplementation(() => { throw new Error('injected seal failure'); })

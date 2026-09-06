@@ -6,9 +6,8 @@ import { b64uEnc, isB64uString, decodeB64uExact, sha256, randomBytes } from './c
 import { seal, openToCache } from './cache_crypto';
 import { planExtend, isAllowedApproveTtl, groupIdOf, isExtendableGroupId, cacheScopePwd } from './cache_policy';
 import { logErr } from './log';
+import { STORAGE_BATCH, deleteKeysBatched } from './storage_batch';
 
-// DO storage batch limits: at most 128 keys per get() and 128 pairs per put().
-const STORAGE_BATCH = 128;
 // Entries read per internal list() page when aggregating the admin cache listing.
 const CACHE_LIST_PAGE = 1000;
 // Hard cap on entries scanned for one listing. Bounds DO CPU/memory on a
@@ -101,22 +100,6 @@ export class AccountCache {
     private readonly storage: DurableObjectStorage,
     private readonly env: Pick<Env, 'CACHE_SECKEY'>,
   ) {}
-
-  // Delete an arbitrary number of keys, in the batches the platform accepts.
-  //
-  // DO storage takes at most STORAGE_BATCH keys per delete() call — the same
-  // documented cap as get()/put(). Handing it a longer array THROWS, and on a
-  // delete that means the cleanup (or the revocation) removes nothing at all
-  // while its caller happily reports the length it intended to remove. Returns
-  // the count storage actually removed, so a caller can report the truth rather
-  // than its intent.
-  private async deleteKeysBatched(keys: string[]): Promise<number> {
-    let deleted = 0;
-    for (let i = 0; i < keys.length; i += STORAGE_BATCH) {
-      deleted += await this.storage.delete(keys.slice(i, i + STORAGE_BATCH));
-    }
-    return deleted;
-  }
 
   // Read an arbitrary number of keys, in the batches the platform accepts.
   //
@@ -314,7 +297,7 @@ export class AccountCache {
         }
         dekParts.push(dek);
       }
-      if (orphaned.length) { try { await this.deleteKeysBatched(orphaned); } catch {} }
+      if (orphaned.length) { try { await deleteKeysBatched(this.storage, orphaned); } catch {} }
 
       // All-or-nothing, including partial hits: every opened DEK is covered
       // by finally, even when a later salt is missing or opening/sealing fails.
