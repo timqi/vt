@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zeroize::Zeroizing;
 
+use crate::caller_meta::{collect_client_meta, current_ppid, get_hostname};
 use crate::core::sanitize_for_display as sanitize;
 use crate::core::sanitize_for_display_uncapped;
 
@@ -111,25 +112,6 @@ pub struct ChallengeMeta {
     pub reason: String,
 }
 
-/// Numeric parent PID of the current process (libc::getppid). 0 where
-/// unavailable. Reported to the worker for audit/forensics only — the DEK cache
-/// is bound to worker-derived IP + client-reported pwd, not to the PID (ppid
-/// was both spoofable and unstable across orchestrated shells, so it was
-/// dropped from the binding).
-#[cfg(unix)]
-pub fn current_ppid() -> u32 {
-    let p = unsafe { libc::getppid() };
-    if p > 0 {
-        p as u32
-    } else {
-        0
-    }
-}
-#[cfg(not(unix))]
-pub fn current_ppid() -> u32 {
-    0
-}
-
 /// Build a `ChallengeMeta` by collecting local context from the running
 /// process: hostname, $USER, cwd, controlling TTY, parent process command
 /// line, and SSH_CLIENT/SSH_CONNECTION. The caller supplies the three
@@ -139,7 +121,7 @@ pub fn collect_meta(op_kind: &str, command: &str, reason: &str) -> ChallengeMeta
     ChallengeMeta {
         op_kind: sanitize(op_kind, 32),
         command: sanitize_for_display_uncapped(command),
-        host: sanitize(&crate::client::get_hostname(), 100),
+        host: sanitize(&get_hostname(), 100),
         user: client.user,
         pwd: client.pwd,
         tty: client.tty,
@@ -148,107 +130,6 @@ pub fn collect_meta(op_kind: &str, command: &str, reason: &str) -> ChallengeMeta
         ssh_client: client.ssh_client,
         reason: sanitize(reason, 200),
     }
-}
-
-/// Collect the per-process display fields shared by both the CF ceremony
-/// (phone approval page) and the SSH-agent (Touch ID prompt) paths. Strings
-/// are pre-sanitized (control chars stripped, length-capped).
-pub fn collect_client_meta() -> crate::core::ClientMeta {
-    crate::core::ClientMeta {
-        user: sanitize(&username(), 64),
-        pwd: sanitize(&cwd(), 200),
-        tty: sanitize(&tty_name(), 40),
-        ppid_cmd: sanitize(&parent_cmd(), 200),
-        ssh_client: sanitize(&ssh_client_env(), 100),
-    }
-}
-
-fn username() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_default()
-}
-
-fn cwd() -> String {
-    std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default()
-}
-
-#[cfg(unix)]
-fn tty_name() -> String {
-    // ttyname(3) on stdin; returns NULL if stdin isn't a TTY (cron, pipes).
-    unsafe {
-        let p = libc::ttyname(0);
-        if p.is_null() {
-            return String::new();
-        }
-        std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-    }
-}
-#[cfg(not(unix))]
-fn tty_name() -> String {
-    String::new()
-}
-
-/// Shorten a parent command line to `basename(argv[0]) + args`. A long
-/// absolute argv[0] (`/opt/homebrew/Cellar/…/bin/zsh -c …`) drowned the
-/// signal on every display surface (Touch ID `via:`, approval page 父进程,
-/// notifications); the field is client-claimed display data everywhere, so
-/// the shortening happens once at collection.
-#[cfg(unix)]
-fn basename_cmdline(first: &str, rest: &[String]) -> String {
-    let base = first.rsplit('/').next().unwrap_or(first);
-    std::iter::once(base)
-        .chain(rest.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[cfg(unix)]
-fn parent_cmd() -> String {
-    let ppid = unsafe { libc::getppid() };
-    if ppid <= 0 {
-        return String::new();
-    }
-    // Linux: /proc/<ppid>/cmdline is NUL-separated argv.
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(buf) = std::fs::read(format!("/proc/{ppid}/cmdline")) {
-            let parts: Vec<String> = buf
-                .split(|b| *b == 0)
-                .filter(|p| !p.is_empty())
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .collect();
-            if let Some(first) = parts.first() {
-                return basename_cmdline(first, &parts[1..]);
-            }
-        }
-    }
-    // Fallback (macOS / no procfs): shell out to `ps`.
-    if let Ok(out) = std::process::Command::new("ps")
-        .args(["-o", "args=", "-p", &ppid.to_string()])
-        .output()
-    {
-        if out.status.success() {
-            let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let mut it = full.split_whitespace().map(str::to_string);
-            if let Some(first) = it.next() {
-                return basename_cmdline(&first, &it.collect::<Vec<_>>());
-            }
-        }
-    }
-    String::new()
-}
-#[cfg(not(unix))]
-fn parent_cmd() -> String {
-    String::new()
-}
-
-fn ssh_client_env() -> String {
-    std::env::var("SSH_CLIENT")
-        .or_else(|_| std::env::var("SSH_CONNECTION"))
-        .unwrap_or_default()
 }
 
 #[derive(Deserialize)]
@@ -674,6 +555,38 @@ fn verify_binding(
 mod tests {
     use super::*;
     use dryoc::classic::crypto_box::crypto_box_keypair;
+
+    #[test]
+    fn challenge_meta_preserves_shape_and_command_newlines() {
+        let meta = collect_meta("decrypt\0", "first\r\nsecond\t", "reason\n");
+        assert_eq!(meta.op_kind, "decrypt");
+        assert_eq!(meta.command, "first\nsecond");
+        assert_eq!(meta.reason, "reason");
+        assert_eq!(meta.host, sanitize(&get_hostname(), 100));
+        assert_eq!(meta.ppid, current_ppid());
+        let json = serde_json::to_value(meta).unwrap();
+        let fields: Vec<_> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "command",
+                "host",
+                "op_kind",
+                "ppid",
+                "ppid_cmd",
+                "pwd",
+                "reason",
+                "ssh_client",
+                "tty",
+                "user"
+            ]
+        );
+    }
 
     fn hex_encode(bytes: &[u8]) -> String {
         let mut s = String::with_capacity(bytes.len() * 2);

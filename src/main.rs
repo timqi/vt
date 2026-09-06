@@ -38,7 +38,7 @@ fn build_audit_push_config(
     };
     // agent_id = hostname. The Worker re-derives HKDF(VT_AUTH_CF, hostname) to
     // verify, so the wire stays per-host-keyed and the Worker is unchanged.
-    let hostname = client::get_hostname();
+    let hostname = caller_meta::get_hostname();
     // Derive the per-host subkey once; pass the Zeroizing<[u8;32]> straight in so
     // no plain heap copy of the key ever exists.
     let key = audit::derive_agent_audit_key(master.as_bytes(), &hostname);
@@ -46,6 +46,7 @@ fn build_audit_push_config(
 }
 
 mod audit;
+mod caller_meta;
 mod cf;
 mod client;
 mod config;

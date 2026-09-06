@@ -7,21 +7,23 @@
 mod commands;
 mod doctor;
 mod inject;
+mod records;
 
 pub use commands::{auth, create, read, rewrap, run};
 pub use doctor::doctor;
 pub use inject::{inject, inject_recover, supervisor_main, SUPERVISOR_SUBCOMMAND};
 
+use crate::caller_meta::{collect_client_meta, get_hostname};
 use crate::cf;
 use crate::config::{ClientRoute, ResolvedConfig};
 use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
 use crate::core::wire::{ErrKind, WIRE_VERSION};
 use crate::core::{
-    client_decrypt_v2, client_encrypt_v2, AuthReq, AuthRes, DecryptInput, DecryptReq,
-    DecryptResItem, EncryptItem, EncryptReq, EncryptResItem, RunReq, RunRes, SecretType, SignReq,
-    SignRes, VtUrl, SALT_LEN,
+    client_encrypt_v2, AuthReq, AuthRes, DecryptReq, EncryptItem, EncryptReq, EncryptResItem,
+    RunReq, RunRes, SignReq, SignRes,
 };
 use anyhow::{ensure, Context, Result};
+use records::DecryptBatch;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use ssh_agent_lib::proto::{Extension, Unparsed};
@@ -456,98 +458,20 @@ impl VTClient {
         }
         #[cfg(unix)]
         {
-            // Parse URLs locally; track v2 inner_ct + type so we can finish
-            // decryption client-side once the agent returns the DEK.
-            enum Local {
-                V2 {
-                    t: SecretType,
-                    salt: [u8; crate::core::SALT_LEN],
-                    inner_ct: Vec<u8>,
-                },
-                Legacy,
-                ParseErr(String),
-            }
-            let mut wire_items: Vec<DecryptInput> = Vec::with_capacity(urls.len());
-            let mut locals: Vec<Local> = Vec::with_capacity(urls.len());
-            for raw_url in urls {
-                match VtUrl::parse(raw_url) {
-                    Ok(VtUrl::V2 { t, salt, inner_ct }) => {
-                        wire_items.push(DecryptInput::V2 { t, salt });
-                        locals.push(Local::V2 { t, salt, inner_ct });
-                    }
-                    Ok(VtUrl::Legacy { .. }) => {
-                        wire_items.push(DecryptInput::Legacy {
-                            url: raw_url.clone(),
-                        });
-                        locals.push(Local::Legacy);
-                    }
-                    Err(e) => {
-                        // Skip the wire roundtrip for unparseable items by
-                        // pushing a Legacy placeholder we'll override on the
-                        // way back. Actually simpler: still push to keep
-                        // index alignment — agent will fail-parse, but better
-                        // to fail locally and avoid the extension call only if
-                        // *every* item is bad. Here we fail locally per-item.
-                        wire_items.push(DecryptInput::Legacy {
-                            url: raw_url.clone(),
-                        });
-                        locals.push(Local::ParseErr(e.to_string()));
-                    }
-                }
-            }
-
+            let batch = DecryptBatch::parse(urls);
             let wire = DecryptReq {
                 host: host.to_string(),
                 command: command.to_string(),
-                items: wire_items,
-                meta: cf::collect_client_meta(),
+                items: batch.agent_items(),
+                meta: collect_client_meta(),
             };
             let payload = serde_json::to_vec(&wire)?;
             let result = self.agent_call_or_fallback("decrypt@vt", payload).await?;
             let bytes = match result {
                 Some(b) => b,
-                None => return self.cf_decrypt(command, urls).await,
+                None => return self.cf_decrypt(command, batch).await,
             };
-            let mut wire_results: Vec<DecryptResItem> = serde_json::from_slice(&bytes)?;
-            ensure!(
-                wire_results.len() == locals.len(),
-                "agent returned {} results for {} items",
-                wire_results.len(),
-                locals.len()
-            );
-
-            let mut out = Vec::with_capacity(locals.len());
-            for (local, wire_res) in locals.into_iter().zip(wire_results.iter_mut()) {
-                let item = match (local, wire_res) {
-                    (Local::ParseErr(e), _) => Err(ItemError(e)),
-                    (Local::V2 { t, salt, inner_ct }, DecryptResItem::V2 { dek, err_message }) => {
-                        let dek_copy: Zeroizing<[u8; 32]> = Zeroizing::new(*dek);
-                        dek.zeroize();
-                        if err_message.is_empty() {
-                            client_decrypt_v2(t, &dek_copy, &salt, &inner_ct)
-                                .map_err(ItemError::from)
-                        } else {
-                            Err(ItemError(std::mem::take(err_message)))
-                        }
-                    }
-                    (
-                        Local::Legacy,
-                        DecryptResItem::Legacy {
-                            result,
-                            err_message,
-                        },
-                    ) => legacy_item_result(std::mem::take(result), std::mem::take(err_message)),
-                    // Mismatched variants — agent returned the wrong shape for
-                    // this index. Should not happen unless the agent and
-                    // client disagree on protocol.
-                    _ => Err(ItemError(
-                        "agent returned mismatched response variant".into(),
-                    )),
-                };
-                out.push(item);
-            }
-            // `bytes` is `Zeroizing<Vec<u8>>` — wiped on drop at end of scope.
-            Ok(out)
+            batch.finish_agent(serde_json::from_slice(&bytes)?)
         }
         #[cfg(not(unix))]
         {
@@ -585,7 +509,7 @@ impl VTClient {
             pubkey: pubkey.to_vec(),
             data: data.to_vec(),
             flags,
-            meta: cf::collect_client_meta(),
+            meta: collect_client_meta(),
         };
         // Without VT_AUTH, or with a passkey pin, skip the agent socket and
         // return the fallback signal. Decrypt-then-sign routes through this
@@ -636,32 +560,12 @@ impl VTClient {
         Ok(out)
     }
 
-    async fn cf_decrypt(&self, command: &str, urls: &[String]) -> Result<Vec<ItemResult>> {
+    async fn cf_decrypt(&self, command: &str, batch: DecryptBatch<'_>) -> Result<Vec<ItemResult>> {
         let config = self
             .config
             .passkey_config()
             .context("SSH agent unavailable; CF passkey env not configured")?;
-
-        // Parse URLs; collect v2 salts in order
-        struct Item {
-            t: SecretType,
-            salt: [u8; SALT_LEN],
-            inner_ct: Vec<u8>,
-        }
-        let mut items: Vec<Result<Item, String>> = Vec::with_capacity(urls.len());
-        let mut salts: Vec<[u8; SALT_LEN]> = Vec::new();
-        for raw_url in urls {
-            match VtUrl::parse(raw_url) {
-                Ok(VtUrl::V2 { t, salt, inner_ct }) => {
-                    salts.push(salt);
-                    items.push(Ok(Item { t, salt, inner_ct }));
-                }
-                Ok(VtUrl::Legacy { .. }) => {
-                    items.push(Err("legacy vt:// URLs require macOS SSH agent".to_string()));
-                }
-                Err(e) => items.push(Err(e.to_string())),
-            }
-        }
+        let salts = batch.salts();
 
         // Fast path: try the opt-in DEK cache first (no phone if all salts are
         // cached for this IP+pwd within the approved TTL). The full meta is sent
@@ -674,24 +578,7 @@ impl VTClient {
             None => cf::get_deks(&config, &salts, meta).await?,
         };
 
-        let mut out = Vec::with_capacity(urls.len());
-        let mut dek_idx = 0usize;
-        for item_res in items {
-            match item_res {
-                Err(e) => out.push(Err(ItemError(e))),
-                Ok(Item { t, salt, inner_ct }) => {
-                    // Bounds-guard rather than index: open_sealed_deks already
-                    // enforces deks.len() == salts.len(), but never let a short
-                    // worker response panic the process here.
-                    let dek = deks.get(dek_idx).ok_or_else(|| {
-                        anyhow::anyhow!("internal: fewer DEKs returned than v2 records")
-                    })?;
-                    dek_idx += 1;
-                    out.push(client_decrypt_v2(t, dek, &salt, &inner_ct).map_err(ItemError::from));
-                }
-            }
-        }
-        Ok(out)
+        batch.finish_cf(&deks)
     }
 
     async fn cf_auth(&self, reason: &str) -> Result<()> {
@@ -731,7 +618,7 @@ impl VTClient {
                 host: get_hostname(),
                 argv,
                 reason: reason.map(str::to_string),
-                meta: cf::collect_client_meta(),
+                meta: collect_client_meta(),
             };
             let payload = serde_json::to_vec(&req)?;
             let result = self.agent_call_or_fallback("run@vt", payload).await?;
@@ -760,7 +647,7 @@ impl VTClient {
             let req = AuthReq {
                 host: get_hostname(),
                 reason: reason.to_string(),
-                meta: cf::collect_client_meta(),
+                meta: collect_client_meta(),
             };
             let payload = serde_json::to_vec(&req)?;
             let result = self.agent_call_or_fallback("auth@vt", payload).await?;
@@ -782,18 +669,12 @@ impl VTClient {
     }
 }
 
-pub fn get_hostname() -> String {
-    hostname::get()
-        .unwrap_or_else(|_| "unknown".into())
-        .to_string_lossy()
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::core::wire::wrap_ok_envelope;
+    use crate::core::DecryptResItem;
 
     #[test]
     fn single_item_result_rejects_wrong_counts_before_item_errors() {
@@ -909,6 +790,47 @@ mod tests {
             }
             if !route.uses_agent() {
                 assert!(client.run(vec!["unused".into()], None).await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypt_empty_fast_path_and_cf_failures_survive_agent_fallback() {
+        for backend in ["auto", "passkey"] {
+            let client = VTClient::new(ResolvedConfig::resolve(
+                Some("unused".into()),
+                Vec::new(),
+                |key| match key {
+                    "VT_BACKEND" => Some(backend.into()),
+                    "SSH_AUTH_SOCK" => Some("\0".into()),
+                    "VT_PASSKEY_URL" => Some("invalid-url".into()),
+                    "VT_PASSKEY_TOKEN" => Some("test-only".into()),
+                    _ => None,
+                },
+                None,
+                None,
+            ))
+            .unwrap();
+            assert!(client
+                .decrypt("host", "test", &[])
+                .await
+                .unwrap()
+                .is_empty());
+            for urls in [
+                vec!["vt://mac/0YWJj".into()],
+                vec!["bad".into()],
+                vec![crate::core::client_encrypt_v2(
+                    crate::core::SecretType::RAW,
+                    &[1; 16],
+                    &[2; 32],
+                    b"fixture",
+                )
+                .unwrap()],
+            ] {
+                // An invalid URL cannot contact a phone or agent. Even a batch
+                // without v2 records must still propagate the ceremony failure.
+                let error = client.decrypt("host", "test", &urls).await.unwrap_err();
+                assert!(format!("{error:#}").contains("relative URL without a base"));
             }
         }
     }
