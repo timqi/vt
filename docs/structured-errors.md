@@ -176,6 +176,12 @@ wrong `v` yields `ProtocolVersion` (exit `22`). Keep client and agent builds
 aligned during upgrades. Same-version extra fields and unknown error kinds are
 forward-compatible as described above; no runtime build-identity check exists.
 
+An older agent may ignore an unknown extension with `Ok(None)` (SSH success,
+empty payload): `try_agent_extension` maps this to
+`Transport("Agent returned empty extension response")`, eligible for the routing
+below, while the dedicated `call_diag` in `src/client/doctor.rs` classifies it as
+`DiagOutcome::TooOld` (see [diag-design.md](diag-design.md)).
+
 Wire rejection does **not** prohibit trying a different backend:
 
 - `agent_call_or_fallback` in `auto` mode treats typed transport failures and
@@ -219,9 +225,10 @@ dispatcher owns response encryption and permit commitment:
 
 4. **Lock state**: agent lock is checked before deriving the auth cipher or
    showing a prompt, so it remains an unstructured SSH-agent failure and can
-   neither consume nor create a grant. Live security validation failure revokes
-   existing grants; this differs from an ordinary user rejection, which adds
-   none but does not itself revoke existing entries.
+   neither consume nor create a grant. A `validate_live` failure and an
+   authenticator returning `AuthOutcome::Unavailable` are separate paths that
+   both revoke existing grants; an ordinary user rejection adds none but does
+   not itself revoke existing entries.
 
 `auth@vt` and `run@vt` always use fresh authorization and never create reusable
 grants. A live permit blocks revocation; cache-hit notifications run only after
@@ -280,9 +287,12 @@ macOS session APIs or a native authentication prompt.
 In `src/core/authorization.rs`, `grant_is_written_only_after_operation_commits_permit`,
 `rejection_and_unavailable_never_grant`,
 `rejected_partial_batch_preserves_existing_grants_and_adds_none`,
-`strict_ttl_does_not_slide`, `ttl_policy_tightening_requires_fresh_approval`, and
-`prompt_unavailable_revokes_preexisting_grants` cover the engine rules above.
-They do not drive dispatcher encryption failures or real signing/decrypt work.
+`strict_ttl_does_not_slide`, and `ttl_policy_tightening_requires_fresh_approval`
+cover commitment, rejection/unavailability, partial batches, and TTL policy.
+`prompt_unavailable_revokes_preexisting_grants` specifically covers revocation
+when the authenticator returns `AuthOutcome::Unavailable`, not a `validate_live`
+failure. These tests do not drive dispatcher encryption failures or real
+signing/decrypt work.
 
 Run these focused suites from the repository root:
 
