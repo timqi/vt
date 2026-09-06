@@ -1,10 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
+import { env } from 'cloudflare:test';
+import app from '../src/index';
 import { AccountNotifications } from '../src/account_notifications';
+import { b64uEnc, hmacSha256 } from '../src/crypto';
 import * as feishu from '../src/feishu';
 import * as slackApp from '../src/slack_app';
+import * as pushover from '../src/pushover';
+import * as slack from '../src/slack';
 import * as notify from '../src/notify';
 import type { Challenge, Env, DoAuditIngestOp } from '../src/types';
-import { inDO, makeChallenge, makeMeta } from './do_helpers';
+import { accountStub, inDO, makeChallenge, makeMeta } from './do_helpers';
 
 const FEISHU_JSON = JSON.stringify({
   app_id: 'test-app', app_secret: 'synthetic-test-value', receive_id: 'test-user',
@@ -172,6 +177,21 @@ describe('AccountNotifications delivery contract', () => {
     });
   });
 
+  it('isolates a synchronous terminal catch-up failure and still stores the sibling reference', async () => {
+    await withNotifications(async ({ notifications, state, tasks, feishuEdit, slackEdit }) => {
+      const ch = makeChallenge();
+      const terminal = { ...ch, status: 'expired' as const, finalized_ms: ch.created_ms + 500 };
+      await state.storage.put(`ch:${ch.approve_token}`, terminal);
+      feishuEdit.mockImplementationOnce(() => { throw new Error('synthetic synchronous edit failure'); });
+      notifications.approval(ch);
+      await expect(Promise.all(tasks)).resolves.toBeDefined();
+      expect(slackEdit).toHaveBeenCalledOnce();
+      expect(await state.storage.get(`ch:${ch.approve_token}`)).toEqual({
+        ...terminal, feishu_message_id: 'test-message', slackapp: { channel: 'test-channel', ts: '1.0' },
+      });
+    });
+  });
+
   it.each(['feishu', 'slackapp'] as const)('never recreates a challenge swept while %s delivery was pending', async (channel) => {
     await withNotifications(async ({ notifications, state, tasks, feishuSend, slackSend, feishuEdit, slackEdit }) => {
       const ch = makeChallenge();
@@ -263,5 +283,58 @@ describe('AccountNotifications delivery contract', () => {
       expect(slackHit).toHaveBeenCalledTimes(4);
       expect(statelessHit.mock.calls[0]![3]).toBe('缓存命中，免 Touch ID');
     });
+  });
+});
+
+describe('approval route notification contract', () => {
+  it('awaits stateless delivery and returns push_warning without failing the created ceremony', async () => {
+    const key = 'synthetic-notification-route-key';
+    const encoder = new TextEncoder();
+    const body = encoder.encode(JSON.stringify({
+      daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
+      timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta(),
+    }));
+    const tag = await hmacSha256(encoder.encode(key), body);
+    let finishSend!: (warning: string) => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    vi.spyOn(pushover, 'notifyPushover').mockImplementationOnce(() => new Promise(resolve => {
+      finishSend = resolve;
+      markStarted();
+    }));
+    const slackSend = vi.spyOn(slack, 'notifySlack').mockRejectedValueOnce(new Error('synthetic failure'));
+    // Drain the internal create response so workerd's isolated storage stack
+    // does not retain an open DO response stream after the public route returns.
+    const account = {
+      idFromName: () => 'account',
+      get: () => ({ fetch: async (url: string, init: RequestInit) => {
+        const response = await accountStub().fetch(url, init);
+        return new Response(await response.text(), { status: response.status });
+      } }),
+    };
+    try {
+      let completed = false;
+      const pending = app.fetch(new Request('https://vt.test.invalid/api/challenge', {
+        method: 'POST', body, headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}` },
+      }), {
+        ...env, VT_AUTH_CF: key, ACCOUNT: account,
+        PUSHOVER_JSON: JSON.stringify({ app_token: 'synthetic-token', user_key: 'synthetic-user' }),
+        SLACK_JSON: JSON.stringify({ webhook_url: 'https://hooks.slack.com/services/test/test/test' }),
+      }).then(response => { completed = true; return response; });
+      await started;
+      expect(completed).toBe(false);
+      expect(slackSend).toHaveBeenCalledOnce();
+      finishSend('synthetic delivery warning');
+      const response = await pending;
+      expect(response.status).toBe(200);
+      const result = await response.json() as { approve_token: string; push_warning: string };
+      expect(result.push_warning).toContain('pushover: synthetic delivery warning');
+      expect(result.push_warning).toContain('slack: notify error');
+      await inDO(async ({ state }) => {
+        expect(await state.storage.get(`ch:${result.approve_token}`)).toMatchObject({ status: 'pending' });
+      });
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

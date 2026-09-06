@@ -3,13 +3,13 @@
 
 import { Env, Challenge, ChallengeMeta, ChallengeStatus, DoAuditIngestOp } from './types';
 import { notifyCacheHit } from './notify';
-import { parseFeishuConfig, sendApprovalCard, editCard, sendCacheHitNotice, FeishuConfig, FeishuState, Kv as FeishuKv } from './feishu';
+import { parseFeishuConfig, sendApprovalCard, editCard, sendCacheHitNotice, FeishuConfig, Kv as FeishuKv } from './feishu';
 import {
   parseSlackAppConfig,
   sendApprovalCard as sendSlackAppCard,
   editCard as editSlackAppCard,
   sendCacheHitNotice as sendSlackAppCacheHitNotice,
-  SlackAppConfig, SlackAppState, SlackAppMsgRef,
+  SlackAppConfig,
 } from './slack_app';
 import { logErr } from './log';
 
@@ -35,6 +35,18 @@ export interface NotificationChannels {
   slackApp: SlackAppConfig | null;
 }
 
+type ReferenceField = 'feishu_message_id' | 'slackapp';
+type TerminalState = Exclude<ChallengeStatus, 'pending'>;
+type EditExtra = { approverLabel?: string; latencyMs?: number };
+
+interface EditableChannel<K extends ReferenceField> {
+  field: K;
+  name: 'feishu' | 'slackapp';
+  missingReference: string;
+  send(ch: Challenge, approveUrl: string): Promise<NonNullable<Challenge[K]> | null>;
+  edit(ref: NonNullable<Challenge[K]>, ch: Challenge, state: TerminalState, extra: EditExtra): Promise<string>;
+}
+
 export class AccountNotifications {
   // In-memory only: eviction can cause one extra notice, never a missing audit.
   private agentCacheNotifyMs = new Map<string, number>();
@@ -50,12 +62,13 @@ export class AccountNotifications {
 
   edit(
     ch: Challenge,
-    state: Exclude<ChallengeStatus, 'pending'>,
-    extra: { approverLabel?: string; latencyMs?: number },
+    state: TerminalState,
+    extra: EditExtra,
     channels?: NotificationChannels,
   ): void {
-    this.feishuEdit(ch, state, extra, channels?.feishu);
-    this.slackAppEdit(ch, state, extra, channels?.slackApp);
+    const configs = channels ?? this.channels();
+    if (configs.feishu) this.scheduleEdit(this.feishuChannel(configs.feishu), ch, state, extra);
+    if (configs.slackApp) this.scheduleEdit(this.slackAppChannel(configs.slackApp), ch, state, extra);
   }
 
   approval(challenge: Challenge): void {
@@ -74,7 +87,7 @@ export class AccountNotifications {
     const slackCfg = this.slackAppCfg();
     if (cfg || slackCfg) {
       const approveUrl = `${this.env.WORKER_ORIGIN}/a/${challenge.approve_token}`;
-      // Both feishuSendAndStore and slackAppSendAndStore do a read-modify-write of
+      // Both channels do a read-modify-write of
       // the SAME `ch:` record, each writing only its own ref field
       // (feishu_message_id / slackapp). As independent waitUntil tasks their
       // `await get`s can both read the pre-write snapshot, so the later `put`
@@ -83,8 +96,8 @@ export class AccountNotifications {
       // waitUntil so the second reads the first's committed write. Client latency
       // is unaffected: opCreate already returns before these settle.
       this.ctx.waitUntil((async () => {
-        if (cfg) await this.feishuSendAndStore(cfg, challenge, approveUrl);
-        if (slackCfg) await this.slackAppSendAndStore(slackCfg, challenge, approveUrl);
+        if (cfg) await this.sendAndStore(this.feishuChannel(cfg), challenge, approveUrl);
+        if (slackCfg) await this.sendAndStore(this.slackAppChannel(slackCfg), challenge, approveUrl);
       })());
     }
   }
@@ -108,7 +121,7 @@ export class AccountNotifications {
 
   // Merge only the delivered channel's reference into the latest challenge.
   // Provider awaits stay outside this get/put pair; a swept record stays gone.
-  private async storeReference<K extends 'feishu_message_id' | 'slackapp'>(
+  private async storeReference<K extends ReferenceField>(
     approveToken: string, field: K, reference: NonNullable<Challenge[K]>,
   ): Promise<Challenge | undefined> {
     const key = `ch:${approveToken}`;
@@ -124,100 +137,68 @@ export class AccountNotifications {
   // can edit it. If the decision raced ahead of the send (challenge already
   // terminal), edit the card straight to its final state instead — the only
   // failure mode of the race is a card that never leaves "⏳", which this closes.
-  private async feishuSendAndStore(cfg: FeishuConfig, ch: Challenge, approveUrl: string): Promise<void> {
+  private async sendAndStore<K extends ReferenceField>(
+    channel: EditableChannel<K>, ch: Challenge, approveUrl: string,
+  ): Promise<void> {
     try {
-      const id = await sendApprovalCard(
-        cfg, this.feishuKv(), Date.now(), ch.meta.op_kind, ch.meta, approveUrl, chSalts(ch));
-      if (!id) { logErr('feishu.send_failed', 'no message_id'); return; }
-      const cur = await this.storeReference(ch.approve_token, 'feishu_message_id', id);
+      const ref = await channel.send(ch, approveUrl);
+      if (!ref) { logErr(`${channel.name}.send_failed`, channel.missingReference); return; }
+      const cur = await this.storeReference(ch.approve_token, channel.field, ref);
       if (!cur) return;
       if (cur.status !== 'pending') {
         // Decision landed first. Edit to the terminal state now that we have the
         // id. Approver label is unavailable on this path (opApprove already ran
         // without an id) — degrade to latency-only; this race is rare + cosmetic.
         const latencyMs = cur.finalized_ms != null ? cur.finalized_ms - cur.created_ms : undefined;
-        const w = await editCard(
-          cfg, this.feishuKv(), Date.now(), id, cur.status as FeishuState,
-          cur.meta.op_kind, cur.meta, { latencyMs }, chSalts(cur));
-        if (w) logErr('feishu.edit_failed', w);
+        await this.editDelivered(channel, ref, cur, cur.status, { latencyMs });
       }
-    } catch (e) { logErr('feishu.send_failed', e); }
+    } catch (e) { logErr(`${channel.name}.send_failed`, e); }
   }
 
-  // Edit an already-sent card to a terminal state (off the decision path).
-  // `cfgHint` lets a caller (the alarm sweep) pass a config parsed ONCE for the
-  // whole batch, instead of this method re-parsing FEISHU_JSON — and re-logging
-  // any config error — for every challenge in a loop. Omit it (undefined) for
-  // the one-shot approve/reject paths, which parse on demand.
-  private feishuEdit(
-    ch: Challenge,
-    state: FeishuState,
-    extra: { approverLabel?: string; latencyMs?: number },
-    cfgHint?: FeishuConfig | null,
+  private async editDelivered<K extends ReferenceField>(
+    channel: EditableChannel<K>, ref: NonNullable<Challenge[K]>,
+    ch: Challenge, state: TerminalState, extra: EditExtra,
+  ): Promise<void> {
+    try {
+      const warning = await channel.edit(ref, ch, state, extra);
+      if (warning) logErr(`${channel.name}.edit_failed`, warning);
+    } catch (e) { logErr(`${channel.name}.edit_failed`, e); }
+  }
+
+  // The alarm supplies configs parsed once for the batch; individual decisions
+  // parse on demand. Delivery remains outside the protected operation.
+  private scheduleEdit<K extends ReferenceField>(
+    channel: EditableChannel<K>, ch: Challenge, state: TerminalState, extra: EditExtra,
   ): void {
-    const cfg = cfgHint !== undefined ? cfgHint : this.feishuCfg();
-    if (!cfg || !ch.feishu_message_id) return;
-    const mid = ch.feishu_message_id;
-    const meta = ch.meta;
-    this.ctx.waitUntil(
-      editCard(cfg, this.feishuKv(), Date.now(), mid, state, meta.op_kind, meta, extra, chSalts(ch))
-        .then((w) => { if (w) logErr('feishu.edit_failed', w); })
-        .catch((e) => logErr('feishu.edit_failed', e)),
-    );
+    const ref = ch[channel.field];
+    if (ref) this.ctx.waitUntil(this.editDelivered(channel, ref, ch, state, extra));
   }
 
-  // ── Slack App channel (stateful: bot token + editable message) ───────────────
-  // Structurally identical to the Feishu channel above (send → store ref → edit
-  // on decision), minus the token cache: a Slack bot token is long-lived, so
-  // there is no KV. A malformed SLACK_APP_JSON is logged once and treated as
-  // "channel off" (best-effort, never breaks the ceremony).
+  private feishuChannel(cfg: FeishuConfig): EditableChannel<'feishu_message_id'> {
+    return {
+      field: 'feishu_message_id', name: 'feishu', missingReference: 'no message_id',
+      send: (ch, url) => sendApprovalCard(
+        cfg, this.feishuKv(), Date.now(), ch.meta.op_kind, ch.meta, url, chSalts(ch)),
+      edit: (ref, ch, state, extra) => editCard(
+        cfg, this.feishuKv(), Date.now(), ref, state, ch.meta.op_kind, ch.meta, extra, chSalts(ch)),
+    };
+  }
+
+  // Slack's long-lived bot token needs no KV cache. A malformed config disables
+  // only this channel, just like Feishu.
   private slackAppCfg(): SlackAppConfig | null {
     const { config, error } = parseSlackAppConfig(this.env.SLACK_APP_JSON);
     if (error) logErr('slackapp.config_error', error);
     return config;
   }
 
-  // Fire the pending approval message (off the ceremony path) and write the
-  // resulting {channel, ts} back onto the challenge so a later approve/reject/
-  // expire can edit it. Mirrors feishuSendAndStore, including the send-vs-decision
-  // race: if the decision landed first, edit straight to the terminal state.
-  private async slackAppSendAndStore(cfg: SlackAppConfig, ch: Challenge, approveUrl: string): Promise<void> {
-    try {
-      const ref = await sendSlackAppCard(cfg, ch.meta.op_kind, ch.meta, approveUrl, chSalts(ch));
-      if (!ref) { logErr('slackapp.send_failed', 'no ts'); return; }
-      const cur = await this.storeReference(ch.approve_token, 'slackapp', ref);
-      if (!cur) return;
-      if (cur.status !== 'pending') {
-        // Decision landed first — edit to the terminal state now that we have the
-        // ref. Approver label is unavailable on this path (opApprove already ran
-        // without a ref) — degrade to latency-only; this race is rare + cosmetic.
-        const latencyMs = cur.finalized_ms != null ? cur.finalized_ms - cur.created_ms : undefined;
-        const w = await editSlackAppCard(
-          cfg, ref, cur.status as SlackAppState, cur.meta.op_kind, cur.meta,
-          { latencyMs }, chSalts(cur));
-        if (w) logErr('slackapp.edit_failed', w);
-      }
-    } catch (e) { logErr('slackapp.send_failed', e); }
-  }
-
-  // Edit an already-sent message to a terminal state (off the decision path).
-  // `cfgHint` mirrors feishuEdit: the alarm sweep passes a config parsed ONCE for
-  // the whole batch; the one-shot approve/reject paths omit it (parse on demand).
-  private slackAppEdit(
-    ch: Challenge,
-    state: SlackAppState,
-    extra: { approverLabel?: string; latencyMs?: number },
-    cfgHint?: SlackAppConfig | null,
-  ): void {
-    const cfg = cfgHint !== undefined ? cfgHint : this.slackAppCfg();
-    if (!cfg || !ch.slackapp) return;
-    const ref: SlackAppMsgRef = ch.slackapp;
-    const meta = ch.meta;
-    this.ctx.waitUntil(
-      editSlackAppCard(cfg, ref, state, meta.op_kind, meta, extra, chSalts(ch))
-        .then((w) => { if (w) logErr('slackapp.edit_failed', w); })
-        .catch((e) => logErr('slackapp.edit_failed', e)),
-    );
+  private slackAppChannel(cfg: SlackAppConfig): EditableChannel<'slackapp'> {
+    return {
+      field: 'slackapp', name: 'slackapp', missingReference: 'no ts',
+      send: (ch, url) => sendSlackAppCard(cfg, ch.meta.op_kind, ch.meta, url, chSalts(ch)),
+      edit: (ref, ch, state, extra) => editSlackAppCard(
+        cfg, ref, state, ch.meta.op_kind, ch.meta, extra, chSalts(ch)),
+    };
   }
 
   // Fan a cache-hit notice out to every configured channel (stateless
