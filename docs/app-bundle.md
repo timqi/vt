@@ -246,10 +246,10 @@ after upgrading.
 
 Managed stderr is drained continuously, retaining only the last 64 KiB in
 memory, not a log file. Exit snapshots do not wait for EOF from descendants.
-A fast (under three seconds) or nonzero exit surfaces the last line and a Doctor
-shortcut, including old-path wrap failures. After installation, running code
-does not change until restart; version comparison uses `agent_version` and the
-bundled `vt version`.
+A fast (under three seconds) or nonzero exit surfaces the last nonempty stderr
+line (up to 120 characters) and a Doctor shortcut, including old-path wrap
+failures. After installation, running code does not change until restart;
+version comparison uses `agent_version` and the bundled `vt version`.
 
 ## 7. Migration from a non-bundle install
 
@@ -265,7 +265,9 @@ open /Applications/VT.app
 
 For example, `/Users/you/.local/bin/vt` is correct only if that was the real
 file, not a symlink to another location. If rebind is skipped and startup cannot
-unwrap v1, the menu surfaces the failure and rebind hint. After migration,
+unwrap v1, the menu surfaces the last nonempty stderr line and a Doctor shortcut
+as described in section 6. The rebind hint is only in the agent's earlier stderr
+warning; the final `Decryption error` line does not include it. After migration,
 future binary moves do not require another rebind. Remove obsolete binaries;
 rollback precautions are in section 2.
 
@@ -329,10 +331,10 @@ and key reload across screen lock, wake, and idle timeout.
 The five-second watcher detects interactive-to-non-interactive transitions and
 sleep/wake clock divergence. On either trigger it revokes grants, then
 `clear_keys_for_reload` clears the decrypted SSH-key map and sets
-`idle_cleared`. The idle sweeper likewise revokes even with an empty key map,
-then clears keys. Request-time live validation independently rejects unsafe
-authorization before the next watcher tick; watcher-based key wiping is not
-instantaneous at lock.
+`idle_cleared` only if the map is nonempty. The idle sweeper likewise revokes
+even with an empty key map, then calls the same helper. Request-time live
+validation independently rejects unsafe authorization before the next watcher
+tick; watcher-based key wiping is not instantaneous at lock.
 
 `ensure_keys_loaded` silently reloads cleared keys on the next interactive use.
 It checks screen-interactive state **before** Keychain I/O and **again before

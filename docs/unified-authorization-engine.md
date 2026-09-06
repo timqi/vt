@@ -154,8 +154,14 @@ whole request Fresh.
 allowlist and sanitizes its prompt before Fresh authorization. Spawn occurs
 while the permit is live; spawn failure drops it and emits the separate
 `spawn_failed` audit event. Neither free-form reason nor command text can turn
-these operations into reusable authority. Adding reuse requires a separate
-structured policy and security review.
+these operations into reusable authority.
+
+Any future reuse would require a separate security review and user-visible
+policy: auth needs structured service, target user, TTY/PAM session, and consumer
+identity; run needs explicit allowlist-rule opt-in, canonical executable
+identity, a full argv digest, a fixed cwd/environment profile, policy version,
+short TTL, and `max_uses`. These are security-review prerequisites, not current
+features or an implementation plan; both operations remain Fresh.
 
 `diag@vt` counts only live grants matching the caller's operation, family, and
 subject; an uncacheable caller sees zero. It is read-only and never resets the
