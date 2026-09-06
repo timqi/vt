@@ -1,9 +1,18 @@
 //! Parse records once, preserving input positions across agent and Worker responses.
 
-use super::{legacy_item_result, ItemError, ItemResult};
+use super::{ItemError, ItemResult};
 use crate::core::{client_decrypt_v2, DecryptInput, DecryptResItem, SecretType, VtUrl, SALT_LEN};
 use anyhow::{ensure, Result};
 use zeroize::{Zeroize, Zeroizing};
+
+fn legacy_item_result(mut result: String, err_message: String) -> ItemResult {
+    if err_message.is_empty() {
+        Ok(result)
+    } else {
+        result.zeroize();
+        Err(ItemError(err_message))
+    }
+}
 
 struct V2Record {
     t: SecretType,
@@ -145,6 +154,35 @@ impl<'a> DecryptBatch<'a> {
 mod tests {
     use super::*;
     use crate::core::client_encrypt_v2;
+
+    #[test]
+    fn legacy_wire_items_become_typed_results_without_retaining_failed_values() {
+        for (value, message) in [
+            ("", ""),
+            ("plaintext", ""),
+            ("discarded-secret", "decrypt failed"),
+        ] {
+            let json = serde_json::json!({"Legacy": {"result": value, "err_message": message}});
+            let item: DecryptResItem = serde_json::from_value(json).unwrap();
+            let DecryptResItem::Legacy {
+                result,
+                err_message,
+            } = item
+            else {
+                unreachable!()
+            };
+            match legacy_item_result(result, err_message) {
+                Ok(result) => {
+                    assert!(message.is_empty());
+                    assert_eq!(result, value);
+                }
+                Err(error) => {
+                    assert_eq!(error.to_string(), message);
+                    assert!(!format!("{error:?}").contains(value));
+                }
+            }
+        }
+    }
 
     fn v2(n: u8) -> String {
         client_encrypt_v2(SecretType::RAW, &[n; SALT_LEN], &[n; 32], &[b'a' + n]).unwrap()

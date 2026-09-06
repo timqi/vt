@@ -1,7 +1,11 @@
 pub mod authorization;
+mod compat;
 pub mod crypto;
 pub mod session;
 pub mod wire;
+
+#[cfg(any(target_os = "macos", test))]
+pub use compat::legacy_decrypt;
 
 use crate::core::crypto::AesGcmCrypto;
 
@@ -535,29 +539,12 @@ impl VtUrl {
     pub fn parse(s: &str) -> Result<Self> {
         // Legacy first: it has the longer prefix.
         if let Some(rest) = s.strip_prefix("vt://mac/") {
-            // Use byte-level access so a non-ASCII first byte doesn't panic
-            // via `&rest[..1]` slicing at a non-char boundary. Reachable from
-            // attacker-supplied URLs flowing into legacy_decrypt on the agent.
-            let &first = rest
-                .as_bytes()
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("empty legacy vt body"))?;
-            ensure!(first.is_ascii(), "legacy vt type byte must be ASCII");
-            let type_buf = [first];
-            let t = SecretType::from_str(std::str::from_utf8(&type_buf).unwrap());
-            let body_b64 = rest[1..].to_string();
-            ensure!(
-                body_b64
-                    .bytes()
-                    .all(|b| { b.is_ascii_alphanumeric() || b == b'-' || b == b'_' }),
-                "legacy vt body must be base64url-no-pad"
-            );
-            return Ok(VtUrl::Legacy { t, body_b64 });
+            return compat::parse_legacy(rest);
         }
         // v2: `vt://{type}{b64}`. No further `/` allowed.
         if let Some(rest) = s.strip_prefix("vt://") {
             ensure!(!rest.contains('/'), "v2 vt URL must not contain '/'");
-            // Same panic-safety concern as the legacy arm above.
+            // Byte access keeps non-ASCII type bytes from panicking on a slice.
             let &first = rest
                 .as_bytes()
                 .first()
@@ -680,50 +667,6 @@ pub fn client_decrypt_v2(
             Ok(code)
         }
         SecretType::UNKNOWN => Err(anyhow::anyhow!("unknown v2 secret type")),
-    }
-}
-
-// ---- Agent-side legacy decrypt ---------------------------------------------
-
-/// Server-side decryption of legacy v0/v1 URLs. Preserves the pre-envelope
-/// behavior: agent decrypts the ciphertext with the master cipher, and for
-/// `type=1` runs TOTP server-side (legacy clients expected the 6-digit code,
-/// not the seed). Used during the migration window.
-pub fn legacy_decrypt(mac_cipher: &AesGcmCrypto, url: &str) -> CryptoResItem {
-    let result: Result<String> = (|| {
-        let parsed = VtUrl::parse(url)?;
-        let (t, body_b64) = match parsed {
-            VtUrl::Legacy { t, body_b64 } => (t, body_b64),
-            VtUrl::V2 { .. } => return Err(anyhow::anyhow!("legacy_decrypt called on a v2 URL")),
-        };
-        let raw = BASE64_URL_SAFE_NO_PAD
-            .decode(body_b64.as_bytes())
-            .map_err(|e| anyhow::anyhow!("base64 decode error: {}", e))?;
-        let plaintext = mac_cipher.decrypt(&raw)?;
-        let plaintext_str =
-            String::from_utf8(plaintext).map_err(|e| anyhow::anyhow!("decryption error: {}", e))?;
-        match t {
-            SecretType::RAW => Ok(plaintext_str),
-            SecretType::TOTP => {
-                let seed_bytes = Secret::Encoded(plaintext_str)
-                    .to_bytes()
-                    .map_err(|e| anyhow::anyhow!("TOTP secret encode error: {}", e))?;
-                TOTP::new_unchecked(Algorithm::SHA1, 6, 1, 30, seed_bytes)
-                    .generate_current()
-                    .map_err(|e| anyhow::anyhow!("TOTP generate error: {}", e))
-            }
-            SecretType::UNKNOWN => Err(anyhow::anyhow!("unknown secret type")),
-        }
-    })();
-    match result {
-        Ok(decrypted_value) => CryptoResItem {
-            result: decrypted_value,
-            err_message: String::new(),
-        },
-        Err(e) => CryptoResItem {
-            result: String::new(),
-            err_message: e.to_string(),
-        },
     }
 }
 

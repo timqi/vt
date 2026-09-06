@@ -8,10 +8,12 @@ mod commands;
 mod doctor;
 mod inject;
 mod records;
+mod rewrap;
 
-pub use commands::{auth, create, read, rewrap, run};
+pub use commands::{auth, create, read, run};
 pub use doctor::doctor;
 pub use inject::{inject, inject_recover, supervisor_main, SUPERVISOR_SUBCOMMAND};
+pub use rewrap::rewrap;
 
 use crate::caller_meta::{collect_client_meta, get_hostname};
 use crate::cf;
@@ -193,14 +195,6 @@ pub(crate) fn single_item_result(
     results
         .remove(0)
         .map_err(|error| anyhow::anyhow!("{error_prefix}: {error}"))
-}
-
-fn legacy_item_result(result: String, err_message: String) -> ItemResult {
-    if err_message.is_empty() {
-        Ok(result)
-    } else {
-        Err(ItemError(err_message))
-    }
 }
 
 #[derive(Clone)]
@@ -674,7 +668,6 @@ mod tests {
     use super::*;
 
     use crate::core::wire::wrap_ok_envelope;
-    use crate::core::DecryptResItem;
 
     #[test]
     fn single_item_result_rejects_wrong_counts_before_item_errors() {
@@ -721,35 +714,6 @@ mod tests {
             assert_eq!(error.to_string(), format!("{prefix}: synthetic failure"));
             assert_eq!(format!("{error:#}"), format!("{prefix}: synthetic failure"));
             assert_eq!(error.chain().count(), 1);
-        }
-    }
-
-    #[test]
-    fn legacy_wire_items_become_typed_results_without_retaining_failed_values() {
-        for (value, message) in [
-            ("", ""),
-            ("plaintext", ""),
-            ("discarded-secret", "decrypt failed"),
-        ] {
-            let json = serde_json::json!({"Legacy": {"result": value, "err_message": message}});
-            let item: DecryptResItem = serde_json::from_value(json).unwrap();
-            let DecryptResItem::Legacy {
-                result,
-                err_message,
-            } = item
-            else {
-                unreachable!()
-            };
-            match legacy_item_result(result, err_message) {
-                Ok(result) => {
-                    assert!(message.is_empty());
-                    assert_eq!(result, value);
-                }
-                Err(error) => {
-                    assert_eq!(error.to_string(), message);
-                    assert!(!format!("{error:?}").contains(value));
-                }
-            }
         }
     }
 
