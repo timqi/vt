@@ -13,18 +13,20 @@ and update the relevant document in the same change.
 |---|---|---|
 | Install or use VT | [`README.md`](../README.md) | `src/main.rs` |
 | Configure auth/routing | [`config.example.toml`](../config.example.toml) | `src/config.rs` (file hydration), `src/config/client.rs` (`ResolvedConfig`), `src/client.rs` |
+| Understand record parsing and decrypt batches | [`README.md` — protocol](../README.md#vt-protocol-format) | `src/core.rs` (`VtUrl`), `src/client/records.rs` (`DecryptBatch`), `src/core/crypto.rs` |
+| Migrate legacy records (`vt rewrap`) | [`README.md` — commands](../README.md#commands) | `src/client/rewrap.rs`, `src/core/compat.rs` |
 | Configure AI-agent hooks | [`hook.md`](hook.md) | `src/hook.rs`, `agent.example.toml` |
 | Use VT for Linux sudo/PAM | [`sudo.md`](sudo.md) | `setup-pam.sh`, `src/client.rs` |
 | Deploy the phone approval Worker | [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/index.ts`, `cf-worker/src/do_account.ts` |
 | Understand Worker audit and notification lifecycle | [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts` |
-| Understand DEK caching | [`dek-cache.md`](dek-cache.md) | `cf-worker/src/do_account.ts`, `src/cf.rs` |
+| Understand DEK caching | [`dek-cache.md`](dek-cache.md) | `cf-worker/src/do_account.ts` (ceremony and audit), `cf-worker/src/account_cache.ts` (cache storage), `cf-worker/src/storage_batch.ts` (shared batch deletion), `src/cf.rs` |
 | Use SSH identities | [`README.md` — portable identity](../README.md#portable-ssh-identity-for-git-vt) | `src/ssh_sign.rs`, `src/client.rs` |
 | Understand agent signing, identity selection, and decrypt-then-sign fallback | [`sign-vt-design.md`](sign-vt-design.md) | `src/ssh_sign.rs` (`resolve_identities`, `decide_sign_route`), `src/client.rs` (`VTClient::sign_vt`), `src/server_macos/ssh_agent/handlers.rs` (`handle_sign_vt`) |
 | Understand extension errors | [`structured-errors.md`](structured-errors.md) | `src/core/wire.rs`, `src/client.rs` |
 | Understand SSH-agent authorization and caching | [`unified-authorization-engine.md`](unified-authorization-engine.md) | `src/core/authorization.rs`, `src/server_macos/authorization.rs`, `src/server_macos/ssh_agent.rs` (dispatcher), `src/server_macos/ssh_agent/handlers.rs` (operations) |
 | Understand grant scopes (destination / workspace / relay) | [`authorization-scopes-v2.md`](authorization-scopes-v2.md) | `src/core/authorization.rs` (`GrantScope`), `src/server_macos/ssh_agent/scopes.rs` (`BindState`, `resolve_workspace`), `src/server_macos/ssh_agent/scopes/process.rs` (kernel queries), `src/server_macos/ssh_agent/scopes/paths.rs` (path policy) |
 | Enable agent audit push | [`agent-audit.md`](agent-audit.md) | `src/audit.rs`, `src/server_macos/audit.rs` |
-| Understand prompt/notification fields and audit context | [`approval-transparency.md`](approval-transparency.md) | `src/server_macos/ssh_agent/handlers.rs` (operation prompts), `src/server_macos/ssh_agent/scopes.rs` (truth lines), `cf-worker/src/notify.ts`, `cf-worker/pwa/approve.js` |
+| Understand prompt/notification fields and audit context | [`approval-transparency.md`](approval-transparency.md) | `src/caller_meta.rs` (client-claimed display fields), `src/server_macos/ssh_agent/handlers.rs` (operation prompts), `src/server_macos/ssh_agent/scopes.rs` (truth lines), `cf-worker/src/notify.ts`, `cf-worker/pwa/approve.js` |
 | Diagnose config/routing/caching (`vt doctor`) | [`diag-design.md`](diag-design.md) | `src/client/doctor.rs`, `src/config/client.rs` (shared routing), `src/server_macos/ssh_agent/handlers.rs` (`handle_diag`) |
 | Build/install VT.app, menu bar UI, native notifications, key-wrap rebind | [`app-bundle.md`](app-bundle.md) | `app/VTShell.swift`, `src/server_macos/security.rs` (`notify_macos`, `upgrade_wrap_v2_if_needed`), `src/core/crypto.rs` (`derive_passphrase_secret_v2`) |
 | Configure Slack App notifications | [`slack-app.md`](slack-app.md) | `cf-worker/src/slack_app.ts` |
@@ -68,6 +70,6 @@ the current behavior against the implementation anchors in the table.
 | Wire format or exit code | `structured-errors.md` and protocol tests |
 | Security invariant | the relevant design doc plus a code comment/test |
 
-Do not treat `CLAUDE.md` as a second product manual. It contains repository
-navigation, invariants, and test gates; user-facing procedures belong here or
-in the linked feature documents.
+[`AGENTS.md`](../AGENTS.md) is the canonical agent guide; `CLAUDE.md` is its
+compatibility symlink. Keep red lines and test gates there, not a second product
+manual; user-facing procedures belong here or in the linked feature documents.
