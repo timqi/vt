@@ -221,7 +221,9 @@ The cache does not re-key existing `vt://` records.
 | Concern | Source |
 |---|---|
 | TTL ladders, per-hop cap, extension arithmetic | `cf-worker/src/cache_policy.ts` (+ `test/cache_policy.test.ts`) |
-| Cache writes/reads, listing, extension commit, audit, notifications | `cf-worker/src/do_account.ts` |
+| Cache key binding, writes/reads, paged aggregation, exhaustive clear, extension storage batches | `cf-worker/src/account_cache.ts` (`AccountCache`, same DO storage/input gate) |
+| Cache request validation, Passkey authorization, ceremony transitions, audit/notification orchestration | `cf-worker/src/do_account.ts` (`AccountDO`) |
+| Audit persistence and notification lifecycle | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts` |
 | Sealed-box cache crypto | `cf-worker/src/cache_crypto.ts` |
 | PWA TTL selection and sealing | `cf-worker/pwa/approve.js` |
 | CLI cache request and source check | `src/cf.rs`, `src/client.rs` |

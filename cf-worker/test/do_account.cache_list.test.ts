@@ -9,7 +9,7 @@
 // The listing may be partial as long as it SAYS so. A clear may not: see the
 // second half of this file.
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { CacheEntry, CacheListResponse } from '../src/types';
 import { extendTtlOptions } from '../src/cache_policy';
 import {
@@ -207,6 +207,52 @@ function seedPastTheCap(h: DoHandle) {
 }
 
 describe('cache clear paths — exhaustive by contract', () => {
+  it.each(['cache-clear-groups', 'cache-clear-origin', 'clear-cache'])(
+    '%s continues across short nonempty pages', async (op) => {
+      await inDO(async h => {
+        const target = await putAt(h, 'z', 7, {
+          cache_group_id: 'g_targetgroup000', origin_token_id: 'shortpageorigin1',
+        });
+        const list = h.state.storage.list.bind(h.state.storage);
+        const pages = vi.spyOn(h.state.storage, 'list').mockImplementation((options: any) =>
+          list(options?.prefix === 'dek:' ? { ...options, limit: 2 } : options));
+        try {
+          const response = await h.inst.fetch(new Request(`https://account.do/op/${op}`, {
+            method: 'POST', body: JSON.stringify({
+              group_ids: ['g_targetgroup000'], token_id: 'shortpageorigin1',
+            }),
+          }));
+          expect(response.status).toBe(200);
+          expect(await response.json()).toMatchObject({ cleared: 7 });
+          expect(pages).toHaveBeenCalledTimes(5);
+        } finally {
+          pages.mockRestore();
+        }
+        expect(await present(h, target)).toBe(0);
+      });
+    },
+  );
+
+  it('fails loudly after a partially completed clear', async () => {
+    await inDO(async h => {
+      const keys = await putAt(h, 'z', 300);
+      const del = h.state.storage.delete.bind(h.state.storage);
+      let attempts = 0;
+      const deletes = vi.spyOn(h.state.storage, 'delete').mockImplementation((keys: any) => {
+        if (++attempts === 2) return Promise.reject(new Error('synthetic clear failure'));
+        return del(keys);
+      });
+      try {
+        await expect(h.inst.fetch(new Request('https://account.do/op/clear-cache', {
+          method: 'POST',
+        }))).rejects.toThrow('synthetic clear failure');
+      } finally {
+        deletes.mockRestore();
+      }
+      expect(await present(h, keys)).toBe(172);
+    });
+  });
+
   it('clears a group that sorts past the listing scan cap', async () => {
     const filler = await inDO(seedPastTheCap);
     const target = await inDO(h => putAt(h, 'z', 3, { cache_group_id: 'g_targetgroup000' }));

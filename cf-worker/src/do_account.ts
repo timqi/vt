@@ -1,5 +1,5 @@
-// AccountDO — singleton ceremony and DEK-cache state machine. Audit persistence
-// and channel delivery are owned by AccountAudit and AccountNotifications.
+// AccountDO — singleton ceremony state machine. AccountCache owns DEK storage;
+// AccountAudit and AccountNotifications own audit persistence and delivery.
 //
 // Storage keys:
 //   ch:{approve_token}        →  Challenge JSON
@@ -16,24 +16,24 @@
 // same DO — no extra locking is needed.
 
 import { DurableObject } from 'cloudflare:workers';
-import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, CacheEntry, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse } from './types';
-import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, sha256, randomBytes, challengeHash } from './crypto';
+import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse } from './types';
+import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, randomBytes, challengeHash } from './crypto';
 import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
-import { seal, openToCache, cachePublicKey, discardedBoxPublicKey } from './cache_crypto';
+import { cachePublicKey, discardedBoxPublicKey } from './cache_crypto';
 import {
-  planExtend,
-  isAllowedApproveTtl, isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
-  groupIdOf, isExtendableGroupId, cacheScopePwd,
+  isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
+  isExtendableGroupId, cacheScopePwd,
 } from './cache_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
 import { AccountNotifications, NotificationChannels } from './account_notifications';
+import { AccountCache } from './account_cache';
 
 const TTL_MS = 5 * 60 * 1000;
 const RETENTION_MS = 10 * 60 * 1000;
 // The TTL whitelist and the extension arithmetic live in cache_policy.ts (pure +
-// unit-tested); this module owns cache storage and ceremony transitions.
+// unit-tested); this module owns authorization and ceremony transitions.
 
 // Admin-requested cache extension is a KILL SWITCH, not an authorization: even
 // when enabled, an extension requires a fresh phone Passkey ceremony. Off by
@@ -43,14 +43,8 @@ function cacheAdminExtendEnabled(env: Env): boolean {
   return v === '1' || v === 'true' || v === 'on' || v === 'yes';
 }
 
-// DO storage batch limits: at most 128 keys per get() and 128 pairs per put().
+// Challenge retention cleanup shares the platform's 128-key delete limit.
 const STORAGE_BATCH = 128;
-// Entries read per internal list() page when aggregating the admin cache listing.
-const CACHE_LIST_PAGE = 1000;
-// Hard cap on entries scanned for one listing. Bounds DO CPU/memory on a
-// pathologically large cache; the response reports `truncated` so the UI can say
-// the view is partial rather than imply completeness.
-const CACHE_LIST_SCAN_MAX = 20000;
 // Cap on groups one extension ceremony may target. Keeps the approval page's
 // summary readable (the approver must be able to see what they are signing for)
 // and bounds the commit's read-modify-write work.
@@ -62,76 +56,8 @@ const CACHE_EXTEND_MAX_GROUPS = 32;
 // operator, so this is generous.
 const MAX_ADMIN_SOCKETS = 8;
 
-// DEK cache entry key. ctx binds the entry to (a) the requester's worker-derived
-// IP (CF-Connecting-IP — unspoofable by the client, the hard boundary) AND (b)
-// the client-reported working directory (pwd), normalized by cacheScopePwd. A
-// lookup recomputes ctx from the same IP + scope, so a request from a different
-// egress IP OR an unrelated cwd finds no key (a clean miss, no oracle).
-//
-// pwd is CLIENT-REPORTED, so — like the removed ppid — it is advisory: a fully
-// compromised local host can spoof it, so it does not widen the real (IP) hard
-// boundary. Its value is same-host blast-radius reduction: a process decrypting
-// from an UNRELATED directory misses the cache, so a cached grant for one project
-// tree does not silently serve another. Crucially — and unlike ppid — pwd is
-// STABLE across orchestrated callers (Claude Code, CI, make, tmux) that spawn a
-// fresh shell per command from the same project dir, so the cache still hits.
-//
-// History: ctx v1 folded in the client-reported parent PID; that was dropped
-// (v1→v2) because ppid is BOTH spoofable AND unstable (getppid() changes every
-// call under orchestrators, so the cache never hit). ppid is still recorded on
-// each entry + audit row for forensics. v2→v3 adds pwd. v3→v4 folds in
-// cacheScopePwd (worktree suffixes stripped) instead of the literal pwd; the tag
-// bump keeps the two derivations from ever sharing a storage key, at the cost of
-// stranding v3 entries (they lapse/sweep normally, and can be cleared from the
-// admin tab). The effective hard guarantee is unchanged: within the TTL,
-// possession of VT_PASSKEY_TOKEN behind the SAME egress IP; the pwd scope only
-// narrows it further, it never widens beyond that IP.
-//
-// Normalization happens HERE, not at the call sites, so no future caller can
-// key a write and a read on different halves of the rule.
-async function cacheCtx(ip: string, pwd: string): Promise<string> {
-  const enc = new TextEncoder();
-  const tag = enc.encode('vt-dek-ctx-v4');
-  const ipBytes = enc.encode(ip);
-  const pwdBytes = enc.encode(cacheScopePwd(pwd));
-  // Length-prefix the IP so (ip="a", pwd="bc") and (ip="ab", pwd="c") can't
-  // collide into the same digest. IP has no NUL, so a NUL separator is
-  // unambiguous, but an explicit u32 length is simplest and future-proof.
-  const lenPrefix = new Uint8Array(4);
-  new DataView(lenPrefix.buffer).setUint32(0, ipBytes.length, false);
-  const buf = new Uint8Array(tag.length + lenPrefix.length + ipBytes.length + pwdBytes.length);
-  let o = 0;
-  buf.set(tag, o); o += tag.length;
-  buf.set(lenPrefix, o); o += lenPrefix.length;
-  buf.set(ipBytes, o); o += ipBytes.length;
-  buf.set(pwdBytes, o);
-  return b64uEnc(await sha256(buf));
-}
-
-function cacheKey(ctx: string, saltB64u: string): string {
-  return `dek:${ctx}:${saltB64u}`;
-}
-
 function badRequest(msg: string): Response {
   return new Response(msg, { status: 400 });
-}
-
-// One aggregated DEK-cache group, as scanned from storage. `keys` holds the
-// `dek:{ctx}:{salt}` storage keys and is populated ONLY for the extension commit
-// — it must never reach a response body (the ctx digest plus a known IP would let
-// a reader brute-force the client-reported `pwd` offline).
-interface CacheAgg {
-  group_id: string;
-  keys: string[];
-  origin_token_id: string;
-  entries: number;
-  live: number;
-  max_expires_ms: number;
-  created_ms: number | null;
-  ip: string;
-  ppid: number;
-  ppid_cmd: string;
-  consistent: boolean;
 }
 
 // Human TTL label matching the PWA's (approve.js ttlLabel), used in the approval
@@ -197,12 +123,14 @@ export class AccountDO extends DurableObject<Env> {
   private readonly expectedOrigin: string;
   private readonly audit: AccountAudit;
   private readonly notifications: AccountNotifications;
+  private readonly cache: AccountCache;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
     this.expectedOrigin = new URL(env.WORKER_ORIGIN).origin;
     this.audit = new AccountAudit(this.ctx.storage.sql, () => this.ctx.getWebSockets('admin'));
     this.notifications = new AccountNotifications(this.ctx, this.env);
+    this.cache = new AccountCache(this.ctx.storage, this.env);
     this.ctx.blockConcurrencyWhile(async () => this.audit.initialize());
     // Schedule initial alarm if none set (alarm() re-arms itself thereafter).
     this.ctx.storage.getAlarm()
@@ -340,72 +268,6 @@ export class AccountDO extends DurableObject<Env> {
     return deleted;
   }
 
-  // Read an arbitrary number of keys, in the batches the platform accepts.
-  //
-  // Same STORAGE_BATCH cap as delete()/put(): a longer array THROWS, which on
-  // the cache-read path turns a clean `{miss:true}` into a 500. The chunk
-  // boundaries depend only on keys.length, never on which key is present, so
-  // this keeps the batched-lookup property the caller relies on — response
-  // timing must not leak the position of the first miss.
-  private async getKeysBatched(keys: string[]): Promise<Map<string, CacheEntry>> {
-    const out = new Map<string, CacheEntry>();
-    for (let i = 0; i < keys.length; i += STORAGE_BATCH) {
-      const part = await this.ctx.storage.get<CacheEntry>(keys.slice(i, i + STORAGE_BATCH));
-      for (const [k, v] of part) out.set(k, v);
-    }
-    return out;
-  }
-
-  // Delete every `dek:` entry `pick` selects, paging the prefix to its END.
-  //
-  // This is the REVOKE direction, so completeness is the contract. Unlike
-  // scanCacheGroups — which stops at CACHE_LIST_SCAN_MAX and makes its caller
-  // surface `truncated` — a clear that stopped early would leave DEKs
-  // decryptable while answering 200 with a count, i.e. a success the operator
-  // cannot tell from a real one. There is deliberately NO cap here; the only
-  // bound left is the request's own CPU/wall budget, and exhausting that fails
-  // LOUDLY instead of under-delivering silently.
-  //
-  // Memory stays O(one page + one delete batch): a matched key is deleted as it
-  // is found and never accumulated, so this is safe on a cache far larger than
-  // an unbounded list() could hold (list() with no options loads the whole
-  // prefix into the isolate's memory).
-  //
-  // Deleting while paging is safe: `startAfter` is a key VALUE, not an index, so
-  // removing keys the cursor already passed cannot make it skip anything.
-  private async sweepCacheEntries(
-    pick: (entry: CacheEntry, key: string) => boolean,
-  ): Promise<{ deleted: number; scanned: number }> {
-    let deleted = 0;
-    let scanned = 0;
-    let startAfter: string | undefined;
-    let batch: string[] = [];
-    for (;;) {
-      const page: Map<string, CacheEntry> = await this.ctx.storage.list<CacheEntry>({
-        prefix: 'dek:',
-        limit: CACHE_LIST_PAGE,
-        ...(startAfter ? { startAfter } : {}),
-      });
-      // Terminate ONLY on an empty page. A short-but-nonempty page does not mean
-      // "end of prefix" (DO storage may cut one below the requested limit to stay
-      // under a response-size cap), and treating it as the end is precisely the
-      // silent partial clear this exists to prevent.
-      if (page.size === 0) break;
-      for (const [key, entry] of page) {
-        startAfter = key;
-        scanned++;
-        if (!entry || typeof entry !== 'object' || !pick(entry, key)) continue;
-        batch.push(key);
-        if (batch.length >= STORAGE_BATCH) {
-          deleted += await this.ctx.storage.delete(batch);
-          batch = [];
-        }
-      }
-    }
-    if (batch.length) deleted += await this.ctx.storage.delete(batch);
-    return { deleted, scanned };
-  }
-
   // ── Alarm — sweep expired + finalized challenges ───────────────────────
 
   async alarm(): Promise<void> {
@@ -451,7 +313,7 @@ export class AccountDO extends DurableObject<Env> {
     // 2. DEK-cache entries: delete past expires_ms. Read-time expiry in
     // opDekCache is the authoritative guard; this just bounds storage growth.
     try {
-      await this.sweepCacheEntries(entry => entry.expires_ms <= now);
+      await this.cache.sweepExpired(now);
     } catch (e) {
       logErr('alarm.cache_sweep_failed', e);
     }
@@ -678,7 +540,7 @@ export class AccountDO extends DurableObject<Env> {
     }
 
     // `ch` was read before the (non-storage) crypto/verify awaits, during which
-    // the DO input gate is open — so (a) the fire-and-forget feishuSendAndStore
+    // the DO input gate is open — so (a) the fire-and-forget notification send
     // may have written feishu_message_id, and (b) a concurrent expiry
     // (read-time expireChallenge from another tab/device, or the alarm) or a
     // racing decision may have finalized this challenge. Re-read once: bail if it
@@ -772,90 +634,6 @@ export class AccountDO extends DurableObject<Env> {
     });
   }
 
-  // Write one cache entry per salt, keyed by ctx(IP,pwd)+salt. Caller has
-  // already verified the WebAuthn assertion, so this is authorized. INVARIANT
-  // (M1): we only reach here because the PHONE sent cache material (the PWA
-  // produces it solely when the human picks TTL > 0) — the Worker cannot
-  // fabricate a cache entry the user did not authorize.
-  private async writeCache(ch: Challenge, ttlS: number, sealedList: string[] | undefined): Promise<void> {
-    // A rejected write means the user approved WITH a TTL but no cache entry
-    // exists — so subsequent decrypts will surprisingly re-prompt. Record a
-    // 'write_failed' row in the unified audit (M2) so this is diagnosable from
-    // the admin page, not just buried in Worker logs.
-    const reject = (reason: string): void => {
-      logErr('cache.write_rejected', new Error(reason));
-      this.audit.cacheEvent(
-        ch.meta,
-        Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0,
-        'write_failed',
-      );
-    };
-
-    // Approve ladder only: the multi-day rungs are extension-only, so a tampered
-    // approve body cannot skip the deliberate extension ceremony.
-    if (!isAllowedApproveTtl(ttlS)) { reject(`ttl ${ttlS} not approvable`); return; }
-    if (!this.env.CACHE_SECKEY || !this.env.CACHE_SECKEY.trim()) {
-      reject('CACHE_SECKEY unset (caching disabled)'); return;
-    }
-    const salts = ch.salts_b64u;
-    // Auth-only ceremonies (no salts) have nothing to cache; a length mismatch
-    // means the PWA and challenge disagree — refuse rather than store garbage.
-    if (salts.length === 0 || !Array.isArray(sealedList) || sealedList.length !== salts.length) {
-      reject('cache_sealed_deks length mismatch'); return;
-    }
-    // Each blob must be crypto_box_seal(32-byte DEK) = 32 + 48 = 80 bytes AND
-    // must actually open to CACHE_PUBKEY. Verifying at write time turns a stale
-    // /wrong cache_pubkey on the phone into one logged error here, instead of
-    // silent permanent cache misses + lazy-delete churn at read time (N1).
-    for (const s of sealedList) {
-      try { decodeB64uExact(s, 80, 'cache_sealed_dek'); }
-      catch { reject('cache_sealed_dek malformed'); return; }
-      const probe = openToCache(s, this.env.CACHE_SECKEY);
-      if (!probe || probe.length !== 32) {
-        probe?.fill(0);
-        reject('cache_sealed_dek does not open to CACHE_PUBKEY'); return;
-      }
-      probe.fill(0);
-    }
-
-    const ip = ch.meta.ip ?? '';
-    // ppid is not part of the binding ctx (ctx = IP + pwd) — kept solely as a
-    // forensic field stored on each cache entry + audit row.
-    const ppid = typeof ch.meta.ppid === 'number' ? ch.meta.ppid : 0;
-    const ctx = await cacheCtx(ip, ch.meta.pwd ?? '');
-    const createdMs = Date.now();
-    const expires = createdMs + ttlS * 1000;
-    // One group handle per write: unique, random, and independent of the
-    // approve_token — an authority-GRANTING mutation (extend) must not hang off a
-    // selector that could ever be ambiguous. created_ms is forensic only (extension
-    // measures from the approval) and is never rewritten afterwards.
-    const groupId = 'g_' + b64uEnc(randomBytes(9));
-    const writes: Record<string, CacheEntry> = {};
-    for (let i = 0; i < salts.length; i++) {
-      writes[cacheKey(ctx, salts[i]!)] = {
-        sealed_to_cache_b64u: sealedList[i]!,
-        expires_ms: expires,
-        origin_token_id: auditKey(ch.approve_token),
-        ip,
-        ppid,
-        ppid_cmd: ch.meta.ppid_cmd ?? '',
-        cache_group_id: groupId,
-        created_ms: createdMs,
-      };
-    }
-    // put() accepts at most STORAGE_BATCH pairs; a ceremony may carry up to 256
-    // salts, so chunk. Partial failure leaves fewer cached entries than approved
-    // — the all-or-nothing read then simply misses and re-prompts (fail-closed).
-    const entries = Object.entries(writes);
-    for (let i = 0; i < entries.length; i += STORAGE_BATCH) {
-      await this.ctx.storage.put(Object.fromEntries(entries.slice(i, i + STORAGE_BATCH)));
-    }
-    this.audit.setCacheTtl(ch.approve_token, ttlS, expires);
-    log('cache.written', {
-      at: tokenPrefix(ch.approve_token), ttl_s: ttlS, n: salts.length, group: groupId,
-    });
-  }
-
   // Fast path: look up cached DEKs for (IP, salts). All-or-nothing — any
   // missing/expired/undecryptable salt yields a uniform miss (no oracle for
   // which salts are cached). On a full hit, re-seal each DEK to the requester's
@@ -878,7 +656,6 @@ export class AccountDO extends DurableObject<Env> {
     // IP + pwd are the cache binding ctx. ppid is forensic-only (logged/audited).
     const ip = meta.ip ?? '';
     const ppid = (typeof meta.ppid === 'number' ? meta.ppid : 0) >>> 0;
-    const pwd = meta.pwd ?? '';
     const salts = body.salts_b64u;
     const miss = (): Response => {
       // No audit row for misses (per design): a miss is a routine fallback and
@@ -887,50 +664,8 @@ export class AccountDO extends DurableObject<Env> {
       return Response.json({ miss: true } satisfies DekCacheResponse);
     };
 
-    // Empty salt set: nothing to deliver. Never a hit.
-    if (salts.length === 0 || salts.length > 256) return miss();
-    if (!this.env.CACHE_SECKEY || !this.env.CACHE_SECKEY.trim()) return miss();
-    for (const s of salts) { if (!isB64uString(s)) return miss(); }
-
-    const ctx = await cacheCtx(ip, pwd);
-    // Batch the lookups (M2): the whole key set is read before anything is
-    // decided, so response timing does not leak the position of the first miss.
-    // Batched via getKeysBatched because salts may run to 256, twice the
-    // STORAGE_BATCH cap a single get() accepts.
-    const keys = salts.map(s => cacheKey(ctx, s));
-    const map = await this.getKeysBatched(keys);
-
-    const now = Date.now();
-    const orphaned: string[] = [];
-    const dekParts: Uint8Array[] = [];
-    let flat: Uint8Array | undefined;
-    let sealedB64u: string;
-    try {
-      for (const key of keys) {
-        const entry = map.get(key);
-        if (!entry || entry.expires_ms <= now) continue;
-        const dek = openToCache(entry.sealed_to_cache_b64u, this.env.CACHE_SECKEY);
-        if (!dek || dek.length !== 32) {
-          dek?.fill(0);
-          // Undecryptable (e.g. CACHE_SECKEY rotated, M3): uniformly miss and
-          // lazily drop the orphaned entry, never surface a 500.
-          orphaned.push(key);
-          continue;
-        }
-        dekParts.push(dek);
-      }
-      if (orphaned.length) { try { await this.deleteKeysBatched(orphaned); } catch {} }
-
-      // All-or-nothing, including partial hits: every opened DEK is covered
-      // by finally, even when a later salt is missing or opening/sealing fails.
-      if (dekParts.length !== salts.length) return miss();
-      flat = new Uint8Array(dekParts.length * 32);
-      for (let i = 0; i < dekParts.length; i++) flat.set(dekParts[i]!, i * 32);
-      sealedB64u = seal(flat, daemonPk);
-    } finally {
-      flat?.fill(0);
-      dekParts.forEach(d => d.fill(0));
-    }
+    const sealedB64u = await this.cache.read(meta, salts, daemonPk);
+    if (sealedB64u === null) return miss();
 
     // Audit the hit with the requester's full meta (host/user/command/…), so the
     // detail dialog is as rich as a ceremony decrypt.
@@ -977,7 +712,7 @@ export class AccountDO extends DurableObject<Env> {
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
-    const { deleted, scanned } = await this.sweepCacheEntries(e => e.origin_token_id === tokenId);
+    const { deleted, scanned } = await this.cache.clearByOrigin(tokenId);
     // Clears are benign admin actions (no secret exposure) — logged to CF logs,
     // not the audit table, to keep it focused on DEK-delivery events.
     log('cache.cleared_by_origin', { at: tokenPrefix(tokenId), n: deleted, scanned });
@@ -994,88 +729,6 @@ export class AccountDO extends DurableObject<Env> {
   // ceremony, and the expiry does not move until a Passkey approves it
   // (opApprove → commitExtend). See docs/dek-cache.md.
 
-  // One aggregated group as scanned from storage. `keys` is populated only when
-  // the caller needs to mutate/delete (kept out of the listing response, which
-  // must never expose a `dek:{ctx}:{salt}` key: ctx plus a known IP would turn the
-  // listing into an offline oracle for the client-reported `pwd`).
-  private static aggInit(groupId: string, e: CacheEntry): CacheAgg {
-    return {
-      group_id: groupId,
-      keys: [],
-      origin_token_id: e.origin_token_id ?? '',
-      entries: 0,
-      live: 0,
-      max_expires_ms: 0,
-      created_ms: typeof e.created_ms === 'number' ? e.created_ms : null,
-      ip: e.ip ?? '',
-      ppid: typeof e.ppid === 'number' ? e.ppid : 0,
-      ppid_cmd: e.ppid_cmd ?? '',
-      consistent: true,
-    };
-  }
-
-  // Aggregate every `dek:` entry into groups. Paged internally (list() caps what
-  // one call should hold in memory) and hard-capped by CACHE_LIST_SCAN_MAX, which
-  // the caller must surface as `truncated` rather than pass off as a full view.
-  //
-  // That cap makes this the wrong tool for a REVOKE: a group past it is simply
-  // never seen, so a clear built on this scan reports success for entries it did
-  // not touch. Clearing therefore uses sweepCacheEntries (uncapped, streaming);
-  // what is left here is the listing and the extension commit, where stopping
-  // short only ever under-grants — and is tallied in the extension's audit row.
-  //
-  // `want` restricts aggregation to specific groups (still a full scan — the group
-  // id is inside the value, not the key — but bounds memory to what is needed).
-  // `collectKeys` additionally records each group's storage keys for a mutation.
-  private async scanCacheGroups(
-    now: number,
-    opts: { want?: Set<string>; collectKeys?: boolean } = {},
-  ): Promise<{ groups: Map<string, CacheAgg>; scanned: number; truncated: boolean }> {
-    const groups = new Map<string, CacheAgg>();
-    let scanned = 0;
-    let truncated = false;
-    let startAfter: string | undefined;
-    for (;;) {
-      const page: Map<string, CacheEntry> = await this.ctx.storage.list<CacheEntry>({
-        prefix: 'dek:',
-        limit: CACHE_LIST_PAGE,
-        ...(startAfter ? { startAfter } : {}),
-      });
-      if (page.size === 0) break;
-      for (const [key, e] of page) {
-        startAfter = key;
-        scanned++;
-        if (!e || typeof e !== 'object') continue;
-        const gid = groupIdOf(e);
-        if (opts.want && !opts.want.has(gid)) continue;
-        let agg = groups.get(gid);
-        if (!agg) { agg = AccountDO.aggInit(gid, e); groups.set(gid, agg); }
-        if (opts.collectKeys) agg.keys.push(key);
-        agg.entries++;
-        const exp = typeof e.expires_ms === 'number' ? e.expires_ms : 0;
-        if (exp > now) agg.live++;
-        if (exp > agg.max_expires_ms) agg.max_expires_ms = exp;
-        // Entries of one group are written by a single put batch, so they MUST
-        // agree on origin/creation/IP. If they don't, something wrote across a
-        // group boundary: report it and refuse to extend (clearing stays safe).
-        const created = typeof e.created_ms === 'number' ? e.created_ms : null;
-        if (agg.origin_token_id !== (e.origin_token_id ?? '')
-            || agg.created_ms !== created
-            || agg.ip !== (e.ip ?? '')) {
-          agg.consistent = false;
-        }
-      }
-      // Terminate ONLY on an empty page. A short-but-nonempty page does not mean
-      // "end of prefix": DO storage may cut a page below the requested limit to
-      // stay under an internal response-size cap. Treating that as completion
-      // would silently drop the remaining groups while still reporting
-      // truncated=false — precisely the silent-partial-view failure this listing
-      // must never have. The cost is one extra empty list() per scan.
-      if (scanned >= CACHE_LIST_SCAN_MAX) { truncated = true; break; }
-    }
-    return { groups, scanned, truncated };
-  }
-
   // Admin: inventory of what is actually cached right now, grouped by the approval
   // that armed it. Read-only. Returns NO secret material (no sealed blob, no ctx,
   // no salts) — see the note on scanCacheGroups.
@@ -1083,7 +736,7 @@ export class AccountDO extends DurableObject<Env> {
     const now = Date.now();
     let scan;
     try {
-      scan = await this.scanCacheGroups(now);
+      scan = await this.cache.scanCacheGroups(now);
     } catch (e) {
       logErr('cache.list_failed', e);
       return new Response('cache list failed', { status: 500 });
@@ -1158,16 +811,9 @@ export class AccountDO extends DurableObject<Env> {
     // meant a group sorting past the cap was never seen, never deleted, and the
     // route still answered 200 {"cleared":0} — a silent partial revocation on
     // the admin tab's only per-row revoke path. Clearing pages to the end.
-    const want = new Set(ids);
-    const hit = new Set<string>();
-    const { deleted, scanned } = await this.sweepCacheEntries(e => {
-      const gid = groupIdOf(e);
-      if (!want.has(gid)) return false;
-      hit.add(gid);
-      return true;
-    });
-    log('cache.cleared_groups', { groups: hit.size, n: deleted, scanned });
-    return Response.json({ cleared: deleted, groups: hit.size });
+    const { deleted, scanned, groups } = await this.cache.clearGroups(ids);
+    log('cache.cleared_groups', { groups, n: deleted, scanned });
+    return Response.json({ cleared: deleted, groups });
   }
 
   // Admin: REQUEST an extension. This mints a pending Passkey ceremony and nothing
@@ -1203,7 +849,7 @@ export class AccountDO extends DurableObject<Env> {
     if (requested.length === 0) return badRequest('no extendable group ids');
 
     const now = Date.now();
-    const scan = await this.scanCacheGroups(now, { want: new Set(requested) });
+    const scan = await this.cache.scanCacheGroups(now, { want: new Set(requested) });
     const targets: CacheExtendPreview[] = [];
     const ctxRows = this.audit.contextFor([...scan.groups.values()].map(g => g.origin_token_id));
     for (const gid of requested) {
@@ -1290,19 +936,24 @@ export class AccountDO extends DurableObject<Env> {
     return Response.json(resp);
   }
 
-  // Commit an APPROVED extension. Called from opApprove only, after the WebAuthn
-  // assertion verified and the challenge was consumed.
-  //
-  // Per group, per storage batch: re-read the entries and apply planExtend to the
-  // FRESH copy with no await between the read and the write. The DO input gate
-  // reopens at every await, so a plan computed from the request-time scan could
-  // otherwise be written over an entry that opDekCache's orphan sweep just
-  // deleted, or that the alarm just expired — i.e. resurrect it. Re-reading in the
-  // same atomic step makes that impossible: only keys still present and still live
-  // at write time are touched.
+  // Storage owns validation and writes; the DO records their effect only after
+  // the verified approval above. A rejected write explains the later re-prompt.
+  private async writeCache(ch: Challenge, ttlS: number, sealedList: string[] | undefined): Promise<void> {
+    const result = await this.cache.writeCache(ch, ttlS, sealedList, auditKey(ch.approve_token));
+    if (!result.ok) {
+      logErr('cache.write_rejected', new Error(result.reason));
+      this.audit.cacheEvent(ch.meta, ch.salts_b64u.length, 'write_failed');
+      return;
+    }
+    this.audit.setCacheTtl(ch.approve_token, ttlS, result.expires_ms);
+    log('cache.written', {
+      at: tokenPrefix(ch.approve_token), ttl_s: ttlS, n: ch.salts_b64u.length, group: result.group_id,
+    });
+  }
+
+  // ONLY opApprove calls this, after verification and single-use consumption.
+  // The switch can remove authority, never supply the Passkey authorization.
   private async commitExtend(ch: Challenge, intent: CacheExtendIntent): Promise<void> {
-    // Re-check the kill switch at commit time: an operator who turned the feature
-    // off between request and approval means it off.
     if (!cacheAdminExtendEnabled(this.env)) {
       logErr('cache.extend_disabled_at_commit', new Error('CACHE_ADMIN_EXTEND off'));
       return;
@@ -1311,83 +962,22 @@ export class AccountDO extends DurableObject<Env> {
       logErr('cache.extend_bad_ttl', new Error(`ttl ${intent.ttl_s}`));
       return;
     }
-    const want = new Set(intent.group_ids.filter(isExtendableGroupId));
-    if (want.size === 0) return;
-    const scan = await this.scanCacheGroups(Date.now(), { want, collectKeys: true });
-    // One merged skip tally for the whole commit — the audit line reports totals,
-    // and nothing consumed the per-group breakdown.
-    const skipped: Record<string, number> = {};
-    let totalExtended = 0;
-    let latest = 0;
-
-    for (const g of scan.groups.values()) {
-      let extended = 0;
-      let groupLatest = 0;
-      // A group that drifted between request and commit is refused outright — we
-      // will not guess which record the approver meant.
-      if (!g.consistent) {
-        skipped.inconsistent = (skipped.inconsistent ?? 0) + g.entries;
-        continue;
-      }
-      // Isolate each group: a storage failure on one must not abort the loop, or
-      // groups that already mutated would go unrecorded by the trailing audit row
-      // (the mutation is durable, so its trail must be too).
-      try {
-        for (let i = 0; i < g.keys.length; i += STORAGE_BATCH) {
-          const chunk = g.keys.slice(i, i + STORAGE_BATCH);
-          const fresh = await this.ctx.storage.get<CacheEntry>(chunk);
-          // ── atomic section: no await until the put ──
-          const now = Date.now();
-          const writes: Record<string, CacheEntry> = {};
-          let chunkLatest = 0;
-          for (const key of chunk) {
-            const entry = fresh.get(key);
-            if (!entry) { skipped.gone = (skipped.gone ?? 0) + 1; continue; }
-            const plan = planExtend(entry, intent.ttl_s, now);
-            if (!plan.ok) { skipped[plan.skip] = (skipped[plan.skip] ?? 0) + 1; continue; }
-            writes[key] = { ...entry, expires_ms: plan.expires_ms };
-            if (plan.expires_ms > chunkLatest) chunkLatest = plan.expires_ms;
-          }
-          const count = Object.keys(writes).length;
-          if (count > 0) {
-            await this.ctx.storage.put(writes);
-            // Account for effects only after storage acknowledges this batch.
-            // A failed later batch must retain the earlier successful tally.
-            extended += count;
-            if (chunkLatest > groupLatest) groupLatest = chunkLatest;
-          }
-          // ── end atomic section ──
-        }
-      } catch (e) {
-        logErr('cache.extend_group_failed', e, { group: g.group_id });
-        skipped.error = (skipped.error ?? 0) + 1;
-      }
-      totalExtended += extended;
-      if (groupLatest > latest) latest = groupLatest;
-      if (extended > 0 && g.origin_token_id) {
-        this.audit.bumpCacheExpiry(g.origin_token_id, groupLatest);
-        this.audit.broadcastRow(g.origin_token_id, 'update');
-      }
+    if (!intent.group_ids.some(isExtendableGroupId)) return;
+    const result = await this.cache.commitExtend(intent);
+    for (const effect of result.effects) {
+      this.audit.bumpCacheExpiry(effect.origin_token_id, effect.expires_ms);
+      this.audit.broadcastRow(effect.origin_token_id, 'update');
     }
-
-    // Durable record of the EFFECT (the ceremony row records the authorization).
-    // Written even when nothing moved: "an extension was approved and changed
-    // nothing" is exactly as interesting as one that did.
-    this.audit.cacheEvent(
-      {
-        ...ch.meta,
-        command: extendSummary(intent),
-        reason: extendOutcomeSummary(skipped, totalExtended, latest),
-      },
-      totalExtended,
-      'extended',
-    );
+    // Include acknowledged batches even when a later group/batch failed, and
+    // record approved no-ops too. The ceremony row records the authorization.
+    this.audit.cacheEvent({
+      ...ch.meta,
+      command: extendSummary(intent),
+      reason: extendOutcomeSummary(result.skipped, result.extended, result.latest),
+    }, result.extended, 'extended');
     log('cache.extended', {
-      at: tokenPrefix(ch.approve_token),
-      ttl_s: intent.ttl_s,
-      groups: scan.groups.size,
-      n: totalExtended,
-      by: intent.requested_by,
+      at: tokenPrefix(ch.approve_token), ttl_s: intent.ttl_s, groups: result.groups,
+      n: result.extended, by: intent.requested_by,
     });
   }
 
@@ -1408,7 +998,7 @@ export class AccountDO extends DurableObject<Env> {
   // every decrypt falls through to a phone approval until new entries are
   // written. Cloudflare-Access gated at the Worker edge.
   private async opClearCache(): Promise<Response> {
-    const { deleted } = await this.sweepCacheEntries(() => true);
+    const { deleted } = await this.cache.clearAll();
     log('cache.cleared', { n: deleted });
     return Response.json({ cleared: deleted });
   }

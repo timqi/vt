@@ -84,7 +84,7 @@ describe('cache read plaintext lifetime', () => {
           return value;
         });
         const cleanup = outcome === 'cleanup-failure'
-          ? vi.spyOn(inst, 'deleteKeysBatched').mockRejectedValue(new Error('injected cleanup failure'))
+          ? vi.spyOn(inst.cache, 'deleteKeysBatched').mockRejectedValue(new Error('injected cleanup failure'))
           : undefined;
         const sealing = outcome === 'seal-failure'
           ? vi.spyOn(nacl.box, 'keyPair').mockImplementation(() => { throw new Error('injected seal failure'); })
@@ -106,6 +106,7 @@ describe('cache read plaintext lifetime', () => {
           }
           expect(opened).toHaveLength(outcome === 'missing' ? 1 : 2);
           for (const value of opened) expect(value.every(byte => byte === 0)).toBe(true);
+          if (cleanup) expect(cleanup).toHaveBeenCalledOnce();
         } finally {
           openSpy.mockRestore();
           cleanup?.mockRestore();
@@ -115,6 +116,75 @@ describe('cache read plaintext lifetime', () => {
     },
   );
 });
+
+it('keeps cache write, read, extension, and clear within every 128-key storage limit', async () => {
+  await inDO(async ({ inst, state }) => {
+    const get = state.storage.get.bind(state.storage);
+    const put = state.storage.put.bind(state.storage);
+    const del = state.storage.delete.bind(state.storage);
+    const sizes = { get: [] as number[], put: [] as number[], delete: [] as number[] };
+    const gets = vi.spyOn(state.storage, 'get').mockImplementation((keys: any) => {
+      if (Array.isArray(keys)) {
+        sizes.get.push(keys.length);
+        expect(keys.length).toBeLessThanOrEqual(128);
+      }
+      return get(keys);
+    });
+    const puts = vi.spyOn(state.storage, 'put').mockImplementation((key: any, value?: any) => {
+      if (typeof key === 'string') return put(key, value);
+      sizes.put.push(Object.keys(key).length);
+      expect(Object.keys(key).length).toBeLessThanOrEqual(128);
+      return put(key);
+    });
+    const deletes = vi.spyOn(state.storage, 'delete').mockImplementation((keys: any) => {
+      if (Array.isArray(keys)) {
+        sizes.delete.push(keys.length);
+        expect(keys.length).toBeLessThanOrEqual(128);
+      }
+      return del(keys);
+    });
+    const post = async (op: string, body: unknown) => {
+      const response = await inst.fetch(new Request(`https://account.do/op/${op}`, {
+        method: 'POST', body: JSON.stringify(body),
+      }));
+      const text = await response.text();
+      expect(response.status).toBe(200);
+      return text === 'ok' ? {} : JSON.parse(text);
+    };
+    const approve = async (ch: Challenge, extra = {}) => post('approve', {
+      approve_token: ch.approve_token,
+      sealed_deks_b64u: b64uEnc(new Uint8Array(48).fill(5)),
+      binding_tag_b64u: b64uEnc(new Uint8Array(32).fill(6)),
+      ...await signApproval(ch.approve_challenge_hash_b64u), ...extra,
+    });
+    try {
+      const salts = Array.from({ length: 150 }, nextSalt);
+      const ch = makeChallenge({ salts_b64u: salts });
+      await post('create', { challenge: ch });
+      await approve(ch, { cache_ttl_s: 1200, cache_sealed_deks_b64u: salts.map(() => sealFakeDek()) });
+      expect(sizes.put).toEqual([2, 128, 22]);
+      const read = await post('dek-cache', {
+        daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)), salts_b64u: salts, meta: ch.meta,
+      });
+      expect(read.source).toBe('cache');
+      expect(sizes.get).toEqual([128, 22]);
+      const listing = await post('cache-list', {});
+      const pending = await post('cache-extend-create', {
+        group_ids: [listing.groups[0].group_id], ttl_s: 86400,
+      });
+      const extension = (await state.storage.get<Challenge>(`ch:${pending.approve_token}`))!;
+      await approve(extension);
+      expect(sizes.get).toEqual([128, 22, 128, 22]);
+      expect(sizes.put).toEqual([2, 128, 22, 2, 128, 22]);
+      expect(await post('clear-cache', {})).toEqual({ cleared: 150 });
+      expect(sizes.delete).toEqual([128, 22]);
+    } finally {
+      gets.mockRestore();
+      puts.mockRestore();
+      deletes.mockRestore();
+    }
+  });
+}, 60_000);
 
 describe('extension storage failures', () => {
   it.each([1, 2])('counts only successful batches when put #%i fails', async (failedBatch) => {

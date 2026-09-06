@@ -30,9 +30,9 @@ beforeEach(async () => {
 });
 
 /** Run a real ceremony over `n` salts and approve it with an 8h cache. */
-async function armCache(n: number): Promise<string[]> {
+async function armCache(n: number, meta = makeMeta()): Promise<string[]> {
   const salts = Array.from({ length: n }, () => nextSalt());
-  const ch = makeChallenge({ salts_b64u: salts });
+  const ch = makeChallenge({ salts_b64u: salts, meta });
   expect((await doPost('create', { challenge: ch })).status).toBe(200);
   const res = await approve(ch, {
     cache_ttl_s: TTL_8H,
@@ -103,5 +103,19 @@ describe('opDekCache — batched reads', () => {
     const res = await read(salts, { pwd: '/home/tester/elsewhere' });
     expect(res.status).toBe(200);
     expect(res.json).toEqual({ miss: true });
+  });
+
+  it('shares normalized worktree scope while preserving literal metadata and the IP boundary', async () => {
+    const writtenPwd = '/home/tester/repo.feature';
+    const readPwd = '/home/tester/repo.main';
+    const salts = await armCache(2, makeMeta({ pwd: writtenPwd }));
+    expect((await read(salts, { pwd: readPwd })).json).toMatchObject({ source: 'cache' });
+    expect((await read(salts, { pwd: readPwd, ip: '198.51.100.4' })).json).toEqual({ miss: true });
+    await inDO(({ state }) => {
+      expect(state.storage.sql.exec('SELECT pwd FROM audit ORDER BY id').toArray())
+        .toEqual([{ pwd: writtenPwd }, { pwd: readPwd }]);
+    });
+    const listing = await doPost('cache-list', {});
+    expect((listing.json as { groups: Array<{ pwd: string }> }).groups[0]!.pwd).toBe(writtenPwd);
   });
 });
