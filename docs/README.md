@@ -19,13 +19,14 @@ and update the relevant document in the same change.
 | Understand Worker audit and notification lifecycle | [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts` |
 | Understand DEK caching | [`dek-cache.md`](dek-cache.md) | `cf-worker/src/do_account.ts`, `src/cf.rs` |
 | Use SSH identities | [`README.md` — portable identity](../README.md#portable-ssh-identity-for-git-vt) | `src/ssh_sign.rs`, `src/client.rs` |
+| Understand agent signing, identity selection, and decrypt-then-sign fallback | [`sign-vt-design.md`](sign-vt-design.md) | `src/ssh_sign.rs` (`resolve_identities`, `decide_sign_route`), `src/client.rs` (`VTClient::sign_vt`), `src/server_macos/ssh_agent/handlers.rs` (`handle_sign_vt`) |
 | Understand extension errors | [`structured-errors.md`](structured-errors.md) | `src/core/wire.rs`, `src/client.rs` |
 | Understand SSH-agent authorization and caching | [`unified-authorization-engine.md`](unified-authorization-engine.md) | `src/core/authorization.rs`, `src/server_macos/authorization.rs`, `src/server_macos/ssh_agent.rs` (dispatcher), `src/server_macos/ssh_agent/handlers.rs` (operations) |
 | Understand grant scopes (destination / workspace / relay) | [`authorization-scopes-v2.md`](authorization-scopes-v2.md) | `src/core/authorization.rs` (`GrantScope`), `src/server_macos/ssh_agent/scopes.rs` (`BindState`, `resolve_workspace`), `src/server_macos/ssh_agent/scopes/process.rs` (kernel queries), `src/server_macos/ssh_agent/scopes/paths.rs` (path policy) |
 | Enable agent audit push | [`agent-audit.md`](agent-audit.md) | `src/audit.rs`, `src/server_macos/audit.rs` |
 | Understand prompt/notification fields and audit context | [`approval-transparency.md`](approval-transparency.md) | `src/server_macos/ssh_agent/handlers.rs` (operation prompts), `src/server_macos/ssh_agent/scopes.rs` (truth lines), `cf-worker/src/notify.ts`, `cf-worker/pwa/approve.js` |
 | Diagnose config/routing/caching (`vt doctor`) | [`diag-design.md`](diag-design.md) | `src/client/doctor.rs`, `src/config/client.rs` (shared routing), `src/server_macos/ssh_agent/handlers.rs` (`handle_diag`) |
-| Build/install VT.app, menu bar UI, native notifications, key-wrap rebind | [`app-bundle.md`](app-bundle.md) | `app/VTShell.swift`, `src/server_macos/security.rs` (`notify_macos`), `src/core/crypto.rs` (`derive_passphrase_secret`) |
+| Build/install VT.app, menu bar UI, native notifications, key-wrap rebind | [`app-bundle.md`](app-bundle.md) | `app/VTShell.swift`, `src/server_macos/security.rs` (`notify_macos`, `upgrade_wrap_v2_if_needed`), `src/core/crypto.rs` (`derive_passphrase_secret_v2`) |
 | Configure Slack App notifications | [`slack-app.md`](slack-app.md) | `cf-worker/src/slack_app.ts` |
 | Configure Feishu/Lark notifications | [`feishu.md`](feishu.md) | `cf-worker/src/feishu.ts` |
 
@@ -35,7 +36,6 @@ The following are implementation history and decision records, not step-by-step
 implementation plans:
 
 - [`ssh-vt-design.md`](ssh-vt-design.md)
-- [`sign-vt-design.md`](sign-vt-design.md)
 - [`feishu-design.md`](feishu-design.md)
 
 Read the status note at the top and the security section first. Ignore review
