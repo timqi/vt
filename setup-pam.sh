@@ -25,15 +25,16 @@ fi
 # home; recover it from $SUDO_USER. VT_CONFIG (if exported) always wins.
 # getent can exit non-zero (SUDO_USER set but no passwd entry) — guard it so
 # `set -e` doesn't abort the script, and fall back to $HOME when empty.
+USER_HOME=""
+if [ -n "${SUDO_USER:-}" ]; then
+    USER_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+fi
+[ -z "$USER_HOME" ] && USER_HOME="${HOME:-/root}"
+
 if [ -n "${VT_CONFIG:-}" ]; then
     CFG="$VT_CONFIG"
 else
-    home=""
-    if [ -n "${SUDO_USER:-}" ]; then
-        home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
-    fi
-    [ -z "$home" ] && home="${HOME:-/root}"
-    CFG="$home/.config/vt/config.toml"
+    CFG="$USER_HOME/.config/vt/config.toml"
 fi
 
 # read_cfg KEY -> value from the flat TOML, empty if absent. Uses awk (not sed)
@@ -93,14 +94,119 @@ paths=""
 [ -n "$VT_PASSKEY_URL" ] && paths="${paths:+$paths + }phone passkey (worker)"
 echo "Configuring paths: $paths"
 
-VT_BIN=$(command -v vt 2>/dev/null || true)
-if [ -z "$VT_BIN" ] || [ ! -x "$VT_BIN" ]; then
-    echo "Error: vt binary not found in PATH" >&2
-    exit 1
-fi
-
 SCRIPT_PATH="/usr/local/bin/vt-sudo-auth.sh"
 PAM_FILE="/etc/pam.d/sudo"
+VT_ROOT_BIN="/usr/local/bin/vt"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# --- Find the vt binary to install ---------------------------------------
+# sudo replaces PATH with secure_path, so `command -v vt` alone misses the
+# usual ~/.local/bin install. Probe the known locations too, list what was
+# found and let the operator confirm which one becomes the root-owned copy.
+# VT_BIN in the environment pins the choice and skips the prompt.
+CANDIDATES=()
+add_candidate() {
+    local p="$1" real seen
+    [ -n "$p" ] || return 0
+    [ -f "$p" ] && [ -x "$p" ] || return 0
+    real="$(readlink -f "$p" 2>/dev/null || echo "$p")"
+    for seen in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
+        [ "$(readlink -f "$seen" 2>/dev/null || echo "$seen")" = "$real" ] && return 0
+    done
+    CANDIDATES+=("$p")
+}
+
+# Describe a candidate without trusting it: stat only, plus a version string
+# obtained as the invoking user when possible. It is about to be executed as
+# root, but not before the operator has picked it.
+describe_candidate() {
+    local p="$1" owner mtime ver=""
+    owner="$(stat -c '%U' "$p" 2>/dev/null || echo '?')"
+    mtime="$(stat -c '%y' "$p" 2>/dev/null | cut -d. -f1 || echo '?')"
+    if [ -n "${SUDO_USER:-}" ] && command -v runuser >/dev/null 2>&1; then
+        ver="$(runuser -u "$SUDO_USER" -- "$p" --version 2>/dev/null | head -1 || true)"
+    else
+        ver="$("$p" --version 2>/dev/null | head -1 || true)"
+    fi
+    printf '%s\n      owner=%s  mtime=%s  %s\n' "$p" "$owner" "$mtime" "${ver:-version unavailable}"
+}
+
+if [ -n "${VT_BIN:-}" ]; then
+    if [ ! -f "$VT_BIN" ] || [ ! -x "$VT_BIN" ]; then
+        echo "Error: VT_BIN=$VT_BIN is not an executable file" >&2
+        exit 1
+    fi
+    echo "Using VT_BIN=$VT_BIN (from environment)"
+else
+    add_candidate "$USER_HOME/.local/bin/vt"
+    add_candidate "$USER_HOME/bin/vt"
+    add_candidate "$SELF_DIR/target/release/vt"
+    add_candidate "$SELF_DIR/target/x86_64-unknown-linux-musl/release/vt"
+    add_candidate "$(command -v vt 2>/dev/null || true)"
+    add_candidate "$VT_ROOT_BIN"
+    add_candidate "/usr/bin/vt"
+
+    if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+        echo "Error: no vt binary found." >&2
+        echo "  Looked in: \$PATH, $USER_HOME/.local/bin, $USER_HOME/bin," >&2
+        echo "             $SELF_DIR/target/*/vt, /usr/local/bin, /usr/bin" >&2
+        echo "  Build it ('just install') or point at it: sudo VT_BIN=/path/to/vt $0" >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "Found vt binary/binaries:"
+    i=0
+    for c in "${CANDIDATES[@]}"; do
+        i=$((i + 1))
+        printf '  %d) %s\n' "$i" "$(describe_candidate "$c")"
+    done
+
+    choice=1
+    if [ "${#CANDIDATES[@]}" -gt 1 ]; then
+        # Read from the terminal, not stdin: pam/pipe invocations have no tty.
+        # Test it by opening, not with -r: under setsid /dev/tty passes the
+        # permission check and then fails to open. No tty -> take candidate 1.
+        # (brace group so the failed open's message goes to /dev/null too --
+        # `exec 3< /dev/tty 2>/dev/null` applies the redirections in order and
+        # would still print it; fd 3 survives the group either way.)
+        if { exec 3< /dev/tty; } 2>/dev/null; then
+            printf 'Install which one to %s? [1-%d, default 1] ' "$VT_ROOT_BIN" "${#CANDIDATES[@]}"
+            read -r reply <&3 || reply=""
+            exec 3<&-
+            [ -n "$reply" ] && choice="$reply"
+            case "$choice" in
+                '' | *[!0-9]*) echo "Error: not a number: $choice" >&2; exit 1 ;;
+            esac
+            if [ "$choice" -lt 1 ] || [ "$choice" -gt "${#CANDIDATES[@]}" ]; then
+                echo "Error: out of range: $choice" >&2
+                exit 1
+            fi
+        else
+            echo "  (no terminal for a prompt; using 1 — set VT_BIN to override)"
+        fi
+    fi
+    VT_BIN="${CANDIDATES[$((choice - 1))]}"
+    echo "Selected $VT_BIN"
+fi
+
+# --- Install vt into a root-owned location -------------------------------
+# PAM runs the helper as root, so the binary it calls must not be writable by
+# the user being authenticated: a vt in ~/.local/bin would let any process
+# running as that user replace it and be executed as root. Copy it to
+# /usr/local/bin (root:root 755, and already in sudo's secure_path) and point
+# the helper there. /usr/bin is dpkg's namespace; don't squat in it.
+# Written to a temp name and rename()d so re-running while an earlier copy is
+# executing can't fail with ETXTBSY or leave a half-written binary in place.
+if [ "$VT_BIN" -ef "$VT_ROOT_BIN" ]; then
+    echo "Using $VT_ROOT_BIN (already root-owned)"
+else
+    install -o root -g root -m 755 "$VT_BIN" "$VT_ROOT_BIN.new"
+    mv -f "$VT_ROOT_BIN.new" "$VT_ROOT_BIN"
+    echo "Installed $VT_BIN -> $VT_ROOT_BIN (root:root, 755)"
+    echo "  Note: this is a COPY. Re-run this script after upgrading vt."
+fi
+VT_BIN="$VT_ROOT_BIN"
 
 # --- Generate the PAM helper script --------------------------------------
 # Secrets are embedded via single-quote-safe printf (no sed placeholder
@@ -158,4 +264,5 @@ echo ""
 echo "Done."
 echo "  Agent path:  ssh -A user@this-host, then 'sudo whoami' -> Touch ID"
 echo "  Worker path: 'sudo whoami' -> approve on your phone (URL shown on the terminal)"
+echo "  After upgrading vt, re-run this script to refresh $VT_ROOT_BIN."
 echo "  Tip: enable a push channel (Pushover/Slack/Feishu) so approvals reach your phone directly."
