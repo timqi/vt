@@ -6,14 +6,11 @@ path.
 
 ## Features
 
-- Secure secret storage using VT's encrypted macOS Keychain-backed store
-- AES-256-GCM encryption
-- Touch ID / local authentication for decrypt operations
-- TOTP support for time-based one-time passwords
-- Environment variable and file injection with automatic cleanup
-- SSH agent with Touch ID gated signing (Ed25519, RSA, ECDSA P-256/P-384) and optional scoped auth caching
-- Remote sudo via Touch ID through SSH agent forwarding or phone Passkey approval
-- Portable SSH identity for `git push`: one Ed25519 key stored as a `vt://` record and used on macOS / Linux / CI via `vt ssh keygen` + `vt ssh connect` — signing reuses the existing approval ceremony (Touch ID locally, phone passkey on headless hosts), and the private key never lives in plaintext on disk
+- AES-256-GCM records backed by macOS Keychain or phone Passkey approval
+- Raw secrets, TOTP, and transient environment/file injection
+- Touch ID-gated SSH signing with optional scoped approval reuse
+- Portable Ed25519 identities for macOS, Linux, and CI
+- Remote sudo approval and on-demand secrets for AI-agent hooks
 
 ## Documentation
 
@@ -23,8 +20,8 @@ common paths are:
 - [`docs/cf-worker-deploy.md`](docs/cf-worker-deploy.md): deploy phone approval;
 - [`docs/sudo.md`](docs/sudo.md): use VT as a Linux sudo/PAM factor;
 - [`docs/hook.md`](docs/hook.md): integrate with AI coding agents;
-- [`docs/ssh-vt-design.md`](docs/ssh-vt-design.md): SSH implementation and
-  security decision record;
+- [`docs/sign-vt-design.md`](docs/sign-vt-design.md): SSH identity selection,
+  signing, and fallback;
 - [`config.example.toml`](config.example.toml) and [`agent.example.toml`](agent.example.toml): configuration templates.
 
 ## Installation
@@ -63,12 +60,10 @@ binary at another path.
 
 ## Quick Start
 
-> **Platform note.** Vault bootstrap and key storage (`init`, `secret *`,
-> `fido2 *`, `ssh agent`/`add`/`list`/`remove`/`comment`/`show`) are
-> macOS-only — they use the Keychain + Touch ID. A Linux host has no local
-> vault: it decrypts by pointing `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN` at the
-> Cloudflare Worker and approving each ceremony on a phone (see the passkey
-> deployment docs). Steps 1–2 below assume macOS.
+> Vault bootstrap and local key management (`init`, `secret *`, `fido2 *`,
+> `ssh agent`/`add`/`list`/`remove`/`comment`/`show`) require macOS Keychain and
+> local authentication. Linux uses a forwarded VT agent or the Worker;
+> `ssh keygen` and `ssh connect` work on both platforms. Steps 1–2 assume macOS.
 
 1. Initialize the vault (creates the `rusty.vault.store` keychain item):
    ```bash
@@ -119,8 +114,8 @@ For a persistent setup, put these values in `~/.config/vt/config.toml` using
 |---------|-------------|
 | `version` | Show version information |
 | `init` | (macOS) Initialize passcode and passphrase in keychain |
-| `doctor` | Diagnose config sources (env vs config.toml), transport routing, worker reachability, and — via the read-only `diag@vt` extension — how a reachable vt agent classifies this connection for caching and why |
-| `create [--type raw\|totp]` | Output an encrypted vt protocol record. On a terminal: prompts for the type, then reads the value without echo. With stdin piped it is fully non-interactive — stdin is the plaintext (one trailing newline stripped), type from `--type` (default `raw`). The plaintext is never a command-line argument |
+| `doctor` | Diagnose config sources, transport routing, Worker reachability, and caller-visible agent cache state |
+| `create [--type raw\|totp]` | Encrypt a secret: interactive hidden input or piped stdin (one trailing newline stripped); piped type defaults to `raw`, never pass plaintext in argv |
 | `read <vt>` | Decrypt a vt protocol string |
 | `rewrap [--no-dry-run] [--backup] <file>...` | Re-encrypt legacy `vt://mac/...` URLs in files to the current envelope format (one agent/phone approval per batch) |
 | `inject [-r FILE] -- cmd...` | Transiently decrypt `vt://` in the file / env / argv, then exec the command |
@@ -132,6 +127,7 @@ For a persistent setup, put these values in `~/.config/vt/config.toml` using
 | `secret export` | (macOS) Export the encrypted master secret |
 | `secret import` | (macOS) Import an encrypted master secret |
 | `secret rotate-passcode` | (macOS) Rotate the passcode for the master secret |
+| `secret rebind` | (macOS) Migrate the master-key wrap after a binary move; see [app-bundle.md](docs/app-bundle.md#2-master-key-wrap-v2-and-vt-secret-rebind) |
 | `ssh agent` | (macOS) Start the SSH agent (supports sign/decrypt auth caches, audit push, and `run@vt` allowlisting) |
 | `ssh add [-f <file>] [-c <comment>]` | (macOS) Add an SSH private key (from file or stdin) |
 | `ssh list` | (macOS) List stored SSH keys (shows fingerprint, algorithm, comment, and public key) |
@@ -285,8 +281,8 @@ and the plaintext seed never touches disk.
 # and ~/.config/vt/git-ssh.pub, and prints the public key to add to GitHub.
 vt ssh keygen -l github
 
-# On each host that runs git push (copy the ciphertext key file there, or set
-# VT_GIT_SSH_PRIVATE_KEY to the raw vt:// record), wire git to sign through vt:
+# On each host that runs git push, copy BOTH ciphertext and .pub files.
+# Alternatively set VT_GIT_SSH_PRIVATE_KEY and VT_GIT_SSH_PUB to their contents:
 git config core.sshCommand "vt ssh connect"
 git push        # signs via the existing ceremony: Touch ID locally, phone passkey on headless hosts
 ```
@@ -296,12 +292,14 @@ wrappers, but generic `vt inject -- …` scans `vt://` values in inherited
 environment variables; do not let that variable reach an unrestricted inject
 command.
 
-How it works: `vt ssh connect` is a `GIT_SSH_COMMAND` driver. It starts an ephemeral in-process
-SSH agent (answering identity requests from the cleartext public key, no prompt), execs the system
-`ssh` (which keeps doing transport + `known_hosts`), and on each signature decrypts the seed on
-demand via the normal `vt://` decrypt path — SSH agent (`$SSH_AUTH_SOCK`, incl. a forwarded laptop
-agent) first, CF passkey ceremony as fallback. The remote host needs `VT_AUTH` set to use a forwarded
-agent; otherwise it goes straight to the phone passkey. See `docs/ssh-vt-design.md` for the full design.
+`vt ssh connect` runs system SSH through an ephemeral signer. When the configured
+route permits it, `sign@vt` signs with a key held by the Mac agent without
+exporting the private key. Eligible failures fall back to decrypt-then-sign only
+if a portable record is available; this places the seed in the caller's memory
+for the connect process lifetime. Explicit rejection does not trigger fallback.
+A forwarded agent requires VT_AUTH; backend pins remain authoritative. See
+[the signing contract](docs/sign-vt-design.md) for discovery, routing, and
+[the relay reference](docs/ssh-vt-design.md) for `--forward-real-agent`.
 
 ### sudo via Touch ID or phone passkey
 
@@ -321,7 +319,8 @@ vt://{type}{data}
 - **type**: `0` for raw secrets, `1` for TOTP
 - **data**: Base64 URL-safe encoded AES-256-GCM envelope (per-record DEK derived from the master key + a salt carried in the URL)
 
-Example: `vt://0SGVsbG8gV29ybGQ`
+Records printed by `vt create` contain an authenticated envelope, not just
+base64-encoded plaintext.
 
 > Legacy `vt://mac/…` records (pre-2.0) remain readable for migration; convert them to the current envelope format with `vt rewrap`.
 
@@ -342,45 +341,31 @@ Example: `vt://0SGVsbG8gV29ybGQ`
 
 ## Secret Management
 
-VT stores all secrets in a **single keychain item**: `rusty.vault.store`. The blob is a JSON document containing:
+VT's macOS store is one Keychain item, `rusty.vault.store`, containing passcode
+and auth-token material plus the encrypted master passphrase, SSH keys, and
+optional FIDO2 credentials. Run the agent as the user who initialized it.
 
-- the random `passcode` + `auth_token` (used to derive the passphrase encryption key and `VT_AUTH`)
-- the encrypted master `passphrase` (the actual AES-256-GCM key, wrapped with a key derived from passcode + `$USER` + binary path)
-- optional encrypted SSH keys (under `encrypted_ssh_keys`)
-- optional encrypted FIDO2 credentials (under `encrypted_fido2`)
-
-One item means one keychain ACL. After the binary's first run is granted "Always Allow", subsequent rebuilds signed with the same code-signing identity reuse that grant — no repeated login-password prompts.
-
-### Security Requirements
-
-- Run `vt ssh agent` from the same user who ran `vt init`
-- Keep the `vt` binary at the same absolute path as during `vt init`
-- The agent requires Touch ID or local authentication for decrypt operations
+New stores use wrap v2, derived from passcode, `$USER`, and a fixed label, not
+the binary path. Legacy wrap v1 is path-bound; use
+[`vt secret rebind`](docs/app-bundle.md#2-master-key-wrap-v2-and-vt-secret-rebind)
+when moving such an installation. Keychain access approval and Touch ID/local
+operation approval are separate. Signing identity changes can require renewed
+Keychain approval; packaging and migration details belong to
+[app-bundle.md](docs/app-bundle.md).
 
 ## Architecture
 
-```
-┌─────────────┐  Unix socket  ┌──────────────┐     ┌─────────────┐
-│  vt client  │ ─────────────▶│ vt ssh agent │────▶│   Keychain  │
-│  (create,   │  encrypted    │  (decrypt,   │     │  (passcode, │
-│   read,     │◀───────────── │   encrypt,   │◀────│  passphrase,│
-│   inject,   │   extension   │   sign,      │     │  ssh keys,  │
-│   auth)     │   payload     │   auth@vt)   │     │  fido2)     │
-└─────────────┘               └──────────────┘     └─────────────┘
-                                     │
-                                     ▼
-                              ┌─────────────┐
-                              │  Touch ID   │
-                              │  (decrypt,  │
-                              │   sign)     │
-                              └─────────────┘
-```
+One Rust binary contains the cross-platform client and macOS-only vault/agent.
+The client uses VT_AUTH-encrypted SSH-agent extensions or the Worker's phone
+WebAuthn/PRF ceremony. Portable SSH keygen/connect are cross-platform; local
+Keychain and agent management are macOS-only.
 
-All keychain access (passcode, passphrase, SSH keys, FIDO2) routes through a single `rusty.vault.store` item — see [Secret Management](#secret-management) for the layout.
-
-### Client / Server Split
-
-The `vt` source tree is split into a cross-platform client (`create`/`read`/`inject`/`auth`) and a macOS-only server (`init`/`secret`/`ssh`/`fido2`, including the SSH agent itself). Both ship in the same binary; on Linux the macOS server is `cfg`-gated out, so the Linux build only contains the client commands.
+Environment variables override `~/.config/vt/config.toml`; `VT_CONFIG` selects
+another file. Keep it mode 600. In `auto`, nonempty VT_AUTH enables agent-first
+routing with Worker fallback only on recoverable errors. `VT_BACKEND=agent`
+and `VT_BACKEND=passkey` pin the transport. See
+[config.example.toml](config.example.toml) for configuration and
+[structured-errors.md](docs/structured-errors.md) for fallback classification.
 
 ## Passkey Approval (Cloudflare Worker)
 

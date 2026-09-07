@@ -32,33 +32,26 @@ and update the relevant document in the same change.
 | Configure Slack App notifications | [`slack-app.md`](slack-app.md) | `cf-worker/src/slack_app.ts` |
 | Configure Feishu/Lark notifications | [`feishu.md`](feishu.md) | `cf-worker/src/feishu.ts` |
 
-## Current versus historical documents
+## Reading guide
 
-The following are implementation history and decision records, not step-by-step
-implementation plans:
+Each feature document owns its current contract; filenames ending in `-design`
+do not imply pending work. In particular:
 
-- [`ssh-vt-design.md`](ssh-vt-design.md)
-- [`feishu-design.md`](feishu-design.md)
+- [`sign-vt-design.md`](sign-vt-design.md) owns SSH identity selection and fallback;
+  [`ssh-vt-design.md`](ssh-vt-design.md) covers portable storage and relay rationale.
+- [`feishu.md`](feishu.md) owns setup;
+  [`feishu-design.md`](feishu-design.md) covers delivery lifecycle and API boundaries.
 
-Read the status note at the top and the security section first. Ignore review
-rounds, PR breakdowns, and superseded alternatives when changing code; verify
-the current behavior against the implementation anchors in the table.
+Implementation history belongs in Git. Verify older decision notes against code
+before treating them as current requirements.
 
-## Fast path for coding agents
+## Editing workflow
 
-1. Find the command, config key, route, or protocol symbol with `rg`.
-2. Read the matching row above and its implementation anchor.
-3. Make the smallest coherent code + documentation change.
-4. Run the narrow test first, then the repository gate:
-
-   ```bash
-   cargo test
-   just check
-   just check-worker
-   ```
-
-5. If behavior, config, routes, secrets, or security boundaries changed, update
-   the matching operator document and this map if the ownership changed.
+Find the symbol with `rg`, read its owning document and implementation, then
+update that document with the smallest coherent change. Run focused tests before
+the relevant [repository gates](../AGENTS.md#validation-and-deployment-entry-points).
+Linux checks do not validate macOS-only behavior. Update this map only when
+ownership or entry points change.
 
 ## Change routing
 
