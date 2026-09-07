@@ -307,6 +307,7 @@
       sub = el('div', 'cell-sub', '至 ' + fmtTime(g.max_expires_ms));
     }
     if (sub) remTd.appendChild(sub);
+    remTd.appendChild(el('div', 'cell-sub', '创建于 ' + (fmtTime(g.created_ms) || '未知')));
 
     var act = document.createElement('td');
     act.className = 'col-act';

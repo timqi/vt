@@ -5,10 +5,55 @@
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import {
   renderTemplate, escapeJsonForHtml, isAdminAssetPath,
   pageVars, adminVars, adminTabs, channelVars, type PageChrome, type AdminTab,
 } from '../src/page';
+
+describe('cache creation time rendering', () => {
+  class Element {
+    children: Element[] = [];
+    textContent = '';
+    classList = { add() {} };
+    appendChild(child: Element) { this.children.push(child); }
+    setAttribute() {}
+    addEventListener() {}
+  }
+
+  const source = readFileSync(new URL('../pwa/admin/cache.js', import.meta.url), 'utf8');
+  // Exercise the actual row renderer without starting fetches, timers, or UI wiring.
+  const wiring = source.indexOf("  document.getElementById('refresh').addEventListener");
+  const context = {
+    location: { pathname: '/admin/cache' },
+    document: {
+      getElementById: () => new Element(), createElement: () => new Element(),
+      addEventListener() {},
+    },
+    renderRow: undefined as unknown as (group: Record<string, unknown>) => Element,
+  };
+  expect(wiring).toBeGreaterThan(0);
+  runInNewContext(source.slice(0, wiring) + 'globalThis.renderRow = renderRow; }());', context);
+
+  function creationLine(created: number | null, expires: number) {
+    const row = context.renderRow({
+      group_id: 'test-group', origin_token_id: 'test-origin',
+      live: 1, entries: 1, created_ms: created, max_expires_ms: expires,
+    });
+    return row.children[4].children.at(-1)!.textContent;
+  }
+
+  it('shows the original creation timestamp before and after extension or expiry', () => {
+    const created = new Date(2026, 0, 2, 3, 4, 5).getTime();
+    for (const expires of [Date.now() + 60_000, Date.now() + 86_400_000, 1]) {
+      expect(creationLine(created, expires)).toBe('创建于 2026-01-02 03:04:05');
+    }
+  });
+
+  it('labels legacy entries without a creation timestamp as unknown', () => {
+    expect(creationLine(null, Date.now() + 60_000)).toBe('创建于 未知');
+  });
+});
 
 describe('renderTemplate', () => {
   it('substitutes every occurrence of a placeholder', () => {
