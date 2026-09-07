@@ -175,6 +175,13 @@ npm run dev        # wrangler dev — local Worker + DO
 
 ## Verify & observe
 
+The DO alarm pages `ch:` records (1,000 per `list()`, ending only on an empty
+page), expires pending challenges after 5 minutes via a fresh re-read so a
+concurrent approval is never overwritten, and deletes finalized records plus
+their `pt:` keys after 10 minutes in batches of at most 128. A failed sweep is
+logged and still rearms the alarm; read-time checks remain the authoritative
+expiry guard.
+
 - Workers Logs (dashboard) show the structured audit events; retention is
   platform-managed (~3 days Free, ~7 days Paid).
 - The admin **audit** page (`/kestrel/audit`) shows the SQLite audit table, cache

@@ -11,9 +11,8 @@
 // it wakes on the approval HTTP request.
 //
 // Alarm: sweeps pending challenges older than TTL_MS and deletes finalized
-// challenges after RETENTION_MS. CF Durable Objects serialize requests (and
-// alarms) per-instance, so the alarm sweep cannot race a mid-flight op on the
-// same DO — no extra locking is needed.
+// challenges after RETENTION_MS. Expiry re-reads each challenge under the DO
+// input gate so a stale list snapshot cannot overwrite a committed decision.
 
 import { DurableObject } from 'cloudflare:workers';
 import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse } from './types';
@@ -29,7 +28,7 @@ import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
 import { AccountNotifications, NotificationChannels } from './account_notifications';
 import { AccountCache } from './account_cache';
-import { deleteKeysBatched } from './storage_batch';
+import { deleteKeysBatched, listPrefixPages } from './storage_batch';
 
 const TTL_MS = 5 * 60 * 1000;
 const RETENTION_MS = 10 * 60 * 1000;
@@ -262,31 +261,29 @@ export class AccountDO extends DurableObject<Env> {
 
     // 1. Challenges: expire pending past TTL_MS; delete finalized past RETENTION_MS.
     try {
-      const list = await this.ctx.storage.list<Challenge>({ prefix: 'ch:' });
-      const toDelete: string[] = [];
       // Parse the Feishu + Slack App configs ONCE for the whole sweep (they
       // can't change mid-sweep) — avoids re-parsing the secrets and re-logging
       // any config error per expiring challenge.
       const channels = this.notifications.channels();
-      for (const [key, ch] of list) {
-        const ptKey = `pt:${ch.poll_token}`;
-        if (ch.status === 'pending' && now - ch.created_ms >= TTL_MS) {
-          // `ch` is a stale snapshot from list() at sweep start; a decision may
-          // have committed after it. expireChallenge re-reads atomically and is a
-          // no-op if no longer pending, so it can't clobber a terminal status,
-          // double-finalize the audit row, or emit a card edit that conflicts
-          // with the decision. It drops the pt: key itself; notifications.edit
-          // fires via waitUntil, so a burst of expiries doesn't stretch the sweep.
-          await this.expireChallenge(ch.approve_token, now, channels);
-        } else if (
-          ch.status !== 'pending'
-          && ch.finalized_ms != null
-          && now - ch.finalized_ms >= RETENTION_MS
-        ) {
-          toDelete.push(key, ptKey);
+      for await (const page of listPrefixPages<Challenge>(this.ctx.storage, 'ch:')) {
+        const toDelete: string[] = [];
+        for (const [key, ch] of page) {
+          if (ch.status === 'pending' && now - ch.created_ms >= TTL_MS) {
+            // `ch` is a stale list snapshot; a decision may have committed after
+            // it. expireChallenge re-reads atomically and no-ops if terminal,
+            // preserving the decision, audit row, and notification state. It
+            // drops pt: itself and dispatches notification edits via waitUntil.
+            await this.expireChallenge(ch.approve_token, now, channels);
+          } else if (
+            ch.status !== 'pending'
+            && ch.finalized_ms != null
+            && now - ch.finalized_ms >= RETENTION_MS
+          ) {
+            toDelete.push(key, `pt:${ch.poll_token}`);
+          }
         }
+        if (toDelete.length) await deleteKeysBatched(this.ctx.storage, toDelete);
       }
-      if (toDelete.length) await deleteKeysBatched(this.ctx.storage, toDelete);
     } catch (e) {
       logErr('alarm.challenge_sweep_failed', e);
     }

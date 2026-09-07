@@ -6,10 +6,8 @@ import { b64uEnc, isB64uString, decodeB64uExact, sha256, randomBytes } from './c
 import { seal, openToCache } from './cache_crypto';
 import { planExtend, isAllowedApproveTtl, groupIdOf, isExtendableGroupId, cacheScopePwd } from './cache_policy';
 import { logErr } from './log';
-import { STORAGE_BATCH, deleteKeysBatched } from './storage_batch';
+import { STORAGE_BATCH, deleteKeysBatched, listPrefixPages } from './storage_batch';
 
-// Entries read per internal list() page when aggregating the admin cache listing.
-const CACHE_LIST_PAGE = 1000;
 // Hard cap on entries scanned for one listing. Bounds DO CPU/memory on a
 // pathologically large cache; the response reports `truncated` so the UI can say
 // the view is partial rather than imply completeness.
@@ -131,29 +129,14 @@ export class AccountCache {
   // is found and never accumulated, so this is safe on a cache far larger than
   // an unbounded list() could hold (list() with no options loads the whole
   // prefix into the isolate's memory).
-  //
-  // Deleting while paging is safe: `startAfter` is a key VALUE, not an index, so
-  // removing keys the cursor already passed cannot make it skip anything.
   private async sweepCacheEntries(
     pick: (entry: CacheEntry, key: string) => boolean,
   ): Promise<{ deleted: number; scanned: number }> {
     let deleted = 0;
     let scanned = 0;
-    let startAfter: string | undefined;
     let batch: string[] = [];
-    for (;;) {
-      const page: Map<string, CacheEntry> = await this.storage.list<CacheEntry>({
-        prefix: 'dek:',
-        limit: CACHE_LIST_PAGE,
-        ...(startAfter ? { startAfter } : {}),
-      });
-      // Terminate ONLY on an empty page. A short-but-nonempty page does not mean
-      // "end of prefix" (DO storage may cut one below the requested limit to stay
-      // under a response-size cap), and treating it as the end is precisely the
-      // silent partial clear this exists to prevent.
-      if (page.size === 0) break;
+    for await (const page of listPrefixPages<CacheEntry>(this.storage, 'dek:')) {
       for (const [key, entry] of page) {
-        startAfter = key;
         scanned++;
         if (!entry || typeof entry !== 'object' || !pick(entry, key)) continue;
         batch.push(key);
@@ -353,16 +336,8 @@ export class AccountCache {
     const groups = new Map<string, CacheAgg>();
     let scanned = 0;
     let truncated = false;
-    let startAfter: string | undefined;
-    for (;;) {
-      const page: Map<string, CacheEntry> = await this.storage.list<CacheEntry>({
-        prefix: 'dek:',
-        limit: CACHE_LIST_PAGE,
-        ...(startAfter ? { startAfter } : {}),
-      });
-      if (page.size === 0) break;
+    for await (const page of listPrefixPages<CacheEntry>(this.storage, 'dek:')) {
       for (const [key, e] of page) {
-        startAfter = key;
         scanned++;
         if (!e || typeof e !== 'object') continue;
         const gid = groupIdOf(e);
@@ -384,12 +359,6 @@ export class AccountCache {
           agg.consistent = false;
         }
       }
-      // Terminate ONLY on an empty page. A short-but-nonempty page does not mean
-      // "end of prefix": DO storage may cut a page below the requested limit to
-      // stay under an internal response-size cap. Treating that as completion
-      // would silently drop the remaining groups while still reporting
-      // truncated=false — precisely the silent-partial-view failure this listing
-      // must never have. The cost is one extra empty list() per scan.
       if (scanned >= CACHE_LIST_SCAN_MAX) { truncated = true; break; }
     }
     return { groups, scanned, truncated };

@@ -24,7 +24,9 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use std::sync::OnceLock;
+use std::time::Duration;
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use zeroize::Zeroizing;
 
 use crate::caller_meta::{collect_client_meta, current_ppid, get_hostname};
@@ -175,6 +177,27 @@ struct DekCacheResp {
     miss: bool,
 }
 
+const CACHE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn http_client(ipv4: bool) -> reqwest::Result<&'static reqwest::Client> {
+    static V4: OnceLock<reqwest::Client> = OnceLock::new();
+    static ANY: OnceLock<reqwest::Client> = OnceLock::new();
+    let slot = if ipv4 { &V4 } else { &ANY };
+    if let Some(client) = slot.get() {
+        return Ok(client);
+    }
+    // Preserve reqwest's proxy defaults, sampled when each pool is first built.
+    // Auth and timeouts belong to requests, never to these shared clients.
+    let mut builder = reqwest::Client::builder();
+    if ipv4 {
+        builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
+    // Failed builds are not cached; concurrent successful builds use one winner.
+    let _ = slot.set(builder.build()?);
+    Ok(slot.get().expect("HTTP client initialized"))
+}
+
 /// POST to the worker with the egress IP family pinned to IPv4 (with graceful
 /// fallback). Both the challenge (which writes the DEK-cache entry, ctx bound to
 /// CF-Connecting-IP) and the dek-cache probe (which reads it) go through here,
@@ -203,13 +226,15 @@ pub(crate) async fn cf_post_with_timeout(
     secs: u64,
 ) -> Result<reqwest::Response> {
     async fn send_once(
-        client: reqwest::Client,
+        client: &reqwest::Client,
         url: &str,
         auth_header: &str,
         body: &[u8],
+        secs: u64,
     ) -> reqwest::Result<reqwest::Response> {
         client
             .post(url)
+            .timeout(Duration::from_secs(secs))
             .header("Authorization", auth_header)
             .header("Content-Type", "application/json")
             .body(body.to_vec())
@@ -217,22 +242,27 @@ pub(crate) async fn cf_post_with_timeout(
             .await
     }
 
-    let v4 = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(secs))
-        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-        .build()?;
-    match send_once(v4, url, auth_header, body).await {
+    match send_once(http_client(true)?, url, auth_header, body, secs).await {
         Ok(r) => Ok(r),
         // IPv6-only host (or no IPv4 route): retry without the family pin so both
         // requests consistently fall back to IPv6.
         Err(e) if e.is_connect() || e.is_builder() => {
-            let any = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(secs))
-                .build()?;
-            Ok(send_once(any, url, auth_header, body).await?)
+            Ok(send_once(http_client(false)?, url, auth_header, body, secs).await?)
         }
         Err(e) => Err(e.into()),
     }
+}
+
+async fn connect_dek_ws(
+    url: &str,
+    timeout: Duration,
+) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
+    let (stream, _) = tokio::time::timeout(timeout, connect_async(url))
+        .await
+        .map_err(|_| anyhow!("WS connection handshake timeout"))?
+        // Neither the URL's poll token nor server-controlled error data is safe to display.
+        .map_err(|_| anyhow!("WS connection handshake failed"))?;
+    Ok(stream)
 }
 
 // ── Main entry point ───────────────────────────────────────────────────────
@@ -313,9 +343,7 @@ pub async fn get_deks(
         ch.poll_token
     );
 
-    let (mut ws_stream, _) = connect_async(&ws_url)
-        .await
-        .with_context(|| format!("WS connect {ws_url}"))?;
+    let mut ws_stream = connect_dek_ws(&ws_url, WS_CONNECT_TIMEOUT).await?;
 
     // Wait for approval (up to 6 minutes — DO TTL is 5 min)
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360);
@@ -393,6 +421,15 @@ pub async fn try_cache(
     salts: &[[u8; 16]],
     meta: &ChallengeMeta,
 ) -> Result<Option<Vec<Zeroizing<[u8; 32]>>>> {
+    try_cache_with_timeout(config, salts, meta, CACHE_PROBE_TIMEOUT).await
+}
+
+async fn try_cache_with_timeout(
+    config: &CfConfig<'_>,
+    salts: &[[u8; 16]],
+    meta: &ChallengeMeta,
+    timeout: Duration,
+) -> Result<Option<Vec<Zeroizing<[u8; 32]>>>> {
     if salts.is_empty() {
         return Ok(None); // auth-only / nothing to look up
     }
@@ -423,16 +460,19 @@ pub async fn try_cache(
     // Same IPv4-pinned client as the challenge POST so CF-Connecting-IP (half the
     // cache ctx) is stable across the two processes. Any transport/HTTP failure →
     // fall back to the ceremony rather than abort.
-    let resp = match cf_post(&url, &auth_header, &req_body).await {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
-    if !resp.status().is_success() {
-        return Ok(None);
-    }
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(_) => return Ok(None),
+    // One budget includes both address-family attempts and the entire body read.
+    // Keep crypto validation outside the recoverable transport/miss path.
+    let bytes = match tokio::time::timeout(timeout, async {
+        let resp = cf_post(&url, &auth_header, &req_body).await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.bytes().await.ok()
+    })
+    .await
+    {
+        Ok(Some(bytes)) => bytes,
+        _ => return Ok(None),
     };
     let parsed: DekCacheResp = match serde_json::from_slice(&bytes) {
         Ok(p) => p,
@@ -554,8 +594,268 @@ fn verify_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dryoc::classic::crypto_box::crypto_box_keypair;
+    use dryoc::classic::crypto_box::{crypto_box_keypair, crypto_box_seal};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
 
+    /// Bind `addr`, accept one connection, and hand it to `handle`. Returns the
+    /// `http://` URL and the server task.
+    async fn serve<F, Fut>(addr: &str, handle: F) -> (String, tokio::task::JoinHandle<()>)
+    where
+        F: FnOnce(BufReader<TcpStream>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle(BufReader::new(stream)).await;
+        });
+        (url, task)
+    }
+
+    async fn join(server: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn read_request(stream: &mut BufReader<TcpStream>) -> (Vec<String>, Vec<u8>) {
+        let mut headers = Vec::new();
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            headers.push(line);
+        }
+        let mut body = vec![0; content_length];
+        stream.read_exact(&mut body).await.unwrap();
+        (headers, body)
+    }
+
+    async fn write_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
+        let headers = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+    }
+
+    /// Optionally send headers plus a truncated body, then hold the connection
+    /// open until the client gives up; the client's timeout must close it.
+    async fn stall_until_client_closes(stream: &mut BufReader<TcpStream>, partial_response: bool) {
+        if partial_response {
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                .await
+                .unwrap();
+        }
+        assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+    }
+
+    async fn cache_server(
+        response: impl FnOnce(serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        serve("127.0.0.1:0", |mut stream| async move {
+            let (_, body) = read_request(&mut stream).await;
+            let request = serde_json::from_slice(&body).unwrap();
+            let body = serde_json::to_vec(&response(request)).unwrap();
+            write_response(stream.get_mut(), 200, &body).await;
+        })
+        .await
+    }
+
+    fn config(url: &str) -> CfConfig<'_> {
+        CfConfig {
+            worker_url: url,
+            worker_auth: "test-auth",
+        }
+    }
+
+    async fn probe(url: &str) -> Result<Option<Vec<Zeroizing<[u8; 32]>>>> {
+        try_cache(&config(url), &[[1; 16]], &ChallengeMeta::default()).await
+    }
+
+    fn ws_url(http_url: &str) -> String {
+        format!(
+            "{}/api/dek?poll_token=test_token",
+            http_url.replacen("http", "ws", 1)
+        )
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_is_bounded_after_tcp_accept() {
+        let (url, server) = serve("127.0.0.1:0", |mut stream| async move {
+            read_request(&mut stream).await;
+            // No upgrade response: cancellation must close the accepted socket.
+            stall_until_client_closes(&mut stream, false).await;
+        })
+        .await;
+        let err = connect_dek_ws(&ws_url(&url), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(format!("{err:#}"), "WS connection handshake timeout");
+        join(server).await;
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_failure_does_not_expose_poll_token() {
+        let (url, server) = serve("127.0.0.1:0", |mut stream| async move {
+            read_request(&mut stream).await;
+            write_response(stream.get_mut(), 403, b"test_token").await;
+        })
+        .await;
+        let err = connect_dek_ws(&ws_url(&url), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(format!("{err:#}"), "WS connection handshake failed");
+        join(server).await;
+    }
+
+    #[tokio::test]
+    async fn cache_probe_opens_successful_hit() {
+        let (url, server) = cache_server(|request| {
+            let pk = decode_b64u_exact::<32>(
+                request["daemon_pubkey_b64u"].as_str().unwrap(),
+                "test public key",
+            )
+            .unwrap();
+            let mut sealed = vec![0; 80];
+            crypto_box_seal(&mut sealed, &[0x42; 32], &pk).unwrap();
+            serde_json::json!({"source": "cache", "sealed_deks_b64u": URL_SAFE_NO_PAD.encode(sealed)})
+        })
+        .await;
+        let result = probe(&url).await.unwrap().unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(
+            *result[0] == [0x42; 32],
+            "cache hit must open the expected test DEK"
+        );
+        join(server).await;
+    }
+
+    #[tokio::test]
+    async fn cache_probe_miss_and_non_cache_responses_remain_misses() {
+        for response in [
+            serde_json::json!({"miss": true}),
+            serde_json::json!({"source": "cache", "miss": true, "sealed_deks_b64u": "bad"}),
+            serde_json::json!({"source": "approved", "sealed_deks_b64u": "bad"}),
+            serde_json::json!({"source": "cache"}),
+        ] {
+            let (url, server) = cache_server(move |_| response).await;
+            assert!(probe(&url).await.unwrap().is_none());
+            join(server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_probe_crypto_errors_are_not_misses() {
+        for sealed in ["!".to_string(), URL_SAFE_NO_PAD.encode([0; 80])] {
+            let (url, server) = cache_server(
+                move |_| serde_json::json!({"source": "cache", "sealed_deks_b64u": sealed}),
+            )
+            .await;
+            assert!(probe(&url).await.is_err());
+            join(server).await;
+        }
+    }
+
+    /// The probe's single budget covers headers, body, and the IPv4→unpinned
+    /// fallback (the `[::1]` server rejects the IPv4-pinned attempt first).
+    #[tokio::test]
+    async fn cache_probe_budget_covers_headers_body_and_ipv6_fallback() {
+        for addr in ["127.0.0.1:0", "[::1]:0"] {
+            for partial_response in [false, true] {
+                let (url, server) = serve(addr, move |mut stream| async move {
+                    read_request(&mut stream).await;
+                    stall_until_client_closes(&mut stream, partial_response).await;
+                })
+                .await;
+                let result = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    try_cache_with_timeout(
+                        &config(&url),
+                        &[[1; 16]],
+                        &ChallengeMeta::default(),
+                        Duration::from_millis(200),
+                    ),
+                )
+                .await
+                .expect("probe budget must bound the whole exchange, not the 30 s request timeout")
+                .unwrap();
+                assert!(result.is_none());
+                join(server).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_pool_reuses_connection_with_fresh_auth_and_timeouts() {
+        let (url, server) = serve("127.0.0.1:0", |mut stream| async move {
+            // Both requests must arrive on this one TCP connection.
+            for auth in ["first-test-auth", "second-test-auth"] {
+                let (headers, body) = read_request(&mut stream).await;
+                assert!(headers
+                    .iter()
+                    .any(|h| h.trim() == format!("authorization: {auth}")));
+                assert_eq!(body, b"{}");
+                write_response(stream.get_mut(), 200, b"{}").await;
+            }
+        })
+        .await;
+        for (auth, secs) in [("first-test-auth", 30), ("second-test-auth", 5)] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                cf_post_with_timeout(&url, auth, b"{}", secs),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.bytes().await.unwrap().as_ref(), b"{}");
+        }
+        join(server).await;
+    }
+
+    #[tokio::test]
+    async fn http_request_timeout_still_bounds_body_reads() {
+        let (url, server) = serve("127.0.0.1:0", |mut stream| async move {
+            read_request(&mut stream).await;
+            stall_until_client_closes(&mut stream, true).await;
+        })
+        .await;
+        let response = cf_post_with_timeout(&url, "test-auth", b"{}", 1)
+            .await
+            .unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), response.bytes())
+            .await
+            .expect("per-request timeout must survive the returned Response")
+            .unwrap_err();
+        assert!(err.is_timeout());
+        join(server).await;
+    }
+
+    #[tokio::test]
+    async fn http_status_errors_do_not_retry() {
+        let (url, server) = serve("127.0.0.1:0", |mut stream| async move {
+            read_request(&mut stream).await;
+            write_response(stream.get_mut(), 401, b"{}").await;
+        })
+        .await;
+        let response = cf_post(&url, "test-auth", b"{}").await.unwrap();
+        assert_eq!(response.status().as_u16(), 401);
+        join(server).await;
+    }
     #[test]
     fn challenge_meta_preserves_shape_and_command_newlines() {
         let meta = collect_meta("decrypt\0", "first\r\nsecond\t", "reason\n");

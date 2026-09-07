@@ -85,6 +85,158 @@ describe('shared storage deletion', () => {
   });
 });
 
+describe('challenge alarm sweep', () => {
+  it('streams full and short pages through an empty page, deleting routing keys in bounded batches', async () => {
+    await inDO(async ({ inst, state }) => {
+      const now = Date.now();
+      let batch: Record<string, Challenge | string> = {};
+      for (let i = 0; i < 1100; i++) {
+        const ch = makeChallenge({ status: 'approved', finalized_ms: now - 2 * TTL_MS - 1000 });
+        batch[`ch:${ch.approve_token}`] = ch;
+        batch[`pt:${ch.poll_token}`] = ch.approve_token;
+        if (Object.keys(batch).length === 128) {
+          await state.storage.put(batch);
+          batch = {};
+        }
+      }
+      if (Object.keys(batch).length) await state.storage.put(batch);
+      const pending = makeChallenge();
+      const recent = makeChallenge({ status: 'rejected', finalized_ms: now });
+      const expired = makeChallenge({ created_ms: now - TTL_MS - 1000 });
+      for (const ch of [pending, recent, expired]) {
+        await state.storage.put({
+          [`ch:${ch.approve_token}`]: ch, [`pt:${ch.poll_token}`]: ch.approve_token,
+        });
+      }
+      inst.audit.create(expired);
+      const list = state.storage.list.bind(state.storage);
+      const del = state.storage.delete.bind(state.storage);
+      const pages: string[][] = [];
+      const lists = vi.spyOn(state.storage, 'list').mockImplementation(async (options) => {
+        if (options?.prefix !== 'ch:') return list(options);
+        expect(options.limit).toBe(1000);
+        expect(options.startAfter).toBe(pages.at(-1)?.at(-1));
+        // A later page must not be fetched before the preceding page is cleaned.
+        if (pages.length && pages.length <= 2) {
+          expect(await state.storage.get(pages.at(-1)![0]!)).toBeUndefined();
+        }
+        const page = await list({ ...options, limit: pages.length === 0 ? 65 : options.limit });
+        pages.push([...page.keys()]);
+        return page;
+      });
+      const deletes = vi.spyOn(state.storage, 'delete').mockImplementation((keys: any) => {
+        if (Array.isArray(keys)) expect(keys.length).toBeLessThanOrEqual(128);
+        return del(keys);
+      });
+      const channels = vi.spyOn(inst.notifications, 'channels');
+      try {
+        await inst.alarm();
+        expect(pages.map(page => page.length)).toEqual([65, 1000, 38, 0]);
+        expect(channels).toHaveBeenCalledOnce();
+        expect([...await list({ prefix: 'ch:' })].map(([key]) => key)).toEqual(
+          [pending, recent, expired].map(ch => `ch:${ch.approve_token}`),
+        );
+        expect([...await list({ prefix: 'pt:' })].map(([key]) => key)).toEqual(
+          [pending, recent].map(ch => `pt:${ch.poll_token}`),
+        );
+        expect(await state.storage.get(`ch:${pending.approve_token}`)).toEqual(pending);
+        expect(await state.storage.get(`ch:${recent.approve_token}`)).toEqual(recent);
+        expect(await state.storage.get(`ch:${expired.approve_token}`)).toMatchObject({ status: 'expired' });
+        expect((await auditRows({ inst, state }))[0]!.status).toBe('expired');
+        const batches = deletes.mock.calls.map(([keys]) => keys).filter(Array.isArray);
+        expect(Math.max(...batches.map(keys => keys.length))).toBe(128);
+        expect(batches.reduce((total, keys) => total + keys.length, 0)).toBe(2200);
+        expect(await state.storage.getAlarm()).toBeGreaterThanOrEqual(now + TTL_MS);
+      } finally {
+        lists.mockRestore();
+        deletes.mockRestore();
+        channels.mockRestore();
+      }
+    });
+  });
+
+  it('freshly rereads each pending challenge and preserves an approval committed after listing', async () => {
+    await inDO(async ({ inst, state }) => {
+      const now = Date.now();
+      const expired = makeChallenge({ created_ms: now - TTL_MS - 1000 });
+      const stale = makeChallenge({ created_ms: expired.created_ms });
+      const approved: Challenge = {
+        ...stale, status: 'approved', finalized_ms: now,
+        sealed_deks_b64u: b64uEnc(new Uint8Array(48).fill(5)),
+      };
+      for (const ch of [expired, stale]) {
+        await state.storage.put({
+          [`ch:${ch.approve_token}`]: ch, [`pt:${ch.poll_token}`]: ch.approve_token,
+        });
+        inst.audit.create(ch);
+      }
+      const list = state.storage.list.bind(state.storage);
+      const lists = vi.spyOn(state.storage, 'list').mockImplementation(async (options) => {
+        const page = await list(options);
+        if (options?.prefix === 'ch:' && !options.startAfter) {
+          await state.storage.put(`ch:${approved.approve_token}`, approved);
+          inst.audit.finalize(approved.approve_token, 'approved', now - approved.created_ms);
+        }
+        return page;
+      });
+      const edits = vi.spyOn(inst.notifications, 'edit');
+      const gets = vi.spyOn(state.storage, 'get');
+      try {
+        await inst.alarm();
+        expect(gets).toHaveBeenCalledWith(`ch:${expired.approve_token}`);
+        expect(gets).toHaveBeenCalledWith(`ch:${stale.approve_token}`);
+        expect(await state.storage.get(`ch:${approved.approve_token}`)).toEqual(approved);
+        expect(await state.storage.get(`pt:${approved.poll_token}`)).toBe(approved.approve_token);
+        expect(await state.storage.get(`pt:${expired.poll_token}`)).toBeUndefined();
+        expect((await auditRows({ inst, state })).map(row => row.status)).toEqual(['expired', 'approved']);
+        expect(edits).toHaveBeenCalledOnce();
+        expect(edits.mock.calls[0]![0]).toMatchObject({ approve_token: expired.approve_token, status: 'expired' });
+      } finally {
+        lists.mockRestore();
+        edits.mockRestore();
+        gets.mockRestore();
+      }
+    });
+  });
+
+  it('isolates a later-page failure and still sweeps the cache, audit, sockets, and rearms the alarm', async () => {
+    await inDO(async ({ inst, state }) => {
+      const now = Date.now();
+      const ch = makeChallenge({ status: 'rejected', finalized_ms: now - 2 * TTL_MS - 1000 });
+      await state.storage.put({
+        [`ch:${ch.approve_token}`]: ch, [`pt:${ch.poll_token}`]: ch.approve_token,
+      });
+      const keys = await seedGroup({ inst, state }, 1, { expires_ms: now - 1 });
+      const list = state.storage.list.bind(state.storage);
+      const lists = vi.spyOn(state.storage, 'list').mockImplementation((options) => {
+        if (options?.prefix === 'ch:' && options.startAfter) {
+          throw new Error('injected challenge pagination failure');
+        }
+        return list(options);
+      });
+      const audit = vi.spyOn(inst.audit, 'sweep');
+      const sockets = vi.spyOn(state, 'getWebSockets');
+      const alarm = vi.spyOn(state.storage, 'setAlarm');
+      try {
+        await expect(inst.alarm()).resolves.toBeUndefined();
+        expect(lists).toHaveBeenCalledWith({ prefix: 'ch:', limit: 1000, startAfter: `ch:${ch.approve_token}` });
+        expect(await state.storage.get(`ch:${ch.approve_token}`)).toBeUndefined();
+        expect(await state.storage.get(`pt:${ch.poll_token}`)).toBeUndefined();
+        expect(await readEntries({ inst, state }, keys)).toEqual([]);
+        expect(audit).toHaveBeenCalledOnce();
+        expect(sockets).toHaveBeenCalledWith('admin');
+        expect(alarm).toHaveBeenCalledOnce();
+        expect(await state.storage.getAlarm()).toBeGreaterThanOrEqual(now + TTL_MS);
+      } finally {
+        lists.mockRestore();
+        audit.mockRestore();
+        sockets.mockRestore();
+        alarm.mockRestore();
+      }
+    });
+  });
+});
+
 describe('cache read plaintext lifetime', () => {
   it.each(['missing', 'malformed', 'cleanup-failure', 'hit', 'seal-failure'])(
     'wipes every opened buffer on %s', async (outcome) => {
