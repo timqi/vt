@@ -102,6 +102,21 @@ password prompt.
   reliable in your PAM environment.
 - `auth@vt` is never cached. An approval always requires Touch ID or a phone
   Passkey ceremony.
+- The approval reason carries the command sudo was asked to run
+  (`sudo whoami` -> `sudo sudo by you — sudo whoami`). `pam_exec` is forked by
+  sudo itself, so the helper reads `/proc/$PPID/cmdline`; it stays empty when
+  `/proc` is unreadable, and only the first 100 characters are kept so a long
+  command cannot overflow the argument limit and fail the whole factor. This is
+  display-only: argv belongs to the caller, and VT renders `--reason` as a
+  client-claimed line after the agent's own truth lines (Touch ID shows 100
+  characters, the agent rejects a reason above 8 KiB). Never treat it as an
+  authorization fact.
+- That command line is also pushed to notification channels and stored in
+  worker audit rows. The helper blanks `VAR=value` assignments
+  (`sudo TOKEN=… cmd`), but a secret passed as a plain argument (`-pSECRET`)
+  is still displayed and retained. On a host where that is unacceptable, drop
+  the `${SUDO_CMD…}` part of the `--reason` string in
+  `/usr/local/bin/vt-sudo-auth.sh` — re-running `setup-pam.sh` restores it.
 - Only `/etc/pam.d/sudo` is modified. `sudo -i` reads `/etc/pam.d/sudo-i` on
   Debian and Ubuntu; add the same `auth` line there if you want login shells
   covered.

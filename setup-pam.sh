@@ -233,6 +233,21 @@ if [ -z "${SSH_AUTH_SOCK:-}" ] && [ -n "$VT_AUTH" ]; then
     fi
 fi
 
+# What sudo was asked to run. pam_exec is forked by sudo itself, so $PPID is
+# the sudo process and its cmdline is `sudo <command>`. Display only: argv
+# comes from the caller, and vt renders --reason as a client-claimed line
+# after the agent's own truth lines. Empty when /proc is unreadable.
+#
+# Two bounds before it becomes an argument. `VAR=value` assignments are
+# blanked: `sudo TOKEN=… cmd` is common and the reason is pushed to phones and
+# kept in worker audit rows. Other argv secrets (`-pSECRET`) still show — see
+# docs/sudo.md. The 100-char cut keeps a long command from overflowing the
+# execve argument limit (which would fail the helper and silently drop the
+# whole factor back to the password stack) and matches the prompt's own cap.
+SUDO_CMD=$(tr '\0' ' ' < /proc/$PPID/cmdline 2>/dev/null |
+    sed -E 's/([A-Za-z_][A-Za-z0-9_]*)=[^[:space:]]*/\1=…/g; s/[[:space:]]+$//')
+SUDO_CMD=${SUDO_CMD:0:100}
+
 # Refuse cleanly if neither path is usable (don't hang on a blank prompt).
 if [ -z "$VT_AUTH" ] && [ -z "$VT_PASSKEY_URL" ]; then exit 1; fi
 
@@ -243,7 +258,7 @@ if [ -z "$VT_AUTH" ] && [ -z "$VT_PASSKEY_URL" ]; then exit 1; fi
 # timeout is 60s: a phone approval needs human reaction time (vs instant Touch
 # ID). Tradeoff: sudo hangs up to 60s before falling back to the password stack.
 BODY
-    printf 'timeout 60 %s auth --reason "sudo ${PAM_SERVICE:-sudo} by ${PAM_USER:-unknown}"\n' "$VT_BIN"
+    printf 'timeout 60 %s auth --reason "sudo ${PAM_SERVICE:-sudo} by ${PAM_USER:-unknown}${SUDO_CMD:+ — $SUDO_CMD}"\n' "$VT_BIN"
 } > "$SCRIPT_PATH"
 
 chmod 700 "$SCRIPT_PATH"
