@@ -62,6 +62,26 @@ new_sqlite_classes = ["AccountDO"]
 # Public origin / RP id for WebAuthn. Use your own domain.
 WORKER_ORIGIN = "https://vt.example.com"
 RP_ID = "vt.example.com"
+# WebAuthn user-verification policy for APPROVAL ceremonies (approve + reject).
+# Registration is unaffected — enrolling a passkey always requires verification.
+#
+# Empty/absent → the built-in default: `discouraged`, so approving is ONE click in
+# the platform/1Password prompt instead of a click plus a second biometric step.
+# User presence (the tap) is still mandatory and still verified server-side, and
+# the approve URL remains an unguessable 96-bit token with a 5-minute life.
+#
+# Raise it wherever you want the biometric step back — every rule and the client's
+# `vt --uv` request can only RAISE the level, never lower it:
+#
+#   APPROVAL_UV_JSON = '{"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{"prod-db":"required"}}'
+#
+# `by_op` keys are op kinds (decrypt / encrypt / auth / cache-extend / …); `by_host`
+# keys are the client-reported hostname (advisory — it may only raise). Levels are
+# `discouraged` | `preferred` | `required`. A malformed value falls back to
+# `required` everywhere, so a typo costs a prompt, never a weaker ceremony. The
+# admin cache-extension ceremony is pinned to `required` and ignores any attempt
+# here to lower it. See src/uv_policy.ts.
+APPROVAL_UV_JSON = ""
 # Cloudflare Access (Zero Trust) gates the /<ADMIN_SEG>/* surface (ADMIN_SEG is
 # a constant in src/index.ts). Fill these in after creating the Access
 # Application whose Path equals ADMIN_SEG (e.g. <origin>/kestrel):

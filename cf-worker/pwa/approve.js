@@ -110,6 +110,14 @@
         var sodiumReady = (typeof sodium !== 'undefined') ? sodium.ready
             : Promise.reject(new Error('libsodium 未加载'));
 
+        // User-verification level for BOTH ceremonies below. The worker decides
+        // it per challenge (uv_policy.ts) and the worker enforces the same value
+        // on the assertion, so the page only relays it. An old/garbled payload
+        // falls back to 'required' — the strict direction, and what the worker
+        // verifies a pre-policy challenge at.
+        var UV = ['discouraged', 'preferred', 'required']
+            .indexOf(data.user_verification) < 0 ? 'required' : data.user_verification;
+
         var refs = buildUi(root, showMeta);
 
         function setStatus(text, kind) {
@@ -229,7 +237,7 @@
                         allowCredentials: data.allow_credentials.map(function (c) {
                             return { type: 'public-key', id: b64uDec(c.id_b64u) };
                         }),
-                        userVerification: 'required',
+                        userVerification: UV,
                         extensions: { prf: { eval: { first: PRF_INPUT } } },
                     },
                 });
@@ -367,7 +375,7 @@
                         allowCredentials: data.allow_credentials.map(function (c) {
                             return { type: 'public-key', id: b64uDec(c.id_b64u) };
                         }),
-                        userVerification: 'required',
+                        userVerification: UV,
                     },
                 });
                 var usedId = b64uEnc(new Uint8Array(assertion.rawId));

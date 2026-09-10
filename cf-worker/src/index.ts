@@ -19,6 +19,7 @@ import { parseFeishuConfig } from './feishu';
 import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp } from './types';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess, type AccessVars } from './access';
+import { effectiveUvLevel, parseUvPolicy } from './uv_policy';
 import {
   escapeJsonForHtml, renderTemplate, isAdminAssetPath,
   pageVars, adminVars, channelVars, type AdminTab, type PageChrome,
@@ -54,7 +55,7 @@ const ADMIN_SEG = 'kestrel';
 // while admin.css stays stale, which desyncs markup from styles. The .html
 // page shells need no token — the Worker reads them server-side per request.)
 // Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
-const ASSET_VER = '20260907-9abe4e4';
+const ASSET_VER = '20260910-79ec9a0';
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
@@ -338,6 +339,11 @@ app.post('/api/challenge', async (c) => {
     return c.text((e as Error).message, 400);
   }
 
+  // 5. Approval UV level: server policy, raised (never lowered) by body.uv.
+  const meta = capChallengeMeta(body.meta, c.req.header('CF-Connecting-IP'));
+  const { policy: uvPolicy, error: uvPolicyError } = parseUvPolicy(c.env.APPROVAL_UV_JSON);
+  if (uvPolicyError) logErr('uv_policy.invalid', uvPolicyError);
+
   // 6. Generate tokens. 12 bytes = 96-bit capability tokens (16 b64url chars):
   // unguessable within the 5-min single-use TTL, and approval still requires a
   // server-verified WebAuthn assertion regardless. Shortens the approve URL.
@@ -358,7 +364,12 @@ app.post('/api/challenge', async (c) => {
     approve_challenge_hash_b64u: b64uEnc(approveHash),
     reject_challenge_hash_b64u: b64uEnc(rejectHash),
     salts_b64u: saltsB64u,
-    meta: capChallengeMeta(body.meta, c.req.header('CF-Connecting-IP')),
+    meta,
+    // Decided HERE, once, from server-side policy plus the client's raise-only
+    // request, and stored on the challenge: the approval page and the assertion
+    // check both read it back from the DO, so neither the phone nor the CLI can
+    // lower what this ceremony is verified at.
+    uv: effectiveUvLevel(uvPolicy, meta, body.uv),
     status: 'pending',
     created_ms: Date.now(),
   };

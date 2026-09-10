@@ -1,5 +1,7 @@
 // Shared types for the vt-passkey v2 Worker.
 
+import type { UvLevel } from './uv_policy';
+
 export interface Env {
   ACCOUNT: DurableObjectNamespace;
   ASSETS: Fetcher;
@@ -40,6 +42,13 @@ export interface Env {
    *  default so a deployment that never wants the capability simply does not
    *  have it (the routes 404 and the UI hides the controls). */
   CACHE_ADMIN_EXTEND?: string;
+  /** JSON: {"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{…}}.
+   *  Server-side WebAuthn user-verification policy for APPROVAL ceremonies only
+   *  (registration stays `required`). Empty/absent → the built-in default
+   *  (`discouraged`, so the common approval is one click in the passkey prompt);
+   *  malformed → `required` everywhere, i.e. the pre-policy behaviour. Every rule
+   *  and the client's request can only RAISE the level. See uv_policy.ts. */
+  APPROVAL_UV_JSON?: string;
   WORKER_ORIGIN: string;
   RP_ID: string;
   /** Cloudflare Access team domain, e.g. "myteam.cloudflareaccess.com". Empty → admin surface fails closed. */
@@ -159,6 +168,13 @@ export interface Challenge {
   /** per-DEK salts from client, each 16 bytes base64url */
   salts_b64u: string[];
   meta: ChallengeMeta;
+  /** Effective WebAuthn user-verification level for THIS ceremony, decided
+   *  server-side at creation as `max(policy, client request)` and never rewritten
+   *  afterwards. The approval page asks for it and the assertion check enforces
+   *  it, both from this stored field — a caller cannot downgrade a ceremony at
+   *  verify time. ABSENT on challenges created by a pre-policy Worker, which are
+   *  verified at `required` (uv_policy.challengeUvLevel). */
+  uv?: UvLevel;
   status: ChallengeStatus;
   /** present after approval: sealed_box([DEK_0||...||DEK_n]) to daemon_pubkey */
   sealed_deks_b64u?: string;
@@ -311,6 +327,10 @@ export interface ChallengeRequest {
   /** per-DEK salts; may be empty for auth-only requests */
   salts_b64u: string[];
   meta?: Partial<ChallengeMeta>;
+  /** Requested user-verification level (`vt --uv` / VT_PASSKEY_UV). Advisory and
+   *  raise-only: the Worker stores `max(policy, this)`. Unknown/absent = no
+   *  request. */
+  uv?: string;
 }
 
 // ── Outbound from /api/challenge ───────────────────────────────────────────
@@ -381,6 +401,9 @@ export interface ApprovePageData {
   salts_b64u: string[];
   rp_id: string;
   allow_credentials: Array<{ id_b64u: string; h_b64u: string; k_b64u: string }>;
+  /** The ceremony's effective UV level — what approve.js passes to
+   *  `navigator.credentials.get`. Server-decided; the page never chooses it. */
+  user_verification: UvLevel;
   metadata: ChallengeMeta;
   /** TTL options (seconds) the PWA renders as cache-duration radios. Always
    *  includes 0 ("不缓存", the default). Empty (only [0]) when caching disabled. */

@@ -19,6 +19,7 @@ and update the relevant document in the same change.
 | Use VT for Linux sudo/PAM | [`sudo.md`](sudo.md) | `setup-pam.sh`, `src/client.rs` |
 | Deploy the phone approval Worker | [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/index.ts`, `cf-worker/src/do_account.ts` |
 | Understand Worker audit and notification lifecycle | [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts` |
+| Tune approval user verification (UV) | [`cf-worker-deploy.md`](cf-worker-deploy.md#approval-user-verification-approval_uv_json) | `cf-worker/src/uv_policy.ts` (policy), `cf-worker/src/webauthn.ts` (enforcement), `cf-worker/pwa/approve.js` |
 | Understand DEK caching | [`dek-cache.md`](dek-cache.md) | `cf-worker/src/do_account.ts` (ceremony and audit), `cf-worker/src/account_cache.ts` (cache storage), `cf-worker/src/storage_batch.ts` (shared batch deletion and prefix paging), `src/cf.rs` |
 | Use SSH identities | [`README.md` — portable identity](../README.md#portable-ssh-identity-for-git-vt) | `src/ssh_sign.rs`, `src/client.rs` |
 | Understand agent signing, identity selection, and decrypt-then-sign fallback | [`sign-vt-design.md`](sign-vt-design.md) | `src/ssh_sign.rs` (`resolve_identities`, `decide_sign_route`), `src/client.rs` (`VTClient::sign_vt`), `src/server_macos/ssh_agent/handlers.rs` (`handle_sign_vt`) |

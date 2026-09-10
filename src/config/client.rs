@@ -15,6 +15,7 @@ pub const CLIENT_CONFIG_KEYS: &[&str] = &[
     "VT_GIT_SSH_PRIVATE_KEY",
     "VT_GIT_SSH_PUB",
     "VT_AGENT_CONFIG",
+    "VT_PASSKEY_UV",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +81,11 @@ impl std::error::Error for RoutingError {}
 #[derive(Clone)]
 pub struct ResolvedConfig {
     auth_token: String,
+    /// Requested WebAuthn user-verification level for the phone ceremony
+    /// (`--uv`, else `VT_PASSKEY_UV`, else the file). Advisory: the Worker
+    /// applies `max(its policy, this)`, so it can only ever ask for MORE
+    /// verification than the deployment already requires.
+    passkey_uv: Option<String>,
     values: BTreeMap<&'static str, Result<String, std::env::VarError>>,
     pub file_populated_keys: Vec<String>,
     pub config_path: Option<PathBuf>,
@@ -88,9 +94,14 @@ pub struct ResolvedConfig {
 }
 
 impl ResolvedConfig {
-    pub fn capture(auth: Option<String>, file_populated_keys: Vec<String>) -> Self {
+    pub fn capture(
+        auth: Option<String>,
+        uv: Option<String>,
+        file_populated_keys: Vec<String>,
+    ) -> Self {
         Self::from_lookup(
             auth,
+            uv,
             file_populated_keys,
             |key| std::env::var(key),
             super::config_path(),
@@ -100,6 +111,7 @@ impl ResolvedConfig {
 
     fn from_lookup(
         auth: Option<String>,
+        uv: Option<String>,
         file_populated_keys: Vec<String>,
         mut lookup: impl FnMut(&str) -> Result<String, std::env::VarError>,
         config_path: Option<PathBuf>,
@@ -117,8 +129,18 @@ impl ResolvedConfig {
                     .cloned()
             })
             .unwrap_or_default();
+        // Same precedence as `auth`: the flag wins, else the env/file value.
+        let passkey_uv = uv
+            .or_else(|| {
+                values
+                    .get("VT_PASSKEY_UV")
+                    .and_then(|value| value.as_ref().ok())
+                    .cloned()
+            })
+            .filter(|v| !v.is_empty());
         Self {
             auth_token,
+            passkey_uv,
             values,
             file_populated_keys,
             config_path,
@@ -137,6 +159,7 @@ impl ResolvedConfig {
     ) -> Self {
         Self::from_lookup(
             auth,
+            None,
             file_populated_keys,
             |key| lookup(key).ok_or(std::env::VarError::NotPresent),
             config_path,
@@ -205,6 +228,7 @@ impl ResolvedConfig {
         Ok(crate::cf::CfConfig {
             worker_url,
             worker_auth,
+            uv: self.passkey_uv.as_deref(),
         })
     }
 
@@ -229,6 +253,7 @@ impl ResolvedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env::VarError;
 
     fn config(auth: Option<&str>, values: &[(&str, &str)]) -> ResolvedConfig {
         ResolvedConfig::resolve(
@@ -324,6 +349,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn passkey_uv_prefers_the_flag_and_stays_absent_when_unset() {
+        let uv = |flag: Option<&str>, env: Option<&str>| {
+            ResolvedConfig::from_lookup(
+                None,
+                flag.map(str::to_owned),
+                Vec::new(),
+                |key| match key {
+                    "VT_PASSKEY_URL" => Ok("https://worker.invalid".to_owned()),
+                    "VT_PASSKEY_TOKEN" => Ok("token".to_owned()),
+                    "VT_PASSKEY_UV" => env.map(str::to_owned).ok_or(VarError::NotPresent),
+                    _ => Err(VarError::NotPresent),
+                },
+                None,
+                None,
+            )
+            .passkey_config()
+            .unwrap()
+            .uv
+            .map(str::to_owned)
+        };
+        assert_eq!(uv(None, None), None);
+        assert_eq!(uv(None, Some("preferred")), Some("preferred".to_owned()));
+        assert_eq!(uv(Some("required"), None), Some("required".to_owned()));
+        // The flag wins over the env/file value, like --auth does.
+        assert_eq!(
+            uv(Some("required"), Some("discouraged")),
+            Some("required".to_owned())
+        );
+        // An empty value is "unset", not a request the worker has to parse.
+        assert_eq!(uv(None, Some("")), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn non_unicode_values_preserve_lazy_environment_errors() {
@@ -331,6 +389,7 @@ mod tests {
         let invalid = std::ffi::OsString::from_vec(vec![0xff]);
         let cfg = ResolvedConfig::from_lookup(
             Some("auth".into()),
+            None,
             Vec::new(),
             |key| match key {
                 "VT_BACKEND" | "VT_PASSKEY_URL" => {

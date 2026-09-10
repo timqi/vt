@@ -73,6 +73,17 @@ struct Cli {
     )]
     auth: Option<String>,
 
+    #[arg(
+        long,
+        global = true,
+        env = "VT_PASSKEY_UV",
+        hide_env = true,
+        value_name = "discouraged|preferred|required",
+        value_parser = ["discouraged", "preferred", "required"],
+        help = "Ask the phone approval page for this WebAuthn user-verification level. Raise-only: the worker applies max(its policy, this), so it can add a biometric step but never remove one (env: VT_PASSKEY_UV)"
+    )]
+    uv: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -665,7 +676,8 @@ fn main() {
     let file_populated_keys = config::hydrate_env_from_file();
 
     let cli = Cli::parse();
-    let config = config::ResolvedConfig::capture(cli.auth.clone(), file_populated_keys);
+    let config =
+        config::ResolvedConfig::capture(cli.auth.clone(), cli.uv.clone(), file_populated_keys);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

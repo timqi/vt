@@ -66,6 +66,7 @@ Edit these fields:
 | `[vars] RP_ID` | WebAuthn RP id = the bare host, e.g. `vt.example.com` |
 | `[vars] ACCESS_TEAM_DOMAIN` | `<team>.cloudflareaccess.com` (filled in step 3) |
 | `[vars] ACCESS_AUD` | Access Application AUD tag (filled in step 3) |
+| `[vars] APPROVAL_UV_JSON` | Approval user-verification policy (optional; see below) |
 
 Notes already baked into the example:
 - `workers_dev = false` and `preview_urls = false` — the Worker is served **only**
@@ -76,6 +77,45 @@ Notes already baked into the example:
   SQLite class — leave these as-is.
 - `[observability]` persists structured audit events (challenge.created /
   approved / rejected / expired / error) to Workers Logs.
+
+### Approval user verification (`APPROVAL_UV_JSON`)
+
+WebAuthn's user-verification level for **approval** ceremonies is server policy,
+decided once per challenge and stored on it
+([`cf-worker/src/uv_policy.ts`](../cf-worker/src/uv_policy.ts)). Credential
+**registration** is not covered and always requires verification.
+
+Unset → `discouraged`: approving is one click in the platform/1Password prompt,
+with no second biometric step. User presence is still mandatory and still checked
+server-side, and the approve URL is still an unguessable 96-bit token that lives
+five minutes.
+
+```toml
+APPROVAL_UV_JSON = '{"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{"prod-db":"required"}}'
+```
+
+- Levels: `discouraged` | `preferred` | `required`.
+- `by_op` keys are op kinds (`decrypt`, `encrypt`, `auth`, `cache-extend`, …);
+  `by_host` keys are the client-reported hostname, which is advisory display
+  data — it may raise the level, never lower it.
+- Every rule, plus the client's `vt --uv` request, can only **raise** the
+  effective level: it is the maximum of everything that applies. A caller cannot
+  weaken a ceremony, and the level is read back from the stored challenge at
+  verification time, never from the assertion or the request body.
+- A malformed value falls back to `required` everywhere (the pre-policy
+  behaviour) and logs `uv_policy.invalid` — a typo costs a prompt, not a weaker
+  ceremony.
+- The admin cache-extension ceremony (`cache-extend`) is pinned to `required`;
+  a `by_op` entry cannot lower it, because approving it grants cache lifetime.
+
+> **Security-key caveat.** The approval page derives its key material from the
+> PRF extension. A platform or 1Password passkey verifies the user as part of
+> unlocking, so its PRF output is the same whatever this policy asks for. A CTAP2
+> security key (YubiKey) derives PRF from a *different* secret when it completes
+> without user verification, so a credential enrolled under `required` cannot
+> unwrap its master key from a `discouraged` ceremony — the approval fails,
+> nothing leaks. Deployments approving with a security key should set
+> `{"default":"required"}` (or pass `vt --uv required` from those hosts).
 
 ## 3. Create the Cloudflare Access application (admin gate)
 
@@ -157,7 +197,13 @@ export VT_PASSKEY_URL="https://vt.example.com"
 export VT_PASSKEY_TOKEN="<the VT_AUTH_CF value from step 4>"
 ```
 
-`VT_PASSKEY_TOKEN` **must** equal the `VT_AUTH_CF` secret. Test:
+`VT_PASSKEY_TOKEN` **must** equal the `VT_AUTH_CF` secret.
+
+Optional: `VT_PASSKEY_UV` (or the global `vt --uv <level>` flag) asks a single
+host or command for a stricter approval than the Worker's policy requires —
+raise-only, so it can add the biometric step but never remove one.
+
+Test:
 
 ```bash
 # Paste a record previously printed by `vt create`.

@@ -331,6 +331,7 @@ base64-encoded plaintext.
 | `VT_AUTH` | SSH-agent authentication token (from `vt init`) | unset |
 | `VT_PASSKEY_URL` | Cloudflare Worker base URL for phone approval | unset |
 | `VT_PASSKEY_TOKEN` | HMAC token matching the Worker `VT_AUTH_CF` secret | unset |
+| `VT_PASSKEY_UV` | Requested WebAuthn user-verification level for phone approval (`discouraged`/`preferred`/`required`); same as `--uv`, raise-only — the Worker's policy decides the floor | unset |
 | `VT_BACKEND` | `auto`, `agent`, or `passkey` transport selection | `auto` |
 | `VT_CONFIG` | Override the config-file path | `~/.config/vt/config.toml` |
 | `VT_AGENT_CONFIG` | Override the AI-agent hook config path | `~/.config/vt/agent.toml` |

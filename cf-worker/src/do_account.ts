@@ -24,6 +24,7 @@ import {
   isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
   isExtendableGroupId, cacheScopePwd,
 } from './cache_policy';
+import { challengeUvLevel } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
 import { AccountNotifications, NotificationChannels } from './account_notifications';
@@ -510,6 +511,9 @@ export class AccountDO extends DurableObject<Env> {
         expectedChallenge,
         rpId: this.env.RP_ID,
         expectedOrigin: this.expectedOrigin,
+        // From the STORED ceremony, never the request: the level this challenge
+        // was created with is the level its assertion is checked against.
+        userVerification: challengeUvLevel(ch.uv),
       });
     } catch (e) {
       logErr('webauthn.verify_failed', e, { at: tokenPrefix(ch.approve_token) });
@@ -894,6 +898,10 @@ export class AccountDO extends DurableObject<Env> {
         await challengeHash(daemonPk, workerNonce, now, [], 'reject')),
       salts_b64u: [],
       meta,
+      // An extension GRANTS cache lifetime (docs/dek-cache.md §extend), and it
+      // is a rare desk-bound admin ceremony, so it keeps the biometric step
+      // whatever APPROVAL_UV_JSON does to the hot decrypt path.
+      uv: 'required',
       status: 'pending',
       created_ms: now,
       extend: intent,
@@ -1031,6 +1039,7 @@ export class AccountDO extends DurableObject<Env> {
         expectedChallenge: b64uDec(ch.reject_challenge_hash_b64u),
         rpId: this.env.RP_ID,
         expectedOrigin: this.expectedOrigin,
+        userVerification: challengeUvLevel(ch.uv),
       });
     } catch (e) {
       logErr('webauthn.verify_failed', e, { at: tokenPrefix(ch.approve_token) });
@@ -1132,6 +1141,10 @@ export class AccountDO extends DurableObject<Env> {
       salts_b64u: ch.salts_b64u,
       rp_id: this.env.RP_ID,
       allow_credentials: creds.c.map(e => ({ id_b64u: e.i, h_b64u: e.h, k_b64u: e.k })),
+      // What the page asks the authenticator for. Server state, so a tampered
+      // page can only make the ceremony fail its own verification, never pass a
+      // weaker one.
+      user_verification: challengeUvLevel(ch.uv),
       metadata: ch.meta,
       cache_options_s: cacheOptionsS,
       cache_pubkey_b64u: cachePubkeyB64u,

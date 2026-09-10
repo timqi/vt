@@ -51,6 +51,12 @@ pub fn random_salts(n: usize) -> Vec<[u8; 16]> {
 pub struct CfConfig<'a> {
     pub worker_url: &'a str,
     pub worker_auth: &'a str,
+    /// Requested WebAuthn user-verification level for the approval ceremony
+    /// (`discouraged` | `preferred` | `required`), or `None` to take whatever
+    /// the Worker's policy says. RAISE-ONLY: the Worker stores
+    /// `max(policy, this)`, so this can never buy a weaker ceremony than the
+    /// deployment configured. See cf-worker/src/uv_policy.ts.
+    pub uv: Option<&'a str>,
 }
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
@@ -83,11 +89,14 @@ fn decode_b64u_exact<const N: usize>(b64u: &str, what: &str) -> Result<[u8; N]> 
 // ── Wire types ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct ChallengeReq {
+struct ChallengeReq<'a> {
     daemon_pubkey_b64u: String,
     timestamp_ms: u64,
     salts_b64u: Vec<String>,
     meta: ChallengeMeta,
+    /// Omitted entirely when unset, which the Worker reads as "no request".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uv: Option<&'a str>,
 }
 
 /// Display-only context shown on the phone's approval page. None of these
@@ -297,6 +306,7 @@ pub async fn get_deks(
         timestamp_ms: ts_ms,
         salts_b64u: salts_b64u.clone(),
         meta,
+        uv: config.uv,
     })?;
 
     let auth_header = hmac_auth_header(config.worker_auth, &req_body);
@@ -680,6 +690,7 @@ mod tests {
         CfConfig {
             worker_url: url,
             worker_auth: "test-auth",
+            uv: None,
         }
     }
 
@@ -757,6 +768,24 @@ mod tests {
             assert!(probe(&url).await.unwrap().is_none());
             join(server).await;
         }
+    }
+
+    #[test]
+    fn challenge_request_carries_only_an_explicit_uv_request() {
+        let request = |uv| {
+            serde_json::to_value(ChallengeReq {
+                daemon_pubkey_b64u: String::new(),
+                timestamp_ms: 0,
+                salts_b64u: Vec::new(),
+                meta: ChallengeMeta::default(),
+                uv,
+            })
+            .unwrap()
+        };
+        // Absent, not null: the worker reads a missing field as "no request"
+        // and applies its own policy.
+        assert!(request(None).get("uv").is_none());
+        assert_eq!(request(Some("required"))["uv"], "required");
     }
 
     #[tokio::test]

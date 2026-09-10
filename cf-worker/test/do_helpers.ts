@@ -232,21 +232,19 @@ function rawSigToDer(raw: Uint8Array): Uint8Array {
   return Uint8Array.from([0x30, body.length, ...body]);
 }
 
-/** Build the assertion the Worker expects for `approve`:
- *  challenge = SHA-256(approve_challenge_hash || pwa_pk). */
-export async function signApproval(approveChallengeHashB64u: string): Promise<{
+/** authenticatorData flags byte: UP is bit0, UV is bit2. The default is what a
+ *  verifying authenticator emits; a test that drives the UV policy passes
+ *  UP_ONLY (a 1Password/Chrome prompt that only confirmed presence). */
+export const FLAGS_UP_UV = 0x05;
+export const FLAGS_UP_ONLY = 0x01;
+
+/** Sign one assertion over `expectedChallenge` with the fixture credential. */
+async function signChallenge(expectedChallenge: Uint8Array, flags: number): Promise<{
   credential_id_b64u: string;
   client_data_json_b64u: string;
   authenticator_data_b64u: string;
   signature_b64u: string;
-  pwa_pk_b64u: string;
 }> {
-  const hash = b64uDec(approveChallengeHashB64u);
-  const effective = new Uint8Array(hash.length + TEST_PWA_PK.length);
-  effective.set(hash, 0);
-  effective.set(TEST_PWA_PK, hash.length);
-  const expectedChallenge = new Uint8Array(await crypto.subtle.digest('SHA-256', effective));
-
   const clientDataJson = new TextEncoder().encode(JSON.stringify({
     type: 'webauthn.get',
     challenge: b64uEnc(expectedChallenge),
@@ -258,7 +256,7 @@ export async function signApproval(approveChallengeHashB64u: string): Promise<{
   const rpIdHash = await sha256(new TextEncoder().encode(testEnv.RP_ID));
   const authData = new Uint8Array(37);
   authData.set(rpIdHash, 0);
-  authData[32] = 0x05;               // UP (bit0) | UV (bit2)
+  authData[32] = flags;
 
   const signedData = new Uint8Array(authData.length + 32);
   signedData.set(authData, 0);
@@ -274,6 +272,28 @@ export async function signApproval(approveChallengeHashB64u: string): Promise<{
     client_data_json_b64u: b64uEnc(clientDataJson),
     authenticator_data_b64u: b64uEnc(authData),
     signature_b64u: b64uEnc(rawSigToDer(rawSig)),
+  };
+}
+
+/** Build the assertion the Worker expects for `approve`:
+ *  challenge = SHA-256(approve_challenge_hash || pwa_pk). */
+export async function signApproval(
+  approveChallengeHashB64u: string,
+  flags = FLAGS_UP_UV,
+): Promise<{
+  credential_id_b64u: string;
+  client_data_json_b64u: string;
+  authenticator_data_b64u: string;
+  signature_b64u: string;
+  pwa_pk_b64u: string;
+}> {
+  const hash = b64uDec(approveChallengeHashB64u);
+  const effective = new Uint8Array(hash.length + TEST_PWA_PK.length);
+  effective.set(hash, 0);
+  effective.set(TEST_PWA_PK, hash.length);
+  const expectedChallenge = new Uint8Array(await crypto.subtle.digest('SHA-256', effective));
+  return {
+    ...(await signChallenge(expectedChallenge, flags)),
     pwa_pk_b64u: b64uEnc(TEST_PWA_PK),
   };
 }
@@ -285,14 +305,28 @@ export async function signApproval(approveChallengeHashB64u: string): Promise<{
 export async function approve(
   ch: Pick<Challenge, 'approve_token' | 'approve_challenge_hash_b64u'>,
   extra: Record<string, unknown> = {},
+  flags = FLAGS_UP_UV,
 ): Promise<DoResult> {
-  const assertion = await signApproval(ch.approve_challenge_hash_b64u);
+  const assertion = await signApproval(ch.approve_challenge_hash_b64u, flags);
   return doPost('approve', {
     approve_token: ch.approve_token,
     sealed_deks_b64u: b64uEnc(new Uint8Array(48).fill(5)),
     binding_tag_b64u: b64uEnc(new Uint8Array(32).fill(6)),
     ...assertion,
     ...extra,
+  });
+}
+
+/** The rejection half of the same ceremony: the assertion is over the stored
+ *  reject_challenge_hash itself (no pwa_pk — a rejection delivers no key
+ *  material). Same authenticator, same flags knob. */
+export async function reject(
+  ch: Pick<Challenge, 'approve_token' | 'reject_challenge_hash_b64u'>,
+  flags = FLAGS_UP_UV,
+): Promise<DoResult> {
+  return doPost('reject', {
+    approve_token: ch.approve_token,
+    ...(await signChallenge(b64uDec(ch.reject_challenge_hash_b64u), flags)),
   });
 }
 

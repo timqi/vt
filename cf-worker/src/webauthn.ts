@@ -6,6 +6,7 @@
 // P-256 signatures arrive DER-encoded; Ed25519 signatures are raw (64 bytes).
 
 import { sha256, b64uDec, ctEq } from './crypto';
+import type { UvLevel } from './uv_policy';
 
 export async function verifyAssertion(opts: {
   /** COSE-encoded public key bytes (from credentials.p) */
@@ -23,8 +24,14 @@ export async function verifyAssertion(opts: {
   rpId: string;
   /** Expected clientData.origin (canonical scheme+host[+port], no trailing slash) */
   expectedOrigin: string;
+  /** The ceremony's effective UV level, read from SERVER state (the stored
+   *  challenge) — never from the assertion or from the request body, or a caller
+   *  could downgrade its own check. `required` → the UV flag must be set;
+   *  `preferred`/`discouraged` → it is not demanded. UP is mandatory either way.
+   *  Not optional: every call site states the level it verifies at. */
+  userVerification: UvLevel;
 }): Promise<void> {
-  const { cosePublicKey, clientDataJson, authenticatorData, signature, expectedChallenge, rpId, expectedOrigin } = opts;
+  const { cosePublicKey, clientDataJson, authenticatorData, signature, expectedChallenge, rpId, expectedOrigin, userVerification } = opts;
 
   // 1. Parse and validate clientDataJSON
   const clientData = JSON.parse(new TextDecoder().decode(clientDataJson));
@@ -54,7 +61,9 @@ export async function verifyAssertion(opts: {
   // 3. Check UP + UV flags (UP=bit0, UV=bit2 of flags byte at offset 32)
   const flags = authenticatorData[32]!;
   if ((flags & 0x01) === 0) throw new Error('user presence (UP) flag not set');
-  if ((flags & 0x04) === 0) throw new Error('user verification required but UV flag not set');
+  if (userVerification === 'required' && (flags & 0x04) === 0) {
+    throw new Error('user verification required but UV flag not set');
+  }
 
   // 4. Build signed data
   const clientDataHash = await sha256(clientDataJson);
