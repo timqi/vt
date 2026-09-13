@@ -18,7 +18,6 @@ import { Env } from './types';
 import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, hkdfSha256, inReplayWindow } from './crypto';
 import { notifyApproval } from './notify';
 import { parsePushoverConfig } from './pushover';
-import { parseSlackConfig } from './slack';
 import { parseSlackAppConfig } from './slack_app';
 import { parseFeishuConfig } from './feishu';
 import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, EnrollRequest, DoEnrollCreateOp, MasterKeyGen } from './types';
@@ -197,7 +196,7 @@ app.get(`/${ADMIN_SEG}/setup`, (c) => servePage(c, '/admin/setup', {
 }));
 
 // Channels page (client-side notification-secret generator). Unlike Passkey,
-// the live PUSHOVER_JSON / SLACK_JSON secrets are plaintext credentials and are
+// the live PUSHOVER_JSON / SLACK_APP_JSON / FEISHU_JSON secrets are plaintext credentials and are
 // NEVER injected — only booleans indicating whether each is currently set, so
 // the page can show a configured/not-configured badge without echoing tokens.
 // The badge runs the SAME parser the dispatch paths use (config !== null), so a
@@ -206,17 +205,15 @@ app.get(`/${ADMIN_SEG}/setup`, (c) => servePage(c, '/admin/setup', {
 // would show ✓ for a secret that silently never delivers.
 app.get(`/${ADMIN_SEG}/channels`, (c) => {
   const pushoverSet = parsePushoverConfig(c.env.PUSHOVER_JSON).config !== null;
-  const slackSet = parseSlackConfig(c.env.SLACK_JSON).config !== null;
   const slackAppSet = parseSlackAppConfig(c.env.SLACK_APP_JSON).config !== null;
   const feishuSet = parseFeishuConfig(c.env.FEISHU_JSON).config !== null;
   return servePage(c, '/admin/channels', {
     ...adminShellVars('channels'),
     VT_DATA: escapeJsonForHtml({
-      pushover_set: pushoverSet, slack_set: slackSet,
+      pushover_set: pushoverSet,
       slackapp_set: slackAppSet, feishu_set: feishuSet,
     }),
     ...channelVars('PUSHOVER', pushoverSet),
-    ...channelVars('SLACK', slackSet),
     ...channelVars('SLACKAPP', slackAppSet),
     ...channelVars('FEISHU', feishuSet),
   });
@@ -429,7 +426,7 @@ app.post('/api/challenge', async (c) => {
   const stored = await doResp.json() as { meta?: ChallengeMeta };
   if (stored.meta) ch.meta = stored.meta;
 
-  // 9. Notifications — Pushover and/or Slack, both opt-in and non-fatal.
+  // 9. Notifications — the stateless Pushover channel, opt-in and non-fatal.
   const origin = c.env.WORKER_ORIGIN;
   const approveUrl = `${origin}/a/${approveToken}`;
 

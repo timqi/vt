@@ -4,7 +4,6 @@
 
 import { Env, ChallengeMeta } from './types';
 import { parsePushoverConfig, notifyPushover } from './pushover';
-import { parseSlackConfig, notifySlack } from './slack';
 
 // Truncate the aggregated warning before it's logged upstream.
 function truncate(s: string, max = 512): string {
@@ -64,7 +63,7 @@ export function buildApprovalMessage(
 // approve URL to tap and no action to take. The title is distinct so an operator
 // can tell at a glance it was served from cache.
 // Shared cache-hit content (title + context lines). Exported so feishu.ts's
-// card renders the SAME title and lines as the Pushover/Slack text — the whole
+// card renders the SAME title and lines as the Pushover text — the whole
 // point of a shared builder is that the two can never drift. Compact — a cache
 // hit is a terminal FYI, not an actionable approval, so it drops the
 // ssh/ip/reason lines and leads with a one-line summary (who · N records · cache
@@ -105,12 +104,12 @@ export function buildCacheHitMessage(
 // '' when every enabled channel succeeded (or none was enabled), or a single
 // aggregated, channel-prefixed warning string on a genuine config/delivery error.
 //
-// NOTE: this path only knows about the STATELESS channels (Pushover, Slack
-// webhook). The STATEFUL channels (Slack App `SLACK_APP_JSON`, Feishu
-// `FEISHU_JSON`) are dispatched independently from the DO's opCreate via
-// waitUntil (see do_account.ts) and are invisible here. So fanOut MUST NOT try
-// to decide whether "any channel is configured" — it can't see half of them,
-// and a stateful-only deployment would produce a false "no channel" warning.
+// NOTE: this path only knows about the STATELESS channel (Pushover). The
+// STATEFUL channels (Slack App `SLACK_APP_JSON`, Feishu `FEISHU_JSON`) are
+// dispatched independently from the DO's opCreate via waitUntil (see
+// do_account.ts) and are invisible here. So fanOut MUST NOT try to decide
+// whether "any channel is configured" — it can't see most of them, and a
+// stateful-only deployment would produce a false "no channel" warning.
 async function fanOut(
   env: Env,
   title: string,
@@ -119,9 +118,7 @@ async function fanOut(
   const warnings: string[] = [];
 
   const po = parsePushoverConfig(env.PUSHOVER_JSON);
-  const sl = parseSlackConfig(env.SLACK_JSON);
   if (po.error) warnings.push(`pushover config: ${po.error}`);
-  if (sl.error) warnings.push(`slack config: ${sl.error}`);
 
   // Each task is .catch()-guarded so a notification channel can never reject
   // Promise.all and abort the awaited ceremony path (index.ts awaits
@@ -135,17 +132,12 @@ async function fanOut(
       // URL/secret. notifyPushover already returns its own diagnostics.
       .catch(() => { warnings.push('pushover: notify error'); }));
   }
-  if (sl.config) {
-    tasks.push(notifySlack(sl.config, title, body)
-      .then((w) => { if (w) warnings.push(`slack: ${w}`); })
-      .catch(() => { warnings.push('slack: notify error'); }));
-  }
 
   await Promise.all(tasks);
   return warnings.length ? truncate(warnings.join('; ')) : '';
 }
 
-// Fan out an approval request to every configured STATELESS channel in parallel.
+// Fan out an approval request to the configured STATELESS channel.
 // Returns '' when every enabled channel succeeded (or none is enabled here), or a
 // single aggregated, channel-prefixed warning string on a genuine error. Whether
 // a stateful channel (Slack App / Feishu) covers this ceremony is decided in the

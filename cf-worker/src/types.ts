@@ -32,19 +32,16 @@ export interface Env {
   CACHE_SECKEY: string;
   /** JSON: {"app_token":"…","user_key":"…"}. Empty/invalid → Pushover disabled. */
   PUSHOVER_JSON: string;
-  /** JSON: {"webhook_url":"https://hooks.slack.com/services/…"}. Empty/invalid → Slack (webhook) disabled. */
-  SLACK_JSON: string;
   /** JSON: {"bot_token","channel","mention"?}. Slack self-built-app (bot token)
    *  channel: @-mentions approvers + edits the message in place on the decision
-   *  (like Feishu, unlike the one-way SLACK_JSON webhook). Empty/invalid → Slack
-   *  App disabled. See slack_app.ts. */
+   *  (like Feishu). Empty/invalid → Slack App disabled. See slack_app.ts. */
   SLACK_APP_JSON: string;
   /** JSON: {"app_id","app_secret","receive_id","receive_id_type"?,"mention"?,"base"?}.
    *  Feishu/Lark self-built-app bot channel: @-mentions approvers + edits the
    *  card in place on the decision. Empty/invalid → Feishu disabled. See feishu.ts. */
   FEISHU_JSON: string;
   /** "1" | "true" | "on" | "yes" → push the 免审批 cache-hit notices (Pushover /
-   *  Slack / Slack App / Feishu). Anything else, including absent, keeps them
+   *  Slack App / Feishu). Anything else, including absent, keeps them
    *  off: a cache hit can fire many times a minute and the stream buries the
    *  approval messages that need a human. The audit row is written regardless,
    *  so cache hits remain fully visible on the admin audit page. */

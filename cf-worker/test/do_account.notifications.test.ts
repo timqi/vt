@@ -6,7 +6,6 @@ import { b64uEnc, hmacSha256 } from '../src/crypto';
 import * as feishu from '../src/feishu';
 import * as slackApp from '../src/slack_app';
 import * as pushover from '../src/pushover';
-import * as slack from '../src/slack';
 import * as notify from '../src/notify';
 import type { Challenge, Env, DoAuditIngestOp } from '../src/types';
 import { accountStub, inDO, makeChallenge, makeMeta } from './do_helpers';
@@ -302,7 +301,6 @@ describe('approval route notification contract', () => {
       finishSend = resolve;
       markStarted();
     }));
-    const slackSend = vi.spyOn(slack, 'notifySlack').mockRejectedValueOnce(new Error('synthetic failure'));
     // Drain the internal create response so workerd's isolated storage stack
     // does not retain an open DO response stream after the public route returns.
     const account = {
@@ -319,17 +317,14 @@ describe('approval route notification contract', () => {
       }), {
         ...env, VT_AUTH_CF: key, ACCOUNT: account,
         PUSHOVER_JSON: JSON.stringify({ app_token: 'synthetic-token', user_key: 'synthetic-user' }),
-        SLACK_JSON: JSON.stringify({ webhook_url: 'https://hooks.slack.com/services/test/test/test' }),
       }).then(response => { completed = true; return response; });
       await started;
       expect(completed).toBe(false);
-      expect(slackSend).toHaveBeenCalledOnce();
       finishSend('synthetic delivery warning');
       const response = await pending;
       expect(response.status).toBe(200);
       const result = await response.json() as { approve_token: string; push_warning: string };
       expect(result.push_warning).toContain('pushover: synthetic delivery warning');
-      expect(result.push_warning).toContain('slack: notify error');
       await inDO(async ({ state }) => {
         expect(await state.storage.get(`ch:${result.approve_token}`)).toMatchObject({ status: 'pending' });
       });

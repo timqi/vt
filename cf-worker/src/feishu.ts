@@ -1,6 +1,6 @@
 // Feishu / Lark notification channel: config parse + send + in-place edit.
 //
-// Unlike pushover.ts / slack.ts (stateless fire-and-forget webhooks), Feishu is
+// Unlike pushover.ts (a stateless fire-and-forget webhook), Feishu is
 // STATEFUL: to @-mention approvers and to edit the card in place on the final
 // decision we must use the self-built-app (bot) API, which needs a cached
 // tenant_access_token and the message_id of the sent card. So these functions
@@ -104,7 +104,7 @@ export function parseFeishuConfig(raw: string | undefined): {
 
 // The API host is derived ONLY from the `base` enum — never from a user-supplied
 // URL — so a bad secret can't turn this channel into an SSRF primitive (same
-// principle as slack.ts pinning hooks.slack.com).
+// principle as slack_app.ts pinning slack.com).
 function apiBase(cfg: FeishuConfig): string {
   return cfg.base === 'larksuite' ? 'https://open.larksuite.com' : 'https://open.feishu.cn';
 }
@@ -223,7 +223,7 @@ export interface EditExtra {
 // human reads to approve. Only the @-mention line is `lark_md` (it must be, for
 // the `<at>` tag), and its ids are charset-validated in parseFeishuConfig so they
 // cannot break out of the tag/attribute. The context lines reuse notify.ts's
-// shared metaLines() so the card and the webhook text can never drift.
+// shared metaLines() so the card and the Pushover text can never drift.
 function buildCard(
   state: FeishuState,
   opKind: string,

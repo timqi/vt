@@ -59,7 +59,6 @@ CREDENTIALS_JSON = '{"v":1,"epoch":1,"c":[{"h":"L0JnHXnwlzt3HXjLqjzbrgit2WcsVKLQ
 
 # Channels off — the DO must never need a third party to run its cache logic.
 PUSHOVER_JSON = ""
-SLACK_JSON = ""
 SLACK_APP_JSON = ""
 FEISHU_JSON = ""
 

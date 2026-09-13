@@ -74,7 +74,7 @@ TTL, a caller can decrypt the approved records without another phone tap.
   binding ctx) and stamps an immutable `created_ms`. The group id is the handle
   the admin surface lists, clears, and extends by.
 - A hit sends a best-effort notification through configured Pushover, Slack
-  Webhook, Slack App, or Feishu channels. Notifications never block DEK
+  App, or Feishu channels. Notifications never block DEK
   delivery and contain no approval URL.
 
 ## Data flow

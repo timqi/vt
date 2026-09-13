@@ -146,7 +146,6 @@ CACHE_ADMIN_EXTEND = "0"
 #                     Empty/absent → caching disabled (every decrypt needs phone).
 #                     Rotate to instantly invalidate all cached DEKs. NEVER inline.
 #   PUSHOVER_JSON     {"app_token":"…","user_key":"…"}  — optional Pushover channel
-#   SLACK_JSON        {"webhook_url":"https://hooks.slack.com/services/…"} — optional Slack (webhook, one-way) channel
 #   SLACK_APP_JSON    {"bot_token":"xoxb-…","channel":"C…","mention"?:["U…"]}
 #                     — optional Slack App channel (bot token): @-mentions approvers
 #                     + edits the message in place on the decision. See docs/slack-app.md.

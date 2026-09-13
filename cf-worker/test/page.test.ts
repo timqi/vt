@@ -190,19 +190,19 @@ describe('page shells', () => {
   });
 
   it('renders the channels shell for every configured/not-configured combination', () => {
-    for (let bits = 0; bits < 16; bits++) {
-      const [po, sl, sa, fs] = [1, 2, 4, 8].map(m => (bits & m) !== 0) as [boolean, boolean, boolean, boolean];
+    for (let bits = 0; bits < 8; bits++) {
+      const [po, sa, fs] = [1, 2, 4].map(m => (bits & m) !== 0) as [boolean, boolean, boolean];
       const html = render('pwa/admin/channels.html', {
         ...adminVars(CHROME, 'channels'),
-        VT_DATA: escapeJsonForHtml({ pushover_set: po, slack_set: sl, slackapp_set: sa, feishu_set: fs }),
-        ...channelVars('PUSHOVER', po), ...channelVars('SLACK', sl),
+        VT_DATA: escapeJsonForHtml({ pushover_set: po, slackapp_set: sa, feishu_set: fs }),
+        ...channelVars('PUSHOVER', po),
         ...channelVars('SLACKAPP', sa), ...channelVars('FEISHU', fs),
       });
-      const configured = [po, sl, sa, fs].filter(Boolean).length;
+      const configured = [po, sa, fs].filter(Boolean).length;
       expect(html.match(/已配置<\/span>/g) ?? []).toHaveLength(configured);
       expect(html.match(/ checked>/g) ?? []).toHaveLength(configured);
       // A not-configured card starts collapsed.
-      expect(html.match(/class="channel-body"[^>]* hidden>/g) ?? []).toHaveLength(4 - configured);
+      expect(html.match(/class="channel-body"[^>]* hidden>/g) ?? []).toHaveLength(3 - configured);
     }
   });
 
@@ -215,7 +215,7 @@ describe('page shells', () => {
       render('pwa/admin/setup.html', { ...adminVars(CHROME, 'setup'), VT_DATA: '{}' }),
       render('pwa/admin/channels.html', {
         ...adminVars(CHROME, 'channels'), VT_DATA: '{}',
-        ...channelVars('PUSHOVER', true), ...channelVars('SLACK', false),
+        ...channelVars('PUSHOVER', true),
         ...channelVars('SLACKAPP', true), ...channelVars('FEISHU', false),
       }),
     ];

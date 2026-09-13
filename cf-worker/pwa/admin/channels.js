@@ -11,11 +11,9 @@
   var data = vt.bootData() || {};
 
   var chkPushover = document.getElementById('chk-pushover');
-  var chkSlack = document.getElementById('chk-slack');
   var chkSlackApp = document.getElementById('chk-slackapp');
   var chkFeishu = document.getElementById('chk-feishu');
   var poBody = document.getElementById('pushover-body');
-  var slBody = document.getElementById('slack-body');
   var saBody = document.getElementById('slackapp-body');
   var fsBody = document.getElementById('feishu-body');
   var out = document.getElementById('output-section');
@@ -24,7 +22,6 @@
     chk.addEventListener('change', function () { body.hidden = !chk.checked; });
   }
   bind(chkPushover, poBody);
-  bind(chkSlack, slBody);
   bind(chkSlackApp, saBody);
   bind(chkFeishu, fsBody);
 
@@ -108,24 +105,6 @@
         }
       } else if (data.pushover_set) {
         notes.push(disableHint('Pushover', 'PUSHOVER_JSON'));
-      }
-
-      // Slack
-      if (chkSlack.checked) {
-        var webhook = val('sl-webhook');
-        if (webhook) {
-          if (!/^https:\/\/hooks\.slack\.com\//.test(webhook)) {
-            throw new Error('Slack：webhook_url 必须是 https://hooks.slack.com/… 开头');
-          }
-          cards.push(resultCard('Slack',
-            JSON.stringify({ webhook_url: webhook }, null, 2), 'SLACK_JSON'));
-        } else if (data.slack_set) {
-          notes.push(el('p', 'hint', 'Slack：未填写新值，保持现有配置不变。'));
-        } else {
-          throw new Error('Slack 已启用：请填写 webhook_url');
-        }
-      } else if (data.slack_set) {
-        notes.push(disableHint('Slack', 'SLACK_JSON'));
       }
 
       // Slack App (Bot token)

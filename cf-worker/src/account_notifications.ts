@@ -82,7 +82,7 @@ export class AccountNotifications {
 
     // Feishu approval card — fire-and-forget (waitUntil), NOT awaited: this keeps
     // a third-party API's latency out of the singleton DO's serialized op path.
-    // Pushover/Slack are sent separately from index.ts (stateless). See feishu.ts.
+    // Pushover is sent separately from index.ts (stateless). See feishu.ts.
     const cfg = this.feishuCfg();
     const slackCfg = this.slackAppCfg();
     if (cfg || slackCfg) {
@@ -202,7 +202,7 @@ export class AccountNotifications {
   }
 
   // Fan a cache-hit notice out to every configured channel (stateless
-  // Pushover/Slack-webhook fanOut + Feishu + Slack App), each via waitUntil —
+  // Pushover fanOut + Feishu + Slack App), each via waitUntil —
   // compact, no @, no edit lifecycle (terminal FYI). Shared by the Worker
   // DEK-cache hit (opDekCache) and the agent Touch-ID-cache hit
   // (notifyAgentCacheHit); `note` names the skipped factor when it isn't the

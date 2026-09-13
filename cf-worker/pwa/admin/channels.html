@@ -38,32 +38,6 @@
       </div>
     </section>
 
-    <section id="slack-card" class="card channel">
-      <div class="card-head">
-        <h2>Slack</h2>
-        <div class="channel-ctrl">
-          {{SLACK_BADGE}}
-          <label class="switch" title="启用 Slack"><input type="checkbox" id="chk-slack"{{SLACK_CHECKED}}><span class="slider"></span></label>
-        </div>
-      </div>
-      <div class="channel-body" id="slack-body"{{SLACK_HIDDEN}}>
-        {{SLACK_KEEP_NOTE}}
-        <p class="hint warn">⚠️ Slack 走 Incoming Webhook，是<strong>单向通知</strong>：<strong>不支持</strong>审批通过/拒绝后回改原消息，也不 @ 人。审批结果只会在审批页与审计页更新。需要「@相关人 + 决策后回改消息」请用下方的 <strong>Slack App</strong>（Bot token）或<strong>飞书 / Lark</strong> 通道。</p>
-        <p class="hint">用 <strong>Incoming Webhook</strong> 方式——这是单向通知（真正的「同意」仍在审批页用 Passkey 完成），所以只需一个 Webhook URL，无需 bot、无需把机器人拉进频道：</p>
-        <ol class="steps">
-          <li>打开 <a href="https://api.slack.com/apps" target="_blank" rel="noopener">api.slack.com/apps</a> → <strong>Create New App</strong> → <strong>From scratch</strong>，填个名字（如 <code>vt-approval</code>）并选择目标 workspace。</li>
-          <li>左侧 <strong>Incoming Webhooks</strong> → 打开 <strong>Activate Incoming Webhooks</strong> 开关。</li>
-          <li>页面底部 <strong>Add New Webhook to Workspace</strong> → 选择接收审批通知的频道（如 <code>#vt-approvals</code>）→ <strong>Allow</strong>。</li>
-          <li>复制生成的 <strong>Webhook URL</strong>（形如 <code>https://hooks.slack.com/services/T…/B…/…</code>），粘贴到下方。</li>
-        </ol>
-        <p class="hint">所需「权限」就是激活 Incoming Webhooks 时自动添加的 <code>incoming-webhook</code> scope，仅能向你授权的那个频道发消息，无其它权限。换频道就重做第 3 步再换 URL 即可。</p>
-        <div class="field">
-          <label for="sl-webhook">Webhook URL（webhook_url）</label>
-          <input id="sl-webhook" type="text" placeholder="https://hooks.slack.com/services/T…/B…/…" autocomplete="off" spellcheck="false">
-        </div>
-      </div>
-    </section>
-
     <section id="slackapp-card" class="card channel">
       <div class="card-head">
         <h2>Slack App</h2>
@@ -74,7 +48,7 @@
       </div>
       <div class="channel-body" id="slackapp-body"{{SLACKAPP_HIDDEN}}>
         {{SLACKAPP_KEEP_NOTE}}
-        <p class="hint">用<strong>自建应用（Bot token）</strong>方式——这是 Slack 侧唯一能<strong>@相关人</strong>并在审批后<strong>回改原消息填结果</strong>的通道（上面的 Incoming Webhook 做不到）。完整步骤见 <code>docs/slack-app.md</code>：创建 App → 加 Bot Token Scopes（<code>chat:write</code>，如按频道名发送另加 <code>chat:write.public</code>）→ 安装到 workspace 取 <strong>Bot User OAuth Token</strong>（<code>xoxb-…</code>）→ 把 Bot 拉进目标频道 → 取频道 ID（<code>C…</code>）与要 @ 的人的成员 ID（<code>U…</code>）。</p>
+        <p class="hint">用<strong>自建应用（Bot token）</strong>方式——Slack 侧能<strong>@相关人</strong>并在审批后<strong>回改原消息填结果</strong>的通道。完整步骤见 <code>docs/slack-app.md</code>：创建 App → 加 Bot Token Scopes（<code>chat:write</code>，如按频道名发送另加 <code>chat:write.public</code>）→ 安装到 workspace 取 <strong>Bot User OAuth Token</strong>（<code>xoxb-…</code>）→ 把 Bot 拉进目标频道 → 取频道 ID（<code>C…</code>）与要 @ 的人的成员 ID（<code>U…</code>）。</p>
         <div class="field">
           <label for="sa-bot-token">Bot Token（bot_token）</label>
           <input id="sa-bot-token" type="text" placeholder="xoxb-…（Bot 凭证，勿泄露）" autocomplete="off" spellcheck="false">

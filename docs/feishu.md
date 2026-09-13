@@ -118,10 +118,10 @@ just deploy-worker    # 全部 secret 设好后统一 deploy 生效
 
 ## 安全模型
 
-- **App Secret = 机器人凭证**：作为 Worker secret 存储，**永不写日志、永不回显到 admin 页**（同 Pushover/Slack 的处理）。泄露后攻击者可冒充机器人在其所在群收发/编辑消息，范围受 scope 与「只拉进目标群」限制。
-- **审批 URL 不是承载凭证**：卡片里的 `/a/<token>` 即使被群里任何人点开，真正的「批准」仍需**已注册的 Passkey + PRF**。群成员身份 = 「谁能看到 / 发起」，不等于「谁能批准」。这与 Slack/Pushover 的信任模型一致。
+- **App Secret = 机器人凭证**：作为 Worker secret 存储，**永不写日志、永不回显到 admin 页**（同 Pushover/Slack App 的处理）。泄露后攻击者可冒充机器人在其所在群收发/编辑消息，范围受 scope 与「只拉进目标群」限制。
+- **审批 URL 不是承载凭证**：卡片里的 `/a/<token>` 即使被群里任何人点开，真正的「批准」仍需**已注册的 Passkey + PRF**。群成员身份 = 「谁能看到 / 发起」，不等于「谁能批准」。这与 Slack App / Pushover 的信任模型一致。
 - **`mention` 里的 open_id** 不是机密（应用维度的用户标识），但同样随 secret 存储。
-- **SSRF 收口**：API 域名只由 `base` 枚举决定（`feishu`/`larksuite`），绝不取用户填的任意 URL，因此坏配置无法把本通道变成 SSRF 原语（同 Slack 绑定 `hooks.slack.com`）。
+- **SSRF 收口**：API 域名只由 `base` 枚举决定（`feishu`/`larksuite`），绝不取用户填的任意 URL，因此坏配置无法把本通道变成 SSRF 原语（同 Slack App 硬编码 `slack.com`）。
 - **不阻塞审批仪式**：所有飞书调用都 best-effort、6s 超时、经 `waitUntil` 异步触发；任何失败只记日志，绝不影响 WebAuthn 仪式或 DEK 下发。
 
 ## 已知取舍 / gap

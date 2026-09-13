@@ -93,7 +93,7 @@ export function adminVars(chrome: PageChrome, active: AdminTab): Record<string, 
 // enable switch's checked state, whether the card body starts expanded, and the
 // "already configured" note.
 export function channelVars(
-  key: 'PUSHOVER' | 'SLACK' | 'SLACKAPP' | 'FEISHU',
+  key: 'PUSHOVER' | 'SLACKAPP' | 'FEISHU',
   set: boolean,
 ): Record<string, string> {
   return {

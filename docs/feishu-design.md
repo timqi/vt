@@ -18,7 +18,7 @@ PATCH im/v1/messages/:message_id          -> edit original card
 card rendering. `cf-worker/src/account_notifications.ts` (`AccountNotifications`)
 owns asynchronous delivery and message-reference persistence; `do_account.ts`
 invokes it at ceremony transitions. Slack App shares this editable-channel
-lifecycle. Pushover and Slack incoming webhooks use the stateless fan-out.
+lifecycle. Pushover uses the stateless fan-out.
 
 ## Delivery lifecycle
 
@@ -74,7 +74,7 @@ see [dek-cache.md](dek-cache.md) and [agent-audit.md](agent-audit.md).
   an enrolled Passkey plus PRF is still required.
 - Caller context renders as `plain_text`, not `lark_md`. Only the mention line
   uses markup, with validated identifiers. Shared `metaLines` formatting keeps
-  card and webhook context consistent without treating client claims as truth.
+  card and Pushover context consistent without treating client claims as truth.
 - Cards use raw JSON and `config.update_multi: true` so edits reach all
   recipients of a shared/group card.
 
