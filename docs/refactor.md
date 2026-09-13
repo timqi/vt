@@ -11,7 +11,7 @@ Two custodies stay: macOS Keychain + Touch ID for the local path, PRF passkey
 via the Worker for everything else. `auto` routing (agent first, Worker on
 recoverable errors), `inject` including `-r` file mode, `run@vt`, PAM `auth`,
 FIDO2 fallback, `diag@vt`, `ui-status@vt`, agent audit push, Worker DEK cache
-with its approve/extend ladders and admin, `VT_AUTH_CF_PREV` rotation.
+with its approve/extend ladders and admin.
 
 ## 1. Delete migration layers
 
@@ -21,6 +21,7 @@ with its approve/extend ladders and admin, `VT_AUTH_CF_PREV` rotation.
 | `vt rewrap` | `src/client/rewrap.rs`, README row | one release after the above |
 | Keychain wrap v1 | `derive_passphrase_secret` (v1), `upgrade_wrap_v2_if_needed`, `secret rebind --to-v1` | `vt secret rebind` stays one release for v1 stores, then goes with wrap v1 |
 | Worker bare-master auth | `auth.legacy_master` branch in `cf-worker/src/index.ts`, "absent = legacy master" fields in `types.ts`, IP-only cache derivation | every host runs `vt enroll` first |
+| `VT_AUTH_CF_PREV` two-generation master | `MasterGen`/`last_key_gen` in `types.ts`, `account_tokens.ts`, `index.ts` auth path, `crypto.ts` dual verify, admin column, `host-token.md` rotation section, `wrangler.toml.example` | rotating `VT_AUTH_CF` = `vt enroll` on every host, same day |
 | Cache ctx v3 mentions | comments in `account_cache.ts`, `dek-cache.md` history | none; v4 entries are re-keyed by step 3 anyway |
 | Legacy id-less inject sidecars | `client/inject.rs` mtime-ordering branch | none after one release (sidecars live minutes) |
 | `docs/dek-v5-design.md` | replaced by this document and step 3 | none |
