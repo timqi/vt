@@ -10,7 +10,7 @@
 <body>
   <main>
     {{ADMIN_TABS}}
-    <p class="hint">每台主机经 <code>vt enroll</code> + 手机 Passkey 审批后获得<strong>自己的</strong> <code>VT_PASSKEY_TOKEN</code>。令牌有效期 7 天，<strong>每次使用自动重设为「此刻 + 7 天」</strong>；到期或被吊销后该主机的解密请求会被拒绝，需重新 enroll。吊销立即生效，不需要 Passkey。此处不显示令牌密文（Worker 从不存储它）。</p>
+    <p class="hint">每台主机经 <code>vt enroll</code> + 手机 Passkey 审批后获得<strong>自己的</strong> <code>VT_PASSKEY_TOKEN</code>。令牌有效期 7 天，<strong>每次使用自动重设为「此刻 + 7 天」</strong>；到期或被吊销后该主机的解密请求会被拒绝，需重新 enroll。吊销立即生效，不需要 Passkey。此处不显示令牌密文（Worker 从不存储它）。轮换主密钥时设置 <code>VT_AUTH_CF_PREV</code> 为旧值，仍按旧主密钥验证的主机会在「最近使用」列标出<strong>旧主密钥</strong>，逐台重新 enroll 后即可清除该 secret。</p>
     <section id="filters">
       <label>状态 <select id="f-live">
         <option value="live">仅有效</option>

@@ -428,7 +428,7 @@ export class AccountDO extends DurableObject<Env> {
     // Host-token path: refuse a dead token BEFORE anything is stored or pushed,
     // and let the record — not the body — say which host/user this is.
     if (parsed.token_id !== undefined) {
-      const t = this.tokens.touch(parsed.token_id, challenge.meta?.ip ?? '', Date.now());
+      const t = this.tokens.touch(parsed.token_id, challenge.meta?.ip ?? '', Date.now(), parsed.key_gen);
       if (!t.ok) return tokenRefused(t.reason);
       challenge.meta = { ...challenge.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
       challenge.token_id = parsed.token_id;
@@ -806,7 +806,7 @@ export class AccountDO extends DurableObject<Env> {
     // A probe is an authenticated use: same liveness check + sliding refresh as
     // a ceremony, and the hit audit row names the token's host/user.
     if (body.token_id !== undefined) {
-      const t = this.tokens.touch(body.token_id, ip, Date.now());
+      const t = this.tokens.touch(body.token_id, ip, Date.now(), body.key_gen);
       if (!t.ok) return tokenRefused(t.reason);
       meta = { ...meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
     }

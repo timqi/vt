@@ -21,7 +21,7 @@ import { parsePushoverConfig } from './pushover';
 import { parseSlackConfig } from './slack';
 import { parseSlackAppConfig } from './slack_app';
 import { parseFeishuConfig } from './feishu';
-import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, EnrollRequest, DoEnrollCreateOp } from './types';
+import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, EnrollRequest, DoEnrollCreateOp, MasterKeyGen } from './types';
 import { deriveHostTokenSecret, isTokenId } from './host_token';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess, type AccessVars } from './access';
@@ -359,7 +359,7 @@ app.post('/api/challenge', async (c) => {
   // 1. HMAC auth
   const authed = await readAuthenticatedDaemonBody(c);
   if (authed instanceof Response) return authed;
-  const { body: rawBody, tokenId } = authed;
+  const { body: rawBody, tokenId, keyGen } = authed;
 
   // 2. Parse body
   let body: ChallengeRequest;
@@ -422,7 +422,7 @@ app.post('/api/challenge', async (c) => {
   const doResp = await accountStub(c).fetch('https://account.do/op/create', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ challenge: ch, token_id: tokenId }),
+    body: JSON.stringify({ challenge: ch, token_id: tokenId, key_gen: keyGen }),
   });
   if (doResp.status === 401) return new Response(doResp.body, doResp);
   if (!doResp.ok) return c.text(`do create: ${await doResp.text()}`, 500);
@@ -480,7 +480,7 @@ app.get('/api/dek', async (c) => {
 app.post('/api/dek-cache', async (c) => {
   const authed = await readAuthenticatedDaemonBody(c);
   if (authed instanceof Response) return authed;
-  const { body: rawBody, tokenId } = authed;
+  const { body: rawBody, tokenId, keyGen } = authed;
 
   let body: DekCacheRequest;
   try { body = JSON.parse(new TextDecoder().decode(rawBody)); }
@@ -500,6 +500,7 @@ app.post('/api/dek-cache', async (c) => {
       salts_b64u: body.salts_b64u,
       meta,
       token_id: tokenId,
+      key_gen: keyGen,
     }),
   });
 });
@@ -592,19 +593,29 @@ app.post('/api/audit-ingest', async (c) => {
   //    started with `--audit-key vt1.…`); any other agent_id is the legacy
   //    hostname-salted subkey of the master.
   const enc = new TextEncoder();
-  let key: Uint8Array;
   let tokenIdHost: string | undefined;
   if (body.agent_id.startsWith('t:')) {
     const id = body.agent_id.slice(2);
     if (!isTokenId(id)) return c.text('bad agent token id', 401);
-    key = await deriveHostTokenSecret(c.env.VT_AUTH_CF, id);
+    // Same rolling-rotation fallback as the daemon path: try the current
+    // master, then the previous generation when one is configured.
+    const cur = await hmacSha256(await deriveHostTokenSecret(c.env.VT_AUTH_CF, id), rawBody);
+    if (!ctEq(providedHmac, cur)) {
+      const prevMaster = c.env.VT_AUTH_CF_PREV ?? '';
+      if (!prevMaster) return c.text('hmac mismatch', 401);
+      const prev = await hmacSha256(await deriveHostTokenSecret(prevMaster, id), rawBody);
+      if (!ctEq(providedHmac, prev)) return c.text('hmac mismatch', 401);
+      log('auth.prev_master', { path: '/api/audit-ingest', token: id });
+    }
     tokenIdHost = id;
   } else {
-    key = await hkdfSha256(
+    // Legacy hostname-salted subkey: no previous-generation fallback, same as
+    // the bare-master daemon branch. It is being deleted, not widened.
+    const key = await hkdfSha256(
       enc.encode(c.env.VT_AUTH_CF), enc.encode(body.agent_id), enc.encode('vt-agent-audit-v1'), 32);
+    const expected = await hmacSha256(key, rawBody);
+    if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
   }
-  const expected = await hmacSha256(key, rawBody);
-  if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
 
   // 4. Replay window on the body timestamp.
   if (typeof body.timestamp_ms !== 'number' || !inReplayWindow(Date.now(), body.timestamp_ms))
@@ -702,12 +713,17 @@ async function readCappedBody(c: Context, maxBytes = CEREMONY_POST_MAX_BYTES): P
 // Two key sources, chosen by the `VT-Token-Id` header:
 //   • present → host token: key = HKDF(VT_AUTH_CF, token_id). Stateless here;
 //     the DO checks the token is alive and slides its expiry (`tokenId` is
-//     returned so the route can forward it).
+//     returned so the route can forward it). If that fails and VT_AUTH_CF_PREV
+//     is set, the same check runs once more under the previous master, so a
+//     master rotation is rolling rather than a fleet-wide flag day (`keyGen`
+//     says which one verified; the DO records it for the admin tab).
 //   • absent  → legacy: key = the master itself. Kept for hosts that have not
 //     run `vt enroll` yet; logged so the operator can see who is still on it.
+//     Deliberately NO previous-generation fallback: this branch is being
+//     deleted, not widened.
 async function readAuthenticatedDaemonBody(
   c: Context<{ Bindings: Env; Variables: AccessVars }>,
-): Promise<{ body: Uint8Array; tokenId?: string } | Response> {
+): Promise<{ body: Uint8Array; tokenId?: string; keyGen?: MasterKeyGen } | Response> {
   const auth = c.req.header('Authorization') ?? '';
   const prefix = 'VT-HMAC ';
   if (!auth.startsWith(prefix)) return c.text('missing auth', 401);
@@ -719,13 +735,23 @@ async function readAuthenticatedDaemonBody(
 
   const rawBody = await readCappedBody(c);
   if (!rawBody) return c.text('body too large', 413);
-  const keyBytes = tokenHeader !== undefined
-    ? await deriveHostTokenSecret(c.env.VT_AUTH_CF, tokenHeader)
-    : new TextEncoder().encode(c.env.VT_AUTH_CF);
-  const expected = await hmacSha256(keyBytes, rawBody);
-  if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
-  if (tokenHeader === undefined) log('auth.legacy_master', { path: new URL(c.req.url).pathname });
-  return tokenHeader !== undefined ? { body: rawBody, tokenId: tokenHeader } : { body: rawBody };
+  if (tokenHeader === undefined) {
+    const expected = await hmacSha256(new TextEncoder().encode(c.env.VT_AUTH_CF), rawBody);
+    if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
+    log('auth.legacy_master', { path: new URL(c.req.url).pathname });
+    return { body: rawBody };
+  }
+  const cur = await hmacSha256(await deriveHostTokenSecret(c.env.VT_AUTH_CF, tokenHeader), rawBody);
+  if (ctEq(providedHmac, cur)) return { body: rawBody, tokenId: tokenHeader, keyGen: 'cur' };
+  const prevMaster = c.env.VT_AUTH_CF_PREV ?? '';
+  if (prevMaster) {
+    const prev = await hmacSha256(await deriveHostTokenSecret(prevMaster, tokenHeader), rawBody);
+    if (ctEq(providedHmac, prev)) {
+      log('auth.prev_master', { path: new URL(c.req.url).pathname, token: tokenHeader });
+      return { body: rawBody, tokenId: tokenHeader, keyGen: 'prev' };
+    }
+  }
+  return c.text('hmac mismatch', 401);
 }
 
 // POST /api/approve — PWA submits sealed DEKs after WebAuthn

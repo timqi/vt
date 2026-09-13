@@ -4,7 +4,7 @@
 // All SQL is synchronous so a check can sit inside a ceremony op without
 // opening the DO input gate (same rule as account_audit.ts).
 
-import type { HostTokenRow } from './types';
+import type { HostTokenRow, MasterKeyGen } from './types';
 import { HOST_TOKEN_TTL_MS } from './host_token';
 import { logErr } from './log';
 
@@ -47,15 +47,28 @@ export class AccountTokens {
          revoked_ms INTEGER
        )`,
     );
+    // Additive migration for tables created before VT_AUTH_CF_PREV existed:
+    // ALTER preserves the rows (a re-created table would revoke every host).
+    // Nullable on purpose — NULL means "not used since the column existed",
+    // which is not the same claim as `cur`.
+    const cols = this.sql
+      .exec<{ name: string }>(`PRAGMA table_info(host_token)`)
+      .toArray();
+    if (cols.length > 0 && !cols.some(c => c.name === 'last_key_gen')) {
+      this.sql.exec(`ALTER TABLE host_token ADD COLUMN last_key_gen TEXT`);
+    }
   }
 
   /** Insert a freshly approved token. Expiry starts one window from now; the
-   *  enrollment counts as the first use so `last_ip` seeds the IP-change hint. */
+   *  enrollment counts as the first use so `last_ip` seeds the IP-change hint.
+   *  A token is always minted from the CURRENT master, so its generation starts
+   *  at `cur` — a host that just enrolled is never the one holding up a
+   *  rotation. */
   create(t: NewHostToken, now: number): void {
     this.sql.exec(
       `INSERT INTO host_token
-         (token_id, host, user, enroll_ip, origin, approve_token_id, created_ms, expires_ms, last_used_ms, last_ip)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (token_id, host, user, enroll_ip, origin, approve_token_id, created_ms, expires_ms, last_used_ms, last_ip, last_key_gen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cur')`,
       t.token_id, t.host, t.user, t.enroll_ip, t.origin, t.approve_token_id,
       now, now + HOST_TOKEN_TTL_MS, now, t.enroll_ip,
     );
@@ -65,15 +78,16 @@ export class AccountTokens {
    *  ALWAYS `now + TTL` (a window that slides, never a budget that accumulates);
    *  a revoked or lapsed token is never revived here — only a new enrollment
    *  can. `prev_ip` is the IP of the previous use when it differs from this
-   *  one, '' otherwise: the approval surfaces show it as an IP-change hint. */
-  touch(tokenId: string, ip: string, now: number): TokenTouchResult {
+   *  one, '' otherwise: the approval surfaces show it as an IP-change hint.
+   *  `keyGen` records which master verified this use (admin tokens tab). */
+  touch(tokenId: string, ip: string, now: number, keyGen: MasterKeyGen = 'cur'): TokenTouchResult {
     const row = this.get(tokenId);
     if (!row) return { ok: false, reason: 'token_unknown' };
     if (row.revoked_ms != null) return { ok: false, reason: 'token_revoked' };
     if (row.expires_ms <= now) return { ok: false, reason: 'token_expired' };
     this.sql.exec(
-      `UPDATE host_token SET expires_ms = ?, last_used_ms = ?, last_ip = ? WHERE token_id = ?`,
-      now + HOST_TOKEN_TTL_MS, now, ip, tokenId,
+      `UPDATE host_token SET expires_ms = ?, last_used_ms = ?, last_ip = ?, last_key_gen = ? WHERE token_id = ?`,
+      now + HOST_TOKEN_TTL_MS, now, ip, keyGen, tokenId,
     );
     const prevIp = row.last_ip && row.last_ip !== ip ? row.last_ip : '';
     return { ok: true, host: row.host, user: row.user, prev_ip: prevIp };

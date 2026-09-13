@@ -66,7 +66,12 @@
       if (!isLive(t)) tr.className = 'expired';
       tr.appendChild(cell(t.host || '?', (t.user ? t.user + ' · ' : '') + t.token_id));
       tr.appendChild(cell(t.enroll_ip || '', (t.origin || '') + (t.origin ? ' · ' : '') + '签发 ' + fmtTime(t.created_ms)));
-      tr.appendChild(cell(fmtTime(t.last_used_ms), t.last_ip && t.last_ip !== t.enroll_ip ? 'IP ' + t.last_ip : ''));
+      var lastSub = [];
+      if (t.last_ip && t.last_ip !== t.enroll_ip) lastSub.push('IP ' + t.last_ip);
+      // `prev` = this host's secret came from VT_AUTH_CF_PREV, i.e. it still
+      // needs `vt enroll` before the old master can be cleared.
+      if (t.last_key_gen === 'prev') lastSub.push('旧主密钥 · 需重新 enroll');
+      tr.appendChild(cell(fmtTime(t.last_used_ms), lastSub.join(' · ')));
       var state = t.revoked_ms != null ? '已吊销 ' + fmtTime(t.revoked_ms) : fmtRemaining(t.expires_ms - now());
       tr.appendChild(cell(state, t.revoked_ms == null ? fmtTime(t.expires_ms) : ''));
       var td = document.createElement('td');
@@ -122,7 +127,10 @@
       localRefMs = Date.now();
       render();
       var live = tokens.filter(isLive).length;
-      setStatus(live + ' 个有效 / 共 ' + tokens.length + (json.truncated ? '（列表已截断）' : ''), json.truncated ? 'error' : '');
+      var prev = tokens.filter(function (t) { return isLive(t) && t.last_key_gen === 'prev'; }).length;
+      setStatus(live + ' 个有效 / 共 ' + tokens.length +
+        (prev ? ' · ' + prev + ' 个仍用旧主密钥（需重新 enroll）' : '') +
+        (json.truncated ? '（列表已截断）' : ''), (json.truncated || prev) ? 'error' : '');
     } catch (e) {
       setStatus('查询失败: ' + (e.message || e), 'error');
     }

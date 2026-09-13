@@ -141,6 +141,13 @@ Secrets are never inlined in `wrangler.toml`. Set them per environment:
 # This value = the CLI's VT_PASSKEY_TOKEN.
 openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | wrangler secret put VT_AUTH_CF
 
+# Optional — PREVIOUS master, accepted as a fallback on host-token paths only,
+# so rotating VT_AUTH_CF is rolling instead of a fleet-wide flag day. Set it to
+# the outgoing master, re-enroll every host, then delete it by a deadline.
+# Empty/absent (the default) → no fallback. See docs/host-token.md §7.
+wrangler secret put VT_AUTH_CF_PREV
+wrangler secret delete VT_AUTH_CF_PREV   # when the rotation window closes
+
 # Required — passkey credentials blob. Produced by the admin setup page in
 # step 6; on first deploy you may seed an empty set: {"v":1,"epoch":0,"c":[]}
 wrangler secret put CREDENTIALS_JSON
@@ -252,8 +259,11 @@ expiry guard.
   URLs), then redeploy.
 - **Cut one host off:** revoke its token on the 主机令牌 tab (immediate; the
   host re-runs `vt enroll` to come back).
-- **Rotate the master:** `wrangler secret put VT_AUTH_CF` — every host token is
-  derived from it, so all hosts must `vt enroll` again afterwards.
+- **Rotate the master:** put the outgoing value in `VT_AUTH_CF_PREV` first, then
+  `wrangler secret put VT_AUTH_CF`; hosts re-enroll one at a time while the
+  主机令牌 tab shows who is still on 旧主密钥, and `VT_AUTH_CF_PREV` is deleted at
+  a set deadline. Full procedure: [host-token.md §7](host-token.md#7-rollout).
+  Skipping `VT_AUTH_CF_PREV` still works and cuts off every host at once.
 - **Invalidate all cached DEKs:** rotate `CACHE_SECKEY` (or use the admin
   clear-cache button).
 - **Revoke a Passkey:** use the setup page (bumps `epoch`), then

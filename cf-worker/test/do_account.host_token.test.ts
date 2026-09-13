@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import app from '../src/index';
-import { b64uEnc, hmacSha256 } from '../src/crypto';
+import { b64uEnc, hkdfSha256, hmacSha256 } from '../src/crypto';
 import { deriveHostTokenSecret, HOST_TOKEN_TTL_MS } from '../src/host_token';
 import type { Challenge, HostTokenRow } from '../src/types';
 import { inDO, setDoVar, doPost, doGet, approve, reject, makeMeta, auditRow } from './do_helpers';
@@ -234,11 +234,122 @@ describe('authenticating with a host token', () => {
     expect((await doGet(`page?approve_token=${res.json.approve_token}`)).json.host_verified).toBe(false);
   });
 
+  it('records the master generation that verified the use', async () => {
+    const { tokenId } = await enrollApproved();
+    // Minted from the current master, so the row starts there.
+    expect((await tokenRow(tokenId))!.last_key_gen).toBe('cur');
+    const body = challengeBody();
+    expect((await post('/api/challenge', body, await tokenHeaders(tokenId, body))).status).toBe(200);
+    expect((await tokenRow(tokenId))!.last_key_gen).toBe('cur');
+  });
+
   it('drops tty / ppid / ssh_client from the stored meta', async () => {
     const body = challengeBody({ meta: { ...makeMeta(), tty: '/dev/pts/1', ppid: 7, ssh_client: '10.0.0.1 1 22' } });
     const res = await post('/api/challenge', body, await legacyHeaders(body));
     const ch = await inDO(h => h.state.storage.get<Challenge>(`ch:${res.json.approve_token}`));
     expect(Object.keys(ch!.meta).sort()).toEqual(['command', 'host', 'ip', 'op_kind', 'ppid_cmd', 'pwd', 'reason', 'user']);
+  });
+});
+
+// Rolling master rotation: VT_AUTH_CF_PREV holds the OLD master so tokens
+// derived from it keep working until their host re-enrolls. Host-token paths
+// only — the legacy bare-master branches must not gain the fallback.
+describe('previous-generation master (VT_AUTH_CF_PREV)', () => {
+  const NEW_MASTER = 'throwaway-rotated-master';
+  /** Router env after a rotation: current = new, previous = the one the
+   *  already-enrolled tokens were derived from. `null` leaves the binding
+   *  absent entirely (an explicit `undefined` would hit the default). */
+  const rotatedEnv = (prev: string | null = MASTER): Env =>
+    ({ ...routerEnv(), VT_AUTH_CF: NEW_MASTER, ...(prev === null ? {} : { VT_AUTH_CF_PREV: prev }) });
+
+  it('accepts a token derived from the previous master and records it as prev', async () => {
+    const { tokenId } = await enrollApproved('oldhost', 'qiqi');
+    expect((await tokenRow(tokenId))!.last_key_gen).toBe('cur');
+    const body = challengeBody();
+    const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body, MASTER), rotatedEnv());
+    expect(res.status).toBe(200);
+    // Still a fully verified host: the record, not the body, names it.
+    const ch = await inDO(h => h.state.storage.get<Challenge>(`ch:${res.json.approve_token}`));
+    expect(ch!.meta.host).toBe('oldhost');
+    expect((await tokenRow(tokenId))!.last_key_gen).toBe('prev');
+    // Re-enrolling under the new master moves it back to `cur`.
+    const after = await post('/api/challenge', body, await tokenHeaders(tokenId, body, NEW_MASTER), rotatedEnv());
+    expect(after.status).toBe(200);
+    expect((await tokenRow(tokenId))!.last_key_gen).toBe('cur');
+  });
+
+  it('refuses a token matching neither generation', async () => {
+    const { tokenId } = await enrollApproved();
+    const body = challengeBody();
+    const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body, 'third-master'), rotatedEnv());
+    expect(res.status).toBe(401);
+    expect(res.text).toBe('hmac mismatch');
+  });
+
+  it('behaves exactly as before when PREV is absent or empty', async () => {
+    const { tokenId } = await enrollApproved();
+    const body = challengeBody();
+    for (const prev of [null, '']) {
+      const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body, MASTER), rotatedEnv(prev));
+      expect(res.status).toBe(401);
+      expect(res.text).toBe('hmac mismatch');
+    }
+    // And a current-master token is unaffected by PREV being configured.
+    const ok = await post('/api/challenge', body, await tokenHeaders(tokenId, body, NEW_MASTER), rotatedEnv());
+    expect(ok.status).toBe(200);
+  });
+
+  it('slides the dek-cache probe under the previous master too', async () => {
+    const { tokenId } = await enrollApproved();
+    const body = { ...challengeBody(), salts_b64u: [b64uEnc(new Uint8Array(16).fill(5))] };
+    const res = await post('/api/dek-cache', body, await tokenHeaders(tokenId, body, MASTER), rotatedEnv());
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ miss: true });
+    expect((await tokenRow(tokenId))!.last_key_gen).toBe('prev');
+  });
+
+  it('does NOT extend the legacy bare-master branch', async () => {
+    // A host with no VT-Token-Id signing with the OLD master: that branch is
+    // being deleted, not widened, so PREV must not rescue it.
+    const body = challengeBody();
+    const res = await post('/api/challenge', body, await legacyHeaders(body), rotatedEnv());
+    expect(res.status).toBe(401);
+    expect(res.text).toBe('hmac mismatch');
+    // The new master on that same branch still works, unchanged.
+    const raw = new TextEncoder().encode(JSON.stringify(body));
+    const mac = await hmacSha256(new TextEncoder().encode(NEW_MASTER), raw);
+    const ok = await post('/api/challenge', body, { Authorization: `VT-HMAC ${b64uEnc(mac)}` }, rotatedEnv());
+    expect(ok.status).toBe(200);
+  });
+
+  it('accepts an audit push under the previous master, but not on the legacy agent key', async () => {
+    const { tokenId } = await enrollApproved('mac', 'qiqi');
+    const body = {
+      timestamp_ms: Date.now(), agent_id: `t:${tokenId}`, hostname: 'mac',
+      entry: { op_kind: 'sign', outcome: 'approved', salts: 0, latency_ms: 1, ts_ms: Date.now(),
+               token_id: `a_prev_${Math.random()}`, meta: { op_kind: 'sign', host: 'mac', user: 'qiqi' } },
+    };
+    const raw = new TextEncoder().encode(JSON.stringify(body));
+    const sign = async (key: Uint8Array) => ({ Authorization: `VT-HMAC ${b64uEnc(await hmacSha256(key, raw))}` });
+    const oldKey = await deriveHostTokenSecret(MASTER, tokenId);
+    expect((await post('/api/audit-ingest', body, await sign(oldKey), rotatedEnv())).status).toBe(200);
+    // Without PREV the same push is refused, as today.
+    expect((await post('/api/audit-ingest', body, await sign(oldKey), rotatedEnv(null))).status).toBe(401);
+    // A background push is not a use: it neither slides expiry nor restamps
+    // the generation (the row still reads `cur` from enrollment).
+    expect((await tokenRow(tokenId))!.last_key_gen).toBe('cur');
+
+    // Legacy hostname-salted agent key: no PREV fallback there either.
+    const legacyBody = { ...body, agent_id: 'mac' };
+    const legacyRaw = new TextEncoder().encode(JSON.stringify(legacyBody));
+    const legacyKey = await hkdfSha256(
+      new TextEncoder().encode(MASTER), new TextEncoder().encode('mac'),
+      new TextEncoder().encode('vt-agent-audit-v1'), 32);
+    const legacyMac = await hmacSha256(legacyKey, legacyRaw);
+    const refused = await post('/api/audit-ingest', legacyBody,
+      { Authorization: `VT-HMAC ${b64uEnc(legacyMac)}` }, rotatedEnv());
+    expect(refused.status).toBe(401);
+    expect(refused.text).toBe('hmac mismatch');
   });
 });
 

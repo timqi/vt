@@ -134,6 +134,11 @@ CACHE_ADMIN_EXTEND = "0"
 #                     HKDF-derived from it at enrollment (docs/host-token.md); it is
 #                     also still accepted directly as the daemon HMAC key by hosts
 #                     that have not enrolled yet. NEVER hand it to a host.
+#   VT_AUTH_CF_PREV   Optional previous-generation master, accepted as a fallback on
+#                     host-token paths only (never the legacy bare-master branch), so
+#                     rotating VT_AUTH_CF is rolling: set it to the outgoing master,
+#                     re-enroll every host (admin 主机令牌 tab shows who is still on it),
+#                     then delete it by a deadline. Empty/absent → no fallback.
 #   CREDENTIALS_JSON  JSON blob with passkey credentials (schema in src/credentials.ts)
 #   CACHE_SECKEY      32-byte base64url X25519 secret key enabling the opt-in DEK
 #                     cache (approve-time TTL → 免审批解密 within IP+pwd scope).
