@@ -15,7 +15,9 @@
 // input gate so a stale list snapshot cannot overwrite a committed decision.
 
 import { DurableObject } from 'cloudflare:workers';
-import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse } from './types';
+import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse, DoEnrollCreateOp, EnrollIntent, HostTokenListResponse } from './types';
+import { formatHostToken, mintPairCode, mintTokenId } from './host_token';
+import { AccountTokens } from './account_tokens';
 import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, randomBytes, challengeHash } from './crypto';
 import { parseCredentials, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
@@ -24,7 +26,7 @@ import {
   isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
   isExtendableGroupId, cacheScopePwd,
 } from './cache_policy';
-import { challengeUvLevel } from './uv_policy';
+import { challengeUvLevel, effectiveUvLevel, parseUvPolicy } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
 import { AccountNotifications, NotificationChannels } from './account_notifications';
@@ -54,6 +56,12 @@ const CACHE_EXTEND_MAX_GROUPS = 32;
 // past the cap is refused (the client retries with backoff). Admin is a single
 // operator, so this is generous.
 const MAX_ADMIN_SOCKETS = 8;
+
+// Cap on enrollment ceremonies pending at once. /api/enroll is unauthenticated,
+// so beyond the per-IP rate limit this bounds how many approval pushes a
+// distributed nuisance can raise before the operator revokes nothing at all —
+// pending ceremonies expire on their own after TTL_MS.
+const ENROLL_PENDING_MAX = 5;
 
 function badRequest(msg: string): Response {
   return new Response(msg, { status: 400 });
@@ -118,11 +126,31 @@ function isPendingExpired(ch: Challenge, now: number): boolean {
   return ch.status === 'pending' && now - ch.created_ms >= TTL_MS;
 }
 
+// What the approver reads for an enrollment. Every line is labeled by trust:
+// host/user are what the requester typed; ip/origin are edge-verified.
+function enrollSummary(intent: EnrollIntent): string {
+  const lines = [
+    'op: 签发主机令牌（7 天滑动有效期，每次使用自动续期）',
+    `host: ${intent.host || '?'}（自报）`,
+  ];
+  if (intent.user) lines.push(`user: ${intent.user}（自报）`);
+  if (intent.origin) lines.push(`from: ${intent.origin}（已验证）`);
+  lines.push(`pair: ${intent.pair_code}（与终端上显示的配对码比对）`);
+  return lines.join('\n');
+}
+
+// Structured 401 for a dead host token. The body is what the CLI shows the
+// user, so it names the remedy instead of just the status.
+function tokenRefused(reason: string): Response {
+  return Response.json({ error: reason, hint: 'run `vt enroll` on this host' }, { status: 401 });
+}
+
 export class AccountDO extends DurableObject<Env> {
   private readonly expectedOrigin: string;
   private readonly audit: AccountAudit;
   private readonly notifications: AccountNotifications;
   private readonly cache: AccountCache;
+  private readonly tokens: AccountTokens;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -130,7 +158,11 @@ export class AccountDO extends DurableObject<Env> {
     this.audit = new AccountAudit(this.ctx.storage.sql, () => this.ctx.getWebSockets('admin'));
     this.notifications = new AccountNotifications(this.ctx, this.env);
     this.cache = new AccountCache(this.ctx.storage, this.env);
-    this.ctx.blockConcurrencyWhile(async () => this.audit.initialize());
+    this.tokens = new AccountTokens(this.ctx.storage.sql);
+    this.ctx.blockConcurrencyWhile(async () => {
+      this.audit.initialize();
+      this.tokens.initialize();
+    });
     // Schedule initial alarm if none set (alarm() re-arms itself thereafter).
     this.ctx.storage.getAlarm()
       .then(a => { if (a == null) return this.ctx.storage.setAlarm(Date.now() + TTL_MS); })
@@ -161,6 +193,9 @@ export class AccountDO extends DurableObject<Env> {
       case 'cache-list':          return this.opCacheList();
       case 'cache-clear-groups':  return this.opCacheClearGroups(request);
       case 'cache-extend-create': return this.opCacheExtendCreate(request);
+      case 'enroll-create':       return this.opEnrollCreate(request);
+      case 'tokens-list':         return this.opTokensList();
+      case 'tokens-revoke':       return this.opTokensRevoke(request);
       case 'clear-cache':         return this.opClearCache();
       case 'clear-audit':         return this.opClearAudit();
       default:                    return new Response('unknown op', { status: 400 });
@@ -189,12 +224,7 @@ export class AccountDO extends DurableObject<Env> {
     const ch = await this.ctx.storage.get<Challenge>(`ch:${approveToken}`);
     if (ch) {
       if (ch.status === 'approved' && ch.sealed_deks_b64u && ch.pwa_pk_b64u && ch.binding_tag_b64u) {
-        server.send(JSON.stringify({
-          status: 'approved',
-          sealed_deks_b64u: ch.sealed_deks_b64u,
-          pwa_pk_b64u: ch.pwa_pk_b64u,
-          binding_tag_b64u: ch.binding_tag_b64u,
-        } satisfies WsMessage));
+        server.send(JSON.stringify(await this.approvedWsMessage(ch)));
         server.close(1000, 'approved');
       } else if (ch.status === 'rejected') {
         server.send(JSON.stringify({ status: 'rejected' } satisfies WsMessage));
@@ -300,6 +330,8 @@ export class AccountDO extends DurableObject<Env> {
     // 3. Audit rows past 90-day retention (cheap: bound param + idx_audit_created).
     // Ceremony + cache events share this table, so one DELETE covers everything.
     this.audit.sweep(now);
+    // Long-dead host tokens (revoked/lapsed > 30 d ago); live ones are never touched.
+    this.tokens.sweep(now);
 
     // 4. Admin audit-stream sockets: close any whose Access-JWT `exp` has passed,
     // so a hibernating stream cannot outlive the admin's authenticated session.
@@ -374,7 +406,6 @@ export class AccountDO extends DurableObject<Env> {
       op_kind: fresh.meta.op_kind,
       host: fresh.meta.host,
       user: fresh.meta.user,
-      tty: fresh.meta.tty,
       age_ms: now - fresh.created_ms,
     });
     this.audit.finalize(fresh.approve_token, 'expired', now - fresh.created_ms);
@@ -394,8 +425,21 @@ export class AccountDO extends DurableObject<Env> {
     if (!challenge || typeof challenge.approve_token !== 'string' || typeof challenge.poll_token !== 'string') {
       return badRequest('invalid challenge');
     }
+    // Host-token path: refuse a dead token BEFORE anything is stored or pushed,
+    // and let the record — not the body — say which host/user this is.
+    if (parsed.token_id !== undefined) {
+      const t = this.tokens.touch(parsed.token_id, challenge.meta?.ip ?? '', Date.now());
+      if (!t.ok) return tokenRefused(t.reason);
+      challenge.meta = { ...challenge.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
+      challenge.token_id = parsed.token_id;
+      // The Worker decided `uv` against the CLAIMED host; re-apply the policy
+      // with the verified one. Raise-only by construction (max of the stored
+      // level and the by_host rule), so a spoofed claim can never lower it.
+      const { policy } = parseUvPolicy(this.env.APPROVAL_UV_JSON);
+      challenge.uv = effectiveUvLevel(policy, challenge.meta, challenge.uv);
+    }
     await this.storeAndAnnounce(challenge);
-    return new Response('ok');
+    return Response.json({ meta: challenge.meta });
   }
 
   // Persist a pending challenge and its routing key, re-arm the alarm, then
@@ -557,6 +601,11 @@ export class AccountDO extends DurableObject<Env> {
     ch.finalized_ms = finalizedMs;
     ch.feishu_message_id = latest.feishu_message_id;
     ch.slackapp = latest.slackapp;
+    // Enrollment: mint the token in the SAME synchronous step as the status
+    // flip (the SQL insert and the put have no await between them), so an
+    // approved enrollment always has its token and a token always has its
+    // approval. Single-use follows from the not-pending early-return above.
+    if (ch.enroll) this.commitEnroll(ch, ch.enroll, finalizedMs);
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 
     log('approved', {
@@ -564,7 +613,6 @@ export class AccountDO extends DurableObject<Env> {
       op_kind: ch.meta.op_kind,
       host: ch.meta.host,
       user: ch.meta.user,
-      tty: ch.meta.tty,
       latency_ms: ch.finalized_ms - ch.created_ms,
     });
     this.audit.finalize(ch.approve_token, 'approved', ch.finalized_ms - ch.created_ms);
@@ -599,12 +647,7 @@ export class AccountDO extends DurableObject<Env> {
 
     // Wake waiting WS clients
     const wss = this.ctx.getWebSockets(`pt:${ch.poll_token}`);
-    const wsMsg = JSON.stringify({
-      status: 'approved',
-      sealed_deks_b64u: body.sealed_deks_b64u,
-      pwa_pk_b64u: body.pwa_pk_b64u,
-      binding_tag_b64u: body.binding_tag_b64u,
-    } satisfies WsMessage);
+    const wsMsg = JSON.stringify(await this.approvedWsMessage(ch));
     for (const ws of wss) {
       try { ws.send(wsMsg); ws.close(1000, 'approved'); } catch {}
     }
@@ -614,6 +657,129 @@ export class AccountDO extends DurableObject<Env> {
       pwa_pk_b64u: body.pwa_pk_b64u,
       binding_tag_b64u: body.binding_tag_b64u,
     });
+  }
+
+  // The 'approved' poll-socket payload. For an enrollment it also carries the
+  // minted host token, re-derived from the master + stored token_id so a
+  // reconnecting CLI (handleWsUpgrade) gets the identical string and nothing
+  // secret ever sits in storage.
+  private async approvedWsMessage(ch: Challenge): Promise<WsMessage> {
+    const msg: WsMessage = {
+      status: 'approved',
+      sealed_deks_b64u: ch.sealed_deks_b64u ?? '',
+      pwa_pk_b64u: ch.pwa_pk_b64u ?? '',
+      binding_tag_b64u: ch.binding_tag_b64u ?? '',
+    };
+    if (ch.enroll_token_id) msg.host_token = await formatHostToken(this.env.VT_AUTH_CF, ch.enroll_token_id);
+    return msg;
+  }
+
+  // ONLY opApprove calls this, after verification, under the DO gate, before
+  // the put that flips the ceremony to 'approved'. Synchronous on purpose.
+  private commitEnroll(ch: Challenge, intent: EnrollIntent, now: number): void {
+    const tokenId = mintTokenId();
+    this.tokens.create({
+      token_id: tokenId,
+      host: intent.host,
+      user: intent.user,
+      enroll_ip: intent.ip,
+      origin: intent.origin,
+      approve_token_id: auditKey(ch.approve_token),
+    }, now);
+    ch.enroll_token_id = tokenId;
+    log('enroll.issued', { at: tokenPrefix(ch.approve_token), token: tokenId, host: intent.host, ip: intent.ip });
+  }
+
+  // Mint a pending enrollment ceremony. Nothing is issued until a Passkey
+  // approves it (opApprove → commitEnroll). The intent is frozen on the
+  // challenge so what the approver reads is what gets enrolled.
+  private async opEnrollCreate(request: Request): Promise<Response> {
+    let op: DoEnrollCreateOp;
+    try { op = await request.json() as DoEnrollCreateOp; }
+    catch { return badRequest('invalid json'); }
+    if (typeof op.host !== 'string' || !op.host) return badRequest('host required');
+
+    const now = Date.now();
+    let pending = 0;
+    for await (const page of listPrefixPages<Challenge>(this.ctx.storage, 'ch:')) {
+      for (const [, ch] of page) {
+        if (ch.enroll && ch.status === 'pending' && !isPendingExpired(ch, now)) pending++;
+      }
+    }
+    if (pending >= ENROLL_PENDING_MAX) {
+      return new Response('too many pending enrollments', { status: 429 });
+    }
+
+    const intent: EnrollIntent = {
+      host: op.host,
+      user: typeof op.user === 'string' ? op.user : '',
+      ip: typeof op.ip === 'string' ? op.ip : '',
+      origin: typeof op.origin === 'string' ? op.origin : '',
+      pair_code: mintPairCode(),
+    };
+    // Same ceremony shape as a cache extension: no salts, a daemon pubkey whose
+    // secret was discarded at birth, biometric UV regardless of policy — this
+    // approval hands out a credential.
+    const approveToken = b64uEnc(randomBytes(12));
+    const pollToken = b64uEnc(randomBytes(12));
+    const workerNonce = randomBytes(16);
+    const daemonPk = discardedBoxPublicKey();
+    const meta: ChallengeMeta = {
+      op_kind: 'enroll',
+      command: enrollSummary(intent),
+      host: intent.host,
+      user: intent.user,
+      pwd: '',
+      ppid_cmd: '',
+      ip: intent.ip,
+      reason: '',
+    };
+    const ch: Challenge = {
+      approve_token: approveToken,
+      poll_token: pollToken,
+      daemon_pubkey_b64u: b64uEnc(daemonPk),
+      worker_nonce_b64u: b64uEnc(workerNonce),
+      timestamp_ms: now,
+      approve_challenge_hash_b64u: b64uEnc(
+        await challengeHash(daemonPk, workerNonce, now, [], 'approve')),
+      reject_challenge_hash_b64u: b64uEnc(
+        await challengeHash(daemonPk, workerNonce, now, [], 'reject')),
+      salts_b64u: [],
+      meta,
+      uv: 'required',
+      status: 'pending',
+      created_ms: now,
+      enroll: intent,
+    };
+    await this.storeAndAnnounce(ch);
+    return Response.json({
+      approve_token: approveToken,
+      poll_token: pollToken,
+      pair_code: intent.pair_code,
+      meta,
+    });
+  }
+
+  private opTokensList(): Response {
+    const { tokens, truncated } = this.tokens.list();
+    const resp: HostTokenListResponse = { tokens, now_ms: Date.now(), truncated };
+    return Response.json(resp);
+  }
+
+  private async opTokensRevoke(request: Request): Promise<Response> {
+    let tokenId: string;
+    let by = '';
+    try {
+      const body = await request.json() as { token_id?: unknown; admin_email?: unknown };
+      if (typeof body.token_id !== 'string' || !body.token_id || body.token_id.length > 32) throw new Error('token_id');
+      tokenId = body.token_id;
+      if (typeof body.admin_email === 'string') by = body.admin_email;
+    } catch (e) {
+      return badRequest(`bad request: ${(e as Error).message}`);
+    }
+    const revoked = this.tokens.revoke(tokenId, Date.now());
+    log('token.revoked', { token: tokenId, revoked, by });
+    return Response.json({ revoked });
   }
 
   // Fast path: look up cached DEKs for (IP, salts). All-or-nothing — any
@@ -633,16 +799,22 @@ export class AccountDO extends DurableObject<Env> {
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
-    const meta = body.meta;
+    let meta = body.meta;
     // ip (worker-derived from CF-Connecting-IP, already forced by capChallengeMeta)
-    // IP + pwd are the cache binding ctx. ppid is forensic-only (logged/audited).
+    // IP + pwd are the cache binding ctx.
     const ip = meta.ip ?? '';
-    const ppid = (typeof meta.ppid === 'number' ? meta.ppid : 0) >>> 0;
+    // A probe is an authenticated use: same liveness check + sliding refresh as
+    // a ceremony, and the hit audit row names the token's host/user.
+    if (body.token_id !== undefined) {
+      const t = this.tokens.touch(body.token_id, ip, Date.now());
+      if (!t.ok) return tokenRefused(t.reason);
+      meta = { ...meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
+    }
     const salts = body.salts_b64u;
     const miss = (): Response => {
       // No audit row for misses (per design): a miss is a routine fallback and
       // the ceremony it triggers is itself audited. Keep only a debug log.
-      log('cache.miss', { n: salts.length, ip, ppid });
+      log('cache.miss', { n: salts.length, ip });
       return Response.json({ miss: true } satisfies DekCacheResponse);
     };
 
@@ -652,7 +824,7 @@ export class AccountDO extends DurableObject<Env> {
     // Audit the hit with the requester's full meta (host/user/command/…), so the
     // detail dialog is as rich as a ceremony decrypt.
     this.audit.cacheEvent(meta, salts.length, 'approved');
-    log('cache.hit', { n: salts.length, ip, ppid });
+    log('cache.hit', { n: salts.length, ip });
 
     // Real-time notice: a cache hit serves a decrypt with NO phone in the loop,
     // so push the same opt-in channels used for approvals. Fire-and-forget —
@@ -673,6 +845,11 @@ export class AccountDO extends DurableObject<Env> {
     if (!op || typeof op.token_id !== 'string' || !op.token_id
         || !op.meta || typeof op.meta !== 'object') {
       return badRequest('invalid audit op');
+    }
+    // A revoked/lapsed host token must not keep writing audit rows either. No
+    // sliding here: a background push is not a use the operator would count.
+    if (op.token_id_host !== undefined && !this.tokens.isLive(op.token_id_host, Date.now())) {
+      return tokenRefused('token_unknown');
     }
     this.audit.agent(op);
     // An agent cache hit (sign / decrypt@vt served from the Touch ID auth
@@ -743,7 +920,6 @@ export class AccountDO extends DurableObject<Env> {
         max_expires_ms: g.max_expires_ms,
         created_ms: g.created_ms,
         ip: g.ip,
-        ppid: g.ppid,
         ppid_cmd: g.ppid_cmd,
         host: row?.host ?? null,
         user: row?.user ?? null,
@@ -879,10 +1055,7 @@ export class AccountDO extends DurableObject<Env> {
       host: 'admin',
       user: op.admin_email ?? '',
       pwd: '',
-      tty: '',
       ppid_cmd: '',
-      ppid: 0,
-      ssh_client: '',
       ip: op.admin_ip ?? '',
       reason: '延长已授权的 DEK 缓存有效期',
     };
@@ -1071,7 +1244,6 @@ export class AccountDO extends DurableObject<Env> {
       op_kind: ch.meta.op_kind,
       host: ch.meta.host,
       user: ch.meta.user,
-      tty: ch.meta.tty,
       latency_ms: ch.finalized_ms - ch.created_ms,
     });
     this.audit.finalize(ch.approve_token, 'rejected', ch.finalized_ms - ch.created_ms);
@@ -1152,6 +1324,8 @@ export class AccountDO extends DurableObject<Env> {
       // worktree path sees that the grant also covers the trunk and its siblings.
       // metadata.pwd keeps the literal directory next to it.
       cache_scope_pwd: cacheScopePwd(ch.meta.pwd ?? ''),
+      ...(ch.enroll ? { enroll_pair_code: ch.enroll.pair_code } : {}),
+      host_verified: !!ch.token_id,
     };
     return Response.json(pageData);
   }

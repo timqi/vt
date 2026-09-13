@@ -29,7 +29,7 @@ use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use zeroize::Zeroizing;
 
-use crate::caller_meta::{collect_client_meta, current_ppid, get_hostname};
+use crate::caller_meta::collect_client_meta;
 use crate::core::sanitize_for_display as sanitize;
 use crate::core::sanitize_for_display_uncapped;
 
@@ -50,6 +50,8 @@ pub fn random_salts(n: usize) -> Vec<[u8; 16]> {
 
 pub struct CfConfig<'a> {
     pub worker_url: &'a str,
+    /// Raw `VT_PASSKEY_TOKEN`: a per-host `vt1.<id>.<secret>` token issued by
+    /// `vt enroll`, or (legacy) the Worker master itself. See [`WorkerAuth`].
     pub worker_auth: &'a str,
     /// Requested WebAuthn user-verification level for the approval ceremony
     /// (`discouraged` | `preferred` | `required`), or `None` to take whatever
@@ -57,6 +59,57 @@ pub struct CfConfig<'a> {
     /// `max(policy, this)`, so this can never buy a weaker ceremony than the
     /// deployment configured. See cf-worker/src/uv_policy.ts.
     pub uv: Option<&'a str>,
+}
+
+/// Prefix of a per-host token (`vt1.<token_id>.<secret_b64u>`), issued by the
+/// Worker at `vt enroll` and stored as `VT_PASSKEY_TOKEN`. The secret is
+/// HKDF(master, token_id) on the Worker side (cf-worker/src/host_token.ts); the
+/// host only ever holds this derived value, never the master.
+pub const HOST_TOKEN_PREFIX: &str = "vt1.";
+
+/// The HMAC key material behind `VT_PASSKEY_TOKEN`, plus the token id the
+/// Worker needs to re-derive it (`VT-Token-Id` header). `token_id == None` is
+/// the legacy shape where the value IS the Worker master (accepted by the
+/// Worker during the migration window only).
+pub struct WorkerAuth {
+    key: Zeroizing<Vec<u8>>,
+    pub token_id: Option<String>,
+}
+
+impl WorkerAuth {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        let Some(rest) = raw.strip_prefix(HOST_TOKEN_PREFIX) else {
+            return Ok(Self {
+                key: Zeroizing::new(raw.as_bytes().to_vec()),
+                token_id: None,
+            });
+        };
+        let (id, secret_b64u) = rest.split_once('.').ok_or_else(|| {
+            anyhow!("VT_PASSKEY_TOKEN: malformed host token (expected vt1.<id>.<secret>)")
+        })?;
+        if id.len() != 16
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            bail!("VT_PASSKEY_TOKEN: malformed host token id");
+        }
+        let secret: [u8; 32] = decode_b64u_exact(secret_b64u, "VT_PASSKEY_TOKEN secret")?;
+        Ok(Self {
+            key: Zeroizing::new(secret.to_vec()),
+            token_id: Some(id.to_owned()),
+        })
+    }
+
+    fn auth_header(&self, body: &[u8]) -> String {
+        hmac_auth_header_raw(&self.key, body)
+    }
+
+    /// Raw HMAC key (32 bytes for a host token; the master's UTF-8 otherwise).
+    pub fn key_bytes(&self) -> &[u8] {
+        &self.key
+    }
 }
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
@@ -71,10 +124,6 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 pub(crate) fn hmac_auth_header_raw(key: &[u8], body: &[u8]) -> String {
     let mac = hmac_sha256(key, body);
     format!("VT-HMAC {}", URL_SAFE_NO_PAD.encode(mac))
-}
-
-fn hmac_auth_header(worker_auth: &str, body: &[u8]) -> String {
-    hmac_auth_header_raw(worker_auth.as_bytes(), body)
 }
 
 fn decode_b64u_exact<const N: usize>(b64u: &str, what: &str) -> Result<[u8; N]> {
@@ -105,40 +154,37 @@ struct ChallengeReq<'a> {
 /// approve. The CLI fills them; the worker forwards them; the PWA renders
 /// them. All strings are sanitized (control chars stripped, length-capped)
 /// before they leave this process.
+///
+/// `host` / `user` are left EMPTY (and omitted from the wire) by the CLI
+/// ceremony path: the Worker fills both from the host-token record, which is
+/// the only verified source. The macOS agent's audit push still sets them —
+/// there the agent names the session host. tty / ppid / ssh_client were
+/// dropped from the wire entirely (docs/approval-transparency.md §2b).
 #[derive(Serialize, Default)]
 pub struct ChallengeMeta {
     pub op_kind: String,
     pub command: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub host: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub user: String,
     pub pwd: String,
-    pub tty: String,
     pub ppid_cmd: String,
-    /// Numeric parent PID. Recorded on the approval + every cache event purely
-    /// for FORENSICS (audit display) — it is NOT part of the DEK-cache binding
-    /// context, which is keyed on worker-derived IP + client-reported pwd. See
-    /// docs/dek-cache.md.
-    pub ppid: u32,
-    pub ssh_client: String,
     pub reason: String,
 }
 
 /// Build a `ChallengeMeta` by collecting local context from the running
-/// process: hostname, $USER, cwd, controlling TTY, parent process command
-/// line, and SSH_CLIENT/SSH_CONNECTION. The caller supplies the three
-/// fields it already knows (`op_kind`, `command`, `reason`).
+/// process: cwd and the parent process command line. The caller supplies the
+/// three fields it already knows (`op_kind`, `command`, `reason`).
 pub fn collect_meta(op_kind: &str, command: &str, reason: &str) -> ChallengeMeta {
     let client = collect_client_meta();
     ChallengeMeta {
         op_kind: sanitize(op_kind, 32),
         command: sanitize_for_display_uncapped(command),
-        host: sanitize(&get_hostname(), 100),
-        user: client.user,
+        host: String::new(),
+        user: String::new(),
         pwd: client.pwd,
-        tty: client.tty,
         ppid_cmd: client.ppid_cmd,
-        ppid: current_ppid(),
-        ssh_client: client.ssh_client,
         reason: sanitize(reason, 200),
     }
 }
@@ -160,6 +206,31 @@ struct WsMsg {
     pwa_pk_b64u: Option<String>,
     #[serde(default)]
     binding_tag_b64u: Option<String>,
+    /// Enrollment ceremonies only: the minted `vt1.…` host token.
+    #[serde(default)]
+    host_token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct EnrollReq<'a> {
+    host: &'a str,
+    user: &'a str,
+    timestamp_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct EnrollResp {
+    approve_url: String,
+    poll_token: String,
+    pair_code: String,
+    #[serde(default)]
+    push_warning: String,
+}
+
+/// Structured 401 body the Worker returns for a dead host token.
+#[derive(Deserialize)]
+struct TokenRefused {
+    error: String,
 }
 
 #[derive(Serialize)]
@@ -219,18 +290,24 @@ fn http_client(ipv4: bool) -> reqwest::Result<&'static reqwest::Client> {
 pub(crate) async fn cf_post(
     url: &str,
     auth_header: &str,
+    token_id: Option<&str>,
     body: &[u8],
 ) -> Result<reqwest::Response> {
-    cf_post_with_timeout(url, auth_header, body, 30).await
+    cf_post_with_timeout(url, auth_header, token_id, body, 30).await
 }
 
 /// Same IPv4-pinned-with-fallback POST as [`cf_post`], but with a caller-chosen
 /// timeout (seconds). The fire-and-forget agent audit push needs a short (5 s)
 /// budget so it can never block the agent — the default `cf_post` 30 s ceiling
 /// would let a single retried row stall up to a minute.
+///
+/// `token_id` (host-token auth) rides in the `VT-Token-Id` header so the Worker
+/// can re-derive the HMAC key; `None` for the legacy master and for the
+/// unauthenticated enroll request (`auth_header` empty).
 pub(crate) async fn cf_post_with_timeout(
     url: &str,
     auth_header: &str,
+    token_id: Option<&str>,
     body: &[u8],
     secs: u64,
 ) -> Result<reqwest::Response> {
@@ -238,28 +315,53 @@ pub(crate) async fn cf_post_with_timeout(
         client: &reqwest::Client,
         url: &str,
         auth_header: &str,
+        token_id: Option<&str>,
         body: &[u8],
         secs: u64,
     ) -> reqwest::Result<reqwest::Response> {
-        client
+        let mut req = client
             .post(url)
             .timeout(Duration::from_secs(secs))
-            .header("Authorization", auth_header)
-            .header("Content-Type", "application/json")
-            .body(body.to_vec())
-            .send()
-            .await
+            .header("Content-Type", "application/json");
+        if !auth_header.is_empty() {
+            req = req.header("Authorization", auth_header);
+        }
+        if let Some(id) = token_id {
+            req = req.header("VT-Token-Id", id);
+        }
+        req.body(body.to_vec()).send().await
     }
 
-    match send_once(http_client(true)?, url, auth_header, body, secs).await {
+    match send_once(http_client(true)?, url, auth_header, token_id, body, secs).await {
         Ok(r) => Ok(r),
         // IPv6-only host (or no IPv4 route): retry without the family pin so both
         // requests consistently fall back to IPv6.
         Err(e) if e.is_connect() || e.is_builder() => {
-            Ok(send_once(http_client(false)?, url, auth_header, body, secs).await?)
+            Ok(send_once(http_client(false)?, url, auth_header, token_id, body, secs).await?)
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Turn a non-2xx ceremony response into the user-facing error. A structured
+/// 401 from a dead host token names the remedy; anything else keeps the
+/// historical `HTTP <status>: <body>` shape.
+async fn ceremony_http_error(what: &str, resp: reqwest::Response) -> anyhow::Error {
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    if status == 401 {
+        if let Ok(refused) = serde_json::from_str::<TokenRefused>(&body) {
+            return anyhow!(
+                "{what}: host token {} — run `vt enroll` on this host to get a new VT_PASSKEY_TOKEN",
+                match refused.error.as_str() {
+                    "token_expired" => "expired (unused for more than 7 days)",
+                    "token_revoked" => "revoked",
+                    _ => "not recognized",
+                }
+            );
+        }
+    }
+    anyhow!("{what}: HTTP {status}: {body}")
 }
 
 async fn connect_dek_ws(
@@ -272,6 +374,111 @@ async fn connect_dek_ws(
         // Neither the URL's poll token nor server-controlled error data is safe to display.
         .map_err(|_| anyhow!("WS connection handshake failed"))?;
     Ok(stream)
+}
+
+/// The `/api/dek` poll socket URL for a ceremony. `poll_token` is
+/// worker-controlled and interpolated into the query string, so it is
+/// restricted to the b64url alphabet: a compromised worker can't inject extra
+/// URL/query/fragment structure into the connect target.
+fn poll_ws_url(worker_url: &str, poll_token: &str) -> Result<String> {
+    if poll_token.is_empty()
+        || !poll_token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("challenge: malformed poll_token");
+    }
+    Ok(format!(
+        "{}/api/dek?poll_token={}",
+        worker_url
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1),
+        poll_token
+    ))
+}
+
+/// Wait on the poll socket until the ceremony reaches a terminal state and
+/// return the `approved` message. Rejection / expiry / timeout are errors.
+async fn await_approval(ws_url: &str) -> Result<WsMsg> {
+    let mut ws_stream = connect_dek_ws(ws_url, WS_CONNECT_TIMEOUT).await?;
+    // Up to 6 minutes — DO TTL is 5 min.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws_stream.next())
+            .await
+            .map_err(|_| anyhow!("approval timeout (6 min)"))?
+            .ok_or_else(|| anyhow!("connection closed before approval"))?
+            .map_err(|_| anyhow!("connection closed before approval"))?;
+        match msg {
+            Message::Text(text) => {
+                let ws: WsMsg = serde_json::from_str(&text).context("WS message parse")?;
+                match ws.status.as_str() {
+                    "waiting" => continue,
+                    "approved" => return Ok(ws),
+                    "rejected" => bail!("approval rejected by user"),
+                    "expired" => bail!("approval request expired"),
+                    other => bail!("unexpected WS status: {other}"),
+                }
+            }
+            Message::Close(_) => bail!("WS closed unexpectedly"),
+            _ => continue,
+        }
+    }
+}
+
+// ── Enrollment ─────────────────────────────────────────────────────────────
+
+/// `vt enroll`: ask the Worker for this host's own `VT_PASSKEY_TOKEN`. The
+/// request is unauthenticated (a fresh host has nothing to sign with) and
+/// becomes a Passkey ceremony on the phone; the Worker shows the same pairing
+/// code we print here so the approver can tell this terminal's request from a
+/// stranger's. Returns the minted `vt1.…` token; the caller persists it.
+pub async fn enroll(worker_url: &str, host: &str, user: &str) -> Result<Zeroizing<String>> {
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let body = serde_json::to_vec(&EnrollReq {
+        host: &sanitize(host, 100),
+        user: &sanitize(user, 64),
+        timestamp_ms: ts_ms,
+    })?;
+    let url = format!("{}/api/enroll", worker_url.trim_end_matches('/'));
+    let resp = cf_post(&url, "", None, &body)
+        .await
+        .context("POST /api/enroll")?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let hint = match status {
+            429 => " (rate limited — wait a minute, or approve/expire the pending requests first)",
+            503 => " (the Worker has no ENROLL_LIMITER binding; see docs/host-token.md)",
+            _ => "",
+        };
+        bail!("enroll: HTTP {status}: {text}{hint}");
+    }
+    let er: EnrollResp =
+        serde_json::from_slice(&resp.bytes().await.context("enroll response read")?)
+            .context("enroll response parse")?;
+    let ws_url = poll_ws_url(worker_url, &er.poll_token)?;
+    if !er.push_warning.is_empty() {
+        eprintln!("vt: push warning: {}", er.push_warning);
+    }
+    eprintln!("vt: approve on your phone: {}", er.approve_url);
+    eprintln!(
+        "vt: pairing code: {}  (approve only if the page shows this code)",
+        sanitize(&er.pair_code, 16)
+    );
+    eprintln!("vt: waiting for approval…");
+    let approved = await_approval(&ws_url).await?;
+    let token = approved
+        .host_token
+        .ok_or_else(|| anyhow!("approved message carries no host token"))?;
+    let parsed = WorkerAuth::parse(&token)?;
+    if parsed.token_id.is_none() {
+        bail!("enroll: Worker returned a non-host token");
+    }
+    Ok(Zeroizing::new(token))
 }
 
 // ── Main entry point ───────────────────────────────────────────────────────
@@ -309,15 +516,19 @@ pub async fn get_deks(
         uv: config.uv,
     })?;
 
-    let auth_header = hmac_auth_header(config.worker_auth, &req_body);
-    let resp = cf_post(&challenge_url, &auth_header, &req_body)
-        .await
-        .context("POST /api/challenge")?;
+    let auth = WorkerAuth::parse(config.worker_auth)?;
+    let auth_header = auth.auth_header(&req_body);
+    let resp = cf_post(
+        &challenge_url,
+        &auth_header,
+        auth.token_id.as_deref(),
+        &req_body,
+    )
+    .await
+    .context("POST /api/challenge")?;
 
     if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("challenge: HTTP {status}: {body}");
+        return Err(ceremony_http_error("challenge", resp).await);
     }
 
     let body = resp.bytes().await.context("challenge response read")?;
@@ -326,17 +537,7 @@ pub async fn get_deks(
     let worker_nonce: [u8; 16] = decode_b64u_exact(&ch.worker_nonce_b64u, "worker_nonce")?;
     let approve_challenge_hash = compute_approve_challenge_hash(&pk, &worker_nonce, ts_ms, salts);
 
-    // poll_token is worker-controlled and interpolated into the WS query string;
-    // restrict it to the b64url alphabet so a compromised worker can't inject
-    // extra URL/query/fragment structure into the connect target.
-    if ch.poll_token.is_empty()
-        || !ch
-            .poll_token
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        bail!("challenge: malformed poll_token");
-    }
+    let ws_url = poll_ws_url(config.worker_url, &ch.poll_token)?;
 
     if !ch.push_warning.is_empty() {
         eprintln!("vt: push warning: {}", ch.push_warning);
@@ -344,70 +545,37 @@ pub async fn get_deks(
     eprintln!("vt: approve on your phone: {}", ch.approve_url);
     eprintln!("vt: waiting for approval…");
 
-    let ws_url = format!(
-        "{}/api/dek?poll_token={}",
-        config
-            .worker_url
-            .replacen("https://", "wss://", 1)
-            .replacen("http://", "ws://", 1),
-        ch.poll_token
-    );
+    let ws = await_approval(&ws_url).await?;
+    let sealed_b64u = ws.sealed_deks_b64u.as_deref().ok_or_else(|| {
+        anyhow!("approved message missing required binding fields: sealed_deks_b64u")
+    })?;
+    let pwa_pk_b64u = ws
+        .pwa_pk_b64u
+        .as_deref()
+        .ok_or_else(|| anyhow!("approved message missing required binding fields: pwa_pk_b64u"))?;
+    let binding_tag_b64u = ws.binding_tag_b64u.as_deref().ok_or_else(|| {
+        anyhow!("approved message missing required binding fields: binding_tag_b64u")
+    })?;
 
-    let mut ws_stream = connect_dek_ws(&ws_url, WS_CONNECT_TIMEOUT).await?;
+    let pwa_pk: [u8; 32] = decode_b64u_exact(pwa_pk_b64u, "pwa_pk")?;
+    let binding_tag: [u8; 32] = decode_b64u_exact(binding_tag_b64u, "binding_tag")?;
+    let sealed_deks_bytes = URL_SAFE_NO_PAD
+        .decode(sealed_b64u)
+        .context("sealed_deks b64u decode")?;
 
-    // Wait for approval (up to 6 minutes — DO TTL is 5 min)
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(360);
-    loop {
-        let msg = tokio::time::timeout_at(deadline, ws_stream.next())
-            .await
-            .map_err(|_| anyhow!("approval timeout (6 min)"))?
-            .ok_or_else(|| anyhow!("connection closed before approval"))?
-            .map_err(|_| anyhow!("connection closed before approval"))?;
+    verify_binding(
+        &pk,
+        &sk,
+        &pwa_pk,
+        &approve_challenge_hash,
+        &sealed_deks_bytes,
+        &binding_tag,
+    )?;
 
-        match msg {
-            Message::Text(text) => {
-                let ws: WsMsg = serde_json::from_str(&text).context("WS message parse")?;
-                match ws.status.as_str() {
-                    "waiting" => continue,
-                    "approved" => {
-                        let sealed_b64u = ws.sealed_deks_b64u.as_deref()
-                            .ok_or_else(|| anyhow!("approved message missing required binding fields: sealed_deks_b64u"))?;
-                        let pwa_pk_b64u = ws.pwa_pk_b64u.as_deref().ok_or_else(|| {
-                            anyhow!("approved message missing required binding fields: pwa_pk_b64u")
-                        })?;
-                        let binding_tag_b64u = ws.binding_tag_b64u.as_deref()
-                            .ok_or_else(|| anyhow!("approved message missing required binding fields: binding_tag_b64u"))?;
-
-                        let pwa_pk: [u8; 32] = decode_b64u_exact(pwa_pk_b64u, "pwa_pk")?;
-                        let binding_tag: [u8; 32] =
-                            decode_b64u_exact(binding_tag_b64u, "binding_tag")?;
-                        let sealed_deks_bytes = URL_SAFE_NO_PAD
-                            .decode(sealed_b64u)
-                            .context("sealed_deks b64u decode")?;
-
-                        verify_binding(
-                            &pk,
-                            &sk,
-                            &pwa_pk,
-                            &approve_challenge_hash,
-                            &sealed_deks_bytes,
-                            &binding_tag,
-                        )?;
-
-                        // Open the SAME decoded bytes the binding tag committed
-                        // to — never re-decode the b64u string, so the bound and
-                        // opened byte sequences are identical by construction.
-                        return open_sealed_deks(&sealed_deks_bytes, &pk, &sk, n_deks);
-                    }
-                    "rejected" => bail!("approval rejected by user"),
-                    "expired" => bail!("approval request expired"),
-                    other => bail!("unexpected WS status: {other}"),
-                }
-            }
-            Message::Close(_) => bail!("WS closed unexpectedly"),
-            _ => continue,
-        }
-    }
+    // Open the SAME decoded bytes the binding tag committed to — never
+    // re-decode the b64u string, so the bound and opened byte sequences are
+    // identical by construction.
+    open_sealed_deks(&sealed_deks_bytes, &pk, &sk, n_deks)
 }
 
 /// Fast path: try the opt-in server-side DEK cache before running a full phone
@@ -466,14 +634,19 @@ async fn try_cache_with_timeout(
     };
 
     let url = format!("{}/api/dek-cache", config.worker_url);
-    let auth_header = hmac_auth_header(config.worker_auth, &req_body);
+    let Ok(auth) = WorkerAuth::parse(config.worker_auth) else {
+        return Ok(None); // the ceremony path reports the malformed token
+    };
+    let auth_header = auth.auth_header(&req_body);
     // Same IPv4-pinned client as the challenge POST so CF-Connecting-IP (half the
     // cache ctx) is stable across the two processes. Any transport/HTTP failure →
     // fall back to the ceremony rather than abort.
     // One budget includes both address-family attempts and the entire body read.
     // Keep crypto validation outside the recoverable transport/miss path.
     let bytes = match tokio::time::timeout(timeout, async {
-        let resp = cf_post(&url, &auth_header, &req_body).await.ok()?;
+        let resp = cf_post(&url, &auth_header, auth.token_id.as_deref(), &req_body)
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -846,7 +1019,7 @@ mod tests {
         for (auth, secs) in [("first-test-auth", 30), ("second-test-auth", 5)] {
             let response = tokio::time::timeout(
                 Duration::from_secs(2),
-                cf_post_with_timeout(&url, auth, b"{}", secs),
+                cf_post_with_timeout(&url, auth, None, b"{}", secs),
             )
             .await
             .unwrap()
@@ -863,7 +1036,7 @@ mod tests {
             stall_until_client_closes(&mut stream, true).await;
         })
         .await;
-        let response = cf_post_with_timeout(&url, "test-auth", b"{}", 1)
+        let response = cf_post_with_timeout(&url, "test-auth", None, b"{}", 1)
             .await
             .unwrap();
         let err = tokio::time::timeout(Duration::from_secs(2), response.bytes())
@@ -881,18 +1054,21 @@ mod tests {
             write_response(stream.get_mut(), 401, b"{}").await;
         })
         .await;
-        let response = cf_post(&url, "test-auth", b"{}").await.unwrap();
+        let response = cf_post(&url, "test-auth", None, b"{}").await.unwrap();
         assert_eq!(response.status().as_u16(), 401);
         join(server).await;
     }
+    /// The CLI ceremony meta: host/user are absent on the wire (the Worker
+    /// fills them from the host-token record), and tty/ppid/ssh_client are
+    /// gone for good — the approval page only ever showed noise for them.
     #[test]
     fn challenge_meta_preserves_shape_and_command_newlines() {
         let meta = collect_meta("decrypt\0", "first\r\nsecond\t", "reason\n");
         assert_eq!(meta.op_kind, "decrypt");
         assert_eq!(meta.command, "first\nsecond");
         assert_eq!(meta.reason, "reason");
-        assert_eq!(meta.host, sanitize(&get_hostname(), 100));
-        assert_eq!(meta.ppid, current_ppid());
+        assert!(meta.host.is_empty());
+        assert!(meta.user.is_empty());
         let json = serde_json::to_value(meta).unwrap();
         let fields: Vec<_> = json
             .as_object()
@@ -900,21 +1076,82 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
+        assert_eq!(fields, ["command", "op_kind", "ppid_cmd", "pwd", "reason"]);
+    }
+
+    /// Agent audit rows still name the session host: non-empty host/user
+    /// serialize, so the Worker keeps reading them from the body there.
+    #[test]
+    fn challenge_meta_serializes_host_user_when_set() {
+        let meta = ChallengeMeta {
+            host: "h".into(),
+            user: "u".into(),
+            ..ChallengeMeta::default()
+        };
+        let json = serde_json::to_value(meta).unwrap();
+        assert_eq!(json["host"], "h");
+        assert_eq!(json["user"], "u");
+    }
+
+    /// `vt1.<id>.<secret>` parses into the raw 32-byte HMAC key + id; anything
+    /// else is the legacy master used verbatim. Malformed host tokens are
+    /// errors, never silently treated as a master.
+    #[test]
+    fn worker_auth_parses_host_token_and_legacy_master() {
+        let legacy = WorkerAuth::parse("plain-master").unwrap();
+        assert!(legacy.token_id.is_none());
+        assert_eq!(&legacy.key[..], b"plain-master");
+
+        let tok = "vt1.AAAAAAAAAAAAAAAA.iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI";
+        let parsed = WorkerAuth::parse(tok).unwrap();
+        assert_eq!(parsed.token_id.as_deref(), Some("AAAAAAAAAAAAAAAA"));
+        assert_eq!(parsed.key.len(), 32);
+        // Same body, same key → same MAC as the Worker computes with the derived
+        // secret (crypto-level parity is pinned by the b64u secret above, which
+        // is the Worker test suite's golden vector for this id).
         assert_eq!(
-            fields,
-            [
-                "command",
-                "host",
-                "op_kind",
-                "ppid",
-                "ppid_cmd",
-                "pwd",
-                "reason",
-                "ssh_client",
-                "tty",
-                "user"
-            ]
+            parsed.auth_header(b"{}"),
+            hmac_auth_header_raw(
+                &URL_SAFE_NO_PAD
+                    .decode("iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI")
+                    .unwrap(),
+                b"{}"
+            )
         );
+
+        assert!(WorkerAuth::parse("vt1.short.xx").is_err());
+        assert!(WorkerAuth::parse("vt1.AAAAAAAAAAAAAAAA").is_err());
+        assert!(WorkerAuth::parse("vt1.AAAAAAAAAAAAAAAA.notb64u!").is_err());
+    }
+
+    /// Requests carry the token id only on the host-token path, and the
+    /// unauthenticated enroll POST sends no Authorization header at all.
+    #[tokio::test]
+    async fn http_post_sends_token_id_header_only_when_given() {
+        let (url, server) = serve("127.0.0.1:0", |mut stream| async move {
+            let (headers, _) = read_request(&mut stream).await;
+            assert!(headers
+                .iter()
+                .any(|h| h.trim() == "vt-token-id: AAAAAAAAAAAAAAAA"));
+            assert!(headers.iter().any(|h| h.trim() == "authorization: a"));
+            write_response(stream.get_mut(), 200, b"{}").await;
+            let (headers, _) = read_request(&mut stream).await;
+            assert!(!headers
+                .iter()
+                .any(|h| h.to_ascii_lowercase().starts_with("vt-token-id")));
+            assert!(!headers
+                .iter()
+                .any(|h| h.to_ascii_lowercase().starts_with("authorization")));
+            write_response(stream.get_mut(), 200, b"{}").await;
+        })
+        .await;
+        let r = cf_post(&url, "a", Some("AAAAAAAAAAAAAAAA"), b"{}")
+            .await
+            .unwrap();
+        r.bytes().await.unwrap();
+        let r = cf_post(&url, "", None, b"{}").await.unwrap();
+        r.bytes().await.unwrap();
+        join(server).await;
     }
 
     fn hex_encode(bytes: &[u8]) -> String {

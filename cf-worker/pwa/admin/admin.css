@@ -209,6 +209,8 @@ tbody tr.clickable { cursor: pointer; }
 #detail-dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
 #detail-dl dt { color: var(--muted); font-size: 13px; }
 #detail-dl dd { margin: 0; font-size: 13px; word-break: break-word; }
+/* Enrollment pairing code: the one value the approver must read exactly. */
+.vt-ap-pair, dd.vt-ap-pair { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 22px; font-weight: 700; letter-spacing: 2px; }
 #detail-dl dd.mono { font-family: var(--mono); white-space: pre-wrap; }
 
 /* Inline Passkey approval ceremony (built by vt.mountApprove, shared with the
@@ -258,12 +260,13 @@ th.col-pick input, td.col-pick input { accent-color: var(--accent); margin: 0; c
 /* Two-line cells (#cache): a primary value with a muted secondary line. This is
    what lets six columns carry what nine used to, so the action buttons and the
    extendability reason stay visible without horizontal scrolling. */
-#cache td { padding-top: 7px; padding-bottom: 7px; vertical-align: top; }
-#cache .cell-main { font-size: 13px; line-height: 1.35; }
-#cache .cell-sub {
+#cache td, #tokens td { padding-top: 7px; padding-bottom: 7px; vertical-align: top; }
+#cache .cell-main, #tokens .cell-main { font-size: 13px; line-height: 1.35; }
+#cache .cell-sub, #tokens .cell-sub {
   font-size: 11.5px; color: var(--muted); line-height: 1.35; margin-top: 2px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+#tokens tr.expired .cell-main { color: var(--muted); }
 #cache .cell-main.trunc-host { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
 #cache .cell-main.trunc-cmd  { max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
 #cache .cell-sub.trunc-sub   { max-width: 200px; }

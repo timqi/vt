@@ -29,8 +29,8 @@ const CACHE_LIST_SCAN_MAX = 20000;
 //
 // History: ctx v1 folded in the client-reported parent PID; that was dropped
 // (v1→v2) because ppid is BOTH spoofable AND unstable (getppid() changes every
-// call under orchestrators, so the cache never hit). ppid is still recorded on
-// each entry + audit row for forensics. v2→v3 adds pwd. v3→v4 folds in
+// call under orchestrators, so the cache never hit); it has since left the wire
+// entirely. v2→v3 adds pwd. v3→v4 folds in
 // cacheScopePwd (worktree suffixes stripped) instead of the literal pwd; the tag
 // bump keeps the two derivations from ever sharing a storage key, at the cost of
 // stranding v3 entries (they lapse/sweep normally, and can be cleared from the
@@ -76,7 +76,6 @@ interface CacheAgg {
   max_expires_ms: number;
   created_ms: number | null;
   ip: string;
-  ppid: number;
   ppid_cmd: string;
   consistent: boolean;
 }
@@ -212,9 +211,6 @@ export class AccountCache {
     }
 
     const ip = ch.meta.ip ?? '';
-    // ppid is not part of the binding ctx (ctx = IP + pwd) — kept solely as a
-    // forensic field stored on each cache entry + audit row.
-    const ppid = typeof ch.meta.ppid === 'number' ? ch.meta.ppid : 0;
     const ctx = await cacheCtx(ip, ch.meta.pwd ?? '');
     const createdMs = Date.now();
     const expires = createdMs + ttlS * 1000;
@@ -230,7 +226,6 @@ export class AccountCache {
         expires_ms: expires,
         origin_token_id: originTokenId,
         ip,
-        ppid,
         ppid_cmd: ch.meta.ppid_cmd ?? '',
         cache_group_id: groupId,
         created_ms: createdMs,
@@ -310,7 +305,6 @@ export class AccountCache {
       max_expires_ms: 0,
       created_ms: typeof e.created_ms === 'number' ? e.created_ms : null,
       ip: e.ip ?? '',
-      ppid: typeof e.ppid === 'number' ? e.ppid : 0,
       ppid_cmd: e.ppid_cmd ?? '',
       consistent: true,
     };

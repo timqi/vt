@@ -147,6 +147,128 @@ pub fn hydrate_env_from_file() -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Writing top-level keys (`vt enroll` persists VT_PASSKEY_URL / VT_PASSKEY_TOKEN)
+
+/// Set top-level `KEY = "value"` entries in the config file, creating it (mode
+/// 600) when absent. Line-based on purpose: the file is hand-edited and full of
+/// comments, and a parse→serialize round trip would drop them. An existing
+/// uncommented top-level line for the key is replaced in place (first match);
+/// otherwise the key is inserted before the first `[section]` header so it
+/// stays top-level. Only `is_allowed_key` names are accepted.
+pub fn upsert_config_values(pairs: &[(&str, &str)]) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    let path = config_path()
+        .context("cannot determine config path (no $VT_CONFIG and no home directory)")?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let updated = upsert_toml_lines(&existing, pairs)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    write_private(&path, &updated)?;
+    Ok(path)
+}
+
+/// Write through a same-directory temp file + rename so a crash never leaves a
+/// half-written config, with the file private from the first byte.
+fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = (|| -> anyhow::Result<()> {
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn toml_basic_string(v: &str) -> String {
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for ch in v.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// True when `line` is an uncommented assignment of `key` (`KEY = …`).
+fn line_assigns(line: &str, key: &str) -> bool {
+    let t = line.trim_start();
+    t.strip_prefix(key)
+        .map(|rest| rest.trim_start().starts_with('='))
+        .unwrap_or(false)
+}
+
+fn upsert_toml_lines(existing: &str, pairs: &[(&str, &str)]) -> anyhow::Result<String> {
+    for (key, _) in pairs {
+        anyhow::ensure!(
+            is_allowed_key(key),
+            "refusing to write non-VT config key {key}"
+        );
+    }
+    let mut lines: Vec<String> = existing.lines().map(str::to_owned).collect();
+    // Top-level region ends at the first table header.
+    let first_section = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+    // New keys go after the last non-blank top-level line, so the blank line(s)
+    // that visually separate the first section stay where they were.
+    let mut insert_at = lines[..first_section]
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    for (key, value) in pairs {
+        let rendered = format!("{key} = {}", toml_basic_string(value));
+        match lines[..first_section]
+            .iter()
+            .position(|l| line_assigns(l, key))
+        {
+            Some(i) => lines[i] = rendered,
+            None => {
+                lines.insert(insert_at, rendered);
+                insert_at += 1;
+            }
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    // Prove the result still parses before it replaces the user's file.
+    out.parse::<toml::Table>()
+        .map_err(|e| anyhow::anyhow!("refusing to write config that no longer parses: {e}"))?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // [agent] section — file defaults for `vt ssh agent` flags
 
 /// Optional `[agent]` table in the same config file: startup *defaults* for
@@ -399,6 +521,53 @@ mod tests {
         // Typos fail loudly instead of silently routing to the wrong path.
         assert!(Backend::parse("pass-key").is_err());
         assert!(Backend::parse("cf").is_err());
+    }
+
+    #[test]
+    fn upsert_replaces_top_level_key_and_keeps_comments_and_sections() {
+        let existing = "# header\n# VT_PASSKEY_TOKEN = \"old-commented\"\nVT_PASSKEY_URL = \"https://a\"\nVT_PASSKEY_TOKEN = \"old\"\n\n[agent]\ntimeout = 60\n";
+        let out = upsert_toml_lines(
+            existing,
+            &[("VT_PASSKEY_TOKEN", "vt1.x.y"), ("VT_BACKEND", "auto")],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "# header\n# VT_PASSKEY_TOKEN = \"old-commented\"\nVT_PASSKEY_URL = \"https://a\"\nVT_PASSKEY_TOKEN = \"vt1.x.y\"\nVT_BACKEND = \"auto\"\n\n[agent]\ntimeout = 60\n"
+        );
+        // A key that only exists under a section is NOT the top-level key.
+        let sectioned = "[agent]\nVT_PASSKEY_TOKEN = \"inner\"\n";
+        let out = upsert_toml_lines(sectioned, &[("VT_PASSKEY_TOKEN", "t")]).unwrap();
+        assert_eq!(
+            out,
+            "VT_PASSKEY_TOKEN = \"t\"\n[agent]\nVT_PASSKEY_TOKEN = \"inner\"\n"
+        );
+        // Empty file, value needing escapes, non-VT key refused.
+        assert_eq!(
+            upsert_toml_lines("", &[("VT_X", "a\"b\\c")]).unwrap(),
+            "VT_X = \"a\\\"b\\\\c\"\n"
+        );
+        assert!(upsert_toml_lines("", &[("PATH", "x")]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upsert_config_values_creates_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vt-cfg-test-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        // VT_CONFIG is process-global; tests in this crate don't otherwise set it.
+        std::env::set_var("VT_CONFIG", &path);
+        let written = upsert_config_values(&[("VT_PASSKEY_URL", "https://w")]).unwrap();
+        assert_eq!(written, path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "VT_PASSKEY_URL = \"https://w\"\n"
+        );
+        std::env::remove_var("VT_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

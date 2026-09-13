@@ -12,23 +12,26 @@ const meta = {
   user: 'qiqi',
   pwd: '/repo',
   ppid_cmd: 'zsh -c deploy.sh',
-  ssh_client: '10.0.0.2 51000 22',
   ip: '203.0.113.9',
   reason: 'release',
 };
 
 describe('metaLines', () => {
-  it('renders who · N 条 head, then pwd/cmd/via/ssh/ip/reason in order', () => {
+  it('renders who · N 条 head, then pwd/cmd/via/ip/reason in order', () => {
     const lines = metaLines(meta, 3);
     expect(lines[0]).toBe('qiqi@devbox · 3 条');
     expect(lines.slice(1)).toEqual([
       'pwd: /repo',
       'op: inject\nfile: .env', // self-labelled multi-line command, no cmd: prefix
       'via: zsh -c deploy.sh',
-      'ssh: 10.0.0.2 51000 22',
       'ip: 203.0.113.9',
       'reason: release',
     ]);
+  });
+
+  it('flags an IP change on the host-token path', () => {
+    const lines = metaLines({ ...meta, ip_prev: '198.51.100.7' });
+    expect(lines).toContain('ip: 203.0.113.9（上次 198.51.100.7）');
   });
 
   it('drops the batch segment at salts=0 and keeps a bare count when who is empty', () => {

@@ -215,7 +215,10 @@ Durable Object storage is copied without the running Worker. It does not
 protect against a compromised Worker. `VT_PASSKEY_TOKEN` is the request
 credential; when a cache entry is live, possession of that token from the same
 egress IP and a `pwd` in the same normalized scope is sufficient to obtain the
-cached DEK.
+cached DEK. Since tokens are per host ([host-token.md](host-token.md)), the
+cache is not bound to the token: a different enrolled host on the same egress
+IP and scope hits it too (the IP boundary was always the hard one). Revoking a
+host's token stops its probes at authentication, before the cache is consulted.
 
 Keep the default TTL at `0` for high-assurance or unattended workloads. Use
 short TTLs for automation that needs repeated decrypts. The multi-day extension

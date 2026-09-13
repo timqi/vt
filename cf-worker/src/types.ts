@@ -5,7 +5,14 @@ import type { UvLevel } from './uv_policy';
 export interface Env {
   ACCOUNT: DurableObjectNamespace;
   ASSETS: Fetcher;
+  /** Worker master. Host tokens are HKDF-derived from it (host_token.ts) and
+   *  the agent audit key too; during the migration window it is also still
+   *  accepted directly as the daemon HMAC key (legacy hosts without a token). */
   VT_AUTH_CF: string;
+  /** Workers Rate Limiting binding guarding the UNAUTHENTICATED POST /api/enroll
+   *  (per connecting IP). Absent → enrollment is refused (fail closed): an
+   *  endpoint that can page the operator's phone must never run unthrottled. */
+  ENROLL_LIMITER?: RateLimit;
   CREDENTIALS_JSON: string;
   /**
    * base64url 32-byte X25519 secret key for the opt-in DEK cache. The PWA seals
@@ -200,6 +207,76 @@ export interface Challenge {
    *  salts and mints no DEKs — approving it only moves expires_ms forward on the
    *  named groups. */
   extend?: CacheExtendIntent;
+  /** Present ONLY on a host-token enrollment ceremony (op_kind='enroll'): what
+   *  the unauthenticated requester claimed plus what the edge verified. Like
+   *  `extend`, immutable after creation; approving mints exactly this token. */
+  enroll?: EnrollIntent;
+  /** Host token the daemon authenticated this ceremony with (absent on the
+   *  legacy master path). Lets the approval page label host/user as verified. */
+  token_id?: string;
+  /** Set by commitEnroll in the same put that flips status to 'approved': the
+   *  token_id minted for this ceremony. The secret is re-derived (never stored)
+   *  when the poll socket delivers or re-delivers the token. */
+  enroll_token_id?: string;
+}
+
+// ── Host-token enrollment (unauthenticated request, phone-approved) ────────
+
+export interface EnrollIntent {
+  /** Client-claimed hostname / user (display; become the token's identity). */
+  host: string;
+  user: string;
+  /** Worker-derived: CF-Connecting-IP and `request.cf` country / AS org. */
+  ip: string;
+  origin: string;
+  /** Six-digit pairing code (`123-456`) shown on the CLI and the approval page. */
+  pair_code: string;
+}
+
+/** Inbound to POST /api/enroll (no auth; rate-limited per IP). */
+export interface EnrollRequest {
+  host: string;
+  user: string;
+  timestamp_ms: number;
+}
+
+export interface EnrollResponse {
+  approve_url: string;
+  poll_token: string;
+  pair_code: string;
+  push_warning?: string;
+}
+
+/** Internal DO op for POST /api/enroll. The Worker has already rate-limited
+ *  the caller and derived `ip` / `origin`; the DO enforces the pending cap and
+ *  mints the ceremony. */
+export interface DoEnrollCreateOp {
+  host: string;
+  user: string;
+  ip: string;
+  origin: string;
+}
+
+/** One row of the DO `host_token` table (account_tokens.ts). Carries no
+ *  secret: the secret is derived from the master + token_id on demand. */
+export interface HostTokenRow {
+  token_id: string;
+  host: string;
+  user: string;
+  enroll_ip: string;
+  origin: string;
+  approve_token_id: string;
+  created_ms: number;
+  expires_ms: number;
+  last_used_ms: number;
+  last_ip: string;
+  revoked_ms: number | null;
+}
+
+export interface HostTokenListResponse {
+  tokens: HostTokenRow[];
+  now_ms: number;
+  truncated: boolean;
 }
 
 // ── Cache extension (admin-requested, phone-approved) ──────────────────────
@@ -250,7 +327,6 @@ export interface CacheGroupSummary {
   created_ms: number | null;
   /** Worker-derived source IP the entries are bound to. */
   ip: string;
-  ppid: number;
   ppid_cmd: string;
   /** Joined from the origin audit row (same fields the audit tab already shows
    *  on the same Access gate). */
@@ -294,29 +370,28 @@ export interface SlackAppMsgRef {
   ts: string;
 }
 
+/** Display context for one approval. Trust levels differ per field and the
+ *  surfaces label them accordingly (docs/approval-transparency.md):
+ *   - `ip` — Worker-derived (CF-Connecting-IP), always.
+ *   - `host` / `user` — from the host-token record when the request carried a
+ *     token (verified at enrollment); client-claimed on the legacy master path
+ *     and on agent audit rows (the agent names the session host).
+ *   - everything else — client-claimed.
+ *  Dropped from the wire (columns kept, NULL): tty, ppid, ssh_client. */
 export interface ChallengeMeta {
   op_kind: string;
   command: string;
   host: string;
-  /** $USER on the daemon machine */
   user: string;
   /** Current working directory of the vt CLI */
   pwd: string;
-  /** Controlling TTY (e.g. /dev/pts/3); empty if not a TTY */
-  tty: string;
   /** Parent process command line — which shell / script invoked vt */
   ppid_cmd: string;
-  /** Numeric parent PID (libc::getppid()) reported by the CLI. Used (with the
-   *  worker-derived IP) to scope the DEK cache: a later /api/dek-cache request
-   *  must carry the SAME ppid AND originate from the SAME IP, or it misses.
-   *  CLIENT-REPORTED, so it is advisory (blast-radius reduction), not a hard
-   *  boundary — a fully-compromised local host can spoof it. The IP is the
-   *  trustworthy half of the binding. */
-  ppid: number;
-  /** SSH_CLIENT / SSH_CONNECTION env if the session is remote */
-  ssh_client: string;
   ip: string;
   reason: string;
+  /** Token path only: the IP of the token's PREVIOUS use when it differs from
+   *  `ip` — an IP-change hint for the approver. '' / absent otherwise. */
+  ip_prev?: string;
 }
 
 // ── Inbound from daemon via POST /api/challenge ────────────────────────────
@@ -387,7 +462,9 @@ export interface RejectRequest {
 
 export type WsMessage =
   | { status: 'waiting' }
-  | { status: 'approved'; sealed_deks_b64u: string; pwa_pk_b64u: string; binding_tag_b64u: string }
+  | { status: 'approved'; sealed_deks_b64u: string; pwa_pk_b64u: string; binding_tag_b64u: string;
+      /** Enrollment ceremonies only: the freshly minted `vt1.…` host token. */
+      host_token?: string }
   | { status: 'rejected' }
   | { status: 'expired' };
 
@@ -416,6 +493,12 @@ export interface ApprovePageData {
    *  tells the approver the reuse scope, while `metadata.pwd` keeps the literal
    *  working directory. */
   cache_scope_pwd: string;
+  /** Enrollment ceremonies only: the pairing code the approver compares with
+   *  the requesting terminal before approving. */
+  enroll_pair_code?: string;
+  /** True when `metadata.host` / `user` came from a host-token record rather
+   *  than the request body. */
+  host_verified: boolean;
 }
 
 // ── DEK cache (opt-in, IP+pwd-scoped) ──────────────────────────────────────
@@ -427,11 +510,10 @@ export interface DekCacheRequest {
   /** salts to look up; empty array is rejected (returns miss). */
   salts_b64u: string[];
   timestamp_ms: number;
-  /** Full display meta (same shape as the challenge request). `meta.pwd` is the
+  /** Display meta (same shape as the challenge request). `meta.pwd` is the
    *  client-reported half of the cache binding ctx (ctx = IP + cacheScopePwd(pwd));
-   *  IP is the worker-derived hard boundary. `meta.ppid` is forensic-only. The rest is
-   *  stored on the hit audit row so a cache hit carries the same context as a
-   *  ceremony decrypt. */
+   *  IP is the worker-derived hard boundary. The rest is stored on the hit audit
+   *  row so a cache hit carries the same context as a ceremony decrypt. */
   meta?: Partial<ChallengeMeta>;
 }
 
@@ -455,7 +537,8 @@ export interface CacheEntry {
   origin_token_id: string;
   /** binding context, stored redundantly for audit/forensics. */
   ip: string;
-  ppid: number;
+  /** Legacy (pre-trim entries only); no longer written. */
+  ppid?: number;
   ppid_cmd: string;
   /** `g_…` handle minted once per writeCache call (one approval, one binding
    *  ctx). This — not the truncated origin_token_id — is what an extension
@@ -514,9 +597,11 @@ export interface AgentAuditEntry {
   relayed?: boolean;
 }
 
-/** Inbound to POST /api/audit-ingest. Signed with `VT-HMAC` over the raw body
- *  using the agent's HKDF-derived key (see crypto.ts hkdfSha256). `agent_id`
- *  selects which key the Worker derives to verify; `hostname` is display-only. */
+/** Inbound to POST /api/audit-ingest. Signed with `VT-HMAC` over the raw body.
+ *  `agent_id` selects the key the Worker derives to verify: `t:<token_id>` →
+ *  that host token's secret (host_token.ts), anything else → the legacy
+ *  hostname-salted HKDF of the master (crypto.ts hkdfSha256). `hostname` is
+ *  display-only. */
 export interface AgentAuditIngestRequest {
   timestamp_ms: number;
   agent_id: string;
@@ -546,12 +631,19 @@ export interface DoAuditIngestOp {
   grant_ttl_s: number | null;
   /** SQLite has no bool: 0 | 1 | null. */
   relayed: number | null;
+  /** Host token the agent signed with (`agent_id = t:<token_id>`); the DO
+   *  refuses the row when it is revoked/expired. Absent = legacy master key. */
+  token_id_host?: string;
 }
 
 // ── Internal DO op bodies ──────────────────────────────────────────────────
 
 export interface DoCreateOp {
   challenge: Challenge;
+  /** Host token the daemon authenticated with (HMAC already verified at the
+   *  edge). The DO checks liveness, slides expiry, and overwrites
+   *  `challenge.meta.host` / `user` from the record. Absent = legacy master. */
+  token_id?: string;
 }
 
 export interface DoApproveOp {
@@ -574,6 +666,8 @@ export interface DoDekCacheOp {
   daemon_pubkey_b64u: string;
   salts_b64u: string[];
   meta: ChallengeMeta;
+  /** See DoCreateOp.token_id. */
+  token_id?: string;
 }
 
 /** Internal DO op for POST /{ADMIN_SEG}/api/cache-extend-request. The Worker has

@@ -220,6 +220,25 @@ fields are unaffected unless noted):
   basename(argv[0]) + args. Affects the `via:` prompt line, the approval
   page 父进程 row, notifications, and audit rows uniformly.
 
+## 2b. Host-token trim
+
+With per-host Worker tokens ([host-token.md](host-token.md)) the Worker learns
+`host` / `user` from the token record, so the ceremony wire meta was cut to
+what still carries signal:
+
+| field | verdict | why |
+|---|---|---|
+| `op_kind` `command` `pwd` `ppid_cmd` `reason` | kept | the operation, its main signal, the cache scope, "which program asked", the user's own words |
+| `ip` | kept | Worker-derived; on the token path `ip_prev` flags a change since the token's last use |
+| `host` `user` | removed from the CLI wire | supplied by the token record and labeled 已验证; the agent audit push still sends them (it names the session host) |
+| `tty` | removed | never verified, never shown in notifications, nobody decided on it |
+| `ppid` | removed | numeric, audit-only, no longer a cache binding |
+| `ssh_client` | removed | spoofable; the host is identified by its token and the IP is verified |
+
+Audit columns stay (NULL on new rows); `metaLines` drops the `ssh:` line; the
+approve page footnote now states which fields are verified per path. The
+agent-side `ClientMeta` (CLI → agent extension wire) is unchanged.
+
 ## 3. Tests
 
 - Rust (`ssh_agent.rs` unit tests): dest line on Fresh bound; no

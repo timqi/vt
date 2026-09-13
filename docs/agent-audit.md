@@ -158,12 +158,15 @@ rows for free.
 ```bash
 vt ssh agent --run-allow zed,code \
   --audit-url https://vt.example.com \
-  --audit-key "$VT_PASSKEY_TOKEN"      # the worker master (== VT_AUTH_CF)
+  --audit-key "$VT_PASSKEY_TOKEN"      # this Mac's host token (vt1.…, from `vt enroll`)
 ```
 
-No pre-derivation, no per-agent file: the agent derives its per-host subkey from
-`--audit-key` + its hostname at startup. The Worker needs **no new secret** — it
-reuses `VT_AUTH_CF`. Audit push is fully opt-in: with `--audit-url` unset (or
+Preferred: `--audit-key` is the Mac's own host token ([host-token.md](host-token.md)).
+Its secret is the HMAC key and `agent_id = t:<token_id>`, so the Worker
+re-derives the same secret and refuses rows once the token is revoked or has
+lapsed. Legacy: a bare master still works — the agent derives its per-host
+subkey from `--audit-key` + its hostname at startup and the Worker mirrors it.
+Either way the Worker needs **no new secret**. Audit push is fully opt-in: with `--audit-url` unset (or
 `--no-audit-push`, or an empty `--audit-key`, or a non-`https://` URL) the
 agent's `spawn_push` is a no-op.
 

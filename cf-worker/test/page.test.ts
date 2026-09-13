@@ -229,7 +229,8 @@ describe('adminTabs', () => {
     expect(nav.match(/class="tab active"/g)).toHaveLength(1);
     expect(nav.match(/aria-current="page"/g)).toHaveLength(1);
     expect(nav).toContain('href="/kestrel/cache" aria-current="page"');
-    expect(nav.match(/<a /g)).toHaveLength(4);
+    expect(nav.match(/<a /g)).toHaveLength(5);
+    expect(nav).toContain('href="/kestrel/tokens"');
   });
 
   it('follows ADMIN_SEG', () => {

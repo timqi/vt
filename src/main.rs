@@ -11,10 +11,13 @@ use crate::client::VTClient;
 
 /// Build the agent's audit-push config from the `--audit-*` flags. Returns a
 /// disabled config (audit push is a no-op) when `--audit-url` is unset,
-/// `--no-audit-push` is given, or `--audit-key` is empty. `agent_id` is the
-/// machine hostname; the agent derives its per-host audit subkey from the master
-/// (`--audit-key`, == VT_AUTH_CF) + that hostname ONCE here at startup, so the
-/// raw master is not retained — only the 32-byte subkey lives in the config.
+/// `--no-audit-push` is given, or `--audit-key` is empty.
+///
+/// `--audit-key` is preferably this Mac's own host token (`vt1.…`, from
+/// `vt enroll`): its secret is the HMAC key and `agent_id = t:<token_id>`, so
+/// the Worker can also refuse rows from a revoked token. A bare master is still
+/// accepted (legacy): the per-host subkey HKDF(master, hostname) is derived
+/// ONCE here so the raw master is not retained.
 #[cfg(target_os = "macos")]
 fn build_audit_push_config(
     audit_url: &Option<String>,
@@ -36,13 +39,19 @@ fn build_audit_push_config(
             return AuditPushConfig::disabled();
         }
     };
-    // agent_id = hostname. The Worker re-derives HKDF(VT_AUTH_CF, hostname) to
-    // verify, so the wire stays per-host-keyed and the Worker is unchanged.
     let hostname = caller_meta::get_hostname();
-    // Derive the per-host subkey once; pass the Zeroizing<[u8;32]> straight in so
-    // no plain heap copy of the key ever exists.
+    if let Some((token_id, key)) = audit::host_token_audit_key(master) {
+        return AuditPushConfig::new(url.clone(), key, format!("t:{token_id}"), hostname);
+    }
+    if master.starts_with(cf::HOST_TOKEN_PREFIX) {
+        tracing::warn!("audit push disabled: --audit-key looks like a host token but is malformed");
+        return AuditPushConfig::disabled();
+    }
+    // Legacy: agent_id = hostname. The Worker re-derives HKDF(VT_AUTH_CF,
+    // hostname) to verify. Derive the per-host subkey once; pass the
+    // Zeroizing<[u8;32]> straight in so no plain heap copy of the key exists.
     let key = audit::derive_agent_audit_key(master.as_bytes(), &hostname);
-    AuditPushConfig::new(url.clone(), key, hostname)
+    AuditPushConfig::new(url.clone(), key, hostname.clone(), hostname)
 }
 
 mod audit;
@@ -96,6 +105,18 @@ enum Commands {
     /// Read-only: asks a reachable vt agent (via diag@vt) how it classifies
     /// this connection and why it is or isn't cacheable
     Doctor,
+    /// Request this host's own VT_PASSKEY_TOKEN from the phone-approval
+    /// Worker. Prints an approve URL plus a pairing code; after the Passkey
+    /// approval the token (valid 7 days, refreshed on every use) is written
+    /// to ~/.config/vt/config.toml ($VT_CONFIG) together with the Worker URL
+    Enroll {
+        #[arg(
+            long,
+            value_name = "URL",
+            help = "Worker base URL, e.g. https://vt.example.com. Defaults to the configured VT_PASSKEY_URL"
+        )]
+        url: Option<String>,
+    },
     /// Will read plain text and output encrypted message for you.
     /// With stdin piped (not a terminal) the plaintext is read from stdin —
     /// one trailing newline stripped — and no prompt is shown
@@ -453,6 +474,7 @@ async fn run(cli: Cli, config: config::ResolvedConfig) -> Result<()> {
             Ok(())
         }
         Commands::Doctor => return client::doctor(&config).await,
+        Commands::Enroll { url } => return client::enroll(&config, url.as_deref()).await,
         #[cfg(target_os = "macos")]
         Commands::Init => server_macos::admin::init(),
         #[cfg(target_os = "macos")]

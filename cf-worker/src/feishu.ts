@@ -227,7 +227,7 @@ export interface EditExtra {
 function buildCard(
   state: FeishuState,
   opKind: string,
-  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ssh_client' | 'ip' | 'reason'>,
+  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ip' | 'reason' | 'ip_prev'>,
   opts: { approveUrl?: string; mention?: string[]; extra?: EditExtra; salts?: number },
 ): unknown {
   const h = HEADER[state];

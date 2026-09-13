@@ -40,9 +40,36 @@ pub fn derive_agent_audit_key(master: &[u8], agent_id: &str) -> Zeroizing<[u8; 3
     out
 }
 
+/// When `--audit-key` is a host token (`vt1.<id>.<secret>`), the audit HMAC key
+/// is the token secret itself and the Worker selects it via `agent_id =
+/// t:<id>`. `None` for anything that is not a well-formed host token (the
+/// caller then treats the value as the legacy master).
+pub fn host_token_audit_key(audit_key: &str) -> Option<(String, Zeroizing<[u8; 32]>)> {
+    let auth = crate::cf::WorkerAuth::parse(audit_key).ok()?;
+    let token_id = auth.token_id.clone()?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(auth.key_bytes());
+    Some((token_id, key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_token_audit_key_only_for_host_tokens() {
+        assert!(host_token_audit_key("plain-master").is_none());
+        assert!(host_token_audit_key("vt1.bad").is_none());
+        let (id, key) = host_token_audit_key(
+            "vt1.AAAAAAAAAAAAAAAA.iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI",
+        )
+        .unwrap();
+        assert_eq!(id, "AAAAAAAAAAAAAAAA");
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(key.as_slice()),
+            "iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI"
+        );
+    }
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     /// Golden vector pinning the agent-audit key derivation. The cf-worker

@@ -63,7 +63,7 @@ export interface PageChrome {
   faviconTags: string;
 }
 
-export type AdminTab = 'audit' | 'cache' | 'setup' | 'channels';
+export type AdminTab = 'audit' | 'cache' | 'tokens' | 'setup' | 'channels';
 
 // Placeholders common to every shell, admin or public.
 export function pageVars(chrome: PageChrome): Record<string, string> {
@@ -76,7 +76,7 @@ export function adminTabs(chrome: PageChrome, active: AdminTab): string {
   const seg = chrome.adminSeg;
   const tab = (href: string, key: AdminTab, label: string) =>
     `<a class="tab${key === active ? ' active' : ''}" href="${href}"${key === active ? ' aria-current="page"' : ''}>${label}</a>`;
-  return `<nav class="tabs">${tab(`/${seg}/audit`, 'audit', '审计')}${tab(`/${seg}/cache`, 'cache', 'DEK 缓存')}${tab(`/${seg}/setup`, 'setup', 'Passkey')}${tab(`/${seg}/channels`, 'channels', '推送渠道')}</nav>`;
+  return `<nav class="tabs">${tab(`/${seg}/audit`, 'audit', '审计')}${tab(`/${seg}/cache`, 'cache', 'DEK 缓存')}${tab(`/${seg}/tokens`, 'tokens', '主机令牌')}${tab(`/${seg}/setup`, 'setup', 'Passkey')}${tab(`/${seg}/channels`, 'channels', '推送渠道')}</nav>`;
 }
 
 // Placeholders every admin shell carries.

@@ -17,9 +17,11 @@
 # Worker base URL for the phone-approval ceremony.
 # VT_PASSKEY_URL = "https://vt.example.com"
 
-# HMAC key signing /api/challenge requests. Must equal the worker's VT_AUTH_CF
-# secret. SENSITIVE — keep this file mode 600.
-# VT_PASSKEY_TOKEN = "your-passkey-token"
+# This host's own Worker token, written here by `vt enroll` (vt1.<id>.<secret>;
+# valid 7 days, refreshed on every use; revocable per host on the Worker admin
+# page). The bare VT_AUTH_CF master is still accepted during migration only.
+# SENSITIVE — keep this file mode 600.
+# VT_PASSKEY_TOKEN = "vt1.…"
 
 # WebAuthn user-verification level to ASK FOR on the approval page:
 # discouraged (one click in the passkey prompt) | preferred | required (adds a

@@ -220,8 +220,8 @@ export class AccountAudit {
       // a future schema change can never silently mis-categorize these rows.
       const cursor = this.sql.exec(
         `INSERT INTO audit
-           (token_id, created_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source, seq)
-         VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ceremony', ?)
+           (token_id, created_ms, status, op_kind, command, reason, host, user, pwd, ppid_cmd, ip, salts, source, seq)
+         VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ceremony', ?)
          ON CONFLICT(token_id) DO NOTHING RETURNING token_id`,
         auditKey(ch.approve_token),
         ch.created_ms ?? Date.now(),
@@ -231,12 +231,9 @@ export class AccountAudit {
         m.host ?? null,
         m.user ?? null,
         m.pwd ?? null,
-        m.tty ?? null,
         m.ppid_cmd ?? null,
-        m.ssh_client ?? null,
         m.ip ?? null,
         Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0,
-        typeof m.ppid === 'number' ? m.ppid : null,
         this.nextSeq(),
       );
       // rowsWritten includes SQLite AUTOINCREMENT bookkeeping on a conflict.
@@ -346,13 +343,12 @@ export class AccountAudit {
       const tokenId = 'c_' + b64uEnc(crypto.getRandomValues(new Uint8Array(9)));
       this.sql.exec(
         `INSERT INTO audit
-           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, ppid, source, seq)
-         VALUES (?, ?, ?, ?, 'cache', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cache', ?)
+           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, ppid_cmd, ip, salts, source, seq)
+         VALUES (?, ?, ?, ?, 'cache', ?, ?, ?, ?, ?, ?, ?, ?, 'cache', ?)
          ON CONFLICT(token_id) DO NOTHING`,
         tokenId, now, now, status,
         meta.command ?? null, meta.reason ?? null, meta.host ?? null, meta.user ?? null,
-        meta.pwd ?? null, meta.tty ?? null, meta.ppid_cmd ?? null, meta.ssh_client ?? null,
-        meta.ip ?? null, salts, typeof meta.ppid === 'number' ? meta.ppid : null,
+        meta.pwd ?? null, meta.ppid_cmd ?? null, meta.ip ?? null, salts,
         this.nextSeq(),
       );
       this.broadcastRow(tokenId, 'insert');
@@ -369,15 +365,14 @@ export class AccountAudit {
     try {
       const cursor = this.sql.exec(
         `INSERT INTO audit
-           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms, ppid, source, seq,
+           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, ppid_cmd, ip, salts, latency_ms, source, seq,
             peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(token_id) DO NOTHING RETURNING token_id`,
         op.token_id, op.ts_ms, op.ts_ms, op.outcome,
         m.op_kind ?? null, m.command ?? null, m.reason ?? null, m.host ?? null,
-        m.user ?? null, m.pwd ?? null, m.tty ?? null, m.ppid_cmd ?? null,
-        m.ssh_client ?? null, m.ip ?? null, op.salts, op.latency_ms,
-        typeof m.ppid === 'number' ? m.ppid : null,
+        m.user ?? null, m.pwd ?? null, m.ppid_cmd ?? null,
+        m.ip ?? null, op.salts, op.latency_ms,
         this.nextSeq(),
         // Agent-authoritative context: the ingest already normalized these to
         // string/number/null — `?? null` only guards a malformed internal op.

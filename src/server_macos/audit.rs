@@ -67,7 +67,9 @@ pub struct AgentAuditEntry {
     /// The `a_` prefix is structurally disjoint from the 16-char ceremony tokens
     /// and the `c_` cache-event rows.
     pub token_id: String,
-    /// Full display context (host/user/pwd/tty/ppid_cmd/ssh_client/ppid/…).
+    /// Display context (host/user/pwd/ppid_cmd/…). Unlike the CLI ceremony,
+    /// the agent DOES name host/user: it knows the session host (relay or
+    /// local) and the Worker keeps the body's values for agent rows.
     pub meta: ChallengeMeta,
     /// Agent-authoritative context, flattened to top-level siblings on the
     /// wire (peer_exe / key_fp / dest / scope_family / scope_label /
@@ -78,8 +80,7 @@ pub struct AgentAuditEntry {
 
 impl AgentAuditEntry {
     /// Build an entry from the per-request client meta plus the agent-derived
-    /// fields. `peer_pid` is the socket peer PID (see `get_peer_pid`); `None`
-    /// for forwarded/remote sessions, in which case `meta.ppid` is left 0.
+    /// fields.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         op_kind: &str,
@@ -88,7 +89,6 @@ impl AgentAuditEntry {
         client_meta: &crate::core::ClientMeta,
         command: &str,
         reason: &str,
-        peer_pid: Option<i32>,
         salts: usize,
         latency_ms: u64,
         agent_id: &str,
@@ -100,12 +100,7 @@ impl AgentAuditEntry {
             host: host.to_string(),
             user: client_meta.user.clone(),
             pwd: client_meta.pwd.clone(),
-            tty: client_meta.tty.clone(),
             ppid_cmd: client_meta.ppid_cmd.clone(),
-            // Q1: the socket peer PID, not the agent's own ppid. 0 (→ absent on
-            // the wire after capChallengeMeta) when the session is forwarded.
-            ppid: peer_pid.filter(|p| *p > 0).map(|p| p as u32).unwrap_or(0),
-            ssh_client: client_meta.ssh_client.clone(),
             reason: reason.to_string(),
         };
         AgentAuditEntry {
@@ -136,14 +131,16 @@ struct IngestBody<'a> {
 pub struct AuditPushConfig {
     /// Worker base URL, e.g. `https://vt-passkey.example.com` (no trailing path).
     url: String,
-    /// The per-host derived HMAC subkey (HKDF of the master + hostname, computed
-    /// at startup in `build_audit_push_config`). The raw master is NOT stored
-    /// here. `Zeroizing` wipes it on drop; the fixed `[u8; 32]` avoids any
-    /// transient un-zeroized heap copy.
+    /// The HMAC key: this Mac's host-token secret (`--audit-key vt1.…`), or the
+    /// legacy per-host subkey HKDF(master, hostname) computed at startup in
+    /// `build_audit_push_config`. The raw master is NOT stored here.
+    /// `Zeroizing` wipes it on drop; the fixed `[u8; 32]` avoids any transient
+    /// un-zeroized heap copy.
     key: Zeroizing<[u8; 32]>,
-    /// The agent's id (= hostname): HKDF salt selector + `token_id` prefix.
+    /// Selects the Worker-side key: `t:<token_id>` for a host token, else the
+    /// hostname (HKDF salt). Also the `token_id` prefix of every row.
     agent_id: String,
-    /// Display-only hostname (currently identical to `agent_id`).
+    /// Display-only hostname.
     hostname: String,
     /// Master switch: false → `spawn_push` is a no-op.
     pub enabled: bool,
@@ -169,11 +166,11 @@ impl AuditPushConfig {
         }
     }
 
-    /// Build an enabled config from the already-derived 32-byte per-host subkey
-    /// and the hostname (used as both `agent_id` and display `hostname`).
-    /// Validates that `url` is an `https://` URL; on failure it logs a warning
-    /// and returns a disabled config (S6 — never silently push to an http origin).
-    pub fn new(url: String, key: Zeroizing<[u8; 32]>, hostname: String) -> Self {
+    /// Build an enabled config from the 32-byte HMAC key, the Worker-side key
+    /// selector `agent_id`, and the display hostname. Validates that `url` is
+    /// an `https://` URL; on failure it logs a warning and returns a disabled
+    /// config (S6 — never silently push to an http origin).
+    pub fn new(url: String, key: Zeroizing<[u8; 32]>, agent_id: String, hostname: String) -> Self {
         let url_ok = url.starts_with("https://") && url.len() > "https://".len();
         if !url_ok {
             tracing::warn!(
@@ -186,7 +183,7 @@ impl AuditPushConfig {
             // Normalize away a trailing slash so `{url}/api/audit-ingest` is clean.
             url: url.trim_end_matches('/').to_string(),
             key,
-            agent_id: hostname.clone(),
+            agent_id,
             hostname,
             enabled: true,
         }
@@ -228,7 +225,7 @@ async fn push_once_with_retry(
     // it surfaces after the loop.
     let mut last_err = anyhow::anyhow!("audit ingest failed");
     for _ in 0..2 {
-        match cf_post_with_timeout(&url, &auth, &body, 5).await {
+        match cf_post_with_timeout(&url, &auth, None, &body, 5).await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -249,7 +246,7 @@ async fn push_once_with_retry(
 /// two events in the same millisecond on a fast machine cannot collide on the
 /// UNIQUE `token_id` column.
 ///
-/// The `agent_id` (hostname) portion is capped at 60 chars so the random suffix
+/// The `agent_id` portion is capped at 60 chars so the random suffix
 /// always survives the Worker's `capMeta(token_id, 80)`: `"a_" + 60 + "_" + 11
 /// = 74 ≤ 80`. Without this cap a long hostname (macOS allows up to 255) would
 /// push the random tail past the cap, so every row from that host would collide
@@ -292,7 +289,6 @@ mod tests {
             &meta,
             "cmd",
             "why",
-            Some(4242),
             3,
             120,
             "AGENTID",
@@ -336,46 +332,19 @@ mod tests {
         assert!(!v["relayed"].as_bool().unwrap());
         let m = v.get("meta").unwrap();
         for k in [
-            "op_kind",
-            "command",
-            "host",
-            "user",
-            "pwd",
-            "tty",
-            "ppid_cmd",
-            "ppid",
-            "ssh_client",
-            "reason",
+            "op_kind", "command", "host", "user", "pwd", "ppid_cmd", "reason",
         ] {
             assert!(m.get(k).is_some(), "missing meta field {k}");
         }
         // ip MUST be absent — the ChallengeMeta wire shape has no ip field, and
-        // the Worker overwrites it from CF-Connecting-IP.
-        assert!(m.get("ip").is_none(), "meta.ip must be absent on the wire");
-        assert_eq!(m.get("ppid").unwrap().as_u64().unwrap(), 4242);
+        // the Worker overwrites it from CF-Connecting-IP. tty/ppid/ssh_client
+        // left the wire with the approval-context trim.
+        for k in ["ip", "tty", "ppid", "ssh_client"] {
+            assert!(m.get(k).is_none(), "meta.{k} must be absent on the wire");
+        }
+        assert_eq!(m["host"].as_str().unwrap(), "host1");
         assert_eq!(v["salts"].as_u64().unwrap(), 3);
         assert!(v["token_id"].as_str().unwrap().starts_with("a_AGENTID_"));
-    }
-
-    /// Forwarded/remote sessions have no socket peer PID → ppid serializes as 0
-    /// (which the Worker reads as absent and stores as 0).
-    #[test]
-    fn build_with_no_peer_pid_yields_zero_ppid() {
-        let entry = AgentAuditEntry::build(
-            "auth",
-            "approved",
-            "h",
-            &crate::core::ClientMeta::default(),
-            "",
-            "",
-            None,
-            0,
-            0,
-            "X",
-            AgentAuditContext::default(),
-        );
-        let v = serde_json::to_value(&entry).unwrap();
-        assert_eq!(v["meta"]["ppid"].as_u64().unwrap(), 0);
     }
 
     /// Config validation: a non-https URL disables; https enables.
@@ -385,6 +354,7 @@ mod tests {
             !AuditPushConfig::new(
                 "http://insecure.example".into(),
                 Zeroizing::new([1u8; 32]),
+                "host".into(),
                 "host".into()
             )
             .enabled
@@ -393,6 +363,7 @@ mod tests {
             AuditPushConfig::new(
                 "https://ok.example".into(),
                 Zeroizing::new([1u8; 32]),
+                "host".into(),
                 "host".into()
             )
             .enabled
@@ -411,7 +382,6 @@ mod tests {
             &crate::core::ClientMeta::default(),
             "",
             "",
-            None,
             0,
             0,
             &long,

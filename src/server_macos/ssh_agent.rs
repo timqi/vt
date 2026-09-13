@@ -696,7 +696,6 @@ impl VtSshSession {
             meta,
             command,
             reason,
-            self.peer_pid,
             salts,
             latency_ms,
             self.audit_push.agent_id(),

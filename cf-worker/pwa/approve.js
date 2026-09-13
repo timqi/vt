@@ -130,29 +130,41 @@
             var meta = data.metadata;
             refs.meta.innerHTML = '';
             if (meta) {
-                // Only `ip` is worker-verified (CF-Connecting-IP); every other
-                // field is client-reported display data — labeled so an
-                // approver weighs them accordingly (the footnote below states
-                // the rule once).
+                // Trust per field: `ip` is worker-verified (CF-Connecting-IP);
+                // host/user come from the host-token record (verified at
+                // enrollment) unless this ceremony IS the enrollment, where they
+                // are the requester's own claim; the rest is client-reported.
+                var enrolling = !!data.enroll_pair_code;
+                var hostVerified = !enrolling && !!data.host_verified;
                 var fields = [
                     ['op_kind',    '类型'],
-                    ['host',       '主机'],
-                    ['user',       '用户'],
+                    ['host',       hostVerified ? '主机（已验证）' : '主机'],
+                    ['user',       hostVerified ? '用户（已验证）' : '用户'],
                     ['pwd',        '目录'],
                     ['command',    '命令'],
-                    ['tty',        '终端'],
                     ['ppid_cmd',   '父进程'],
-                    ['ssh_client', 'SSH 来源'],
                     ['ip',         'IP（已验证）'],
                     ['reason',     '原因']
                 ];
                 for (var i = 0; i < fields.length; i++) {
                     var key = fields[i][0], label = fields[i][1];
                     if (meta[key] == null || meta[key] === '') continue;
+                    var value = String(meta[key]);
+                    // Host-token path: this token last spoke from another IP.
+                    if (key === 'ip' && meta.ip_prev) value += '（上次 ' + meta.ip_prev + '）';
                     var row = document.createElement('div');
                     row.appendChild(el('dt', null, label));
-                    row.appendChild(el('dd', null, String(meta[key])));
+                    row.appendChild(el('dd', null, value));
                     refs.meta.appendChild(row);
+                }
+                // Enrollment: the pairing code is the approver's proof that this
+                // request is the terminal in front of them, not a stranger's
+                // concurrent one. Big, on its own row.
+                if (enrolling) {
+                    var prow = document.createElement('div');
+                    prow.appendChild(el('dt', null, '配对码'));
+                    prow.appendChild(el('dd', 'vt-ap-pair', data.enroll_pair_code));
+                    refs.meta.appendChild(prow);
                 }
                 // Decrypt batch size — worker-derived (the DEKs this approval
                 // would mint), not client-claimed meta. An anomalous batch is
@@ -164,8 +176,11 @@
                     srow.appendChild(el('dd', null, String(salts) + ' 条'));
                     refs.meta.appendChild(srow);
                 }
-                var note = el('p', 'hint vt-ap-meta-note',
-                    '除 IP 外均为客户端自报信息，仅供参考。');
+                var note = el('p', 'hint vt-ap-meta-note', enrolling
+                    ? '主机 / 用户为申请方自报；IP 与来源已由服务端验证。仅当配对码与终端上显示的一致时批准。'
+                    : hostVerified
+                        ? '主机 / 用户来自已登记的主机令牌，IP 已验证；其余为客户端自报信息，仅供参考。'
+                        : '除 IP 外均为客户端自报信息，仅供参考（该主机尚未 vt enroll）。');
                 refs.meta.parentNode.appendChild(note);
             }
         }

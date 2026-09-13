@@ -10,7 +10,7 @@ mod inject;
 mod records;
 mod rewrap;
 
-pub use commands::{auth, create, read, run};
+pub use commands::{auth, create, enroll, read, run};
 pub use doctor::doctor;
 pub use inject::{inject, inject_recover, supervisor_main, SUPERVISOR_SUBCOMMAND};
 pub use rewrap::rewrap;

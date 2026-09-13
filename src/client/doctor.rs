@@ -90,7 +90,25 @@ fn basis_human(tag: &str) -> String {
 fn doctor_redact(key: &str, value: &str) -> String {
     // Bearer secrets: presence + length is enough to diagnose; showing a
     // prefix in terminal scrollback helps nobody.
-    if matches!(key, "VT_AUTH" | "VT_PASSKEY_TOKEN") {
+    // VT_PASSKEY_TOKEN: say WHICH kind — the token id is public (it travels in
+    // a request header) and is what the admin 主机令牌 tab lists, so it is the
+    // one thing worth echoing; a bare master is flagged as the legacy shape.
+    if key == "VT_PASSKEY_TOKEN" {
+        return match crate::cf::WorkerAuth::parse(value) {
+            Ok(auth) => match auth.token_id {
+                Some(id) => format!("set (host token {id})"),
+                None => format!(
+                    "set (len {}) ⚠ legacy shared master — run `vt enroll`",
+                    value.len()
+                ),
+            },
+            Err(_) => format!(
+                "set (len {}) ⚠ malformed host token — run `vt enroll`",
+                value.len()
+            ),
+        };
+    }
+    if key == "VT_AUTH" {
         return format!("set (len {})", value.len());
     }
     // Named PRIVATE_KEY: expected to hold a vt:// ciphertext record — safe to
@@ -362,6 +380,17 @@ mod tests {
         let r = doctor_redact("VT_AUTH", "supersecrettoken");
         assert!(!r.contains("supersecret"), "got {r}");
         assert!(r.contains("len 16"));
+        // The passkey token names its kind; the secret half never appears.
+        let r = doctor_redact(
+            "VT_PASSKEY_TOKEN",
+            "vt1.AAAAAAAAAAAAAAAA.iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI",
+        );
+        assert_eq!(r, "set (host token AAAAAAAAAAAAAAAA)");
+        let r = doctor_redact("VT_PASSKEY_TOKEN", "sharedmaster");
+        assert!(
+            !r.contains("sharedmaster") && r.contains("legacy"),
+            "got {r}"
+        );
         // The private-key slot acknowledges a vt:// record but never echoes
         // the value — not even a prefix — when it holds anything else.
         let r = doctor_redact("VT_GIT_SSH_PRIVATE_KEY", "vt://0abcdef");

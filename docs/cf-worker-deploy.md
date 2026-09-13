@@ -12,7 +12,7 @@ CLI  ──WS /api/dek?poll_token──────▶  Worker
 phone (PWA) ── approve: WebAuthn + PRF ─▶ derives DEKs, seals to CLI pubkey ─▶ WS delivers
 ```
 
-- Ceremony endpoints live at the root (`/api/challenge`, `/api/dek`, `/api/approve`, `/api/reject`, `/a/:token`), secured by `HMAC(VT_AUTH_CF)` + unguessable tokens + WebAuthn.
+- Ceremony endpoints live at the root (`/api/challenge`, `/api/dek`, `/api/approve`, `/api/reject`, `/a/:token`), secured by a body HMAC keyed on the caller's per-host token (derived from `VT_AUTH_CF`; see [host-token.md](host-token.md)) + unguessable tokens + WebAuthn. `/api/enroll` is the unauthenticated, rate-limited request for such a token.
 - The admin surface (`/<ADMIN_SEG>/…`, currently `ADMIN_SEG = "kestrel"` in `cf-worker/src/index.ts`) is gated by **Cloudflare Access** at the edge plus `cf-worker/src/access.ts` JWT verification.
 
 Request bodies for `/api/challenge`, `/api/dek-cache`, `/api/approve`, and
@@ -193,11 +193,17 @@ reading repository-specific agent instructions.
 On every host that uses the phone-approval ceremony:
 
 ```bash
-export VT_PASSKEY_URL="https://vt.example.com"
-export VT_PASSKEY_TOKEN="<the VT_AUTH_CF value from step 4>"
+vt enroll --url https://vt.example.com
 ```
 
-`VT_PASSKEY_TOKEN` **must** equal the `VT_AUTH_CF` secret.
+It prints an approve URL and a pairing code; approve on the phone once the page
+shows the same code. The host's own `VT_PASSKEY_TOKEN` (valid 7 days, refreshed
+on every use) and `VT_PASSKEY_URL` are written to `~/.config/vt/config.toml`.
+Enrollment needs the `ENROLL_LIMITER` rate-limit binding from
+`wrangler.toml.example` (without it the Worker answers 503). Tokens are listed
+and revoked on the admin **主机令牌** tab. Never hand `VT_AUTH_CF` itself to a
+host; the bare-master form of `VT_PASSKEY_TOKEN` is accepted only as a
+migration path (logged `auth.legacy_master`). Details: [host-token.md](host-token.md).
 
 Optional: `VT_PASSKEY_UV` (or the global `vt --uv <level>` flag) asks a single
 host or command for a stricter approval than the Worker's policy requires —
@@ -244,8 +250,10 @@ expiry guard.
 - **After editing anything in `cf-worker/pwa/`:** `just bump-assets` stamps
   `<YYYYMMDD>-<git short hash>` into `ASSET_VER` (cache-busts the `?v=` asset
   URLs), then redeploy.
-- **Rotate the CLI token:** `wrangler secret put VT_AUTH_CF`, then update
-  `VT_PASSKEY_TOKEN` on all hosts.
+- **Cut one host off:** revoke its token on the 主机令牌 tab (immediate; the
+  host re-runs `vt enroll` to come back).
+- **Rotate the master:** `wrangler secret put VT_AUTH_CF` — every host token is
+  derived from it, so all hosts must `vt enroll` again afterwards.
 - **Invalidate all cached DEKs:** rotate `CACHE_SECKEY` (or use the admin
   clear-cache button).
 - **Revoke a Passkey:** use the setup page (bumps `epoch`), then

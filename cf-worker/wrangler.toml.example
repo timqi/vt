@@ -58,6 +58,17 @@ class_name = "AccountDO"
 tag = "v1"
 new_sqlite_classes = ["AccountDO"]
 
+# Per-IP throttle on POST /api/enroll — the ONE unauthenticated route that can
+# page the operator's phone (a host asking for its own VT_PASSKEY_TOKEN; see
+# docs/host-token.md). Without this binding the Worker refuses enrollment (503)
+# rather than run it unthrottled. `namespace_id` is any integer unique among the
+# rate limits in this account. 3 attempts / minute / IP is plenty for a human.
+[[unsafe.bindings]]
+name = "ENROLL_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 3, period = 60 }
+
 [vars]
 # Public origin / RP id for WebAuthn. Use your own domain.
 WORKER_ORIGIN = "https://vt.example.com"
@@ -119,7 +130,10 @@ CACHE_HIT_NOTIFY = "0"
 CACHE_ADMIN_EXTEND = "0"
 
 # Secrets (wrangler secret put — never inlined):
-#   VT_AUTH_CF        32-byte base64url token, daemon→Worker HMAC on /api/challenge
+#   VT_AUTH_CF        32-byte base64url master. Per-host VT_PASSKEY_TOKENs are
+#                     HKDF-derived from it at enrollment (docs/host-token.md); it is
+#                     also still accepted directly as the daemon HMAC key by hosts
+#                     that have not enrolled yet. NEVER hand it to a host.
 #   CREDENTIALS_JSON  JSON blob with passkey credentials (schema in src/credentials.ts)
 #   CACHE_SECKEY      32-byte base64url X25519 secret key enabling the opt-in DEK
 #                     cache (approve-time TTL → 免审批解密 within IP+pwd scope).

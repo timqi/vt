@@ -61,6 +61,40 @@ pub async fn create(vt_client: VTClient, type_arg: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `vt enroll [--url]`: obtain a per-host Worker token via a phone Passkey
+/// ceremony and persist it (plus the URL) in the config file. From then on the
+/// ordinary passkey path picks the token up like any other VT_PASSKEY_TOKEN.
+pub async fn enroll(config: &crate::config::ResolvedConfig, url: Option<&str>) -> Result<()> {
+    let url = match url.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(u) => u.to_owned(),
+        None => config
+            .value("VT_PASSKEY_URL")
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("no Worker URL: pass --url or set VT_PASSKEY_URL"))?,
+    };
+    ensure!(
+        url.starts_with("https://")
+            || url.starts_with("http://localhost")
+            || url.starts_with("http://127."),
+        "Worker URL must be https:// (got {url})"
+    );
+    let url = url.trim_end_matches('/').to_owned();
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+    let token = crate::cf::enroll(&url, &get_hostname(), &user).await?;
+    // Token value never printed. The file is the only copy.
+    let path = crate::config::upsert_config_values(&[
+        ("VT_PASSKEY_URL", url.as_str()),
+        ("VT_PASSKEY_TOKEN", token.as_str()),
+    ])?;
+    eprintln!("vt: enrolled — host token written to {}", path.display());
+    if std::env::var_os("VT_PASSKEY_TOKEN").is_some() {
+        eprintln!("vt: note: VT_PASSKEY_TOKEN is set in this environment and overrides the file; unset it to use the new token");
+    }
+    Ok(())
+}
+
 pub async fn auth(vt_client: VTClient, reason: &str) -> Result<()> {
     vt_client.auth(reason).await
 }

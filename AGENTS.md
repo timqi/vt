@@ -108,6 +108,14 @@ in [src/client/inject.rs](src/client/inject.rs). Keep these implementation bound
 
 Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
 
+- Hosts authenticate with per-host tokens (`vt1.<id>.<secret>`, secret =
+  HKDF(`VT_AUTH_CF`, id)); the edge verifies statelessly, the DO checks
+  liveness and slides expiry to now + 7 d on every use, never reviving a
+  revoked/expired token. `/api/enroll` is unauthenticated: keep the per-IP rate
+  limiter (absent → 503), the pending cap, and the pairing code. Issue a token
+  only inside `opApprove` → `commitEnroll`; never store the secret. On the token
+  path `meta.host`/`user` come from the record, never the body. Remove the
+  bare-master branch after migration, never widen it. See [docs/host-token.md](docs/host-token.md).
 - Worker-derived IP is the hard cache boundary; client `pwd` is advisory.
   Apply `cacheScopePwd` only inside `cacheCtx` for both reads and writes; retain
   literal `meta.pwd` and show `cache_scope_pwd` beside approval duration controls.

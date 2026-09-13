@@ -99,14 +99,15 @@ the same `create`, `read`, and `inject` commands; the approval URL is opened on
 the phone.
 
 ```bash
-export VT_PASSKEY_URL=https://vt.example.com
-export VT_PASSKEY_TOKEN=<the-worker-VT_AUTH_CF-value>
+vt enroll --url https://vt.example.com   # approve on the phone; compare the pairing code
 # Paste a URL produced by `vt create`.
 vt read 'vt://0<your-record>'
 ```
 
-For a persistent setup, put these values in `~/.config/vt/config.toml` using
-[`config.example.toml`](config.example.toml). Keep that file private.
+`vt enroll` writes this host's own `VT_PASSKEY_TOKEN` (valid 7 days, refreshed
+on every use) and `VT_PASSKEY_URL` to `~/.config/vt/config.toml`; see
+[`config.example.toml`](config.example.toml) for the other keys and keep that
+file private. Tokens can be revoked per host on the Worker's admin page.
 
 ## Commands
 
@@ -115,6 +116,7 @@ For a persistent setup, put these values in `~/.config/vt/config.toml` using
 | `version` | Show version information |
 | `init` | (macOS) Initialize passcode and passphrase in keychain |
 | `doctor` | Diagnose config sources, transport routing, Worker reachability, and caller-visible agent cache state |
+| `enroll [--url URL]` | Request this host's own Worker token via a phone Passkey approval (pairing code shown on both ends) and write it to the config file |
 | `create [--type raw\|totp]` | Encrypt a secret: interactive hidden input or piped stdin (one trailing newline stripped); piped type defaults to `raw`, never pass plaintext in argv |
 | `read <vt>` | Decrypt a vt protocol string |
 | `rewrap [--no-dry-run] [--backup] <file>...` | Re-encrypt legacy `vt://mac/...` URLs in files to the current envelope format (one agent/phone approval per batch) |
@@ -330,7 +332,7 @@ base64-encoded plaintext.
 |----------|-------------|---------|
 | `VT_AUTH` | SSH-agent authentication token (from `vt init`) | unset |
 | `VT_PASSKEY_URL` | Cloudflare Worker base URL for phone approval | unset |
-| `VT_PASSKEY_TOKEN` | HMAC token matching the Worker `VT_AUTH_CF` secret | unset |
+| `VT_PASSKEY_TOKEN` | This host's Worker token (`vt1.…`, written by `vt enroll`; the bare `VT_AUTH_CF` master is accepted only during migration) | unset |
 | `VT_PASSKEY_UV` | Requested WebAuthn user-verification level for phone approval (`discouraged`/`preferred`/`required`); same as `--uv`, raise-only — the Worker's policy decides the floor | unset |
 | `VT_BACKEND` | `auto`, `agent`, or `passkey` transport selection | `auto` |
 | `VT_CONFIG` | Override the config-file path | `~/.config/vt/config.toml` |

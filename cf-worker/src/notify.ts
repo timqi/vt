@@ -21,7 +21,7 @@ function truncate(s: string, max = 512): string {
 // cache-hit head: an anomalous batch is exactly what an approver should see before
 // tapping the link. 0 (auth/encrypt, or callers without a ceremony) drops the segment.
 export function metaLines(
-  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ssh_client' | 'ip' | 'reason'>,
+  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ip' | 'reason' | 'ip_prev'>,
   salts = 0,
 ): string[] {
   const who = [meta.user, meta.host].filter(Boolean).join('@');
@@ -36,12 +36,11 @@ export function metaLines(
     lines.push(meta.command.includes('\n') ? meta.command : `cmd: ${meta.command}`);
   }
   // The parent-process line mirrors the approval page's 父进程 row: users often
-  // decide from the notification alone, and "which program asked" is a
-  // higher-signal field than tty (still omitted here). Client-claimed, like
-  // every meta field except ip.
+  // decide from the notification alone, and "which program asked" is the
+  // highest-signal client-claimed field. ip is worker-verified; on the host-token
+  // path `ip_prev` flags that this token last spoke from somewhere else.
   if (meta.ppid_cmd) lines.push(`via: ${meta.ppid_cmd}`);
-  if (meta.ssh_client) lines.push(`ssh: ${meta.ssh_client}`);
-  if (meta.ip) lines.push(`ip: ${meta.ip}`);
+  if (meta.ip) lines.push(meta.ip_prev ? `ip: ${meta.ip}（上次 ${meta.ip_prev}）` : `ip: ${meta.ip}`);
   if (meta.reason) lines.push(`reason: ${meta.reason}`);
   return lines;
 }
@@ -49,7 +48,7 @@ export function metaLines(
 // Compose the human-facing approval message once; every channel reuses it.
 export function buildApprovalMessage(
   opKind: string,
-  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ssh_client' | 'ip' | 'reason'>,
+  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ip' | 'reason' | 'ip_prev'>,
   approveUrl: string,
   salts = 0,
 ): { title: string; body: string } {
@@ -169,7 +168,7 @@ export async function notifyApproval(
 // the hit). Returns the same aggregated warning string contract.
 export async function notifyCacheHit(
   env: Env,
-  meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd' | 'ssh_client' | 'ip' | 'reason'>,
+  meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd' | 'ip' | 'reason'>,
   salts: number,
   note?: string,
 ): Promise<string> {
