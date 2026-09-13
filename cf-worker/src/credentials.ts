@@ -2,7 +2,7 @@
 //
 // Schema (same as v1, unchanged):
 // {
-//   "v": 1, "epoch": 3,
+//   "v": 1,
 //   "c": [{
 //     "h": "<b64u(SHA-256(credential_id))>",  // lookup index
 //     "i": "<b64u(credential_id)>",            // for allowCredentials
@@ -12,6 +12,12 @@
 //     "t": 1716105600
 //   }]
 // }
+//
+// The admin setup page also stores an `epoch` counter it bumps on every
+// revocation and shows beside the credential list. It is a page-local operator
+// signal: the Worker never reads it, never writes CREDENTIALS_JSON, and parsing
+// stays tolerant of it (and of any other extra key) rather than declaring a
+// field nothing here consumes.
 
 import { b64uDec, b64uEnc, sha256 } from './crypto';
 
@@ -26,7 +32,6 @@ export interface CredentialEntry {
 
 export interface CredentialsBlob {
   v: number;
-  epoch?: number;
   c: CredentialEntry[];
 }
 

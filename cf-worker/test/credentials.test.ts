@@ -13,10 +13,12 @@ const entry = (over: Record<string, unknown> = {}) => ({
 });
 
 describe('parseCredentials', () => {
-  it('accepts a well-formed v1 blob', () => {
+  it('accepts a well-formed v1 blob, tolerating the setup page\'s `epoch`', () => {
+    // The Worker declares no `epoch` (nothing here consumes it), but a stored
+    // blob written by the setup page carries one and must still parse.
     const blob = parseCredentials(JSON.stringify({ v: 1, epoch: 3, c: [entry()] }));
     expect(blob.c).toHaveLength(1);
-    expect(blob.epoch).toBe(3);
+    expect((blob as unknown as { epoch?: number }).epoch).toBe(3);
   });
 
   it('rejects an unsupported version', () => {
