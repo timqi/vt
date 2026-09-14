@@ -135,18 +135,17 @@ fn bundle_notify_helper() -> Option<std::path::PathBuf> {
     (helper.is_file() && helper != exe).then_some(helper)
 }
 
+/// Bundled `VTApp notify` is the only transport: a bare `vt` outside the
+/// bundle logs and drops the notification (no osascript, no second path).
 fn notify_macos(title: &str, body: &str) {
-    // Sanitize BOTH fields identically before they leave the agent — the
-    // same filter guards the AppleScript interpolation of the fallback and
-    // the argv of the helper (control chars could still garble the native
-    // notification UI). All current callers pass static titles, but
-    // sanitizing the title too removes a latent injection if a future
-    // caller ever passes dynamic text.
+    let Some(helper) = bundle_notify_helper() else {
+        tracing::debug!("no bundled notify helper; notification dropped");
+        return;
+    };
+    // Control chars could garble the native notification UI; both fields
+    // are filtered so a future dynamic title gets the same treatment.
     let sanitize = |s: &str, max: usize| -> String {
-        s.chars()
-            .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
-            .take(max)
-            .collect()
+        s.chars().filter(|c| !c.is_control()).take(max).collect()
     };
     let safe = sanitize(body, 150);
     let safe_title = sanitize(title, 100);
@@ -157,25 +156,14 @@ fn notify_macos(title: &str, body: &str) {
     // the child so no zombie is left; the ≥30 s per-kind throttle bounds
     // thread churn.
     std::thread::spawn(move || {
-        if let Some(helper) = bundle_notify_helper() {
-            // Argv only — no shell, no AppleScript interpolation.
-            let ok = std::process::Command::new(&helper)
-                .args(["notify", "--title", &safe_title, "--body", &safe])
-                .status()
-                .is_ok_and(|s| s.success());
-            if ok {
-                return;
-            }
-            tracing::debug!("bundled notify helper failed, falling back to osascript");
+        // Argv only — no shell.
+        let ok = std::process::Command::new(&helper)
+            .args(["notify", "--title", &safe_title, "--body", &safe])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            tracing::debug!("bundled notify helper failed");
         }
-        let script = format!(
-            r#"display notification "{}" with title "{}""#,
-            safe, safe_title
-        );
-        let _ = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .status();
     });
 }
 

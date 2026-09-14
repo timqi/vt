@@ -86,14 +86,14 @@ v1, which this release then rejects until it is rebound on that binary.
 
 ## 3. Native notifications
 
-`notify_macos` in `src/server_macos/security.rs` sanitizes title and body once
-before either transport: control characters, quotes, and backslashes are
-removed, with 100-character title and 150-character body limits. A reaper
-thread invokes bundled `VTApp notify --title <t> --body <b>` without a shell.
-The Swift helper handles this mode before starting the menu app, uses
+`notify_macos` in `src/server_macos/security.rs` strips control characters
+from title and body, with 100-character title and 150-character body limits. A
+reaper thread invokes bundled `VTApp notify --title <t> --body <b>` without a
+shell. The Swift helper handles this mode before starting the menu app, uses
 `UNUserNotificationCenter`, and can request system notification permission on
-first use. Missing helper, launch failure, or unsuccessful helper exit falls
-back to `osascript` with the same sanitized text.
+first use. The bundled helper is the only transport: a bare `vt` outside
+VT.app logs at debug and drops the notification; a helper failure is logged,
+never retried through another path.
 
 Notification work is fire-and-forget from the protected operation. The thread
 waits for/reaps the helper, not the signing or decrypt handler; notification
