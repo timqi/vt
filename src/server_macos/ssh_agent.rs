@@ -1968,7 +1968,10 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             .unwrap()
             .encrypt(&AesGcmCrypto::generate_key())
             .unwrap();
-        store.set_encrypted_passphrase(&wrapped);
+        store.encrypted_passphrase = {
+            use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
+            BASE64_URL_SAFE_NO_PAD.encode(wrapped)
+        };
         store
     }
 

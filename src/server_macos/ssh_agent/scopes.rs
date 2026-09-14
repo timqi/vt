@@ -16,7 +16,7 @@ mod process;
 use paths::{find_git_root, is_ssh_client_path, workspace_root_acceptable};
 
 fn cwd_fallback_acceptable(cwd: &std::path::Path, home: Option<&std::path::Path>) -> bool {
-    paths::cwd_root_acceptable(cwd, home) && !darwin_user_temp_dir().is_some_and(|t| cwd == t)
+    paths::cwd_root_acceptable(cwd, home) && darwin_user_temp_dir().is_none_or(|t| cwd != t)
 }
 
 pub(super) struct PeerIdentity {

@@ -64,11 +64,6 @@ impl KeychainStore {
         }
     }
 
-    pub fn set_encrypted_passphrase(&mut self, bytes: &[u8]) {
-        self.encrypted_passphrase = BASE64_URL_SAFE_NO_PAD.encode(bytes);
-        self.wrap_v = WRAP_V2;
-    }
-
     /// Read the store from the keychain. Returns an error if the item does
     /// not exist or cannot be parsed — callers should treat "not initialized"
     /// distinctly from "parse failure" by inspecting the error message if
