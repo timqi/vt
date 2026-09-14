@@ -16,20 +16,16 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
     Biometric,
-    Fido2,
     Password,
 }
 
 impl AuthMethod {
     /// True if a successful auth via this method may grant a TTL-bounded
-    /// cache entry. All three methods qualify in the VT model: Touch ID
-    /// biometric, FIDO2 YubiKey touch, and the macOS account password each
-    /// require explicit physical or credentialed action per attempt.
+    /// cache entry. Both methods qualify in the VT model: Touch ID
+    /// biometric and the macOS account password each require explicit
+    /// physical or credentialed action per attempt.
     pub fn is_cacheable(self) -> bool {
-        matches!(
-            self,
-            AuthMethod::Biometric | AuthMethod::Fido2 | AuthMethod::Password
-        )
+        matches!(self, AuthMethod::Biometric | AuthMethod::Password)
     }
 }
 
@@ -360,7 +356,6 @@ mod tests {
     #[test]
     fn auth_outcome_is_success() {
         assert!(AuthOutcome::Success(AuthMethod::Biometric).is_success());
-        assert!(AuthOutcome::Success(AuthMethod::Fido2).is_success());
         assert!(AuthOutcome::Success(AuthMethod::Password).is_success());
         assert!(!AuthOutcome::Rejected.is_success());
         assert!(!AuthOutcome::Unavailable(UnavailableReason::NotInteractive).is_success());

@@ -59,7 +59,7 @@ binary at another path.
 
 ## Quick Start
 
-> Vault bootstrap and local key management (`init`, `secret *`, `fido2 *`,
+> Vault bootstrap and local key management (`init`, `secret *`,
 > `ssh agent`/`add`/`list`/`remove`/`comment`/`show`) require macOS Keychain and
 > local authentication. Linux uses a forwarded VT agent or the Worker;
 > `ssh keygen` and `ssh connect` work on both platforms. Steps 1–2 assume macOS.
@@ -122,7 +122,6 @@ file private. Tokens can be revoked per host on the Worker's admin page.
 | `inject --recover` | Restore ciphertext for any file left decrypted by a crashed/rebooted supervisor (run at login/boot; no auth) |
 | `auth [--reason <text>]` | Trigger bio auth via SSH agent forwarding (for PAM/sudo) |
 | `run -- argv...` | (SSH-agent path) Ask a forwarded macOS agent to launch an allowlisted program locally after Touch ID |
-| `fido2 {register,list,remove,remove-all}` | (macOS) Manage FIDO2/YubiKey credentials used as a Touch-ID fallback factor |
 | `secret export` | (macOS) Export the encrypted master secret |
 | `secret import` | (macOS) Import an encrypted master secret |
 | `secret rotate-passcode` | (macOS) Rotate the passcode for the master secret |
@@ -334,8 +333,8 @@ base64-encoded plaintext.
 ## Secret Management
 
 VT's macOS store is one Keychain item, `rusty.vault.store`, containing passcode
-and auth-token material plus the encrypted master passphrase, SSH keys, and
-optional FIDO2 credentials. Run the agent as the user who initialized it.
+and auth-token material plus the encrypted master passphrase and SSH keys.
+Run the agent as the user who initialized it.
 
 New stores use wrap v2, derived from passcode, `$USER`, and a fixed label, not
 the binary path. Legacy wrap v1 is path-bound; use

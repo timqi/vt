@@ -81,7 +81,7 @@ pub enum ExtBody<T> {
 pub enum ErrKind {
     /// Unclassified server error.
     Generic,
-    /// User actively rejected the biometric / FIDO2 / password prompt.
+    /// User actively rejected the biometric / password prompt.
     AuthRejected,
     /// Screen is locked or off-console; cannot prompt right now.
     SessionLocked,
@@ -313,11 +313,7 @@ mod tests {
     #[test]
     fn outcome_to_err_strict_never_returns_none_for_failure() {
         // Success path: None (unchanged).
-        for m in [
-            AuthMethod::Biometric,
-            AuthMethod::Fido2,
-            AuthMethod::Password,
-        ] {
+        for m in [AuthMethod::Biometric, AuthMethod::Password] {
             assert_eq!(outcome_to_err_strict(AuthOutcome::Success(m)), None);
         }
         // All non-Success outcomes resolve to Some(_) — the fail-closed
@@ -339,10 +335,6 @@ mod tests {
     fn outcome_to_err_table() {
         assert_eq!(
             outcome_to_err(AuthOutcome::Success(AuthMethod::Biometric)),
-            None
-        );
-        assert_eq!(
-            outcome_to_err(AuthOutcome::Success(AuthMethod::Fido2)),
             None
         );
         assert_eq!(

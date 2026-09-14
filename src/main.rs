@@ -213,29 +213,6 @@ enum Commands {
     /// keygen/connect are cross-platform)
     #[command(subcommand)]
     Ssh(SshCommands),
-    /// (Mac only) Manage FIDO2 (YubiKey) credentials for Touch ID fallback
-    #[cfg(target_os = "macos")]
-    #[command(subcommand)]
-    Fido2(Fido2Commands),
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Subcommand, PartialEq)]
-pub enum Fido2Commands {
-    /// Register a new YubiKey. Requires Touch ID or password first.
-    Register {
-        #[arg(short = 'l', long = "label", help = "Human label for this credential")]
-        label: Option<String>,
-    },
-    /// List registered YubiKey credentials
-    List,
-    /// Remove a credential by short-id prefix
-    Remove {
-        #[arg(help = "Short-id prefix (shown in `vt fido2 list`)")]
-        short_id: String,
-    },
-    /// Remove all credentials
-    RemoveAll,
 }
 
 #[cfg(target_os = "macos")]
@@ -513,15 +490,6 @@ async fn run(cli: Cli, config: config::ResolvedConfig) -> Result<()> {
             } => server_macos::ssh_cli::ssh_comment(fingerprint, comment),
             #[cfg(target_os = "macos")]
             SshCommands::Show { fingerprint } => server_macos::ssh_cli::ssh_show(fingerprint),
-        },
-        #[cfg(target_os = "macos")]
-        Commands::Fido2(cmd) => match cmd {
-            Fido2Commands::Register { label } => {
-                server_macos::fido2_cli::fido2_register(label.clone())
-            }
-            Fido2Commands::List => server_macos::fido2_cli::fido2_list(),
-            Fido2Commands::Remove { short_id } => server_macos::fido2_cli::fido2_remove(short_id),
-            Fido2Commands::RemoveAll => server_macos::fido2_cli::fido2_remove_all(),
         },
         Commands::Create { secret_type } => {
             let vt_client = VTClient::new(config.clone())?;

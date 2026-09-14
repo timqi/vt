@@ -72,7 +72,7 @@ original agent error's code.
 | `Ok`                 | success (not on the error enum, listed for completeness)     | 0         |
 | `Generic`            | unclassified handler failure, including key-load/sign/spawn failures | 1  |
 | `Unknown`            | unrecognized future wire `kind` value                       | 1         |
-| `AuthRejected`       | user actively rejected Touch ID / FIDO2 / password           | 10        |
+| `AuthRejected`       | user actively rejected Touch ID / password                   | 10        |
 | `SessionLocked`      | screen locked or off-console (`UnavailableReason::NotInteractive`) | 11    |
 | `NoGuiSession`       | no GUI session at all (LaunchDaemon-style context)           | 12        |
 | `NotInitialized`     | handler cannot validate or load master-key material after auth-cipher derivation | 13 |

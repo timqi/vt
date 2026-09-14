@@ -245,9 +245,9 @@ pub enum EvalOutcome {
     /// `1d9d5d1`.
     Rejected,
     /// Biometry was attempted but is locked/unavailable/not-enrolled, or the
-    /// device has no passcode. Caller should try the next factor in the chain
-    /// (FIDO2 → password). This is the new fallback path the objc2 refactor
-    /// unlocks — previously these were indistinguishable from Rejected.
+    /// device has no passcode. Caller should fall back to the system password.
+    /// This is the fallback path the objc2 refactor unlocks — previously these
+    /// were indistinguishable from Rejected.
     TryFallback,
     /// System couldn't display dialog (NotInteractive, SystemCancel, etc.).
     /// Caller should return `Unavailable`.
@@ -367,7 +367,7 @@ mod la {
         if matches!(outcome, EvalOutcome::TryFallback) {
             tracing::info!(
                 la_error_code = code,
-                "biometry unavailable for evaluatePolicy; falling back to FIDO2/password"
+                "biometry unavailable for evaluatePolicy; falling back to password"
             );
         }
         outcome
@@ -378,22 +378,18 @@ mod la {
 ///
 /// **Pre-check**: if `CGSessionCopyCurrentDictionary` says the screen is
 /// locked / off-console / login pending → `Unavailable(NotInteractive)`.
-/// If the dict is NULL → `Unavailable(NoGuiSession)`. No FIDO2 fallback in
+/// If the dict is NULL → `Unavailable(NoGuiSession)`. No password fallback in
 /// either case (physical-presence model).
 ///
 /// **Touch ID** (when `canEvaluatePolicy` for biometrics succeeds): success
 /// → `Biometric`. `EvalOutcome::Rejected` is terminal (per commit `1d9d5d1`)
 /// after a session re-check disambiguates "user rejected" from "screen
 /// locked mid-prompt". `EvalOutcome::TryFallback` (Lockout / NotAvailable /
-/// NotEnrolled / PasscodeNotSet) **falls through to FIDO2 → password** —
-/// new behavior unlocked by the objc2 refactor; previously these errors
-/// were indistinguishable from a user rejection.
-///
-/// **FIDO2 → Password chain**: `FidoOutcome::Rejected` aborts; `Skip` falls
-/// to system password (`DeviceOwnerAuthentication` policy).
+/// NotEnrolled / PasscodeNotSet) **falls through to the system password**
+/// (`DeviceOwnerAuthentication` policy) — behavior unlocked by the objc2
+/// refactor; previously these errors were indistinguishable from a user
+/// rejection.
 pub fn authenticate(reason: &str) -> AuthOutcome {
-    use super::fido2::FidoOutcome;
-
     // Pre-check: screen lock state. Cached for 1s to bound CPU under spammy
     // callers (locked-screen + tight-loop client = naturally O(1)).
     match screen_state_cached() {
@@ -431,19 +427,18 @@ pub fn authenticate(reason: &str) -> AuthOutcome {
                 return AuthOutcome::Unavailable(UnavailableReason::NotInteractive);
             }
             EvalOutcome::TryFallback => {
-                // Biometry locked/unavailable: drop into FIDO2 → password.
+                // Biometry locked/unavailable: drop into the password fallback.
             }
         }
     }
 
-    // Re-check session state before entering the fallback chain. We may have
+    // Re-check session state before the password fallback. We may have
     // arrived here via two paths:
     //   1. `can_evaluate(WithBiometrics) == false` upfront (no LAContext call).
     //   2. `evaluate` returned `TryFallback` (Lockout / NotAvailable / etc.).
     // In either case, the screen could have locked since the cached pre-check
-    // (1s TTL window). Don't prompt FIDO2 / password on a locked machine —
-    // physical-presence model says no auth on a locked screen, even with a
-    // YubiKey plugged in.
+    // (1s TTL window). Don't prompt for the password on a locked machine —
+    // physical-presence model says no auth on a locked screen.
     match screen_state_now() {
         SessionState::NotInteractive => {
             notify_locked_rejected(reason);
@@ -453,12 +448,6 @@ pub fn authenticate(reason: &str) -> AuthOutcome {
             return AuthOutcome::Unavailable(UnavailableReason::NoGuiSession);
         }
         SessionState::Interactive => {}
-    }
-
-    match super::fido2::authenticate(reason) {
-        FidoOutcome::Success => return AuthOutcome::Success(AuthMethod::Fido2),
-        FidoOutcome::Rejected => return AuthOutcome::Rejected,
-        FidoOutcome::Skip => {}
     }
 
     match la::evaluate(la::Policy::DeviceOwner, reason) {
@@ -503,13 +492,12 @@ pub fn create_and_save_passcode_passphrase(real_passphrase: &[u8; 32]) -> Result
     let aes = AesGcmCrypto::new(&passphrase_secret)?;
     let encrypted_passphrase = aes.encrypt(real_passphrase)?;
 
-    // Preserve any pre-existing SSH keys / FIDO2 credentials on rotate.
-    // The rotated passcode does not change `real_passphrase` (the master key
-    // for SSH/FIDO2 ciphertexts), so those blobs remain decryptable.
+    // Preserve any pre-existing SSH keys on rotate. The rotated passcode does
+    // not change `real_passphrase` (the master key for the SSH ciphertext), so
+    // that blob remains decryptable.
     let mut store = KeychainStore::new(&passcode_and_auth_token, &encrypted_passphrase);
     if let Ok(existing) = KeychainStore::load() {
         store.encrypted_ssh_keys = existing.encrypted_ssh_keys;
-        store.encrypted_fido2 = existing.encrypted_fido2;
     }
     store.save()?;
     tracing::info!("keychain store saved!");
@@ -525,7 +513,7 @@ pub fn create_and_save_passcode_passphrase(real_passphrase: &[u8; 32]) -> Result
 /// The passphrase cipher is supplied separately so callers can hold it
 /// long-term (serve) without keeping the decrypted master key in memory.
 ///
-/// Returns both the cipher (SSH key and FIDO2 credential store) and the raw 32-byte master
+/// Returns both the cipher (SSH key store) and the raw 32-byte master
 /// key (needed as HKDF IKM for v2 envelope DEK derivation). The raw key is
 /// returned in a `Zeroizing` wrapper so it is wiped from memory on drop;
 /// callers should drop it as soon as derivation is complete.
@@ -604,7 +592,7 @@ fn wrap_secret_for(wrap_v: u32, passcode: &[u8; 32], bin_path: Option<&str>) -> 
 /// Tries, in order: the store's recorded wrap, then (for v1 stores) the
 /// explicit `old_bin_path` string — the old binary need not exist, only its
 /// path enters the derivation. Preserves `passcode_and_auth_token` (VT_AUTH),
-/// `encrypted_ssh_keys`, and `encrypted_fido2` untouched.
+/// and `encrypted_ssh_keys` untouched.
 pub(super) fn rewrap_passphrase(
     store: &mut super::store::KeychainStore,
     old_bin_path: Option<&str>,
@@ -650,7 +638,7 @@ pub(super) fn rewrap_passphrase(
 
 /// Transparent wrap v1→v2 upgrade, run at agent startup (docs/app-bundle.md
 /// §2). Under the store flock: re-checks `wrap_v == 1`, rewraps only
-/// `encrypted_passphrase`, never touches passcode/auth_token/SSH/FIDO2
+/// `encrypted_passphrase`, never touches passcode/auth_token/SSH
 /// blobs. Returns Ok(false) if the store is absent or already v2; unwrap
 /// failure (binary already moved before upgrading) is left to
 /// `vt secret rebind` and reported as an error for the caller to log.
@@ -711,7 +699,6 @@ mod tests {
         let mut store = KeychainStore::new(&passcode_and_auth_token, &v1_wrapped);
         store.set_encrypted_passphrase(&v1_wrapped, WRAP_V1);
         store.set_encrypted_ssh_keys(b"ssh-blob");
-        store.set_encrypted_fido2(b"fido2-blob");
         let tokens_before = store.passcode_and_auth_token.clone();
 
         // v1 (old path) -> v2: recorded-wrap candidate fails (current_exe !=
@@ -740,10 +727,6 @@ mod tests {
         assert_eq!(
             store.encrypted_ssh_keys.as_deref(),
             Some(BASE64_URL_SAFE_NO_PAD.encode(b"ssh-blob").as_str())
-        );
-        assert_eq!(
-            store.encrypted_fido2.as_deref(),
-            Some(BASE64_URL_SAFE_NO_PAD.encode(b"fido2-blob").as_str())
         );
     }
 
@@ -873,14 +856,14 @@ mod tests {
     #[test]
     fn classify_la_biometry_not_paired_is_try_fallback() {
         // -12: hardware paired state lost. Same family as NotAvailable —
-        // biometry can't run, but other factors (FIDO2/password) might.
+        // biometry can't run, but the password fallback might.
         assert_eq!(classify_la_error(-12), EvalOutcome::TryFallback);
     }
 
     #[test]
     fn classify_la_biometry_disconnected_is_try_fallback() {
         // -13: sensor temporarily disconnected (e.g. external Touch ID device).
-        // Treat as TryFallback so the user can still auth via FIDO2 / password.
+        // Treat as TryFallback so the user can still auth via password.
         assert_eq!(classify_la_error(-13), EvalOutcome::TryFallback);
     }
 

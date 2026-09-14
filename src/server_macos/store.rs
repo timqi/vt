@@ -1,10 +1,10 @@
 //! Single-keychain-item storage for all vt secrets.
 //!
-//! Background: vt previously used four separate keychain items
+//! Background: vt previously used separate keychain items per secret type
 //! (`rusty.vault.passcode`, `rusty.vault.passphrase`, `rusty.vault.ssh_keys`,
-//! `rusty.vault.fido2_credentials`). Each item carries its own ACL, so a binary
-//! whose codesign requirement no longer matches gets one login-password prompt
-//! per item on first access — three to four prompts after every rebuild.
+//! ...). Each item carries its own ACL, so a binary whose codesign requirement
+//! no longer matches gets one login-password prompt per item on first access
+//! — several prompts after every rebuild.
 //!
 //! Consolidating into a single `rusty.vault.store` reduces that to at most one
 //! prompt per process, regardless of how many secret types are read.
@@ -52,10 +52,6 @@ pub struct KeychainStore {
     /// `None` means no SSH keys have been added yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_ssh_keys: Option<String>,
-    /// base64 of AES-GCM ciphertext wrapping the FIDO2-credential JSON blob.
-    /// `None` means no FIDO2 credentials have been registered.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encrypted_fido2: Option<String>,
 }
 
 impl KeychainStore {
@@ -68,7 +64,6 @@ impl KeychainStore {
             passcode_and_auth_token: BASE64_URL_SAFE_NO_PAD.encode(passcode_and_auth_token),
             encrypted_passphrase: BASE64_URL_SAFE_NO_PAD.encode(encrypted_passphrase),
             encrypted_ssh_keys: None,
-            encrypted_fido2: None,
         }
     }
 
@@ -129,24 +124,9 @@ impl KeychainStore {
         self.encrypted_ssh_keys = Some(BASE64_URL_SAFE_NO_PAD.encode(bytes));
     }
 
-    pub fn encrypted_fido2_bytes(&self) -> Result<Option<Vec<u8>>> {
-        match &self.encrypted_fido2 {
-            Some(b64) => Ok(Some(
-                BASE64_URL_SAFE_NO_PAD
-                    .decode(b64)
-                    .context("invalid base64 in encrypted_fido2")?,
-            )),
-            None => Ok(None),
-        }
-    }
-
-    pub fn set_encrypted_fido2(&mut self, bytes: &[u8]) {
-        self.encrypted_fido2 = Some(BASE64_URL_SAFE_NO_PAD.encode(bytes));
-    }
-
     /// Acquire the cross-process write lock, load the store, run `f`, then
     /// save. Used for user-triggered RMW operations (ssh add/remove,
-    /// rotate-passcode, fido2 register/remove). Blocks if another vt process
+    /// rotate-passcode). Blocks if another vt process
     /// is currently inside its own `modify` call.
     pub fn modify<F>(f: F) -> Result<()>
     where
@@ -157,25 +137,6 @@ impl KeychainStore {
         f(&mut store)?;
         store.save()?;
         Ok(())
-    }
-
-    /// Best-effort RMW. Returns `Ok(false)` if the file lock is currently
-    /// held by another process — caller should accept that the update did
-    /// not happen and continue. Used by the FIDO2 sign-counter persistence
-    /// path, which runs inside the SSH `sign()` handler while a tokio read
-    /// lock is held; blocking on a file lock there could starve other SSH
-    /// sessions waiting to add/remove keys.
-    pub fn try_modify<F>(f: F) -> Result<bool>
-    where
-        F: FnOnce(&mut Self) -> Result<()>,
-    {
-        let Some(_lock) = StoreLock::try_acquire()? else {
-            return Ok(false);
-        };
-        let mut store = Self::load()?;
-        f(&mut store)?;
-        store.save()?;
-        Ok(true)
     }
 }
 
@@ -210,17 +171,6 @@ impl StoreLock {
             .map_err(|e| anyhow!("failed to acquire keychain lock: {e}"))?;
         Ok(Self { file })
     }
-
-    fn try_acquire() -> Result<Option<Self>> {
-        let file = Self::open_lock_file()?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self { file })),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => {
-                Err(anyhow!("failed to try-acquire keychain lock: {e}"))
-            }
-        }
-    }
 }
 
 impl Drop for StoreLock {
@@ -245,21 +195,29 @@ mod tests {
         );
         assert_eq!(parsed.encrypted_passphrase_bytes().unwrap(), vec![1u8; 60]);
         assert!(parsed.encrypted_ssh_keys.is_none());
-        assert!(parsed.encrypted_fido2.is_none());
     }
 
     #[test]
     fn test_serde_roundtrip_with_optional_fields() {
         let mut store = KeychainStore::new(&[2u8; 64], &[3u8; 60]);
         store.set_encrypted_ssh_keys(&[4u8; 100]);
-        store.set_encrypted_fido2(&[5u8; 50]);
         let json = serde_json::to_vec(&store).unwrap();
         let parsed: KeychainStore = serde_json::from_slice(&json).unwrap();
         assert_eq!(
             parsed.encrypted_ssh_keys_bytes().unwrap(),
             Some(vec![4u8; 100])
         );
-        assert_eq!(parsed.encrypted_fido2_bytes().unwrap(), Some(vec![5u8; 50]));
+    }
+
+    /// A store written by a build that still had the FIDO2 fallback carries
+    /// `encrypted_fido2`; it parses, and the blob is dropped on the next save.
+    #[test]
+    fn test_legacy_fido2_field_is_ignored_and_dropped() {
+        let json = r#"{"v":1,"passcode_and_auth_token":"AA","encrypted_passphrase":"BB","encrypted_fido2":"CC"}"#;
+        let parsed: KeychainStore = serde_json::from_str(json).unwrap();
+        assert!(parsed.encrypted_ssh_keys.is_none());
+        let out = serde_json::to_string(&parsed).unwrap();
+        assert!(!out.contains("encrypted_fido2"));
     }
 
     #[test]
@@ -267,7 +225,6 @@ mod tests {
         let store = KeychainStore::new(&[0u8; 64], &[1u8; 60]);
         let json = serde_json::to_string(&store).unwrap();
         assert!(!json.contains("encrypted_ssh_keys"));
-        assert!(!json.contains("encrypted_fido2"));
     }
 
     #[test]
@@ -275,6 +232,5 @@ mod tests {
         let json = r#"{"v":1,"passcode_and_auth_token":"AA","encrypted_passphrase":"BB"}"#;
         let parsed: KeychainStore = serde_json::from_str(json).unwrap();
         assert!(parsed.encrypted_ssh_keys.is_none());
-        assert!(parsed.encrypted_fido2.is_none());
     }
 }

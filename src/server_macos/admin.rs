@@ -117,7 +117,7 @@ pub async fn rotate_passcode() -> Result<()> {
 /// label), or back to v1 with `--to-v1` before rolling back to an old
 /// binary. `--old-bin-path` supplies the path term for v1 stores written by
 /// a binary at a different location (docs/app-bundle.md §2). Runs under the
-/// store flock; preserves VT_AUTH, SSH keys, and FIDO2 blobs byte-for-byte.
+/// store flock; preserves VT_AUTH and SSH keys byte-for-byte.
 pub async fn rebind(old_bin_path: Option<String>, to_v1: bool) -> Result<()> {
     if !local_authentication("rebind master key wrap") {
         Err(anyhow::anyhow!(

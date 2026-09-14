@@ -1,8 +1,8 @@
 # VT coding-agent guide
 
 This is the canonical agent guide; `CLAUDE.md` is a relative symlink to it.
-VT is one Rust binary with a macOS SSH-agent transport (Touch ID, Keychain,
-optional FIDO2) and a Cloudflare Worker transport (Passkey/WebAuthn).
+VT is one Rust binary with a macOS SSH-agent transport (Touch ID, Keychain)
+and a Cloudflare Worker transport (Passkey/WebAuthn).
 
 ## Principles
 
@@ -57,7 +57,7 @@ the rules fail on the thing, not on the number.
 | --- | --- | --- |
 | `src/core/` | 1.1k | record format, crypto, wire envelopes, authorization engine and session model — platform-blind |
 | `src/client/` | 1.4k | CLI verbs, `inject` with its recovery supervisor, `doctor`, record parsing |
-| `src/server_macos/` | 4.5k | SSH agent, scopes, Keychain, FIDO2, socket owner check, audit push, UI status; step 4 of refactor.md decides the scopes share |
+| `src/server_macos/` | 4.5k | SSH agent, scopes, Keychain, socket owner check, audit push, UI status; step 4 of refactor.md decides the scopes share |
 | root `src/*.rs` | 2.5k | entry, config, `cf.rs` Worker client, `ssh_sign.rs` relay routing, caller metadata, audit |
 | `cf-worker/src/` | 3.5k | one DO owning state, routes, host tokens, DEK cache policy, WebAuthn, notifications, admin page |
 | one module | 750 | rule 2 before splitting; `core/authorization.rs`, `server_macos/ssh_agent.rs`, `client/inject.rs` are the open tripwires |

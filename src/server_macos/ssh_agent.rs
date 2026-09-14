@@ -2252,11 +2252,8 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     // --- AuthMethod::is_cacheable tests ---
 
     #[test]
-    fn test_auth_method_is_cacheable_includes_fido2() {
-        // FIDO2 (YubiKey touch) is treated as equivalent to Touch ID for
-        // cache-grant purposes — verify the policy is in effect.
+    fn test_auth_method_is_cacheable() {
         assert!(AuthMethod::Biometric.is_cacheable());
-        assert!(AuthMethod::Fido2.is_cacheable());
         assert!(AuthMethod::Password.is_cacheable());
     }
 }

@@ -82,7 +82,7 @@ The old binary need not exist; the exact resolved path string is sufficient.
 On success it writes v2 and tells the operator to restart a running agent.
 
 Only `encrypted_passphrase` and `wrap_v` change. Passcode/auth token (`VT_AUTH`),
-encrypted SSH keys, and encrypted FIDO2 blobs are preserved byte-for-byte.
+and encrypted SSH keys are preserved byte-for-byte.
 The rewrap mutator must not call `create_and_save_passcode_passphrase`, which
 mints fresh passcode/auth-token material and would rotate client credentials.
 
@@ -303,8 +303,8 @@ cargo test --locked core::authorization::tests
 ```
 
 On macOS, `test_rewrap_round_trip_preserves_store` in
-`src/server_macos/security.rs` checks v1/v2/v1 recovery and untouched token/SSH/
-FIDO2 fields over an in-memory store. `ui_status_token_gate_locked_report_and_revoke`
+`src/server_macos/security.rs` checks v1/v2/v1 recovery and untouched token/SSH
+fields over an in-memory store. `ui_status_token_gate_locked_report_and_revoke`
 in `src/server_macos/ssh_agent.rs` checks absent/wrong/correct tokens, unknown
 actions, locked status, labels/expiry, and revoke. The same module tests idle
 dual-clock expiry and lock/wake watcher classification. Run its tests and the

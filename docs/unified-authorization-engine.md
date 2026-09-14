@@ -22,7 +22,7 @@ Both cache durations default to `0`. `ReusePolicy::from_ttl_secs(0)` selects
 first-class `Fresh`, never `StrictTtl(0)`. Fresh requests do not read or write
 grants but still use prompt serialization, live validation, epoch checks,
 permits, and decision audit. A missing reusable subject also makes a request
-effectively fresh. Biometric, FIDO2, and password approvals are cacheable
+effectively fresh. Biometric and password approvals are cacheable
 methods when the operation and scope permit reuse (`AuthMethod::is_cacheable`).
 
 Agent flags and `[agent]` defaults are documented in
@@ -205,4 +205,4 @@ cargo test --locked server_macos::ssh_agent
 
 Repository gates are `cargo test`, `just check`, and `just check-worker`.
 Linux does not compile the macOS adapter or handlers. Unit tests do not replace
-native Touch ID/FIDO2/password, lock/wake/idle, Keychain, and notification checks.
+native Touch ID/password, lock/wake/idle, Keychain, and notification checks.
