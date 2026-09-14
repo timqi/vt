@@ -472,7 +472,7 @@ pub async fn enroll(worker_url: &str, host: &str, user: &str) -> Result<Zeroizin
         let text = resp.text().await.unwrap_or_default();
         let hint = match status {
             429 => " (rate limited — wait a minute, or approve/expire the pending requests first)",
-            503 => " (the Worker has no ENROLL_LIMITER binding; see docs/host-token.md)",
+            503 => " (the Worker has no LIMITER binding; see docs/host-token.md)",
             _ => "",
         };
         bail!("enroll: HTTP {status}: {text}{hint}");

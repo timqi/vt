@@ -9,25 +9,6 @@ pub fn get_hostname() -> String {
         .to_string()
 }
 
-/// Numeric parent PID of the current process (libc::getppid). 0 where
-/// unavailable. Reported to the worker for audit/forensics only — the DEK cache
-/// is bound to the host token + client-reported project, not to the PID (ppid
-/// was both spoofable and unstable across orchestrated shells, so it was
-/// dropped from the binding).
-#[cfg(unix)]
-pub fn current_ppid() -> u32 {
-    let p = unsafe { libc::getppid() };
-    if p > 0 {
-        p as u32
-    } else {
-        0
-    }
-}
-#[cfg(not(unix))]
-pub fn current_ppid() -> u32 {
-    0
-}
-
 /// Collect the per-process display fields shared by both the CF ceremony
 /// (phone approval page) and the SSH-agent (Touch ID prompt) paths. Strings
 /// are pre-sanitized (control chars stripped, length-capped).

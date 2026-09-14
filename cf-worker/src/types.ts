@@ -499,8 +499,6 @@ export interface CacheEntry {
   origin_token_id: string;
   /** Worker-derived source IP at approval; audit/forensics only, not bound. */
   ip: string;
-  /** Legacy (pre-trim entries only); no longer written. */
-  ppid?: number;
   ppid_cmd: string;
   /** Client-reported project (for the listing) and name claim at approval;
    *  absent on entries written before they were stored. */
