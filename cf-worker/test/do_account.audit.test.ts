@@ -32,6 +32,7 @@ describe('AccountAudit persistence and projection', () => {
       audit.broadcastRow(auditKey(ch.approve_token), 'insert');
       const initial = audit.query(new URLSearchParams());
       expect(pushed).toEqual([{ kind: 'audit', event: 'insert', row: initial.rows[0] }]);
+      expect(initial.rows[0]!.project).toBe(makeMeta().project);
       audit.finalize(ch.approve_token, 'approved', 123);
       audit.setCacheTtl(ch.approve_token, 1200, 1000);
       audit.bumpCacheExpiry(ch.approve_token, 2000);
@@ -184,7 +185,7 @@ describe('AccountAudit persistence and projection', () => {
       const row = audit.query(new URLSearchParams()).rows[0]!;
       expect(row).toMatchObject({
         token_id: 'historical', created_ms: 123, status: 'approved', seq: row.id,
-        source: 'ceremony', cache_ttl_s: null, cache_expires_ms: null, peer_exe: null,
+        source: 'ceremony', cache_ttl_s: null, cache_expires_ms: null, peer_exe: null, project: null,
       });
       audit.create(makeChallenge());
       expect(audit.query(new URLSearchParams()).snapshot_seq).toBeGreaterThan(row.seq);

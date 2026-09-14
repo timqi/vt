@@ -63,7 +63,7 @@ export function buildApprovalMessage(
 // (no phone approval); the agent's Touch-ID-cache ingest path passes its own
 // (免 Touch ID). `salts` of 0 (e.g. an agent `sign` hit has no records) drops
 // the count segment rather than printing "0 条". `names` are the served
-// records' labels (owned name, 自报 claim or 未命名 — account_names.nameLabel),
+// records' labels (owned name, 自报 claim or salt prefix — account_names.nameLabel),
 // the first few of them: which secrets went out without a tap.
 export function buildCacheHitMessage(
   meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd'>,

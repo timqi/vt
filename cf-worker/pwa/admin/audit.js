@@ -51,8 +51,11 @@ vt.tabs.audit = function (panel) {
   // max-width (see .trunc.* in admin.css) so a long host / command truncates
   // with an ellipsis instead of widening the table into a horizontal scroll.
   // The full value lives whole in the row's detail sheet.
-  function cellClipped(text, cls) {
-    return cell(vt.el('span', 'trunc ' + cls, (text === null || text === undefined) ? '' : String(text)));
+  function cellClipped(content, cls) {
+    var span = vt.el('span', 'trunc ' + cls);
+    if (content && content.nodeType) span.appendChild(content);
+    else span.textContent = (content === null || content === undefined) ? '' : String(content);
+    return cell(span);
   }
 
   // Friendly type label. DEK-cache events share op_kind='cache'; the status
@@ -95,6 +98,7 @@ vt.tabs.audit = function (panel) {
     var live = hasLiveCache(r);
     var badge = statusBadge(r);
     var recs = vt.recordsSummary(r.records, r.salts);
+    var proj = vt.projectName(r.project);
     // 缓存: live → TTL label; armed-but-elapsed → grey 过期; never armed → —.
     var cache = (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) ? (live ? ttlLabel(r.cache_ttl_s) : '过期') : '—';
     // 操作: a "清除缓存" button on EVERY approval that ever armed a cache — not
@@ -117,12 +121,16 @@ vt.tabs.audit = function (panel) {
         // or the bare count for rows written before names were stored.
         // Command and IP live in the detail sheet.
         return [cell(fmtTime(r.created_ms)), cell(badge), cellClipped(r.host, 'col-host'),
-          cellClipped(recs, 'col-rec'), cell(cache, cache === '过期' ? 'cache-expired' : null), cell(btn)];
+          cellClipped(proj, 'col-proj'), cellClipped(recs, 'col-rec'),
+          cell(cache, cache === '过期' ? 'cache-expired' : null), cell(btn)];
       },
       row: function () {
+        // Sub line: the project, then the records; the full path is in the sheet.
+        var line = (proj || recs) ? vt.el('div', null, proj) : null;
+        if (line && recs) { if (proj) line.appendChild(document.createTextNode(' · ')); line.appendChild(recs); }
         return {
           main: r.host || '—',
-          sub: [recs ? vt.el('div', null, recs) : null,
+          sub: [line,
             vt.el('div', null, fmtTime(r.created_ms) + (cache !== '—' ? ' · 缓存 ' + cache : ''))],
           trail: badge, actions: btn ? [btn] : [],
         };
@@ -291,6 +299,7 @@ vt.tabs.audit = function (panel) {
     addRow(dl, '主机', r.host);
     addRow(dl, '用户', r.user);
     addRow(dl, '目录', r.pwd);
+    addRow(dl, '项目', r.project);
     addRow(dl, '终端', r.tty);
     addRow(dl, '父进程', r.ppid_cmd);
     if (r.ppid != null) addRow(dl, '父进程PID', r.ppid);

@@ -252,7 +252,9 @@ tbody tr.clickable { cursor: pointer; }
    table; the whole value lives in the detail sheet or hovercard. */
 .trunc { display: inline-block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; max-width: 100%; }
 .trunc.col-host { max-width: 120px; }
+.trunc.col-proj { max-width: 120px; }
 .trunc.col-rec  { max-width: 260px; }
+.rec-summary code, .rec-name.salt { font-family: var(--mono); }
 
 /* Record names: one list, renameable in place (admin.js vt.recordList). The
    name is a button so the rename target is a real control; unnamed records

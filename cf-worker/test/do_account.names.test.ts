@@ -4,7 +4,8 @@
 //   • a name typed on the page lands only through a VERIFIED approval, never over an owned name;
 //   • rename is a session-gated PUT; an empty name deletes;
 //   • oversize / miscounted suggestions are refused at the edge (400);
-//   • names flow to audit rows (ceremony + hit), the cache listing and the hit push.
+//   • names flow to audit rows (ceremony + hit), the cache listing and the hit push;
+//   • a record with neither name nor claim is labeled by its salt prefix, never 未命名.
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { env } from 'cloudflare:test';
@@ -226,7 +227,8 @@ describe('names on the audit, cache and push surfaces', () => {
     expect(send).toHaveBeenCalledTimes(2);
     const body = JSON.parse(send.mock.calls[1]![1] as string) as { kind: string; body: string };
     expect(body.kind).toBe('cache_hit');
-    expect(body.body).toContain('records: A, B（自报）, 未命名');
+    // A record with neither name nor claim is its salt's first 8 chars.
+    expect(body.body).toContain(`records: A, B（自报）, ${salts[2]!.slice(0, 8)}…`);
     send.mockRestore();
   });
 });

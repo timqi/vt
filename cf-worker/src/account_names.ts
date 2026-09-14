@@ -33,9 +33,10 @@ export function checkAdopt(raw: unknown, count: number): { index: number; name: 
 }
 
 // What a surface prints for one record when it has to be a single string:
-// the owned name, else the client's claim marked as such, else 未命名.
+// the owned name, else the client's claim marked as such, else the salt's
+// first 8 characters — a stable handle the operator can match across rows.
 export function nameLabel(r: RecordName): string {
-  return r.name ?? (r.claimed ? `${r.claimed}（自报）` : '未命名');
+  return r.name ?? (r.claimed ? `${r.claimed}（自报）` : `${r.salt_b64u.slice(0, 8)}…`);
 }
 
 export class AccountNames {

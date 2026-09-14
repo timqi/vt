@@ -124,15 +124,31 @@
 
   // ── Record names (audit 记录 column + dialog, cache rows) ─────────────────
   // One record's label: the operator-owned name, else the client's claim marked
-  // 自报, else 未命名 (mirrors account_names.nameLabel).
+  // 自报, else the salt's first 8 chars — a handle that matches across rows
+  // (mirrors account_names.nameLabel).
+  function isSaltLabel(r) { return !r.name && !r.claimed; }
   vt.recordLabel = function (r) {
-    return r.name || (r.claimed ? r.claimed + '（自报）' : '未命名');
+    return r.name || (r.claimed ? r.claimed + '（自报）' : (r.salt_b64u || '').slice(0, 8) + '…');
   };
 
-  // Column text: the labels joined, or `N 条` for a row that stored no records.
+  // Column content: the labels joined (a salt handle in <code>), or `N 条` for
+  // a row that stored no records; null when there is nothing to show.
   vt.recordsSummary = function (records, n) {
-    if (!records || !records.length) return n > 0 ? n + ' 条' : '';
-    return records.map(vt.recordLabel).join(', ');
+    if (!records || !records.length) return n > 0 ? vt.el('span', null, n + ' 条') : null;
+    var span = vt.el('span', 'rec-summary');
+    records.forEach(function (r, i) {
+      if (i) span.appendChild(document.createTextNode(', '));
+      span.appendChild(isSaltLabel(r) ? vt.el('code', null, vt.recordLabel(r))
+        : document.createTextNode(vt.recordLabel(r)));
+    });
+    return span;
+  };
+
+  // The project shown beside a host: the repository's directory name (the
+  // project is its common git dir, so `/…/vt/.git` reads `vt`).
+  vt.projectName = function (p) {
+    var parts = String(p || '').replace(/\/\.git$/, '').split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : '';
   };
 
   // Renameable list. Clicking a name opens an input in place; Enter saves via
@@ -148,7 +164,7 @@
       records.forEach(function (r, i) {
         if (!expanded && i >= limit) return;
         var li = document.createElement('li');
-        var btn = vt.el('button', 'rec-name' + (r.name ? '' : ' unnamed'), vt.recordLabel(r));
+        var btn = vt.el('button', 'rec-name' + (r.name ? '' : ' unnamed') + (isSaltLabel(r) ? ' salt' : ''), vt.recordLabel(r));
         btn.type = 'button';
         btn.title = '点击重命名';
         btn.addEventListener('click', function (e) { e.stopPropagation(); edit(li, r); });

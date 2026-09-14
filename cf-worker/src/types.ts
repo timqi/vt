@@ -34,6 +34,9 @@ export interface AuditRow {
   host: string | null;
   user: string | null;
   pwd: string | null;
+  /** The client's project root (ChallengeMeta.project); NULL on rows written
+   *  before the column existed. */
+  project: string | null;
   tty: string | null;
   ppid_cmd: string | null;
   ssh_client: string | null;

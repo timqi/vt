@@ -13,7 +13,7 @@ const AUDIT_SELECT_COLS =
   `id, token_id, created_ms, finalized_ms, status, op_kind, command, reason,
    host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms,
    verify_failures, cache_ttl_s, cache_expires_ms, ppid, source, seq,
-   peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed, records`;
+   peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed, records, project`;
 
 // Columns added after the per-challenge schema shipped, in the order they
 // landed. An older table gains each one it lacks by ALTER (rows preserved); a
@@ -22,7 +22,7 @@ const AUDIT_SELECT_COLS =
 const ADDED_COLUMNS = [
   'cache_ttl_s INTEGER', 'ppid INTEGER', "source TEXT NOT NULL DEFAULT 'ceremony'", 'seq INTEGER',
   'peer_exe TEXT', 'key_fp TEXT', 'dest TEXT', 'scope_family TEXT', 'scope_label TEXT',
-  'grant_ttl_s INTEGER', 'relayed INTEGER', 'cache_expires_ms INTEGER', 'records TEXT',
+  'grant_ttl_s INTEGER', 'relayed INTEGER', 'cache_expires_ms INTEGER', 'records TEXT', 'project TEXT',
 ];
 
 // The stored form of AuditRow.records: `[salt_b64u, claimed]` pairs, or null.
@@ -206,8 +206,8 @@ export class AccountAudit {
 
   // The display columns shared by every row kind, from a (partial) meta.
   private static metaCols(m: Partial<ChallengeMeta>): Record<string, unknown> {
-    const { op_kind, command, reason, host, user, pwd, ppid_cmd, ip } = m;
-    return { op_kind, command, reason, host, user, pwd, ppid_cmd, ip };
+    const { op_kind, command, reason, host, user, pwd, project, ppid_cmd, ip } = m;
+    return { op_kind, command, reason, host, user, pwd, project, ppid_cmd, ip };
   }
 
   // INSERT the full challenge params once, at creation (status=pending).
