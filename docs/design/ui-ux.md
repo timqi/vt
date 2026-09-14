@@ -171,7 +171,8 @@ Used on a phone, one hand, under time pressure. Field set and order come from
   **login** — one primary button `使用 Passkey 登录` and the status line;
   **console** — the tab strip 审计 · DEK 缓存 · 主机令牌 · Passkey · 设置, tab
   in the URL hash (`/admin#audit`), first tab default.
-- 审计: filter bar, list/table (时间 / 状态 / 主机 / 记录 / 缓存 / 操作),
+- 审计: filter bar, list/table (时间 / 状态 / 主机 / 项目 / 记录 / 缓存 / 操作;
+  项目 is the directory name, `vt.projectName`, the path in the sheet),
   `加载更多` with `已加载 N 条`, live indicator, detail sheet with inline
   approval and record rename. DEK 缓存: filter bar, bulk bar, list/table
   (主机 · 项目 / 记录 / 条目 / 剩余 · 到期 / 操作), extend sheet. A record name
@@ -199,7 +200,7 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 | Status line: `vt.statusLine(el)` returns the tab's `setStatus` | `common.js` |
 | `fmtTime`, `fmtRemaining`, `ttlLabel`, `el` | `common.js` (`vt.*`) |
 | Passkey ceremony | `approve.js` (`vt.mountApprove`) |
-| Record names: `vt.recordLabel`, `vt.recordsSummary`, renameable `vt.recordList` | `admin.js` |
+| Record names: `vt.recordLabel` (name, `X（自报）`, else salt prefix in `code`), `vt.recordsSummary`, renameable `vt.recordList`; `vt.projectName` | `admin.js` |
 
 A second copy of any row is a bug (AGENTS.md Budgets rule 3).
 

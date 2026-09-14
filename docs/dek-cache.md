@@ -60,7 +60,11 @@ TTL, a caller can decrypt the approved records without another phone tap.
   `source='manual'`). Audit rows store `[salt, claimed]` pairs and resolve
   them on every read, so a rename retitles history; cache entries keep the
   claim and the `project`; the cache listing, the hit audit row and the hit
-  push show the resolved name, else the claim tagged 自报, else 未命名.
+  push show the resolved name, else the claim tagged 自报, else the salt's
+  first 8 characters (`K0g8nyJ5…`, the same handle on every surface, in
+  `code` on the console). Audit rows also carry the challenge's `project`
+  (NULL before the column existed): its directory name sits beside the host,
+  the full path in the detail sheet.
 - A cache key is `dek:{token_id}:{project_h}:{salt_b64u}`. `token_id` is the
   host token the edge verified on the request ([host-token.md](host-token.md))
   and the **hard boundary**: a grant serves only the host that earned it, from

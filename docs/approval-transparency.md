@@ -172,7 +172,8 @@ Worker side (`cf-worker`):
   client can propose a misleading name but never make the page state it as
   fact. Named records are read-only on the page; rename lives in admin. The
   same rule holds on the audit table, the DEK 缓存 tab and the cache-hit
-  push: owned name, else `X（自报）`, else `未命名`. The footnote says
+  push: owned name, else `X（自报）`, else the salt's first 8 characters
+  (`account_names.nameLabel`, `vt.recordLabel`). The footnote says
   `记录名由服务端保存`.
 - **C6 — fold** (operator feedback, one-handed phone use): above the fold
   are the decision lines only — 类型, 记录, 主机（已验证）@用户, 命令 — then

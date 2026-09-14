@@ -90,9 +90,9 @@ POST {audit_url}/api/audit-ingest
     entry = { op_kind, outcome, salts, latency_ms, ts_ms, token_id, meta,
               peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s,
               relayed }
-      meta = ChallengeMeta wire shape (op_kind, command, host, user, pwd, tty,
-             ppid_cmd, ppid, ssh_client, reason) — NO `ip` (the Worker forces it
-             from CF-Connecting-IP).
+      meta = ChallengeMeta wire shape (op_kind, command, host, user, pwd,
+             project — '' from the agent, tty, ppid_cmd, ppid, ssh_client,
+             reason) — NO `ip` (the Worker forces it from CF-Connecting-IP).
 ```
 
 The seven trailing fields are agent-authoritative context
