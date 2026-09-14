@@ -15,7 +15,6 @@ and update the relevant document in the same change.
 | Configure auth/routing | [`config.example.toml`](../config.example.toml) | `src/config.rs` (file hydration), `src/config/client.rs` (`ResolvedConfig`), `src/client.rs` |
 | Issue / revoke per-host Worker tokens (`vt enroll`) | [`host-token.md`](host-token.md) | `cf-worker/src/host_token.ts` (derivation), `cf-worker/src/account_tokens.ts` (lifecycle), `src/cf.rs` (`WorkerAuth`, `enroll`), `src/config.rs` (`upsert_config_values`) |
 | Understand record parsing and decrypt batches | [`README.md` — protocol](../README.md#vt-protocol-format) | `src/core.rs` (`VtUrl`), `src/client/records.rs` (`DecryptBatch`), `src/core/crypto.rs` |
-| Migrate legacy records (`vt rewrap`) | [`README.md` — commands](../README.md#commands) | `src/client/rewrap.rs`, `src/core/compat.rs` |
 | Configure AI-agent hooks | [`hook.md`](hook.md) | `src/hook.rs`, `agent.example.toml` |
 | Use VT for Linux sudo/PAM | [`sudo.md`](sudo.md) | `setup-pam.sh`, `src/client.rs` |
 | Deploy the phone approval Worker | [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/index.ts`, `cf-worker/src/do_account.ts` |

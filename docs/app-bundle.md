@@ -102,8 +102,7 @@ This binds v1 to the **rebind binary's current resolved path**, not the
 binary must run at that same path. Do not restart a new agent between downgrade
 and replacement: startup would upgrade it again. The existing
 `vt secret export` / `vt secret import` workflow is another recovery route;
-handle its secret material accordingly. Top-level `vt rewrap` operates on
-`vt://` URLs in files and is unrelated to this Keychain wrap.
+handle its secret material accordingly.
 
 ## 3. Native notifications
 

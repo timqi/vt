@@ -179,24 +179,6 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Re-encrypt legacy `vt://mac/...` URLs in files as the v2 envelope
-    /// format. Without `--no-dry-run` only previews what would change.
-    /// One Touch ID covers the whole batch (decrypt); re-encrypt is silent.
-    Rewrap {
-        #[arg(required = true, help = "Files to scan and rewrite")]
-        files: Vec<std::path::PathBuf>,
-        #[arg(
-            long,
-            help = "Actually decrypt, re-encrypt, and rewrite files. Without this flag the command only previews the URLs it would migrate."
-        )]
-        no_dry_run: bool,
-        #[arg(
-            long,
-            help = "Leave a <file>.vt-rewrap-backup copy next to each rewritten file. Off by default."
-        )]
-        backup: bool,
-    },
-
     /// AI-agent command hook. Reads an agent's proposed shell command and,
     /// per the `[[rules]]` whitelist in ~/.config/vt/agent.toml, accepts it,
     /// blocks it, or rewrites it to run under `vt inject` so vt:// secrets in
@@ -612,14 +594,6 @@ async fn run(cli: Cli, config: config::ResolvedConfig) -> Result<()> {
         Commands::Run { reason, argv } => {
             let vt_client = VTClient::new(config.clone())?;
             client::run(vt_client, argv.clone(), reason.as_deref()).await
-        }
-        Commands::Rewrap {
-            files,
-            no_dry_run,
-            backup,
-        } => {
-            let vt_client = VTClient::new(config.clone())?;
-            client::rewrap(vt_client, files.clone(), *no_dry_run, *backup).await
         }
         Commands::Inject {
             replace_file,

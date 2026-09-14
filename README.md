@@ -119,7 +119,6 @@ file private. Tokens can be revoked per host on the Worker's admin page.
 | `enroll [--url URL]` | Request this host's own Worker token via a phone Passkey approval (pairing code shown on both ends) and write it to the config file |
 | `create [--type raw\|totp]` | Encrypt a secret: interactive hidden input or piped stdin (one trailing newline stripped); piped type defaults to `raw`, never pass plaintext in argv |
 | `read <vt>` | Decrypt a vt protocol string |
-| `rewrap [--no-dry-run] [--backup] <file>...` | Re-encrypt legacy `vt://mac/...` URLs in files to the current envelope format (one agent/phone approval per batch) |
 | `inject [-r FILE] -- cmd...` | Transiently decrypt `vt://` in the file / env / argv, then exec the command |
 | `inject --recover` | Restore ciphertext for any file left decrypted by a crashed/rebooted supervisor (run at login/boot; no auth) |
 | `auth [--reason <text>]` | Trigger bio auth via SSH agent forwarding (for PAM/sudo) |
@@ -139,12 +138,6 @@ file private. Tokens can be revoked per host on the Worker's admin page.
 | `ssh show <fingerprint>` | (macOS) Show the public key for a stored key |
 | `ssh keygen [-l <label>] [-c <comment>] [--key-file <path>]` | Generate a portable Ed25519 identity stored as a `vt://` record; prints the OpenSSH public key (cross-platform) |
 | `ssh connect [--forward-real-agent] [ssh args...]` | Git SSH driver — `GIT_SSH_COMMAND="vt ssh connect"`; signs with a portable `vt://` identity or a discovered VT-agent key. The flag must precede SSH args. |
-
-`rewrap` preserves the target's POSIX permission bits. Temporary files and optional
-backups are created privately and exclusively; existing `.vt-rewrap-tmp` or
-`.vt-rewrap-backup` paths are refused rather than overwritten. Inspect any leftover
-sidecars before removing them and retrying. Ownership, ACLs, and extended attributes
-are not copied when the target inode is replaced.
 
 ### Inject Command
 
