@@ -17,8 +17,7 @@ with its approve/extend ladders and admin.
 
 | Leaves | Files | Operator step |
 | --- | --- | --- |
-| Legacy `vt://mac/` v0/v1 records | `src/core/compat.rs`, `VtUrl::Legacy`, `legacy_decrypt`, legacy branches in `client/records.rs`, `ssh_agent/handlers.rs` | ship one release with `vt rewrap`; the next removes `rewrap` too |
-| `vt rewrap` | `src/client/rewrap.rs`, README row | one release after the above |
+| Legacy `vt://mac/` v0/v1 records and `vt rewrap` | `src/core/compat.rs`, `VtUrl::Legacy`, `legacy_decrypt`, `DecryptInput::Legacy`, legacy branches in `client/records.rs`, `ssh_agent/handlers.rs`, the engine's "legacy batch stays fresh" rule, `src/client/rewrap.rs`, `--no-legacy-decrypt`, README row | run `vt rewrap --no-dry-run` on the current release before upgrading; rewrap has no key of its own, so it cannot outlive the agent's legacy path |
 | Keychain wrap v1 | `derive_passphrase_secret` (v1), `upgrade_wrap_v2_if_needed`, `secret rebind --to-v1` | `vt secret rebind` stays one release for v1 stores, then goes with wrap v1 |
 | Worker bare-master auth | `auth.legacy_master` branch in `cf-worker/src/index.ts`, "absent = legacy master" fields in `types.ts`, IP-only cache derivation | every host runs `vt enroll` first |
 | `VT_AUTH_CF_PREV` two-generation master | `MasterGen`/`last_key_gen` in `types.ts`, `account_tokens.ts`, `index.ts` auth path, `crypto.ts` dual verify, admin column, `host-token.md` rotation section, `wrangler.toml.example` | rotating `VT_AUTH_CF` = `vt enroll` on every host, same day |
