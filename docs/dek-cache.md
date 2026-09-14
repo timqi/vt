@@ -116,9 +116,9 @@ client opens the result with the existing sealed-box implementation.
 
 ## Admin surface: the DEK 缓存 tab
 
-`/<ADMIN_SEG>/cache` lists what is **actually cached right now**, one row per
-cache group, joined with the approval that armed it (host, user, directory,
-command). Each row shows its original `created_ms` below the remaining time and
+The admin shell's DEK 缓存 tab (`/<ADMIN_SEG>#cache`) lists what is **actually
+cached right now**, one row per cache group, joined with the approval that
+armed it (host, user, directory, command). Each row shows its original `created_ms` below the remaining time and
 expiry, in the browser's local time. Legacy entries without that timestamp show
 `创建于 未知`; extending a cache does not change its creation time.
 It is the only view of the real entry set — the audit tab can merely

@@ -13,7 +13,7 @@ phone (PWA) ── approve: WebAuthn + PRF ─▶ derives DEKs, seals to CLI pub
 ```
 
 - Ceremony endpoints live at the root (`/api/challenge`, `/api/dek`, `/api/approve`, `/api/reject`, `/a/:token`), secured by a body HMAC keyed on the caller's per-host token (derived from `VT_AUTH_CF`; see [host-token.md](host-token.md)) + unguessable tokens + WebAuthn. `/api/enroll` is the unauthenticated, rate-limited request for such a token.
-- The admin surface (`/<ADMIN_SEG>/…`, currently `ADMIN_SEG = "kestrel"` in `cf-worker/src/index.ts`) is gated by **Cloudflare Access** at the edge plus `cf-worker/src/access.ts` JWT verification.
+- The admin surface — one shell at `/<ADMIN_SEG>` (tabs in the URL hash: `#audit` `#cache` `#tokens` `#setup` `#settings`) and its API under `/<ADMIN_SEG>/api/*`, currently `ADMIN_SEG = "kestrel"` in `cf-worker/src/page.ts` — is gated by **Cloudflare Access** at the edge plus `cf-worker/src/access.ts` JWT verification. The shell's assets under `/pwa/admin/*` are public and hold no data.
 
 Request bodies for `/api/challenge`, `/api/dek-cache`, `/api/approve`, and
 `/api/reject` are limited to 256 KiB; `/api/audit-ingest` retains its 64 KiB
@@ -169,7 +169,7 @@ this is the only way to reach it.
 ## 6. Enroll the first Passkey (bootstrap)
 
 `CREDENTIALS_JSON` holds PRF-wrapped master material. Generate it on the
-Access-gated setup page `https://vt.example.com/kestrel/setup`:
+Access-gated admin shell's Passkey tab, `https://vt.example.com/kestrel#setup`:
 
 1. On your Mac: `vt secret export` (Touch ID), set a one-time export passphrase,
    copy the base64.
@@ -235,9 +235,9 @@ expiry guard.
 
 - Workers Logs (dashboard) show the structured audit events; retention is
   platform-managed (~3 days Free, ~7 days Paid).
-- The admin **audit** page (`/kestrel/audit`) shows the SQLite audit table, cache
+- The admin **审计** tab (`/kestrel#audit`) shows the SQLite audit table, cache
   TTL/expiry columns, and the **“清除 DEK 缓存”** (clear-cache) button.
-- The admin **DEK 缓存** page (`/kestrel/cache`) is the inventory of entries that
+- The admin **DEK 缓存** tab (`/kestrel#cache`) is the inventory of entries that
   actually exist right now, grouped by the approval that armed them, with
   per-group and bulk clear. Extending a group's window is gated on both Access
   and a fresh phone Passkey approval, and is off unless `CACHE_ADMIN_EXTEND` is

@@ -75,8 +75,9 @@ secret     = HKDF-SHA256(ikm = VT_AUTH_CF, salt = token_id,
 
 ## 4. Admin
 
-`/<ADMIN_SEG>/tokens` lists every token (no secret material) with host, user,
-issue IP · origin, last use / IP, remaining window, and a 吊销 button.
+The admin shell's 主机令牌 tab (`/<ADMIN_SEG>#tokens`) lists every token (no
+secret material) with host, user, issue IP · origin, last use / IP, remaining
+window, and a 吊销 button.
 Revocation is authority-reducing, so Cloudflare Access alone suffices (same
 rule as cache clears); it is immediate and idempotent. Revoked/lapsed rows stay
 listed for 30 days, then the alarm sweep drops them.

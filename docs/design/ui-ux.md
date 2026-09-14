@@ -39,7 +39,7 @@ wins over a convention; a changed convention updates this file.
 - **Page head** `ported`: the tab strip is a slim 8px-inset rounded glass
   strip floating over the content, which pads its top by what covers it. On a
   phone it hides the title and wraps the tabs.
-- **Tables** `vt`: `#table-wrap` owns horizontal scrolling; a long value
+- **Tables** `vt`: a tab's `.table-wrap` owns horizontal scrolling; a long value
   truncates (`.trunc`, `.cell-main`/`.cell-sub`) and lives whole in the detail
   dialog or hovercard, never only in a `title`. Two lines per cell before a
   seventh column.
@@ -131,7 +131,8 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 - **`pwa/approve.html`** at `/a/:token`: header, `#vt-approve-root`, the
   ceremony. Unchanged by the slim.
 - **`pwa/admin/admin.html`** at `/admin` renders one of three states from
-  `VT_DATA.state`: **setup** — the bootstrap form of worker-slim §3.3 (setup
+  `VT_DATA.state` (today only `console` exists; `setup`/`login` land with
+  worker-slim §3): **setup** — the bootstrap form of worker-slim §3.3 (setup
   token, label, `vt secret export` blob + passphrase, one `生成` action);
   **login** — one primary button `使用 Passkey 登录` and the status line;
   **console** — the tab strip 审计 · DEK 缓存 · 主机令牌 · Passkey · 设置, tab
@@ -154,8 +155,8 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 | `.badge`, `.badge-*`, `.reason-badge` | `admin.css` |
 | `.switch`, segmented `#modes` | `admin.css` |
 | Filter bar, `#bulkbar`, table + `.trunc`/`.cell-*` | `admin.css` |
-| Detail dialog, hovercard | `admin.js` |
-| Status line `setStatus` | `common.js` (`vt.setStatus`) |
+| Detail dialog (`vt.dialog`), hovercard (`vt.hovercard`), `vt.commandSummary`, `vt.api` | `admin.js` |
+| Status line: `vt.statusLine(el)` returns the tab's `setStatus` | `common.js` |
 | `fmtTime`, `fmtRemaining`, `ttlLabel`, `el` | `common.js` (`vt.*`) |
 | Passkey ceremony | `approve.js` (`vt.mountApprove`) |
 
