@@ -351,13 +351,10 @@ pub async fn inject(
     }
 
     // Execute the command with decrypted arguments.
-    // DO NOT log `command` / `args` — post-decryption command line contains
-    // plaintext values substituted in for `vt://` URLs.
-    let command = &decrypted_args[0];
-    let args = &decrypted_args[1..];
-
-    // exec() never returns on success; reaching here means it failed.
-    let err = exec::Command::new(command).args(args).exec();
+    // DO NOT log `decrypted_args` — the post-decryption command line
+    // contains plaintext values substituted in for `vt://` URLs.
+    // execvp never returns on success; reaching here means it failed.
+    let err = execvp(&decrypted_args);
 
     // Restore on exec failure so the user doesn't wait out the
     // supervisor's timeout. The supervisor will later observe ENOENT on the
@@ -372,6 +369,24 @@ pub async fn inject(
         );
     }
     Err(anyhow::anyhow!("Failed to execute command: {}", err))
+}
+
+/// execvp(3) `argv` (PATH lookup on `argv[0]`); returns only on failure.
+fn execvp(argv: &[String]) -> io::Error {
+    let c_args: Vec<std::ffi::CString> = match argv
+        .iter()
+        .map(|a| std::ffi::CString::new(a.as_bytes()))
+        .collect()
+    {
+        Ok(v) => v,
+        Err(e) => return io::Error::new(io::ErrorKind::InvalidInput, e),
+    };
+    let mut ptrs: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    // SAFETY: `ptrs` is NUL-terminated and every entry points into a CString
+    // in `c_args`, alive for the call; execvp only reads through them.
+    unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };
+    io::Error::last_os_error()
 }
 
 /// One armed exposure's unwind state, kept by the parent for the exec-failure
