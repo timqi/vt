@@ -19,10 +19,11 @@ describe('cache creation time rendering', () => {
     className = '';
     hidden = false;
     classList = { add() {}, toggle() {} };
-    appendChild(child: Element) { this.children.push(child); }
+    appendChild(child: Element) { this.children.push(child); return child; }
     setAttribute() {}
     addEventListener() {}
     querySelector() { return new Element(); }
+    querySelectorAll() { return []; }
   }
 
   // The tab script registers vt.tabs.cache; run it against a stub panel with
@@ -38,6 +39,7 @@ describe('cache creation time rendering', () => {
       addEventListener() {}, body: new Element(),
     },
     addEventListener() {},
+    matchMedia: () => ({ matches: false, addEventListener() {} }),   // desktop: the table branch
     TextEncoder, crypto,
   };
   context.window = context; // common.js publishes `window.vt`; scripts read the global `vt`
@@ -54,6 +56,11 @@ describe('cache creation time rendering', () => {
     });
     return row.children[4].children.at(-1)!.textContent;
   }
+
+  it('renders the six table cells at desktop width', () => {
+    const row = renderRow({ group_id: 'g', origin_token_id: 'o', live: 1, entries: 1, created_ms: 1, max_expires_ms: Date.now() + 60_000 });
+    expect(row.children).toHaveLength(6);
+  });
 
   it('shows the original creation timestamp before and after extension or expiry', () => {
     const created = new Date(2026, 0, 2, 3, 4, 5).getTime();
@@ -75,8 +82,8 @@ describe('admin shell scripts against the shell markup', () => {
   const html = pwa('admin/admin.html');
   const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]));
 
-  it('declares every id the setup, settings and shell scripts query', () => {
-    for (const js of ['admin/admin.js', 'admin/setup.js', 'admin/settings.js']) {
+  it('declares every id the tab and shell scripts query', () => {
+    for (const js of ['admin/admin.js', 'admin/audit.js', 'admin/cache.js', 'admin/tokens.js', 'admin/setup.js', 'admin/settings.js']) {
       // `'tab-' + key` builds panel ids; the literal ones are what matter here.
       const wanted = [...pwa(js).matchAll(/(?:\$\(|getElementById\()'#?([a-z][a-z0-9-]*[a-z0-9])'/g)].map(m => m[1]);
       const missing = wanted.filter(id => !ids.has(id));
@@ -94,7 +101,8 @@ describe('admin shell scripts against the shell markup', () => {
     const context: Record<string, unknown> = {
       location: { pathname: '/admin', hash: '' },
       document: { getElementById: () => new Element(), createElement: () => new Element(), addEventListener() {}, body: new Element() },
-      addEventListener() {}, TextEncoder, crypto, console,
+      addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }),
+      TextEncoder, crypto, console,
     };
     context.window = context;
     for (const js of ['common.js', 'admin/admin.js', 'admin/setup.js', 'admin/settings.js']) runInNewContext(pwa(js), context);

@@ -364,28 +364,29 @@ vt.tabs.setup = function (panel, data) {
   });
 
   // textContent everywhere (labels are operator-controlled at registration).
+  var list = vt.list($('#creds').parentNode);   // rows on a phone, the table on desktop
   function renderCurrent() {
-    var host = $('#current-list');
-    var meta = $('#current-meta');
-    host.innerHTML = '';
-    meta.textContent = entries.length + ' 个 · epoch ' + epoch;
+    $('#current-meta').textContent = entries.length + ' 个 · epoch ' + epoch;
+    list.clear();
     entries.forEach(function (e) {
-      var li = document.createElement('li');
-      var name = document.createElement('strong');
-      name.textContent = e.l || '(无标签)';
-      var detail = document.createElement('span');
-      detail.className = 'mono';
+      var name = e.l || '(无标签)';
+      var id = String(e.i || '').slice(0, 12) + '…';
       var when = '';
       if (typeof e.t === 'number' && e.t > 0) {
         try { when = new Date(e.t * 1000).toISOString().slice(0, 10); } catch (_) {}
       }
-      detail.textContent = ' · ' + String(e.i || '').slice(0, 12) + '…' + (when ? ' · ' + when : '');
-      li.appendChild(name);
-      li.appendChild(detail);
-      host.appendChild(li);
+      list.body().appendChild(list.item({
+        cells: function () {
+          return [vt.el('td', null, name), vt.el('td', 'mono', id), vt.el('td', null, when)];
+        },
+        row: function () { return { main: name, sub: id + (when ? ' · ' + when : '') }; },
+      }));
     });
+    if (!entries.length) list.empty('没有 Passkey');
   }
+  vt.onLayout(renderCurrent);
 
+  vt.seg($('#modes'));
   refreshModeUI();
   load();
 };

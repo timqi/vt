@@ -2,7 +2,7 @@
 
 // Audit tab. One row per challenge from /{seg}/api/audit (id-cursor
 // pagination). Read-only; all rendering via textContent (no HTML injection).
-// Click a row to open the shared detail dialog with the full stored params.
+// Click a row to open the shared detail sheet with the full stored params.
 //
 // Real-time: a WebSocket (/api/admin/audit-stream, session-gated) pushes each
 // audit change (new pending / approved / rejected / expired / verify-fail /
@@ -16,10 +16,11 @@ vt.tabs.audit = function (panel) {
   var setStatus = vt.statusLine($('.status'));
   var fmtTime = vt.fmtTime, ttlLabel = vt.ttlLabel;
 
+  var list = vt.list($('.table-wrap'));   // rows on a phone, the table on desktop
   var oldestId = null;   // cursor: smallest id seen so far (before_id pagination)
   var exhausted = false;
   var byId = {};         // id -> full row, for the detail card + in-place updates
-  var trById = {};       // id -> <tr> element, for in-place update/remove
+  var trById = {};       // id -> list element (tr / li), for in-place update/remove
 
   // ── Real-time stream state ────────────────────────────────────────────────
   // newestSeq: high-water mark over the monotonic `seq` the server bumps on every
@@ -38,23 +39,20 @@ vt.tabs.audit = function (panel) {
   var activeStatus = '';
   var activeHost = '';
 
-  function cell(tr, text) {
+  function cell(content, cls) {
     var td = document.createElement('td');
-    td.textContent = (text === null || text === undefined) ? '' : String(text);
-    tr.appendChild(td);
+    if (cls) td.className = cls;
+    if (content && content.nodeType) td.appendChild(content);
+    else td.textContent = (content === null || content === undefined) ? '' : String(content);
+    return td;
   }
 
   // Width-capped cell: wraps the text in an inline-block span with a fixed
   // max-width (see .trunc.* in admin.css) so a long host / command truncates
   // with an ellipsis instead of widening the table into a horizontal scroll.
-  // The full value lives whole in the row's detail dialog.
-  function cellClipped(tr, text, cls) {
-    var td = document.createElement('td');
-    var span = document.createElement('span');
-    span.className = 'trunc ' + cls;
-    span.textContent = (text === null || text === undefined) ? '' : String(text);
-    td.appendChild(span);
-    tr.appendChild(td);
+  // The full value lives whole in the row's detail sheet.
+  function cellClipped(text, cls) {
+    return cell(vt.el('span', 'trunc ' + cls, (text === null || text === undefined) ? '' : String(text)));
   }
 
   // Friendly type label. DEK-cache events share op_kind='cache'; the status
@@ -88,51 +86,48 @@ vt.tabs.audit = function (panel) {
     return span;
   }
 
-  // Build the <tr> for one row. Pure of list state, so it is reused for the
-  // initial render, in-place updates, and the cache-expiry refresh.
+  // Build the list element for one row (table cells or a phone .row from the
+  // same nodes). Pure of list state, so it is reused for the initial render,
+  // in-place updates, and the cache-expiry refresh.
   function renderRow(r) {
-    var tr = document.createElement('tr');
-    tr.className = 'clickable';
-    tr.setAttribute('data-id', r.id);
     // data-cache-live drives the cache-expiry timer: it only re-renders a row
     // when this flag flips from live→elapsed, avoiding needless DOM churn.
     var live = hasLiveCache(r);
-    tr.setAttribute('data-cache-live', live ? '1' : '0');
-    cell(tr, fmtTime(r.created_ms));
-    var st = document.createElement('td'); st.appendChild(statusBadge(r)); tr.appendChild(st);
-    cellClipped(tr, r.host, 'col-host');
-    // 记录: the row's records by name (server-owned, else the 自报 claim), or
-    // the bare count for rows written before names were stored. Command and IP
-    // live in the detail dialog.
-    cellClipped(tr, vt.recordsSummary(r.records, r.salts), 'col-rec');
-    // 缓存列: live → TTL label; armed-but-elapsed → grey 过期; never armed → —.
-    var cc = document.createElement('td');
-    if (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) {
-      if (live) {
-        cc.textContent = ttlLabel(r.cache_ttl_s);
-      } else {
-        cc.textContent = '过期';
-        cc.className = 'cache-expired';
-      }
-    } else {
-      cc.textContent = '—';
-    }
-    tr.appendChild(cc);
+    var badge = statusBadge(r);
+    var recs = vt.recordsSummary(r.records, r.salts);
+    // 缓存: live → TTL label; armed-but-elapsed → grey 过期; never armed → —.
+    var cache = (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) ? (live ? ttlLabel(r.cache_ttl_s) : '过期') : '—';
     // 操作: a "清除缓存" button on EVERY approval that ever armed a cache — not
     // just ones this view believes are still live. Liveness here is a projection
     // (and, for a pre-migration row, an inference); if it is ever wrong, an extra
     // clear click is harmless, whereas hiding the button would leave a live cache
     // unrevokable from this page. Fail toward being able to revoke.
-    var act = document.createElement('td');
+    var btn = null;
     if (armedCache(r)) {
-      var btn = document.createElement('button');
-      btn.type = 'button'; btn.className = 'danger small'; btn.textContent = '清除缓存';
+      btn = vt.el('button', 'danger small', '清除缓存');
+      btn.type = 'button';
       btn.addEventListener('click', function (e) { e.stopPropagation(); clearOrigin(r.token_id, btn); });
-      act.appendChild(btn);
     }
-    tr.appendChild(act);
-    tr.addEventListener('click', function () { openDetail(r.id); });
-    return tr;
+    return list.item({
+      cls: 'clickable',
+      attrs: { id: r.id, 'cache-live': live ? '1' : '0' },
+      click: function () { openDetail(r.id); },
+      cells: function () {
+        // 记录: the row's records by name (server-owned, else the 自报 claim),
+        // or the bare count for rows written before names were stored.
+        // Command and IP live in the detail sheet.
+        return [cell(fmtTime(r.created_ms)), cell(badge), cellClipped(r.host, 'col-host'),
+          cellClipped(recs, 'col-rec'), cell(cache, cache === '过期' ? 'cache-expired' : null), cell(btn)];
+      },
+      row: function () {
+        return {
+          main: r.host || '—',
+          sub: [recs ? vt.el('div', null, recs) : null,
+            vt.el('div', null, fmtTime(r.created_ms) + (cache !== '—' ? ' · 缓存 ' + cache : ''))],
+          trail: badge, actions: btn ? [btn] : [],
+        };
+      },
+    });
   }
 
   // Track the highest seq seen from ANY source (initial load, catch-up, live) —
@@ -142,8 +137,8 @@ vt.tabs.audit = function (panel) {
   }
 
   function render(rows, append) {
-    var tbody = $('.rows');
-    if (!append) { tbody.innerHTML = ''; byId = {}; trById = {}; }
+    var tbody = list.body();
+    if (!append) { list.clear(); byId = {}; trById = {}; }
     rows.forEach(function (r) {
       if (typeof r.id !== 'number') return;
       trackNewest(r);
@@ -168,9 +163,20 @@ vt.tabs.audit = function (panel) {
     return true;
   }
 
-  // Insert a not-yet-shown row into the tbody at its id-DESC position.
+  // Re-render every shown row in place (the phone/desktop layout switched).
+  function renderAll() {
+    list.clear();
+    trById = {};
+    Object.keys(byId).map(Number).sort(function (a, b) { return b - a; }).forEach(function (id) {
+      trById[id] = renderRow(byId[id]);
+      list.body().appendChild(trById[id]);
+    });
+  }
+  vt.onLayout(renderAll);
+
+  // Insert a not-yet-shown row into the list at its id-DESC position.
   function insertRowSorted(r) {
-    var tbody = $('.rows');
+    var tbody = list.body();
     byId[r.id] = r;
     oldestId = (oldestId === null) ? r.id : Math.min(oldestId, r.id);
     var tr = renderRow(r);
@@ -201,7 +207,7 @@ vt.tabs.audit = function (panel) {
       }
       var newTr = renderRow(r);
       if (oldTr && oldTr.parentNode) oldTr.parentNode.replaceChild(newTr, oldTr);
-      else $('.rows').appendChild(newTr);
+      else list.body().appendChild(newTr);
       trById[r.id] = newTr;
       // Keep an open detail card for this row in sync (isRefresh=true so a
       // mounted, in-flight ceremony below isn't torn down mid-approval); an

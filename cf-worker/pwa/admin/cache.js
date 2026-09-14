@@ -20,6 +20,7 @@ vt.tabs.cache = function (panel) {
   var setStatus = vt.statusLine($('.status'));
   var el = vt.el, fmtTime = vt.fmtTime, fmtRemaining = vt.fmtRemaining, ttlLabel = vt.ttlLabel;
 
+  var list = vt.list($('.table-wrap'));   // rows on a phone, the table on desktop
   var groups = [];            // last listing, newest expiry first
   var byGroup = {};           // group_id -> summary
   var selected = {};          // group_id -> true
@@ -95,7 +96,7 @@ vt.tabs.cache = function (panel) {
   // Two-line cell: a primary value plus a muted secondary line. Halves the column
   // count so the action buttons and the extendability reason stay on screen at
   // laptop width instead of hiding behind a horizontal scroll.
-  function cell2(tr, main, sub, opts) {
+  function cell2(main, sub, opts) {
     opts = opts || {};
     var td = document.createElement('td');
     var m = el('div', 'cell-main' + (opts.mainCls ? ' ' + opts.mainCls : ''), main || '—');
@@ -105,22 +106,14 @@ vt.tabs.cache = function (panel) {
       var s = el('div', 'cell-sub' + (opts.subCls ? ' ' + opts.subCls : ''), sub);
       if (opts.subHover) { s.setAttribute('data-hover', opts.subHover); s.classList.add('has-hover'); }
       td.appendChild(s);
-    } else if (opts.subNode) {
-      td.appendChild(opts.subNode);
     }
-    tr.appendChild(td);
     return td;
   }
 
   function renderRow(g) {
     var t = now();
     var live = g.max_expires_ms > t;
-    var tr = document.createElement('tr');
-    tr.setAttribute('data-group', g.group_id);
-    tr.setAttribute('data-live', live ? '1' : '0');
 
-    var pickTd = document.createElement('td');
-    pickTd.className = 'col-pick';
     var pick = document.createElement('input');
     pick.type = 'checkbox';
     pick.checked = !!selected[g.group_id];
@@ -129,55 +122,35 @@ vt.tabs.cache = function (panel) {
       if (pick.checked) selected[g.group_id] = true; else delete selected[g.group_id];
       syncBulkBar();
     });
-    pickTd.appendChild(pick);
-    tr.appendChild(pickTd);
 
     // 主机 · 项目: the two halves of the key (verified token, advisory project).
     // Command, IP, user and directory are the hover detail.
-    cell2(tr, g.host || '—',
-      (g.user || '?') + ' · ' + (g.project ? shortPath(g.project) : '项目未知'),
-      { mainCls: 'trunc-host',
-        mainHover: '主机: ' + (g.host || '—') + '\n用户: ' + (g.user || '—')
-          + '\n命令: ' + (g.command || '—') + (g.ppid_cmd ? '\n父进程: ' + g.ppid_cmd : '')
-          + '\n批准时来源 IP: ' + (g.ip || '—') + '（仅作审计，不参与绑定）'
-          + '\n分组: ' + g.group_id + '\n来源审批: ' + g.origin_token_id,
-        subCls: 'trunc-sub',
-        subHover: '项目: ' + (g.project || '未知（早期条目）') + '\n工作目录: ' + (g.pwd || '—')
-          + '\n\n（缓存绑定该主机的令牌与客户端自报的项目，两者一致才会命中）' });
+    var who = (g.user || '?') + ' · ' + (g.project ? shortPath(g.project) : '项目未知');
+    var hostHover = '主机: ' + (g.host || '—') + '\n用户: ' + (g.user || '—')
+      + '\n命令: ' + (g.command || '—') + (g.ppid_cmd ? '\n父进程: ' + g.ppid_cmd : '')
+      + '\n批准时来源 IP: ' + (g.ip || '—') + '（仅作审计，不参与绑定）'
+      + '\n分组: ' + g.group_id + '\n来源审批: ' + g.origin_token_id;
+    var projHover = '项目: ' + (g.project || '未知（早期条目）') + '\n工作目录: ' + (g.pwd || '—')
+      + '\n\n（缓存绑定该主机的令牌与客户端自报的项目，两者一致才会命中）';
 
     // 记录: the group's records by name, renameable in place (the salt is the key).
-    var recTd = document.createElement('td');
-    recTd.className = 'col-rec';
-    recTd.appendChild(vt.recordList(g.records || [], null, 4));
-    tr.appendChild(recTd);
+    var records = vt.recordList(g.records || [], null, 4);
 
-    // 条目: live count, with the swept-but-present total only when they differ.
-    cell2(tr, String(g.live), g.entries !== g.live ? '共 ' + g.entries : '',
-      { mainCls: 'col-num' }).className = 'col-num';
+    // 剩余 / 余量: remaining window on top; below it either the exact expiry or
+    // — critically — WHY this group cannot be extended. The reason used to live
+    // only in the far-right action cell, which scrolled off screen, so the page
+    // never explained itself.
+    var remaining = live ? fmtRemaining(g.max_expires_ms - t) : '已过期';
+    var why = (!g.extendable && g.reason) ? (REASON_TEXT[g.reason] || g.reason) : '';
+    var until = live ? '至 ' + fmtTime(g.max_expires_ms) : '';
+    var created = '创建于 ' + (fmtTime(g.created_ms) || '未知');
 
-    // 剩余 / 余量: remaining window on top; below it either the extendable
-    // headroom or — critically — WHY this group cannot be extended. The reason
-    // used to live only in the far-right action cell, which scrolled off screen,
-    // so the page never explained itself.
-    var remTd = cell2(tr, live ? fmtRemaining(g.max_expires_ms - t) : '已过期', '',
-      { mainCls: live ? '' : 'cache-expired' });
-    // Sub-line: the exact expiry while live, or WHY the row cannot be extended.
-    var sub = null;
-    if (!g.extendable && g.reason) {
-      sub = el('div', 'cell-sub reason-badge', REASON_TEXT[g.reason] || g.reason);
-    } else if (live) {
-      sub = el('div', 'cell-sub', '至 ' + fmtTime(g.max_expires_ms));
-    }
-    if (sub) remTd.appendChild(sub);
-    remTd.appendChild(el('div', 'cell-sub', '创建于 ' + (fmtTime(g.created_ms) || '未知')));
-
-    var act = document.createElement('td');
-    act.className = 'col-act';
+    var actions = [];
     var clr = el('button', 'danger small', '清除');
     clr.type = 'button';
     clr.title = '立即失效这 ' + g.live + ' 条缓存，之后解密需重新手机审批';
     clr.addEventListener('click', function () { clearGroups([g.group_id], clr); });
-    act.appendChild(clr);
+    actions.push(clr);
     if (g.extendable) {
       var ttlNow = selectedTtl();
       var gains = wouldGain(g, ttlNow);
@@ -189,17 +162,44 @@ vt.tabs.cache = function (panel) {
         : '所选时长 ' + ttlLabel(ttlNow) + ' 短于现有剩余 '
           + fmtRemaining(g.max_expires_ms - t) + '，不会生效；请在上方选更长的时长';
       ext.addEventListener('click', function () { requestExtend([g.group_id], ext); });
-      act.appendChild(ext);
+      actions.push(ext);
     }
-    tr.appendChild(act);
-    return tr;
+
+    return list.item({
+      attrs: { group: g.group_id, live: live ? '1' : '0' },
+      cells: function () {
+        var pickTd = document.createElement('td');
+        pickTd.className = 'col-pick';
+        pickTd.appendChild(pick);
+        var recTd = document.createElement('td');
+        recTd.className = 'col-rec';
+        recTd.appendChild(records);
+        // 条目: live count, with the swept-but-present total only when they differ.
+        var numTd = cell2(String(g.live), g.entries !== g.live ? '共 ' + g.entries : '', { mainCls: 'col-num' });
+        numTd.className = 'col-num';
+        var remTd = cell2(remaining, '', { mainCls: live ? '' : 'cache-expired' });
+        if (why) remTd.appendChild(el('div', 'cell-sub reason-badge', why));
+        else if (until) remTd.appendChild(el('div', 'cell-sub', until));
+        remTd.appendChild(el('div', 'cell-sub', created));
+        var act = document.createElement('td');
+        act.className = 'col-act';
+        actions.forEach(function (b) { act.appendChild(b); });
+        return [pickTd,
+          cell2(g.host || '—', who, { mainCls: 'trunc-host', mainHover: hostHover, subCls: 'trunc-sub', subHover: projHover }),
+          recTd, numTd, remTd, act];
+      },
+      row: function () {
+        var sub = [el('div', null, who), records,
+          el('div', null, g.live + ' 条 · ' + (why || until || '') + ' · ' + created)];
+        return { lead: pick, main: g.host || '—', sub: sub, trail: remaining, actions: actions };
+      },
+    });
   }
 
   function render() {
-    var tbody = $('.rows');
-    tbody.innerHTML = '';
+    list.clear();
     var rows = visibleGroups();
-    rows.forEach(function (g) { tbody.appendChild(renderRow(g)); });
+    rows.forEach(function (g) { list.body().appendChild(renderRow(g)); });
     var pickAll = $('#pick-all');
     pickAll.checked = rows.length > 0 && rows.every(function (g) { return selected[g.group_id]; });
     syncBulkBar();
@@ -538,5 +538,6 @@ vt.tabs.cache = function (panel) {
   setInterval(function () { if (!vt.dialog.isOpen() && !panel.querySelector('.rec-edit')) render(); }, 15000);
 
   vt.hovercard.attach($('.table-wrap'));
+  vt.onLayout(render);
   load();
 };

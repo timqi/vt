@@ -8,8 +8,9 @@
 // inside its own panel. Loaded before the tab scripts; boots on DOMContentLoaded.
 //
 // Shared here (admin-only): the API base and its 401 handling, the login
-// ceremony, the detail dialog, the hovercard and the command summariser.
-// Cross-shell helpers live in common.js (vt.*).
+// ceremony, the phone/desktop layout switch (vt.phone, vt.onLayout, vt.list),
+// the detail sheet, the hovercard and the command summariser. Cross-shell
+// helpers live in common.js (vt.*).
 
 (function () {
   vt.api = function (path) { return '/api/admin/' + path; };
@@ -55,6 +56,70 @@
     }
     var v = basenameLeadingProgram(pick);
     return v.length > max ? v.slice(0, max) + '…' : v;
+  };
+
+  // ── Layout: rows on a phone, tables at ≥ 768px ───────────────────────────
+  // One breakpoint for every list (admin.css). Tabs register their full render
+  // with vt.onLayout so a resize across it re-renders from the same data.
+  vt.phone = window.matchMedia('(max-width: 767px)');
+  var layoutFns = [];
+  vt.onLayout = function (fn) { layoutFns.push(fn); };
+  vt.phone.addEventListener('change', function () { layoutFns.forEach(function (f) { f(); }); });
+
+  function fill(node, content) {
+    if (content == null) return node;
+    (Array.isArray(content) ? content : [content]).forEach(function (c) {
+      if (c == null || c === '') return;
+      if (typeof c === 'string' || typeof c === 'number') node.appendChild(document.createTextNode(String(c)));
+      else node.appendChild(c);
+    });
+    return node;
+  }
+
+  // A list bound to one .table-wrap: `body()` is the container to append to
+  // (the <tbody> or the <ul class="row-list"> the helper adds), `item(spec)`
+  // builds one entry for the current layout — `spec.cells()` returns the <td>s,
+  // `spec.row()` returns { lead, main, sub, trail, actions } — so a tab
+  // describes both from one data object and one set of handlers. `cls`,
+  // `attrs` (data-*) and `click` apply to either element.
+  vt.list = function (wrap) {
+    var tbody = wrap.querySelector('tbody');
+    var ul = vt.el('ul', 'row-list');
+    wrap.appendChild(ul);
+    var cols = wrap.querySelectorAll('th').length || 1;
+    return {
+      body: function () { return vt.phone.matches ? ul : tbody; },
+      clear: function () { tbody.innerHTML = ''; ul.innerHTML = ''; },
+      item: function (spec) {
+        var phone = vt.phone.matches;
+        var e = document.createElement(phone ? 'li' : 'tr');
+        e.className = (phone ? 'row ' : '') + (spec.cls || '');
+        Object.keys(spec.attrs || {}).forEach(function (k) { e.setAttribute('data-' + k, spec.attrs[k]); });
+        if (spec.click) {
+          // A clickable entry is a keyboard target too: Tab to it, Enter opens.
+          e.tabIndex = 0;
+          e.addEventListener('click', spec.click);
+          e.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && ev.target === e) spec.click(ev); });
+        }
+        if (!phone) { spec.cells().forEach(function (td) { e.appendChild(td); }); return e; }
+        var r = spec.row();
+        if (r.lead) e.appendChild(fill(vt.el('div', 'row-lead'), r.lead));
+        var body = vt.el('div', 'row-body');
+        body.appendChild(fill(vt.el('div', 'row-main'), r.main));
+        if (r.sub) body.appendChild(fill(vt.el('div', 'cell-sub'), r.sub));
+        e.appendChild(body);
+        if (r.trail) e.appendChild(fill(vt.el('div', 'row-trail'), r.trail));
+        if (r.actions && r.actions.length) e.appendChild(fill(vt.el('div', 'row-actions'), r.actions));
+        return e;
+      },
+      // One muted line when there is nothing to list.
+      empty: function (text) {
+        if (vt.phone.matches) { ul.appendChild(vt.el('li', 'row')).appendChild(vt.el('div', 'row-empty', text)); return; }
+        var td = vt.el('td', null, text);
+        td.colSpan = cols;
+        tbody.appendChild(document.createElement('tr')).appendChild(td);
+      },
+    };
   };
 
   // ── Record names (audit 记录 column + dialog, cache rows) ─────────────────
@@ -139,13 +204,15 @@
     return ul;
   };
 
-  // ── Detail dialog ─────────────────────────────────────────────────────────
-  // #detail-backdrop / #detail-card exist once in the shell. open() fills the
+  // ── Detail sheet ──────────────────────────────────────────────────────────
+  // #detail is one native <dialog> in the shell: a bottom sheet on a phone
+  // (swipe down to dismiss), a centred card on desktop. open() fills the
   // heading, the warning and hands back the empty <dl> plus the ceremony box;
   // it never clears the ceremony box (a live re-render must not disturb a
-  // mounted ceremony) — close() does. Escape, the close control and a backdrop
-  // tap close; focus returns to the opener on dismissal.
-  var backdrop = document.getElementById('detail-backdrop');
+  // mounted ceremony) — close() does. Escape (the dialog's own cancel), the
+  // close control and a backdrop tap close; focus returns to the opener.
+  var dialog = document.getElementById('detail');
+  var sheetBody = document.getElementById('detail-body');
   var dialogTitle = document.getElementById('detail-title');
   var dialogWarn = document.getElementById('detail-warn');
   var dialogDl = document.getElementById('detail-dl');
@@ -161,21 +228,16 @@
       dialogWarn.hidden = !opts.warn;
       dialogWarn.textContent = opts.warn || '';
       dialogDl.innerHTML = '';
-      if (backdrop.hidden) dialogOpener = document.activeElement;
       dialogOnClose = opts.onClose || null;
-      backdrop.hidden = false;
+      if (!dialog.open) {
+        dialogOpener = document.activeElement;
+        sheetBody.scrollTop = 0;
+        dialog.showModal();
+      }
       return { dl: dialogDl, approve: dialogApprove };
     },
-    close: function () {
-      if (backdrop.hidden) return;
-      backdrop.hidden = true;
-      dialogApprove.innerHTML = '';
-      var cb = dialogOnClose; dialogOnClose = null;
-      if (cb) cb();
-      if (dialogOpener && dialogOpener.focus) dialogOpener.focus();
-      dialogOpener = null;
-    },
-    isOpen: function () { return !backdrop.hidden; },
+    close: function () { if (dialog.open) dialog.close(); },
+    isOpen: function () { return dialog.open; },
     // A <dt>/<dd> pair; skipped for an empty value. `mono` marks paths/commands.
     addRow: function (dl, label, value, mono) {
       if (value === null || value === undefined || value === '') return;
@@ -183,8 +245,42 @@
       dl.appendChild(vt.el('dd', mono ? 'mono' : null, String(value)));
     },
   };
+  // Logical close happens here (also for Escape); the exit transition continues.
+  dialog.addEventListener('close', function () {
+    dialogApprove.innerHTML = '';
+    var cb = dialogOnClose; dialogOnClose = null;
+    if (cb) cb();
+    if (dialogOpener && dialogOpener.focus) dialogOpener.focus();
+    dialogOpener = null;
+  });
   document.getElementById('detail-close').addEventListener('click', vt.dialog.close);
-  backdrop.addEventListener('click', function (e) { if (e.target === backdrop) vt.dialog.close(); });
+  // A click whose target is the dialog element itself landed on ::backdrop —
+  // the sheet's content is wrapped, so its own padding never counts.
+  dialog.addEventListener('click', function (e) { if (e.target === dialog) vt.dialog.close(); });
+
+  // Swipe down (phone): follow the finger via element.style.transform (CSSOM)
+  // from the sheet's top, release past 90px closes, else it springs back.
+  var swipeY = 0, swiping = false;
+  dialog.addEventListener('touchstart', function (e) {
+    swipeY = e.touches[0].clientY;
+    swiping = vt.phone.matches && sheetBody.scrollTop <= 0;
+  }, { passive: true });
+  dialog.addEventListener('touchmove', function (e) {
+    if (!swiping) return;
+    var dy = e.touches[0].clientY - swipeY;
+    if (dy <= 0) { swiping = false; dialog.classList.remove('dragging'); dialog.style.transform = ''; return; }
+    e.preventDefault();
+    dialog.classList.add('dragging');
+    dialog.style.transform = 'translateY(' + dy + 'px)';
+  }, { passive: false });
+  dialog.addEventListener('touchend', function (e) {
+    if (!swiping) return;
+    swiping = false;
+    var dy = e.changedTouches[0].clientY - swipeY;
+    dialog.classList.remove('dragging');
+    dialog.style.transform = '';
+    if (dy > 90) vt.dialog.close();
+  });
 
   // ── Hover card ────────────────────────────────────────────────────────────
   // The native `title` tooltip is the wrong tool for a bound directory or an
@@ -246,18 +342,16 @@
   } };
   window.addEventListener('scroll', hideHover, true);
   window.addEventListener('resize', hideHover);
-  document.addEventListener('keydown', function (e) {
-    if (e.key !== 'Escape') return;
-    hideHover();
-    vt.dialog.close();
-  });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideHover(); });
 
-  // ── Tab strip ─────────────────────────────────────────────────────────────
+  // ── Tab bar ───────────────────────────────────────────────────────────────
   // Tab in the URL hash (/{seg}#audit), first tab default. A panel's script
   // runs once, on first activation, so a hidden tab costs nothing until opened.
+  // Marks are single Unicode glyphs (no icon set); the label sits under the
+  // mark on a phone, beside it on desktop.
   var TABS = [
-    ['audit', '审计'], ['cache', 'DEK 缓存'], ['tokens', '主机令牌'],
-    ['setup', 'Passkey'], ['settings', '设置'],
+    ['audit', '审计', '≣'], ['cache', 'DEK 缓存', '◷'], ['tokens', '主机令牌', '⌂'],
+    ['setup', 'Passkey', '⚷'], ['settings', '设置', '⚙\uFE0E'],
   ];
   var started = {};
 
@@ -276,20 +370,41 @@
         if (vt.tabs[key]) vt.tabs[key](panel, data);
       }
     });
-    document.title = 'VT — ' + TABS.filter(function (t) { return t[0] === key; })[0][1];
+    var title = TABS.filter(function (t) { return t[0] === key; })[0][1];
+    document.getElementById('page-title').textContent = title;
+    document.title = 'VT — ' + title;
+  }
+
+  // Phone: the bar shrinks to marks while the content scrolls down and
+  // restores on scroll up or when scrolling stops (admin.css .compact).
+  function scrollShrink(nav) {
+    var lastY = window.scrollY, stop = null;
+    window.addEventListener('scroll', function () {
+      var y = window.scrollY;
+      if (y > lastY + 4 && y > 40) nav.classList.add('compact');
+      else if (y < lastY - 4) nav.classList.remove('compact');
+      lastY = y;
+      clearTimeout(stop);
+      stop = setTimeout(function () { nav.classList.remove('compact'); }, 400);
+    }, { passive: true });
   }
 
   function bootConsole(data) {
     var nav = document.getElementById('tabs');
     TABS.forEach(function (t) {
-      var a = vt.el('a', 'tab', t[1]);
+      var a = vt.el('a', 'tab');
       a.id = 'tab-link-' + t[0];
       a.href = '#' + t[0];
+      var mark = vt.el('span', 'tab-mark', t[2]);
+      mark.setAttribute('aria-hidden', 'true');
+      a.appendChild(mark);
+      a.appendChild(vt.el('span', 'tab-label', t[1]));
       nav.appendChild(a);
     });
     document.getElementById('page-head').hidden = false;
     document.getElementById('console').hidden = false;
     window.addEventListener('hashchange', function () { activate(data); });
+    scrollShrink(nav);
     activate(data);
   }
 

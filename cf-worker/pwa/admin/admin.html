@@ -13,9 +13,11 @@
   <!-- The only data on this page. The shell itself is a public asset; the
        Worker renders it per request behind the admin gate. -->
   <script type="application/json" id="vt-data">{{VT_DATA}}</script>
+  <!-- Page head: the tab's title; the tab bar is a bottom glass pill on a
+       phone and the same strip, sticky at the top, on desktop (admin.css). -->
   <header class="page-head" id="page-head" hidden>
-    <h1>VT</h1>
-    <nav class="tabs" id="tabs" aria-label="控制台"></nav>
+    <h1 id="page-title">VT</h1>
+    <nav class="tabbar glass" id="tabs" aria-label="控制台"></nav>
   </header>
   <p id="shell-status" class="status" role="status" aria-live="polite"></p>
 
@@ -150,10 +152,12 @@
           <h2>当前 Passkey</h2>
           <span id="current-meta" class="badge"></span>
         </div>
-        <ul id="current-list" class="cred-list"></ul>
+        <div class="table-wrap"><table id="creds"><thead><tr>
+          <th>标签</th><th>凭据 ID</th><th>注册日期</th>
+        </tr></thead><tbody class="rows"></tbody></table></div>
       </section>
 
-      <div id="modes" role="radiogroup" aria-label="操作模式">
+      <div id="modes" class="seg glass" role="radiogroup" aria-label="操作模式">
         <label><input type="radio" name="mode" value="add" checked><span>新增</span></label>
         <label><input type="radio" name="mode" value="revoke"><span>吊销</span></label>
       </div>
@@ -231,16 +235,19 @@
     </section>
 
   </main>
-  <!-- One detail dialog for every tab (admin.js vt.dialog): the audit row, the
-       cache-extend request, and the inline Passkey ceremony both mount through
-       the SAME vt.mountApprove() the standalone /a/:token page uses. -->
-  <div id="detail-backdrop" hidden><div id="detail-card" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+  <!-- One detail sheet for every tab (admin.js vt.dialog, native <dialog>): the
+       audit row, the cache-extend request, and the inline Passkey ceremony both
+       mount through the SAME vt.mountApprove() the standalone /a/:token page uses. -->
+  <dialog id="detail" aria-modal="true" aria-labelledby="detail-title">
+    <div class="sheet-grab" aria-hidden="true"></div>
     <button id="detail-close" type="button" aria-label="关闭">×</button>
-    <h2 id="detail-title" hidden></h2>
-    <dl id="detail-dl"></dl>
-    <p id="detail-warn" class="warn" hidden></p>
-    <div id="detail-approve"></div>
-  </div></div>
+    <div class="sheet-body" id="detail-body">
+      <h2 id="detail-title" hidden></h2>
+      <dl id="detail-dl"></dl>
+      <p id="detail-warn" class="warn" hidden></p>
+      <div id="detail-approve"></div>
+    </div>
+  </dialog>
   <script src="/pwa/libsodium.js"></script>
   <script src="/pwa/common.js?v={{ASSET_VER}}"></script>
   <script src="/pwa/approve.js?v={{ASSET_VER}}"></script>

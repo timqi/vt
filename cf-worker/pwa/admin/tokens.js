@@ -18,6 +18,8 @@ vt.tabs.tokens = function (panel) {
 
   function isLive(t) { return t.revoked_ms == null && t.expires_ms > now(); }
 
+  var list = vt.list($('.table-wrap'));   // rows on a phone, the table on desktop
+
   function cell(main, sub) {
     var td = document.createElement('td');
     td.appendChild(el('div', 'cell-main', main));
@@ -25,9 +27,41 @@ vt.tabs.tokens = function (panel) {
     return td;
   }
 
+  function renderRow(t) {
+    var live = isLive(t);
+    var issued = (t.origin || '') + (t.origin ? ' · ' : '') + '签发 ' + fmtTime(t.created_ms);
+    var lastIp = (t.last_ip && t.last_ip !== t.enroll_ip) ? 'IP ' + t.last_ip : '';
+    var state = t.revoked_ms != null ? '已吊销 ' + fmtTime(t.revoked_ms) : fmtRemaining(t.expires_ms - now());
+    var btn = null;
+    if (live) {
+      btn = el('button', 'danger small', '吊销');
+      btn.type = 'button';
+      btn.addEventListener('click', function () { revoke(t, btn); });
+    }
+    return list.item({
+      cls: live ? '' : 'expired',
+      cells: function () {
+        var td = document.createElement('td');
+        if (btn) td.appendChild(btn);
+        return [cell(t.host || '?', (t.user ? t.user + ' · ' : '') + t.token_id),
+          cell(t.enroll_ip || '', issued), cell(fmtTime(t.last_used_ms), lastIp),
+          cell(state, t.revoked_ms == null ? fmtTime(t.expires_ms) : ''), td];
+      },
+      row: function () {
+        return {
+          main: t.host || '?',
+          sub: [el('div', null, (t.user ? t.user + ' · ' : '') + t.token_id),
+            el('div', null, (t.enroll_ip || '') + ' · ' + issued),
+            el('div', null, '最近使用 ' + (fmtTime(t.last_used_ms) || '—') + (lastIp ? ' · ' + lastIp : '')
+              + (t.revoked_ms == null ? ' · 到期 ' + fmtTime(t.expires_ms) : ''))],
+          trail: state, actions: btn ? [btn] : [],
+        };
+      },
+    });
+  }
+
   function render() {
-    var tbody = $('.rows');
-    tbody.innerHTML = '';
+    list.clear();
     var onlyLive = $('.f-live').value === 'live';
     var hostQ = ($('.f-host').value || '').trim().toLowerCase();
     var shown = 0;
@@ -35,33 +69,9 @@ vt.tabs.tokens = function (panel) {
       if (onlyLive && !isLive(t)) return;
       if (hostQ && String(t.host || '').toLowerCase().indexOf(hostQ) < 0) return;
       shown++;
-      var tr = document.createElement('tr');
-      if (!isLive(t)) tr.className = 'expired';
-      tr.appendChild(cell(t.host || '?', (t.user ? t.user + ' · ' : '') + t.token_id));
-      tr.appendChild(cell(t.enroll_ip || '', (t.origin || '') + (t.origin ? ' · ' : '') + '签发 ' + fmtTime(t.created_ms)));
-      var lastSub = [];
-      if (t.last_ip && t.last_ip !== t.enroll_ip) lastSub.push('IP ' + t.last_ip);
-      tr.appendChild(cell(fmtTime(t.last_used_ms), lastSub.join(' · ')));
-      var state = t.revoked_ms != null ? '已吊销 ' + fmtTime(t.revoked_ms) : fmtRemaining(t.expires_ms - now());
-      tr.appendChild(cell(state, t.revoked_ms == null ? fmtTime(t.expires_ms) : ''));
-      var td = document.createElement('td');
-      if (isLive(t)) {
-        var btn = el('button', 'danger small', '吊销');
-        btn.type = 'button';
-        btn.addEventListener('click', function () { revoke(t, btn); });
-        td.appendChild(btn);
-      }
-      tr.appendChild(td);
-      tbody.appendChild(tr);
+      list.body().appendChild(renderRow(t));
     });
-    if (shown === 0) {
-      var tr0 = document.createElement('tr');
-      var td0 = document.createElement('td');
-      td0.colSpan = 5;
-      td0.textContent = onlyLive ? '没有有效令牌（切换到「全部」查看历史）' : '没有令牌';
-      tr0.appendChild(td0);
-      tbody.appendChild(tr0);
-    }
+    if (shown === 0) list.empty(onlyLive ? '没有有效令牌（切换到「全部」查看历史）' : '没有令牌');
   }
 
   async function revoke(t, btn) {
@@ -105,6 +115,7 @@ vt.tabs.tokens = function (panel) {
   $('.refresh').addEventListener('click', function () { load(); });
   $('.f-live').addEventListener('change', render);
   $('.f-host').addEventListener('input', render);
+  vt.onLayout(render);
   setInterval(render, 60000);
   load();
 };
