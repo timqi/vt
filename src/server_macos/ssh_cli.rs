@@ -114,40 +114,41 @@ pub fn ssh_list() -> Result<()> {
     Ok(())
 }
 
+/// The one stored entry whose fingerprint contains `needle`. No match and
+/// more than one match are errors (the candidates are listed), so a caller
+/// never mutates on an ambiguous prefix.
+fn select_entry(entries: &[SshKeyEntry], needle: &str) -> Result<usize> {
+    let matches: Vec<usize> = (0..entries.len())
+        .filter(|&i| entries[i].fingerprint.contains(needle))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(anyhow::anyhow!("No key found matching '{}'", needle)),
+        [i] => Ok(*i),
+        _ => {
+            println!("Multiple keys match '{}':", needle);
+            for &i in &matches {
+                let m = &entries[i];
+                println!("  {} {} {}", m.algorithm, m.fingerprint, m.comment);
+            }
+            Err(anyhow::anyhow!(
+                "Ambiguous fingerprint, please be more specific"
+            ))
+        }
+    }
+}
+
 pub fn ssh_remove(fingerprint: &str) -> Result<()> {
     if !local_authentication("remove SSH key") {
         return Err(anyhow::anyhow!("Authentication failed"));
     }
 
-    let needle = fingerprint.to_string();
     let mut removed_info: Option<String> = None;
     with_ssh_keys(|entries| {
-        let matches: Vec<_> = entries
-            .iter()
-            .filter(|e| e.fingerprint.contains(&needle))
-            .cloned()
-            .collect();
-
-        if matches.is_empty() {
-            return Err(anyhow::anyhow!("No key found matching '{}'", needle));
-        }
-        if matches.len() > 1 {
-            println!("Multiple keys match '{}':", needle);
-            for m in &matches {
-                println!("  {} {} {}", m.algorithm, m.fingerprint, m.comment);
-            }
-            return Err(anyhow::anyhow!(
-                "Ambiguous fingerprint, please be more specific"
-            ));
-        }
-
-        let entry = &matches[0];
+        let entry = entries.remove(select_entry(entries, fingerprint)?);
         removed_info = Some(format!(
             "{} {} {}",
             entry.algorithm, entry.fingerprint, entry.comment
         ));
-
-        entries.retain(|e| e.fingerprint != entry.fingerprint);
         Ok(true)
     })?;
 
@@ -176,31 +177,13 @@ pub fn ssh_comment(fingerprint: &str, comment: &str) -> Result<()> {
         return Err(anyhow::anyhow!("Authentication failed"));
     }
 
-    let needle = fingerprint.to_string();
     let new_comment = comment.to_string();
     let mut updated_info: Option<(String, String)> = None;
     with_ssh_keys(|entries| {
-        let matches: Vec<_> = entries
-            .iter()
-            .filter(|e| e.fingerprint.contains(&needle))
-            .collect();
-
-        if matches.is_empty() {
-            return Err(anyhow::anyhow!("No key found matching '{}'", needle));
-        }
-        if matches.len() > 1 {
-            println!("Multiple keys match '{}':", needle);
-            for m in &matches {
-                println!("  {} {} {}", m.algorithm, m.fingerprint, m.comment);
-            }
-            return Err(anyhow::anyhow!(
-                "Ambiguous fingerprint, please be more specific"
-            ));
-        }
-
-        let fp = matches[0].fingerprint.clone();
-        let algorithm = matches[0].algorithm.clone();
-        let entry = entries.iter_mut().find(|e| e.fingerprint == fp).unwrap();
+        let i = select_entry(entries, fingerprint)?;
+        let entry = &mut entries[i];
+        let fp = entry.fingerprint.clone();
+        let algorithm = entry.algorithm.clone();
 
         let privkey = PrivateKey::from_openssh(entry.key_data.as_bytes())
             .context("Failed to parse stored key")?;
@@ -230,27 +213,7 @@ pub fn ssh_show(fingerprint: &str) -> Result<()> {
 
     let store = KeychainStore::load().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
     let entries = load_ssh_keys(&store)?;
-
-    let matches: Vec<_> = entries
-        .iter()
-        .filter(|e| e.fingerprint.contains(fingerprint))
-        .cloned()
-        .collect();
-
-    if matches.is_empty() {
-        return Err(anyhow::anyhow!("No key found matching '{}'", fingerprint));
-    }
-    if matches.len() > 1 {
-        println!("Multiple keys match '{}':", fingerprint);
-        for m in &matches {
-            println!("  {} {} {}", m.algorithm, m.fingerprint, m.comment);
-        }
-        return Err(anyhow::anyhow!(
-            "Ambiguous fingerprint, please be more specific"
-        ));
-    }
-
-    let entry = &matches[0];
+    let entry = &entries[select_entry(&entries, fingerprint)?];
     let privkey = PrivateKey::from_openssh(entry.key_data.as_bytes())
         .context("Failed to parse stored key")?;
     let pubkey_str = privkey
@@ -259,4 +222,34 @@ pub fn ssh_show(fingerprint: &str) -> Result<()> {
         .context("Failed to serialize public key")?;
     println!("{}", pubkey_str);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(fp: &str) -> SshKeyEntry {
+        SshKeyEntry {
+            fingerprint: fp.to_string(),
+            algorithm: "ssh-ed25519".to_string(),
+            comment: String::new(),
+            key_data: String::new(),
+        }
+    }
+
+    #[test]
+    fn select_entry_is_unique_substring_match_or_error() {
+        let entries = vec![
+            entry("SHA256:abcdef"),
+            entry("SHA256:abxyz"),
+            entry("SHA256:qrs"),
+        ];
+        assert_eq!(select_entry(&entries, "cdef").unwrap(), 0);
+        assert_eq!(select_entry(&entries, "SHA256:qrs").unwrap(), 2);
+        let none = select_entry(&entries, "zzz").unwrap_err().to_string();
+        assert_eq!(none, "No key found matching 'zzz'");
+        let many = select_entry(&entries, "SHA256:ab").unwrap_err().to_string();
+        assert_eq!(many, "Ambiguous fingerprint, please be more specific");
+        assert!(select_entry(&[], "").is_err());
+    }
 }
