@@ -23,8 +23,11 @@ in an envelope carried as plain JSON in the extension reply details:
 | `sign@vt` | `SignRes` |
 | `diag@vt` | `DiagRes` |
 
-`ExtResponse<T>` and its flattened, `status`-tagged `ExtBody<T>` declare the
-wire shape. For example:
+`ExtResponse<T>` in `src/core/wire.rs` is the one envelope type: a flat
+struct with `v`, `status`, and optional `data` / `kind` / `detail`. It is flat
+rather than a `status`-tagged body enum because serde's flatten and
+internally-tagged paths buffer through `Content`, which cannot carry the
+borrowed `RawValue` the client needs. For example:
 
 ```json
 {"v":1,"status":"ok","data":{"approved":true}}
@@ -39,7 +42,8 @@ wire shape. For example:
 - `kind` uses snake_case enum names. `detail` is optional and omitted on
   serialization when absent; deserialization also accepts `null` as absent.
 - Unknown extra fields are ignored. Unknown `kind` values are accepted as
-  `ErrKind::Unknown`; a missing `kind` on an error is a parse failure.
+  `ErrKind::Unknown`; a missing `kind` on an error is a transport error in
+  the client, never a default.
 - `session-bind@openssh.com` and the token-gated `ui-status@vt` channel are
   dispatched before the lock check and the Keychain path. Neither
   uses this envelope. Standard SSH signing also retains SSH-agent wire errors.
@@ -152,9 +156,9 @@ details, not operation-specific success payloads such as `DiagRes`.
 ## Client-side mapping
 
 `try_agent_extension` decrypts response details into a `Zeroizing` buffer and
-calls `parse_envelope`. The parser uses a flat `ParsedEnvelope` with borrowed
-`&RawValue` data, not `ExtResponse<RawValue>`: serde flattening cannot preserve
-the raw JSON span. Successful `data` is copied into another zeroizing buffer.
+calls `parse_envelope`, which deserializes `ExtResponse<&RawValue>` so the
+`data` span is borrowed, then enforces `ok => data`, `err => kind`. Successful
+`data` is copied once into another zeroizing buffer.
 
 - `status: err` becomes `VtClientError::Agent(kind, detail)`.
 - Malformed JSON, unknown status, missing success data or error kind, and

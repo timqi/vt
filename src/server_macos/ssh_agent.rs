@@ -1048,7 +1048,8 @@ async fn commit_authorization(permit: AuthorizationPermit) -> Result<(), WireFai
 // ---- Envelope serialization helpers -----------------------------------------
 
 /// Concrete shape used to serialize an `err` envelope. Mirrors the JSON
-/// produced by `ExtResponse<T> { v, body: ExtBody::Err { .. } }`.
+/// produced by `ExtResponse::err(kind, detail)`; `&'static str` detail
+/// restricts construction to the reviewed `DETAIL_*` allow-list.
 #[derive(Serialize)]
 struct ErrEnvelope {
     v: u16,

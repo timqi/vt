@@ -16,14 +16,13 @@ pub use inject::{inject, inject_recover, supervisor_main, SUPERVISOR_SUBCOMMAND}
 use crate::caller_meta::{collect_client_meta, get_hostname};
 use crate::cf;
 use crate::config::{ClientRoute, ResolvedConfig};
-use crate::core::wire::{ErrKind, WIRE_VERSION};
+use crate::core::wire::{ErrKind, ExtResponse, Status, WIRE_VERSION};
 use crate::core::{
     client_encrypt_v2, AuthReq, AuthRes, DecryptReq, EncryptItem, EncryptReq, EncryptResItem,
     RunReq, RunRes, SignReq, SignRes,
 };
 use anyhow::{ensure, Context, Result};
 use records::DecryptBatch;
-use serde::Deserialize;
 use serde_json::value::RawValue;
 use ssh_agent_lib::proto::{Extension, Unparsed};
 use std::sync::Arc;
@@ -75,35 +74,6 @@ fn transport<E: Into<anyhow::Error>>(e: E) -> anyhow::Error {
     anyhow::Error::from(VtClientError::Transport(e.into()))
 }
 
-/// Parse an agent envelope. Returns the inner `data` JSON bytes on
-/// success (still potentially containing DEKs — caller is responsible for
-/// scrubbing); maps the `err` variant to `VtClientError::Agent` and version
-/// mismatch to `ErrKind::ProtocolVersion`.
-///
-/// We do NOT reuse the `ExtResponse<T>` type from `core::wire` here, because
-/// it relies on `#[serde(flatten)]` which is incompatible with
-/// `Box<RawValue>` — flatten goes through serde's internal `Content` buffer
-/// that doesn't preserve the raw JSON span `RawValue` requires. Instead we
-/// deserialize the wire form directly into this flat struct and switch on
-/// `status` manually. The on-the-wire shape is identical to what
-/// `ExtResponse` produces (verified by the round-trip tests in
-/// `core::wire::tests`).
-#[derive(Deserialize)]
-struct ParsedEnvelope<'a> {
-    v: u16,
-    status: String,
-    /// Present iff `status == "ok"`. Captured as `&RawValue` so any
-    /// DEK-bearing bytes inside are not re-allocated through
-    /// `serde_json::Value`.
-    #[serde(borrow, default)]
-    data: Option<&'a RawValue>,
-    /// Present iff `status == "err"`.
-    #[serde(default)]
-    kind: Option<ErrKind>,
-    #[serde(default)]
-    detail: Option<String>,
-}
-
 /// Policy for the `auto` backend mode: when an SSH agent call fails, may we
 /// silently retry via the CF passkey path?
 ///
@@ -132,16 +102,23 @@ fn should_fallback_to_cf(err: &anyhow::Error) -> bool {
     }
 }
 
+/// Parse an agent envelope. Returns the inner `data` JSON bytes on
+/// success (still potentially containing DEKs — caller is responsible for
+/// scrubbing); maps the `err` variant to `VtClientError::Agent` and version
+/// mismatch to `ErrKind::ProtocolVersion`.
+///
+/// `data` is captured as `&RawValue` so DEK-bearing bytes are copied once,
+/// into the returned `Zeroizing` buffer, never through `serde_json::Value`.
 fn parse_envelope(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-    let env: ParsedEnvelope = serde_json::from_slice(bytes)
+    let env: ExtResponse<&RawValue> = serde_json::from_slice(bytes)
         .map_err(|e| transport(anyhow::anyhow!("failed to parse agent envelope: {}", e)))?;
     if env.v != WIRE_VERSION {
         // Different protocol versions: refuse even an "ok"-looking body.
         // The client and agent binaries must be from the same build.
         return Err(VtClientError::Agent(ErrKind::ProtocolVersion, None).into());
     }
-    match env.status.as_str() {
-        "ok" => {
+    match env.status {
+        Status::Ok => {
             let raw = env.data.ok_or_else(|| {
                 transport(anyhow::anyhow!(
                     "agent envelope status=ok but missing `data` field"
@@ -149,7 +126,7 @@ fn parse_envelope(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
             })?;
             Ok(Zeroizing::new(raw.get().as_bytes().to_vec()))
         }
-        "err" => {
+        Status::Err => {
             let kind = env.kind.ok_or_else(|| {
                 transport(anyhow::anyhow!(
                     "agent envelope status=err but missing `kind` field"
@@ -157,10 +134,6 @@ fn parse_envelope(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
             })?;
             Err(VtClientError::Agent(kind, env.detail).into())
         }
-        other => Err(transport(anyhow::anyhow!(
-            "agent envelope has unknown status `{}`",
-            other
-        ))),
     }
 }
 
@@ -892,8 +865,8 @@ mod tests {
 
     /// Regression test for the `#[serde(flatten)]` + `RawValue` incompatibility
     /// that produced `invalid type: newtype struct, expected any valid JSON
-    /// value` on the first attempt. If someone ever switches `parse_envelope`
-    /// back to `ExtResponse<Box<RawValue>>`, this test must fail.
+    /// value` on the first attempt. If someone ever reintroduces a flattened
+    /// or `status`-tagged body enum in `ExtResponse`, this test must fail.
     #[test]
     fn parse_envelope_ok_with_array_data() {
         let inner = br#"[{"V2":{"dek":[1,2,3,4,5,6,7,8],"err_message":""}}]"#;
@@ -968,6 +941,20 @@ mod tests {
             }
             _ => panic!("expected Agent"),
         }
+    }
+
+    #[test]
+    fn parse_envelope_err_missing_kind_is_transport_error() {
+        // Absent `kind` must not default to anything — `#[serde(other)]
+        // Unknown` only catches unknown *values*, not absent fields.
+        let envelope = format!(r#"{{"v":{},"status":"err"}}"#, WIRE_VERSION);
+        let err = parse_envelope(envelope.as_bytes()).expect_err("must fail");
+        let vt_err = err.downcast_ref::<VtClientError>().unwrap();
+        assert!(
+            matches!(vt_err, VtClientError::Transport(_)),
+            "missing kind must surface as Transport, got {:?}",
+            vt_err
+        );
     }
 
     #[test]

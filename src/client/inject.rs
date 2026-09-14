@@ -1800,7 +1800,7 @@ mod tests {
             Option<ssh_agent_lib::proto::Extension>,
             ssh_agent_lib::error::AgentError,
         > {
-            use crate::core::wire::{ExtBody, ExtResponse, WIRE_VERSION};
+            use crate::core::wire::ExtResponse;
             use crate::core::{DecryptInput, DecryptReq, DecryptResItem};
             assert_eq!(extension.name, "decrypt@vt");
             let request: DecryptReq = serde_json::from_slice(extension.details.as_ref()).unwrap();
@@ -1821,11 +1821,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let bytes = serde_json::to_vec(&ExtResponse {
-                v: WIRE_VERSION,
-                body: ExtBody::Ok { data },
-            })
-            .unwrap();
+            let bytes = serde_json::to_vec(&ExtResponse::ok(data)).unwrap();
             Ok(Some(ssh_agent_lib::proto::Extension {
                 name: extension.name,
                 details: ssh_agent_lib::proto::Unparsed::from(bytes),

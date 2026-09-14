@@ -33,41 +33,65 @@ use crate::core::session::{AuthOutcome, UnavailableReason};
 /// [`ErrKind::ProtocolVersion`].
 pub const WIRE_VERSION: u16 = 1;
 
-/// Structured response envelope. `T` is the success payload type, which the
-/// client deserializes only on `status: ok` arms.
+/// Structured response envelope. `T` is the success payload type; the client
+/// parses with `T = &RawValue` so DEK-bearing `data` stays a borrowed span
+/// (never re-allocated through `serde_json::Value`).
 ///
-/// This is the declarative definition of the wire shape, not the production
-/// serializer: the agent emits OK envelopes through [`wrap_ok_envelope`] (see
-/// its DEK-copy rationale) and error envelopes through hand-built JSON, while
-/// the client parses into its own narrower types. The tests below and in
-/// `client::inject` round-trip against this type so those hand-built forms
-/// cannot drift from the declared shape — hence `dead_code` in a build that
-/// compiles no tests.
-#[allow(dead_code)]
+/// The shape is deliberately flat — `status` is a plain field and `data` /
+/// `kind` / `detail` are optional — rather than a `#[serde(tag = "status")]`
+/// body enum: serde's flatten/internally-tagged paths buffer through
+/// `Content`, which cannot carry a `RawValue`. The client enforces the
+/// `ok => data`, `err => kind` pairing in `parse_envelope`.
+///
+/// The agent emits OK envelopes through [`wrap_ok_envelope`] (see its
+/// DEK-copy rationale); tests serialize this type to pin that byte shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtResponse<T> {
     pub v: u16,
-    #[serde(flatten)]
-    pub body: ExtBody<T>,
+    pub status: Status,
+    /// Present iff `status == ok`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    /// Present iff `status == err`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ErrKind>,
+    /// Server-controlled static detail string, safe to surface to humans
+    /// and to forward over `auth@vt`. NEVER contains user-supplied data
+    /// (host, command, reason, fingerprints, paths) — see
+    /// `docs/structured-errors.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
-/// Body half of [`ExtResponse`]; see its note on why this is test-only.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ExtBody<T> {
-    Ok {
-        data: T,
-    },
-    Err {
-        kind: ErrKind,
-        /// Server-controlled static detail string, safe to surface to humans
-        /// and to forward over `auth@vt`. NEVER contains user-supplied data
-        /// (host, command, reason, fingerprints, paths) — see
-        /// `docs/structured-errors.md`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
+#[cfg(test)]
+impl<T> ExtResponse<T> {
+    pub fn ok(data: T) -> Self {
+        ExtResponse {
+            v: WIRE_VERSION,
+            status: Status::Ok,
+            data: Some(data),
+            kind: None,
+            detail: None,
+        }
+    }
+
+    pub fn err(kind: ErrKind, detail: Option<String>) -> Self {
+        ExtResponse {
+            v: WIRE_VERSION,
+            status: Status::Err,
+            data: None,
+            kind: Some(kind),
+            detail,
+        }
+    }
+}
+
+/// `status` discriminator of [`ExtResponse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Ok,
+    Err,
 }
 
 /// Stable error taxonomy. Append-only: removing or renaming a variant
@@ -236,23 +260,13 @@ mod tests {
     #[test]
     fn roundtrip_all_kinds() {
         for &k in all_kinds() {
-            let env: ExtResponse<Dummy> = ExtResponse {
-                v: WIRE_VERSION,
-                body: ExtBody::Err {
-                    kind: k,
-                    detail: Some("explanation".into()),
-                },
-            };
+            let env: ExtResponse<Dummy> = ExtResponse::err(k, Some("explanation".into()));
             let bytes = serde_json::to_vec(&env).unwrap();
             let parsed: ExtResponse<Dummy> = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(parsed.v, WIRE_VERSION);
-            match parsed.body {
-                ExtBody::Err { kind, detail } => {
-                    assert_eq!(kind, k, "kind mismatch for {:?}", k);
-                    assert_eq!(detail.as_deref(), Some("explanation"));
-                }
-                ExtBody::Ok { .. } => panic!("expected Err variant for {:?}", k),
-            }
+            assert_eq!(parsed.status, Status::Err);
+            assert_eq!(parsed.kind, Some(k), "kind mismatch for {:?}", k);
+            assert_eq!(parsed.detail.as_deref(), Some("explanation"));
         }
     }
 
@@ -282,15 +296,11 @@ mod tests {
             "detail": "something happened",
         });
         let env: ExtResponse<Dummy> = serde_json::from_value(raw).unwrap();
-        match env.body {
-            ExtBody::Err { kind, detail } => {
-                assert_eq!(kind, ErrKind::Unknown);
-                // Client maps Unknown → exit 1 (same as Generic).
-                assert_eq!(kind.exit_code(), 1);
-                assert_eq!(detail.as_deref(), Some("something happened"));
-            }
-            _ => panic!("expected err"),
-        }
+        assert_eq!(env.status, Status::Err);
+        assert_eq!(env.kind, Some(ErrKind::Unknown));
+        // Client maps Unknown → exit 1 (same as Generic).
+        assert_eq!(ErrKind::Unknown.exit_code(), 1);
+        assert_eq!(env.detail.as_deref(), Some("something happened"));
     }
 
     #[test]
@@ -367,36 +377,15 @@ mod tests {
             "future_field": "ignored",
         });
         let env: ExtResponse<Dummy> = serde_json::from_value(raw).unwrap();
-        match env.body {
-            ExtBody::Ok { data } => assert_eq!(data, Dummy { n: 7 }),
-            _ => panic!("expected ok"),
-        }
-    }
-
-    #[test]
-    fn err_body_missing_kind_field_is_parse_error() {
-        // Absent `kind` is a hard parse error — `#[serde(other)] Unknown`
-        // only catches unknown *values*, not absent fields. Make sure the
-        // client sees this as a parse error rather than silently defaulting.
-        let raw = json!({
-            "v": WIRE_VERSION,
-            "status": "err",
-        });
-        let res: Result<ExtResponse<Dummy>, _> = serde_json::from_value(raw);
-        assert!(res.is_err(), "missing kind must fail parse");
+        assert_eq!(env.status, Status::Ok);
+        assert_eq!(env.data, Some(Dummy { n: 7 }));
     }
 
     #[test]
     fn detail_none_roundtrip_skips_field() {
         // `detail: None` must NOT serialize as `"detail":null` — it must be
         // omitted. Locks in `#[serde(skip_serializing_if = "Option::is_none")]`.
-        let env: ExtResponse<Dummy> = ExtResponse {
-            v: WIRE_VERSION,
-            body: ExtBody::Err {
-                kind: ErrKind::AuthRejected,
-                detail: None,
-            },
-        };
+        let env: ExtResponse<Dummy> = ExtResponse::err(ErrKind::AuthRejected, None);
         let json: Value = serde_json::to_value(&env).unwrap();
         let body = json.as_object().unwrap();
         assert!(
@@ -408,31 +397,20 @@ mod tests {
         // Round-trip preserves None.
         let bytes = serde_json::to_vec(&env).unwrap();
         let parsed: ExtResponse<Dummy> = serde_json::from_slice(&bytes).unwrap();
-        match parsed.body {
-            ExtBody::Err { kind, detail } => {
-                assert_eq!(kind, ErrKind::AuthRejected);
-                assert!(detail.is_none());
-            }
-            _ => panic!("expected err"),
-        }
+        assert_eq!(parsed.kind, Some(ErrKind::AuthRejected));
+        assert!(parsed.detail.is_none());
     }
 
     #[test]
     fn wrap_ok_envelope_matches_ext_response_schema() {
         // The agent produces OK envelopes via the manual byte concat in
         // `wrap_ok_envelope`. If anyone ever renames `data` → `payload` (or
-        // similar) in `ExtResponse`/`ExtBody`, the manual concat must be
-        // updated in lockstep. This test serializes via `ExtResponse` (the
-        // canonical schema) and asserts byte equality with what
-        // `wrap_ok_envelope` would emit for the same inner body.
+        // similar) in `ExtResponse`, the manual concat must be updated in
+        // lockstep. This test serializes via `ExtResponse` (the canonical
+        // schema) and asserts byte equality with what `wrap_ok_envelope`
+        // would emit for the same inner body.
         let inner = serde_json::to_vec(&Dummy { n: 11 }).unwrap();
-        let canonical = serde_json::to_vec(&ExtResponse {
-            v: WIRE_VERSION,
-            body: ExtBody::Ok {
-                data: Dummy { n: 11 },
-            },
-        })
-        .unwrap();
+        let canonical = serde_json::to_vec(&ExtResponse::ok(Dummy { n: 11 })).unwrap();
         let manual = wrap_ok_envelope(&inner);
         assert_eq!(
             canonical, manual,
@@ -442,17 +420,10 @@ mod tests {
 
     #[test]
     fn ok_envelope_roundtrip() {
-        let env: ExtResponse<Dummy> = ExtResponse {
-            v: WIRE_VERSION,
-            body: ExtBody::Ok {
-                data: Dummy { n: 5 },
-            },
-        };
+        let env: ExtResponse<Dummy> = ExtResponse::ok(Dummy { n: 5 });
         let bytes = serde_json::to_vec(&env).unwrap();
         let parsed: ExtResponse<Dummy> = serde_json::from_slice(&bytes).unwrap();
-        match parsed.body {
-            ExtBody::Ok { data } => assert_eq!(data, Dummy { n: 5 }),
-            _ => panic!("expected ok"),
-        }
+        assert_eq!(parsed.status, Status::Ok);
+        assert_eq!(parsed.data, Some(Dummy { n: 5 }));
     }
 }
