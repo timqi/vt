@@ -159,19 +159,10 @@ impl SecretType {
     }
 }
 
-impl SecretType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SecretType::RAW => "0",
-            SecretType::TOTP => "1",
-            SecretType::UNKNOWN => "_",
-        }
-    }
-}
-
+/// The v2 URL type byte.
 impl std::fmt::Display for SecretType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
+        write!(f, "{}", self.as_byte() as char)
     }
 }
 
@@ -530,15 +521,12 @@ impl VtUrl {
                 .ok_or_else(|| anyhow::anyhow!("empty v2 vt body"))?;
             ensure!(first.is_ascii(), "v2 vt type byte must be ASCII");
             ensure!(rest.len() >= 2, "v2 vt URL too short");
-            let type_buf = [first];
-            let type_str = std::str::from_utf8(&type_buf).unwrap();
-            let t = SecretType::from_str(type_str);
-            // Type must be a known v2 type byte (`0` or `1`); reject `_`/UNKNOWN.
-            ensure!(
-                matches!(t, SecretType::RAW | SecretType::TOTP),
-                "unknown v2 secret type: {}",
-                type_str
-            );
+            // Only the known type bytes; `_` (UNKNOWN) is rejected here.
+            let t = match first {
+                b'0' => SecretType::RAW,
+                b'1' => SecretType::TOTP,
+                _ => anyhow::bail!("unknown v2 secret type: {}", first as char),
+            };
             let body_b64 = &rest[1..];
             let blob = BASE64_URL_SAFE_NO_PAD
                 .decode(body_b64.as_bytes())
