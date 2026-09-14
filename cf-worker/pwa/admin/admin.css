@@ -186,6 +186,25 @@ tbody tr.clickable { cursor: pointer; }
 .trunc { display: inline-block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; max-width: 100%; }
 .trunc.col-host { max-width: 120px; }
 .trunc.col-cmd  { max-width: 240px; }
+.trunc.col-rec  { max-width: 260px; }
+
+/* Record names: one list, renameable in place (admin.js vt.recordList). The
+   name is a button so the rename target is a real control; unnamed records
+   read muted. */
+.record-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.record-list li { display: inline-flex; align-items: center; gap: 4px; }
+.rec-name {
+  background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
+  padding: 4px 8px; font-size: 12px; font-weight: 500; margin: 0; min-height: 32px;
+  white-space: nowrap; max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+}
+.rec-name:hover { filter: none; border-color: var(--accent); }
+.rec-name.unnamed { color: var(--muted); font-weight: 400; }
+.rec-name.more { background: transparent; border-style: dashed; color: var(--muted); }
+.rec-edit { min-width: 140px; width: 200px; padding: 4px 8px; font-size: 12px; min-height: 32px; }
+#cache td.col-rec { white-space: normal; min-width: 220px; max-width: 360px; }
+#detail-dl .record-list { margin-top: 2px; }
+#detail-dl .rec-name { min-height: 44px; }
 
 .badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; background: var(--panel-2); color: var(--muted); }
 .badge-pending { background: #e7eaef; color: #5b6573; }
@@ -288,7 +307,7 @@ th.col-pick input, td.col-pick input { accent-color: var(--accent); margin: 0; c
   margin: 0; padding: 6px 12px; background: var(--panel);
   border: 1px solid var(--border); border-radius: 10px; font-size: 13px;
 }
-.vt-ap-meta > div { display: grid; grid-template-columns: 6.5em 1fr; gap: 8px; padding: 4px 0; }
+.vt-ap-meta > div { display: grid; grid-template-columns: 7.5em 1fr; gap: 8px; padding: 4px 0; }
 .vt-ap-meta > div + div { border-top: 1px solid var(--border); }
 .vt-ap-meta dt { color: var(--muted); }
 /* Values are identifiers, paths, commands — mono; the labels are UI text. */
@@ -296,6 +315,17 @@ th.col-pick input, td.col-pick input { accent-color: var(--accent); margin: 0; c
 /* Enrollment pairing code: the one value the approver must read exactly. */
 .vt-ap-pair, dd.vt-ap-pair { font-family: var(--mono); font-size: 22px; font-weight: 700; letter-spacing: 2px; }
 .vt-ap-meta-note { margin-top: 8px; }
+/* Collapsed request details (目录 / 项目 / 父进程 / IP / 原因). */
+.vt-ap-details { margin-top: 8px; }
+.vt-ap-details > summary { cursor: pointer; color: var(--muted); font-size: 13px; padding: 12px 0; }
+.vt-ap-details > .vt-ap-meta { margin-top: 4px; }
+/* Record lines: owned names bold, unnamed muted with the client's claim in code. */
+.vt-ap-records { list-style: none; margin: 0; padding: 0; font-family: inherit; }
+.vt-ap-records li { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 2px 0; }
+.vt-ap-records .rec-text { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.vt-ap-records .muted { color: var(--muted); }
+.vt-ap-adopt { flex-direction: row; align-items: center; gap: 4px; margin: 0; min-height: 44px; cursor: pointer; color: var(--fg); }
+.vt-ap-adopt input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
 .vt-ap-cache-section { margin: 14px 0; }
 .vt-ap-cache-section .cache-warn { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
 .vt-ap-cache-section .cache-warn strong { color: var(--err); }
@@ -343,6 +373,7 @@ pre.cmd {
   label { display: flex; margin-right: 0; }
   .trunc.col-host { max-width: 90px; }
   .trunc.col-cmd  { max-width: 150px; }
+  .trunc.col-rec  { max-width: 150px; }
   #cache .cell-main.trunc-host, #cache .cell-sub.trunc-sub { max-width: 120px; }
   #cache .cell-main.trunc-cmd { max-width: 160px; }
   #detail-dl { grid-template-columns: 1fr; gap: 2px 0; }

@@ -1,7 +1,7 @@
 'use strict';
 
-// 设置 tab: the session (logout / 退出所有会话), the config knobs (cache,
-// hit notify, UV policy — GET/PUT /api/admin/config), SECRET rotation, and push
+// 设置 tab: the session (logout / 退出所有会话), the config knobs (hit
+// notify, UV policy — GET/PUT /api/admin/config), SECRET rotation, and push
 // subscriptions — this device subscribes with the Worker's VAPID key and posts
 // the result; every row can be tested or removed. Rendering is textContent
 // only; the endpoint's keys never come back from the server.
@@ -27,7 +27,6 @@ vt.tabs.settings = function (panel) {
     var resp = await vt.apiFetch(vt.api('config'), { headers: { 'Accept': 'application/json' } });
     if (!resp.ok) { cfgStatus('读取配置失败 HTTP ' + resp.status, 'error'); return; }
     var c = await resp.json();
-    $('#cfg-cache').checked = !!c.cache_enabled;
     $('#cfg-hit-notify').checked = !!c.cache_hit_notify;
     $('#cfg-uv').value = c.uv_policy == null ? '' : JSON.stringify(c.uv_policy);
   }
@@ -42,7 +41,7 @@ vt.tabs.settings = function (panel) {
       }
       var resp = await vt.apiFetch(vt.api('config'), {
         method: 'PUT', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ cache_enabled: $('#cfg-cache').checked, cache_hit_notify: $('#cfg-hit-notify').checked, uv_policy: uv }),
+        body: JSON.stringify({ cache_hit_notify: $('#cfg-hit-notify').checked, uv_policy: uv }),
       });
       if (!resp.ok) { cfgStatus('保存失败：' + (await resp.text()), 'error'); return; }
       cfgStatus('已保存', 'ok');

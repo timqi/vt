@@ -57,6 +57,88 @@
     return v.length > max ? v.slice(0, max) + '…' : v;
   };
 
+  // ── Record names (audit 记录 column + dialog, cache rows) ─────────────────
+  // One record's label: the operator-owned name, else the client's claim marked
+  // 自报, else 未命名 (mirrors account_names.nameLabel).
+  vt.recordLabel = function (r) {
+    return r.name || (r.claimed ? r.claimed + '（自报）' : '未命名');
+  };
+
+  // Column text: the labels joined, or `N 条` for a row that stored no records.
+  vt.recordsSummary = function (records, n) {
+    if (!records || !records.length) return n > 0 ? n + ' 条' : '';
+    return records.map(vt.recordLabel).join(', ');
+  };
+
+  // Renameable list. Clicking a name opens an input in place; Enter saves via
+  // PUT /api/admin/names ('' deletes), Escape or blur cancels. `records` is
+  // mutated on success so the caller's row state stays current; `onSaved` lets
+  // it re-render. Past `max` items the rest sit behind a 「+N」 toggle.
+  vt.recordList = function (records, onSaved, max) {
+    var ul = vt.el('ul', 'record-list');
+    var limit = max || records.length;
+    var expanded = false;
+    function render() {
+      ul.innerHTML = '';
+      records.forEach(function (r, i) {
+        if (!expanded && i >= limit) return;
+        var li = document.createElement('li');
+        var btn = vt.el('button', 'rec-name' + (r.name ? '' : ' unnamed'), vt.recordLabel(r));
+        btn.type = 'button';
+        btn.title = '点击重命名';
+        btn.addEventListener('click', function (e) { e.stopPropagation(); edit(li, r); });
+        li.appendChild(btn);
+        if (r.name && r.claimed && r.claimed !== r.name) li.appendChild(vt.el('span', 'cell-sub', '客户端称 ' + r.claimed));
+        ul.appendChild(li);
+      });
+      if (!expanded && records.length > limit) {
+        var more = vt.el('button', 'rec-name more', '+' + (records.length - limit) + ' 条');
+        more.type = 'button';
+        more.addEventListener('click', function (e) { e.stopPropagation(); expanded = true; render(); });
+        ul.appendChild(vt.el('li', null)).appendChild(more);
+      }
+    }
+    function edit(li, r) {
+      var input = document.createElement('input');
+      input.type = 'text'; input.maxLength = 40; input.value = r.name || r.claimed || '';
+      input.className = 'rec-edit';
+      input.setAttribute('aria-label', '记录名');
+      input.addEventListener('click', function (e) { e.stopPropagation(); });
+      input.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') { e.stopPropagation(); render(); }
+        if (e.key === 'Enter') { e.preventDefault(); save(); }
+      });
+      input.addEventListener('blur', function () { if (!saving) render(); });
+      var saving = false;
+      async function save() {
+        saving = true;
+        input.disabled = true;
+        var name = input.value.trim();
+        try {
+          var resp = await vt.apiFetch(vt.api('names'), {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ salt_b64u: r.salt_b64u, name: name }),
+          });
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          r.name = name || null;
+          r.source = name ? 'manual' : null;
+          if (onSaved) onSaved(r);
+        } catch (e) {
+          input.disabled = false; saving = false;
+          input.setCustomValidity('保存失败：' + (e.message || e));
+          input.reportValidity();
+          return;
+        }
+        render();
+      }
+      li.innerHTML = '';
+      li.appendChild(input);
+      input.focus(); input.select();
+    }
+    render();
+    return ul;
+  };
+
   // ── Detail dialog ─────────────────────────────────────────────────────────
   // #detail-backdrop / #detail-card exist once in the shell. open() fills the
   // heading, the warning and hands back the empty <dl> plus the ceremony box;

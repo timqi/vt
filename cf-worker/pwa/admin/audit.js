@@ -101,9 +101,10 @@ vt.tabs.audit = function (panel) {
     cell(tr, fmtTime(r.created_ms));
     var st = document.createElement('td'); st.appendChild(statusBadge(r)); tr.appendChild(st);
     cellClipped(tr, r.host, 'col-host');
-    cellClipped(tr, vt.commandSummary(r.command, 200), 'col-cmd');
-    cell(tr, r.ip);
-    cell(tr, r.salts);
+    // 记录: the row's records by name (server-owned, else the 自报 claim), or
+    // the bare count for rows written before names were stored. Command and IP
+    // live in the detail dialog.
+    cellClipped(tr, vt.recordsSummary(r.records, r.salts), 'col-rec');
     // 缓存列: live → TTL label; armed-but-elapsed → grey 过期; never armed → —.
     var cc = document.createElement('td');
     if (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) {
@@ -203,8 +204,9 @@ vt.tabs.audit = function (panel) {
       else $('.rows').appendChild(newTr);
       trById[r.id] = newTr;
       // Keep an open detail card for this row in sync (isRefresh=true so a
-      // mounted, in-flight ceremony below isn't torn down mid-approval).
-      if (vt.dialog.isOpen() && openDetailId === r.id) openDetail(r.id, true);
+      // mounted, in-flight ceremony below isn't torn down mid-approval); an
+      // in-progress rename in the card is left alone too.
+      if (vt.dialog.isOpen() && openDetailId === r.id && !document.querySelector('#detail-dl .rec-edit')) openDetail(r.id, true);
     } else {
       // Not currently shown. Only surface it if it matches the filter; the
       // cursor still advanced via trackNewest so it won't be re-fetched.
@@ -298,6 +300,19 @@ vt.tabs.audit = function (panel) {
     addRow(dl, 'SSH 来源', r.ssh_client);
     addRow(dl, 'IP', r.ip);
     addRow(dl, 'DEK 数', r.salts);
+    // Records with inline rename; a saved name updates this row's cached copy so
+    // the table cell and a later re-open agree without a refetch.
+    if (r.records && r.records.length) {
+      dl.appendChild(vt.el('dt', null, '记录'));
+      var dd = vt.el('dd', null);
+      dd.appendChild(vt.recordList(r.records, function () {
+        var fresh = renderRow(r);
+        var old = trById[r.id];
+        if (old && old.parentNode) old.parentNode.replaceChild(fresh, old);
+        trById[r.id] = fresh;
+      }));
+      dl.appendChild(dd);
+    }
     if (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) addRow(dl, '缓存 TTL', ttlLabel(r.cache_ttl_s));
     // Actual expiry (updated by an approved extension); shown alongside the
     // originally-approved TTL so an extended row is self-explaining.
@@ -385,7 +400,7 @@ vt.tabs.audit = function (panel) {
       }
       exhausted = rows.length < 100;
       $('#more').disabled = exhausted;
-      setStatus(exhausted ? '已全部加载' : '已加载，可继续加载更多', 'ok');
+      setStatus('已加载 ' + Object.keys(byId).length + ' 条' + (exhausted ? ' · 已全部加载' : ' · 加载更多'), 'ok');
     } catch (e) {
       setStatus('网络错误：' + (e.message || e), 'error');
     } finally {

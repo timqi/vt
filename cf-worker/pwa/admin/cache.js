@@ -24,8 +24,7 @@ vt.tabs.cache = function (panel) {
   var byGroup = {};           // group_id -> summary
   var selected = {};          // group_id -> true
   var meta = {                // listing-level fields
-    extend_enabled: false, ttl_options_s: [],
-    truncated: false, scanned: 0,
+    ttl_options_s: [], truncated: false, scanned: 0,
   };
   // Server clock at listing time + the local monotonic reference we advance it
   // from, so remaining-time math never depends on the browser's wall clock.
@@ -133,24 +132,24 @@ vt.tabs.cache = function (panel) {
     pickTd.appendChild(pick);
     tr.appendChild(pickTd);
 
-    // 目标: host over user · directory. The full directory is the hover title;
-    // the key binds the host token plus the project the approval reported.
+    // 主机 · 项目: the two halves of the key (verified token, advisory project).
+    // Command, IP, user and directory are the hover detail.
     cell2(tr, g.host || '—',
-      (g.user || '?') + (g.pwd ? ' · ' + shortPath(g.pwd) : ''),
+      (g.user || '?') + ' · ' + (g.project ? shortPath(g.project) : '项目未知'),
       { mainCls: 'trunc-host',
-        mainHover: '主机: ' + (g.host || '—') + '\n分组: ' + g.group_id
-          + '\n来源审批: ' + g.origin_token_id,
+        mainHover: '主机: ' + (g.host || '—') + '\n用户: ' + (g.user || '—')
+          + '\n命令: ' + (g.command || '—') + (g.ppid_cmd ? '\n父进程: ' + g.ppid_cmd : '')
+          + '\n批准时来源 IP: ' + (g.ip || '—') + '（仅作审计，不参与绑定）'
+          + '\n分组: ' + g.group_id + '\n来源审批: ' + g.origin_token_id,
         subCls: 'trunc-sub',
-        subHover: '用户: ' + (g.user || '—') + '\n工作目录: ' + (g.pwd || '—')
+        subHover: '项目: ' + (g.project || '未知（早期条目）') + '\n工作目录: ' + (g.pwd || '—')
           + '\n\n（缓存绑定该主机的令牌与客户端自报的项目，两者一致才会命中）' });
 
-    // 命令: the command over the source IP at approval (audit metadata).
-    cell2(tr, vt.commandSummary(g.command, 120), g.ip,
-      { mainCls: 'trunc-cmd',
-        mainHover: (g.command || '—') + (g.ppid_cmd ? '\n\n父进程: ' + g.ppid_cmd : ''),
-        subCls: 'mono',
-        subHover: '批准时来源 IP: ' + (g.ip || '—')
-          + '\n（Worker 侧取自 CF-Connecting-IP，仅作审计，不参与绑定）' });
+    // 记录: the group's records by name, renameable in place (the salt is the key).
+    var recTd = document.createElement('td');
+    recTd.className = 'col-rec';
+    recTd.appendChild(vt.recordList(g.records || [], null, 4));
+    tr.appendChild(recTd);
 
     // 条目: live count, with the swept-but-present total only when they differ.
     cell2(tr, String(g.live), g.entries !== g.live ? '共 ' + g.entries : '',
@@ -164,7 +163,7 @@ vt.tabs.cache = function (panel) {
       { mainCls: live ? '' : 'cache-expired' });
     // Sub-line: the exact expiry while live, or WHY the row cannot be extended.
     var sub = null;
-    if (meta.extend_enabled && !g.extendable && g.reason) {
+    if (!g.extendable && g.reason) {
       sub = el('div', 'cell-sub reason-badge', REASON_TEXT[g.reason] || g.reason);
     } else if (live) {
       sub = el('div', 'cell-sub', '至 ' + fmtTime(g.max_expires_ms));
@@ -179,7 +178,7 @@ vt.tabs.cache = function (panel) {
     clr.title = '立即失效这 ' + g.live + ' 条缓存，之后解密需重新手机审批';
     clr.addEventListener('click', function () { clearGroups([g.group_id], clr); });
     act.appendChild(clr);
-    if (meta.extend_enabled && g.extendable) {
+    if (g.extendable) {
       var ttlNow = selectedTtl();
       var gains = wouldGain(g, ttlNow);
       var ext = el('button', 'small ghost', '延长');
@@ -206,9 +205,9 @@ vt.tabs.cache = function (panel) {
     syncBulkBar();
     var liveTotal = groups.reduce(function (n, g) { return n + g.live; }, 0);
     var msg = rows.length + ' 组 / 共 ' + liveTotal + ' 条有效缓存';
-    // When extension is on but NOTHING is extendable, say why up front. Without
-    // this the page looks broken: buttons absent, no explanation in view.
-    if (meta.extend_enabled && rows.length > 0) {
+    // When NOTHING is extendable, say why up front. Without this the page looks
+    // broken: buttons absent, no explanation in view.
+    if (rows.length > 0) {
       var extendable = rows.filter(function (g) { return g.extendable; }).length;
       if (extendable === 0) {
         var why = {};
@@ -251,17 +250,6 @@ vt.tabs.cache = function (panel) {
       if (g.extendable) { extendable++; extGroups.push(g); }
     });
     countEl.textContent = '已选 ' + ids.length + ' 组 / ' + entries + ' 条';
-    var ttlLabelEl = $('#extend-ttl-label');
-    if (!meta.extend_enabled) {
-      // Caching off ⇒ extension is not offered. Hide the controls
-      // entirely rather than offer a button that can only 404.
-      extendBtn.hidden = true;
-      ttlLabelEl.hidden = true;
-      note.textContent = '延长不可用：请先在「设置」启用 DEK 缓存';
-      return;
-    }
-    ttlLabelEl.hidden = false;
-    extendBtn.hidden = false;
     var gainers = extGroups.filter(function (g) { return wouldGain(g, ttl); });
     // Disabled when the request would provably change nothing — the server would
     // refuse it as no_gain anyway, and a button that 409s is worse than one that
@@ -334,7 +322,6 @@ vt.tabs.cache = function (panel) {
       Object.keys(selected).forEach(function (id) { if (!byGroup[id]) delete selected[id]; });
       serverNowMs = typeof json.now_ms === 'number' ? json.now_ms : Date.now();
       localRefMs = Date.now();
-      meta.extend_enabled = !!json.extend_enabled;
       meta.ttl_options_s = json.ttl_options_s || [];
       meta.truncated = !!json.truncated;
       meta.scanned = json.scanned || 0;
@@ -418,10 +405,6 @@ vt.tabs.cache = function (panel) {
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ group_ids: targets, ttl_s: ttl }),
       });
-      if (resp.status === 404) {
-        setStatus('延长不可用：DEK 缓存未启用', 'error');
-        return;
-      }
       if (resp.status === 401) return; // the shell shows the login view
       if (resp.status === 409) {
         // Refresh FIRST, then report — load() re-renders and would otherwise
@@ -551,7 +534,8 @@ vt.tabs.cache = function (panel) {
   // Re-render every 15s: countdowns tick down and a group that just lapsed turns
   // grey (and drops its 延长 button) without a round trip. Skipped while the
   // ceremony modal is open so a re-render cannot tear down a live WebAuthn prompt.
-  setInterval(function () { if (!vt.dialog.isOpen()) render(); }, 15000);
+  // Also skipped while a record name is being edited in place.
+  setInterval(function () { if (!vt.dialog.isOpen() && !panel.querySelector('.rec-edit')) render(); }, 15000);
 
   vt.hovercard.attach($('.table-wrap'));
   load();

@@ -62,7 +62,7 @@
   <main id="console" hidden>
 
     <section class="tab-panel" id="tab-audit" hidden>
-      <p class="hint">每个挑战一行（pending / approved / rejected / expired）。「缓存」列显示该次审批授予的 DEK 缓存时长；带有效缓存的行可在「操作」列单独清除。点击行查看完整详情。保留 90 天。</p>
+      <p class="hint">每个挑战一行（pending / approved / rejected / expired）。「记录」列显示本次涉及记录的名称（服务端保存；客户端自报的名称标为「自报」，可在详情里点击重命名）。「缓存」列显示该次审批授予的 DEK 缓存时长；带有效缓存的行可在「操作」列单独清除。点击行查看命令、IP 等完整详情。保留 90 天。</p>
       <section class="filters">
         <label>状态 <select id="f-status">
           <option value="">全部</option>
@@ -82,7 +82,7 @@
         </div>
       </section>
       <div class="table-wrap"><table id="audit"><thead><tr>
-        <th>时间</th><th>状态</th><th>主机</th><th>命令</th><th>IP</th><th>DEK</th><th>缓存</th><th>操作</th>
+        <th>时间</th><th>状态</th><th>主机</th><th>记录</th><th>缓存</th><th>操作</th>
       </tr></thead><tbody class="rows"></tbody></table></div>
       <section class="actions">
         <button id="more" type="button">加载更多</button>
@@ -111,13 +111,13 @@
         <button id="extend-selected" type="button">申请延长（需 Passkey）</button>
         <span id="extend-note" class="hint"></span>
       </section>
-      <!-- Six columns, two lines per cell: the previous nine columns pushed the
-           action buttons (and the "why not extendable" reason) off-screen at
-           1280px, so the page silently hid the one thing an operator needs. -->
+      <!-- Six columns, two lines per cell: more columns pushed the action
+           buttons (and the "why not extendable" reason) off-screen at 1280px.
+           Command and IP are audit metadata and live in the host cell's hover. -->
       <div class="table-wrap"><table id="cache"><thead><tr>
         <th class="col-pick"><input id="pick-all" type="checkbox" aria-label="全选"></th>
-        <th>目标 / 用户 · 目录</th><th>命令 / IP</th><th class="col-num">条目</th>
-        <th>剩余 / 到期时间</th><th>操作</th>
+        <th>主机 · 项目</th><th>记录</th><th class="col-num">条目</th>
+        <th>剩余 · 到期</th><th>操作</th>
       </tr></thead><tbody class="rows"></tbody></table></div>
       <section class="actions">
         <span class="status" role="status" aria-live="polite"></span>
@@ -190,10 +190,7 @@
       </section>
       <section class="card">
         <div class="card-head"><h2>缓存与审批</h2></div>
-        <p class="hint">设置保存在 Durable Object 的加密配置里，保存即生效。关闭缓存不会删除已有条目（用 DEK 缓存页的「清除全部」）；命中通知每次免审批解密都会推送，默认关闭。UV 策略只能提高审批的验证级别，格式见 <code>docs/cf-worker-deploy.md</code>；留空为默认（<code>discouraged</code>）。</p>
-        <div class="field">
-          <label class="switch"><input id="cfg-cache" type="checkbox"> <span>启用 DEK 缓存（审批页提供缓存时长，可申请延长）</span></label>
-        </div>
+        <p class="hint">设置保存在 Durable Object 的加密配置里，保存即生效。审批页始终提供缓存时长，默认「不缓存」即不写入；命中通知每次免审批解密都会推送，默认关闭。UV 策略只能提高审批的验证级别，格式见 <code>docs/cf-worker-deploy.md</code>；留空为默认（<code>discouraged</code>）。</p>
         <div class="field">
           <label class="switch"><input id="cfg-hit-notify" type="checkbox"> <span>缓存命中时推送通知</span></label>
         </div>

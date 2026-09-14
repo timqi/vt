@@ -34,10 +34,19 @@
         var refs = {};
 
         if (showMeta) {
+            // The decision block (类型, 记录, 主机, 命令) stays above the fold;
+            // the rest of the request folds into 详情 (docs/approval-transparency.md).
             var metaSec = el('section', 'vt-ap-meta-section');
             metaSec.appendChild(el('h2', null, '请求信息'));
             refs.meta = el('dl', 'vt-ap-meta');
             metaSec.appendChild(refs.meta);
+            refs.details = el('details', 'vt-ap-details');
+            refs.details.appendChild(el('summary', null, '详情'));
+            refs.detailMeta = el('dl', 'vt-ap-meta');
+            refs.details.appendChild(refs.detailMeta);
+            metaSec.appendChild(refs.details);
+            refs.metaNote = el('p', 'hint vt-ap-meta-note');
+            metaSec.appendChild(refs.metaNote);
             root.appendChild(metaSec);
         }
 
@@ -107,38 +116,75 @@
         var refs = buildUi(root, showMeta);
         var setStatus = vt.statusLine(refs.status);
 
+        // The 采用 checkboxes: index into salts_b64u of each suggestion the
+        // approver adopts; posted with the approval, written only after it verifies.
+        var adoptBoxes = [];
+
+        // One line per record. Server-owned names are truth lines and come
+        // first; an unnamed record shows the client's claim labeled as such,
+        // with the opt-in 采用 box (omitted when the client sent nothing).
+        function renderRecords(records) {
+            var ul = el('ul', 'vt-ap-records');
+            var named = records.filter(function (r) { return r.name; });
+            var unnamed = records.filter(function (r) { return !r.name; });
+            named.concat(unnamed).forEach(function (r) {
+                var li = document.createElement('li');
+                var text = el('span', 'rec-text');
+                li.appendChild(text);
+                if (r.name) {
+                    text.appendChild(el('strong', null, r.name));
+                    if (r.claimed && r.claimed !== r.name) {
+                        text.appendChild(el('span', 'muted', '（客户端称 ' + r.claimed + '）'));
+                    }
+                } else {
+                    text.appendChild(el('span', 'muted', r.claimed ? '未命名 · 客户端称 ' : '未命名'));
+                    if (r.claimed) {
+                        text.appendChild(el('code', null, r.claimed));
+                        var adopt = el('label', 'vt-ap-adopt');
+                        var box = document.createElement('input');
+                        box.type = 'checkbox';
+                        box.setAttribute('data-index', String(records.indexOf(r)));
+                        adopt.appendChild(box);
+                        adopt.appendChild(el('span', null, '采用'));
+                        li.appendChild(adopt);
+                        adoptBoxes.push(box);
+                    }
+                }
+                ul.appendChild(li);
+            });
+            return ul;
+        }
+
+        function addRow(dl, label, value) {
+            if (value == null || value === '') return;
+            var row = document.createElement('div');
+            row.appendChild(el('dt', null, label));
+            var dd = el('dd', null, typeof value === 'string' ? value : null);
+            if (typeof value !== 'string') dd.appendChild(value);
+            row.appendChild(dd);
+            dl.appendChild(row);
+        }
+
         // ── Request metadata ─────────────────────────────────────────────
         if (showMeta && refs.meta) {
             var meta = data.metadata;
             refs.meta.innerHTML = '';
             if (meta) {
-                // Trust per field: `ip` is worker-verified (CF-Connecting-IP);
-                // host/user come from the host-token record (verified at
-                // enrollment) unless this ceremony IS the enrollment, where they
-                // are the requester's own claim; the rest is client-reported.
+                // Trust per field: record names are server-owned; `ip` is
+                // worker-verified (CF-Connecting-IP); host/user come from the
+                // host-token record (verified at enrollment) unless this ceremony
+                // IS the enrollment, where they are the requester's own claim;
+                // the rest is client-reported.
                 var enrolling = !!data.enroll_pair_code;
                 var hostVerified = !enrolling && !!data.host_verified;
-                var fields = [
-                    ['op_kind',    '类型'],
-                    ['host',       hostVerified ? '主机（已验证）' : '主机'],
-                    ['user',       hostVerified ? '用户（已验证）' : '用户'],
-                    ['pwd',        '目录'],
-                    ['command',    '命令'],
-                    ['ppid_cmd',   '父进程'],
-                    ['ip',         'IP（已验证）'],
-                    ['reason',     '原因']
-                ];
-                for (var i = 0; i < fields.length; i++) {
-                    var key = fields[i][0], label = fields[i][1];
-                    if (meta[key] == null || meta[key] === '') continue;
-                    var value = String(meta[key]);
-                    // Host-token path: this token last spoke from another IP.
-                    if (key === 'ip' && meta.ip_prev) value += '（上次 ' + meta.ip_prev + '）';
-                    var row = document.createElement('div');
-                    row.appendChild(el('dt', null, label));
-                    row.appendChild(el('dd', null, value));
-                    refs.meta.appendChild(row);
+                addRow(refs.meta, '类型', meta.op_kind);
+                var records = Array.isArray(data.records) ? data.records : [];
+                if (records.length > 0) {
+                    addRow(refs.meta, '记录 · ' + records.length + ' 条', renderRecords(records));
                 }
+                var who = [meta.user, meta.host].filter(Boolean).join('@');
+                addRow(refs.meta, hostVerified ? '主机（已验证）' : '主机', who);
+                addRow(refs.meta, '命令', meta.command);
                 // Enrollment: the pairing code is the approver's proof that this
                 // request is the terminal in front of them, not a stranger's
                 // concurrent one. Big, on its own row.
@@ -148,28 +194,25 @@
                     prow.appendChild(el('dd', 'vt-ap-pair', data.enroll_pair_code));
                     refs.meta.appendChild(prow);
                 }
-                // Decrypt batch size — worker-derived (the DEKs this approval
-                // would mint), not client-claimed meta. An anomalous batch is
-                // exactly what an approver should see before tapping 同意.
-                var salts = Array.isArray(data.salts_b64u) ? data.salts_b64u.length : 0;
-                if (salts > 0) {
-                    var srow = document.createElement('div');
-                    srow.appendChild(el('dt', null, '记录数'));
-                    srow.appendChild(el('dd', null, String(salts) + ' 条'));
-                    refs.meta.appendChild(srow);
-                }
-                var note = el('p', 'hint vt-ap-meta-note', enrolling
+                addRow(refs.detailMeta, '目录', meta.pwd);
+                addRow(refs.detailMeta, '项目', meta.project);
+                addRow(refs.detailMeta, '父进程', meta.ppid_cmd);
+                // Host-token path: this token last spoke from another IP.
+                addRow(refs.detailMeta, 'IP（已验证）', meta.ip
+                    ? meta.ip + (meta.ip_prev ? '（上次 ' + meta.ip_prev + '）' : '') : '');
+                addRow(refs.detailMeta, '原因', meta.reason);
+                refs.details.hidden = !refs.detailMeta.firstChild;
+                refs.metaNote.textContent = enrolling
                     ? '主机 / 用户为申请方自报；IP 与来源已由服务端验证。仅当配对码与终端上显示的一致时批准。'
                     : hostVerified
-                        ? '主机 / 用户来自已登记的主机令牌，IP 已验证；其余为客户端自报信息，仅供参考。'
-                        : '除 IP 外均为客户端自报信息，仅供参考（该主机尚未 vt enroll）。');
-                refs.meta.parentNode.appendChild(note);
+                        ? '记录名由服务端保存；主机 / 用户来自已登记的主机令牌，IP 已验证；其余为客户端自报信息，仅供参考。'
+                        : '记录名由服务端保存；除 IP 外均为客户端自报信息，仅供参考（该主机尚未 vt enroll）。';
             }
         }
 
         // ── DEK-cache duration selector ──────────────────────────────────
-        // Shown only when the worker offers caching (cache_enabled) AND this
-        // ceremony has DEKs to cache. Default = 0 ("不缓存").
+        // Shown when this ceremony has DEKs to cache. Default = 0 ("不缓存"),
+        // which writes nothing.
         (function renderCacheOptions() {
             var optsList = data.cache_options_s || [];
             var pk = data.cache_pubkey_b64u || '';
@@ -343,6 +386,8 @@
                         binding_tag_b64u: b64uEnc(bindingTag),
                         cache_ttl_s: cacheTtlS,
                         cache_sealed_deks_b64u: cacheSealed,
+                        adopt_names: adoptBoxes.filter(function (b) { return b.checked; })
+                            .map(function (b) { return parseInt(b.getAttribute('data-index'), 10); }),
                     }),
                 });
                 if (!resp.ok) throw new Error('提交失败（HTTP ' + resp.status + '）');
