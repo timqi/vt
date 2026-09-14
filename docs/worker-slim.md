@@ -34,37 +34,44 @@ DEK cache ladders and admin actions, audit table and stream, alarm sweep,
 
 ## 2. Trust model
 
-All derivations take `ikm = utf8(SECRET)`, HKDF-SHA256, `L = 32`.
+`SECRET` is a KEK. The root key `R` (32 random bytes, generated at bootstrap)
+is stored as `root:v1 = {wraps: [AES-256-GCM(K_kek, R)]}`; every other key
+derives from `R`, so `SECRET` alone and DO storage alone are each worthless.
 
-| Key | salt | info | Protects |
-| --- | --- | --- | --- |
-| host token secret | `token_id` | `vt-host-token-v1` | daemon HMAC (unchanged, [host-token.md](host-token.md)) |
-| `K_cfg` AES-256-GCM | empty | `vt-config-key-v1` | the config blob at rest (§4) |
-| `K_sess` HMAC | empty | `vt-admin-session-v1` | admin session cookie (§3.1) |
-| cache X25519 scalar | empty | `vt-cache-seckey-v1` | DEK sealed boxes; `cachePublicKey` derives the point as today |
-| setup token | — | `b64u(HMAC-SHA256(utf8(SECRET), "vt-setup-token-v1"))` | first registration (§3.3); HMAC, not HKDF, because the operator computes it with one `openssl` line |
+| Key | ikm | salt | info | Protects |
+| --- | --- | --- | --- | --- |
+| `K_kek` AES-256-GCM | `utf8(SECRET)` | empty | `vt-kek-v1` | `R` at rest |
+| host token secret | `R` | `token_id` | `vt-host-token-v1` | daemon HMAC ([host-token.md](host-token.md)); existing tokens are re-issued by `vt enroll` once, at step 5 |
+| `K_cfg` AES-256-GCM | `R` | empty | `vt-config-key-v1` | the config blob at rest (§4) |
+| `K_sess` HMAC | `R` | empty | `vt-admin-session-v1` | admin session cookie (§3.1) |
+| cache X25519 scalar | `R` | empty | `vt-cache-seckey-v1` | DEK sealed boxes; `cachePublicKey` derives the point as today |
 
-Not derived: the VAPID key pair (§5.2) — WebCrypto cannot turn a derived
-scalar into its public point, so it is generated once and stored under `K_cfg`.
+HKDF-SHA256, `L = 32`. Not derived: the VAPID key pair (§5.2) — WebCrypto
+cannot turn a derived scalar into its public point, so it is generated once and
+stored under `K_cfg`.
 
-- `SECRET` is 32 random bytes, base64url, set once with `wrangler secret put`.
-  It is never sent to a host, a browser, or a log.
-- **Rotation is a factory reset.** New `SECRET` ⇒ every host token fails
-  (`vt enroll` everywhere), `K_cfg` changes so `cfg:v1` is unreadable ⇒ the
-  Worker is *unconfigured* (§4.3): ceremony routes answer `503 not_configured`,
-  `/admin` shows the setup view, passkeys, settings and push subscriptions are
-  re-entered, cached DEKs are misses. Audit rows and the `host_token` table are
-  plaintext SQLite and survive; revoke stale rows by hand.
-- **A stolen `SECRET` yields:** forging a live host's token (its `token_id` is
-  public) — paging the phone as that host and reading its live cached DEKs for
-  their TTL; forging admin sessions — every console action, including passkey
-  revocation (lockout) and subscribing a phone to pushes; with a copy of DO
-  storage, the config blob and VAPID private key. It does **not** yield the
-  master key (PRF-wrapped), record plaintext beyond live cache entries, a
-  passkey approval, or a cache extension (passkey-gated). Same envelope as
-  today's `VT_AUTH_CF` + `CACHE_SECKEY` + a Cloudflare Access session, minus
-  Access.
-- The setup token is useless once one credential exists (§3.3 step 5).
+- `SECRET` is 32 random bytes, base64url, set with `wrangler secret put`. It is
+  never sent to a host, a browser, or a log. The DO unwraps `R` once per
+  instance and keeps it in memory.
+- **Rotation keeps `R`.** 设置 → 轮换 SECRET (passkey session): the DO generates
+  a new `SECRET`, appends a second wrap of `R`, and returns the value once for
+  `wrangler secret put SECRET`. Unwrap tries each wrap (at most two); the first
+  success under the new `SECRET` deletes the other. Host tokens, passkeys,
+  config, subscriptions and cache entries survive. Nothing is typed into the
+  browser; the two wraps live only in the DO and only during the window.
+- **Factory reset** is `R` compromise (DO storage read) or a lost `SECRET`
+  before rotation completes: delete `root:v1` and `cfg:v1` from the console (or
+  redeploy with a fresh DO) ⇒ unconfigured (§4.3): ceremony routes answer
+  `503 not_configured`, `/admin` shows the setup view, every host runs
+  `vt enroll`. Audit rows and the `host_token` table are plaintext SQLite and
+  survive; revoke stale rows by hand.
+- **A stolen `SECRET` yields nothing** without DO storage. `SECRET` + DO storage
+  yields: forging a live host's token — paging the phone as that host and
+  reading its live cached DEKs for their TTL; forging admin sessions — every
+  console action, including passkey revocation (lockout) and subscribing a
+  phone to pushes; the config blob and VAPID private key. It does **not** yield
+  the master key (PRF-wrapped), record plaintext beyond live cache entries, a
+  passkey approval, or a cache extension (passkey-gated).
 
 ## 3. Admin auth
 
@@ -116,24 +123,28 @@ Set-Cookie: …; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800
 
 ### 3.3 Bootstrap
 
-1. `wrangler secret put SECRET`; `just deploy-worker`. No `cfg:v1` ⇒
-   unconfigured: ceremony routes and `/api/enroll` answer `503 not_configured`.
-2. Operator, in the shell that holds `SECRET`:
-   ```bash
-   printf 'vt-setup-token-v1' | openssl dgst -sha256 -hmac "$SECRET" -binary | openssl base64 -A | tr '+/' '-_' | tr -d '='
-   ```
-3. Open `https://<host>/admin` — the setup view. Fill in the setup token, a
-   label, and the `vt secret export` blob + passphrase (the passkey master must
-   equal the macOS `mac_key`, as today; the blob is decrypted in the browser
-   only). The page registers the passkey (`residentKey: 'required'`,
+No setup token: before bootstrap the Worker holds nothing worth taking, and a
+stranger who registers first is visible and evictable (step 5). Certificate
+transparency publishes a new hostname within minutes, so treat the window as
+public and bootstrap right after `just deploy-worker`.
+
+1. `wrangler secret put SECRET`; `just deploy-worker`. No `root:v1` ⇒
+   unconfigured: every route except `/admin`, `/api/admin/bootstrap` and the
+   public PWA assets answers `503 not_configured`.
+2. Open `https://<host>/admin` — the setup view. Fill in a label and the
+   `vt secret export` blob + passphrase (the passkey master must equal the
+   macOS `mac_key`, as today; the blob is decrypted in the browser only). The
+   page registers the passkey (`residentKey: 'required'`,
    `userVerification: 'required'`, `prf`), asserts once for PRF, wraps the
    master and builds the credential entry (`setup.js` byte formats unchanged).
-4. `POST /api/admin/bootstrap {setup_token, entry}`.
-5. DO, one gated step: `cfg:v1` exists → `409 already_configured`; constant-time
-   compare of `setup_token` → `403` (log `admin.bootstrap_refused`); else write
-   `{v:1, origin: <request origin>, epoch:1, credentials:[entry], …defaults}`
-   and return a session cookie. A concurrent stranger can at most receive the
-   403; the not-exists check and the put share the step.
+3. `POST /api/admin/bootstrap {entry}`.
+4. DO, one gated step: `root:v1` exists → `409 already_configured` with
+   `{registered_ms, ip}` of the first credential; else generate `R`, write
+   `root:v1` and `{v:1, origin: <request origin>, epoch:1, credentials:[entry],
+   …defaults}`, return a session cookie. The not-exists check and the puts
+   share the step, so a concurrent stranger receives the 409.
+5. The 409 view shows that time and IP and one line: not you ⇒ delete
+   `root:v1`/`cfg:v1` (factory reset, §2) and redo. Nothing else exists yet.
 6. The console opens on the 设置 tab: enable caching, subscribe this phone.
 
 `origin` is the request origin of the bootstrap call; it is the WebAuthn
@@ -327,8 +338,8 @@ after it.
 | # | Change | Files | Tests moving to rejected-input |
 | --- | --- | --- | --- |
 | 3 | **One admin shell**, assets public, ui-ux doc | `pwa/admin/admin.html` + `admin.js` replace five shells (`push.js` folds into the 设置 tab) and `adminTabs`; `isAdminAssetPath` and the `/<seg>/pwa/*` mount go; `docs/design/ui-ux.md`; `docs/README.md`; AGENTS.md asset line (Q1) | `page.test.ts` `isAdminAssetPath` cases → "public `/pwa/admin/admin.js` serves 200"; `adminTabs follows ADMIN_SEG` deleted |
-| 4 | **Passkey admin auth** (after v5) | new `admin_auth.ts` (cookie mint/verify, setup token, pure); `account_admin.ts` gains `credentials`, `origin`, `epoch`, login challenges, bootstrap, add/revoke; `do_account.ts` dispatches `admin-*` ops and verifies the cookie on every admin op and `/ws-admin`; `index.ts` `/admin`, `/api/admin/*`, `LIMITER login:` keys; `access.ts`, `ADMIN_SEG`, `CREDENTIALS_JSON` deleted; `setup.js` → bootstrap/add/revoke over the API; `credentials.ts` parses entries, not the envelope; `host-token.md` §4, `dek-cache.md` gate table, `cf-worker-deploy.md`, AGENTS.md admin lines | `credentials.test.ts` "tolerates epoch" → "`{v,c}` envelope posted to credentials-add is 400"; new `admin_auth.test.ts` (MAC tamper/expiry/epoch → 401, wrong `Origin` → 403, `Cf-Access-Jwt-Assertion` ignored, challenge single-use and 120 s, pending cap 429, limiter absent 503, bootstrap 403/409 then login 204, last-credential revoke 409) |
-| 5 | **Config in DO**, one secret | `account_admin.ts` gains `cache_enabled`, `cache_hit_notify`, `uv_policy`, `GET/PUT config`; `opCreate` applies UV; `account_cache.ts`/`cache_crypto.ts` derive the scalar; `CACHE_ADMIN_EXTEND`, `CACHE_HIT_NOTIFY`, `APPROVAL_UV_JSON`, `WORKER_ORIGIN`, `RP_ID`, `CACHE_SECKEY` leave `Env`; `VT_AUTH_CF` → `SECRET`, `ENROLL_LIMITER` → `LIMITER`; 设置 tab; `wrangler.toml.example` (no `[vars]`), `cf-worker-deploy.md` rewrite, `dek-cache.md`, AGENTS.md cache lines; `test/do_helpers.ts` env → `{SECRET, LIMITER?, ACCOUNT, ASSETS}` | `do_account.uv.test.ts` reads policy from config; `do_account.dek_cache.test.ts` adds "`cache_enabled=false` with live entries → miss, approve page offers `[0]`, extend routes 404"; `do_account.host_token.test.ts` rotation case keeps its name with `SECRET` |
+| 4 | **Passkey admin auth** (after v5; `R` is introduced in step 5, so bootstrap here writes `cfg:v1` under the interim `K_cfg` and the 409 view carries `registered_ms`/`ip`) | new `admin_auth.ts` (cookie mint/verify, pure); `account_admin.ts` gains `credentials`, `origin`, `epoch`, login challenges, bootstrap, add/revoke; `do_account.ts` dispatches `admin-*` ops and verifies the cookie on every admin op and `/ws-admin`; `index.ts` `/admin`, `/api/admin/*`, `LIMITER login:` keys; `access.ts`, `ADMIN_SEG`, `CREDENTIALS_JSON` deleted; `setup.js` → bootstrap/add/revoke over the API; `credentials.ts` parses entries, not the envelope; `host-token.md` §4, `dek-cache.md` gate table, `cf-worker-deploy.md`, AGENTS.md admin lines | `credentials.test.ts` "tolerates epoch" → "`{v,c}` envelope posted to credentials-add is 400"; new `admin_auth.test.ts` (MAC tamper/expiry/epoch → 401, wrong `Origin` → 403, `Cf-Access-Jwt-Assertion` ignored, challenge single-use and 120 s, pending cap 429, limiter absent 503, bootstrap 409 with registered_ms/ip then login 204, last-credential revoke 409) |
+| 5 | **Config in DO**, one secret, root key | `account_admin.ts` gains `root:v1` (generate/wrap/unwrap `R`, 轮换 SECRET op, two-wrap window per §2), every derivation re-rooted on `R` (host tokens re-enrolled once), `cache_enabled`, `cache_hit_notify`, `uv_policy`, `GET/PUT config`; `opCreate` applies UV; `account_cache.ts`/`cache_crypto.ts` derive the scalar; `CACHE_ADMIN_EXTEND`, `CACHE_HIT_NOTIFY`, `APPROVAL_UV_JSON`, `WORKER_ORIGIN`, `RP_ID`, `CACHE_SECKEY` leave `Env`; `VT_AUTH_CF` → `SECRET`, `ENROLL_LIMITER` → `LIMITER`; 设置 tab; `wrangler.toml.example` (no `[vars]`), `cf-worker-deploy.md` rewrite, `dek-cache.md`, AGENTS.md cache lines; `test/do_helpers.ts` env → `{SECRET, LIMITER?, ACCOUNT, ASSETS}` | `do_account.uv.test.ts` reads policy from config; `do_account.dek_cache.test.ts` adds "`cache_enabled=false` with live entries → miss, approve page offers `[0]`, extend routes 404"; `do_account.host_token.test.ts` rotation case keeps its name with `SECRET` |
 
 ## 8. Budget
 
