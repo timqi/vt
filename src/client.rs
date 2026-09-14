@@ -771,7 +771,9 @@ mod tests {
                     "VT_BACKEND" => Some(backend.into()),
                     "SSH_AUTH_SOCK" => Some("\0".into()),
                     "VT_PASSKEY_URL" => Some("invalid-url".into()),
-                    "VT_PASSKEY_TOKEN" => Some("test-only".into()),
+                    "VT_PASSKEY_TOKEN" => Some(
+                        "vt1.AAAAAAAAAAAAAAAA.iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI".into(),
+                    ),
                     _ => None,
                 },
                 None,

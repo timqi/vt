@@ -137,16 +137,9 @@ Access → Applications, create a **self-hosted** application:
 Secrets are never inlined in `wrangler.toml`. Set them per environment:
 
 ```bash
-# Required — 32-byte base64url token; CLI↔Worker HMAC on /api/challenge.
-# This value = the CLI's VT_PASSKEY_TOKEN.
+# Required — 32-byte base64url master; every host token is HKDF-derived from
+# it at `vt enroll`. Never a host's VT_PASSKEY_TOKEN.
 openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | wrangler secret put VT_AUTH_CF
-
-# Optional — PREVIOUS master, accepted as a fallback on host-token paths only,
-# so rotating VT_AUTH_CF is rolling instead of a fleet-wide flag day. Set it to
-# the outgoing master, re-enroll every host, then delete it by a deadline.
-# Empty/absent (the default) → no fallback. See docs/host-token.md §7.
-wrangler secret put VT_AUTH_CF_PREV
-wrangler secret delete VT_AUTH_CF_PREV   # when the rotation window closes
 
 # Required — passkey credentials blob. Produced by the admin setup page in
 # step 6; on first deploy you may seed an empty set: {"v":1,"epoch":0,"c":[]}
@@ -208,8 +201,8 @@ on every use) and `VT_PASSKEY_URL` are written to `~/.config/vt/config.toml`.
 Enrollment needs the `ENROLL_LIMITER` rate-limit binding from
 `wrangler.toml.example` (without it the Worker answers 503). Tokens are listed
 and revoked on the admin **主机令牌** tab. Never hand `VT_AUTH_CF` itself to a
-host; the bare-master form of `VT_PASSKEY_TOKEN` is accepted only as a
-migration path (logged `auth.legacy_master`). Details: [host-token.md](host-token.md).
+host; `VT_PASSKEY_TOKEN` must be a `vt1.` host token — the CLI and the Worker
+both refuse anything else. Details: [host-token.md](host-token.md).
 
 Optional: `VT_PASSKEY_UV` (or the global `vt --uv <level>` flag) asks a single
 host or command for a stricter approval than the Worker's policy requires —
@@ -258,11 +251,8 @@ expiry guard.
   URLs), then redeploy.
 - **Cut one host off:** revoke its token on the 主机令牌 tab (immediate; the
   host re-runs `vt enroll` to come back).
-- **Rotate the master:** put the outgoing value in `VT_AUTH_CF_PREV` first, then
-  `wrangler secret put VT_AUTH_CF`; hosts re-enroll one at a time while the
-  主机令牌 tab shows who is still on 旧主密钥, and `VT_AUTH_CF_PREV` is deleted at
-  a set deadline. Full procedure: [host-token.md §7](host-token.md#7-rollout).
-  Skipping `VT_AUTH_CF_PREV` still works and cuts off every host at once.
+- **Rotate the master:** `wrangler secret put VT_AUTH_CF`, then `vt enroll` on
+  every host the same day — every existing token stops verifying at once.
 - **Invalidate all cached DEKs:** rotate `CACHE_SECKEY` (or use the admin
   clear-cache button).
 - **Revoke a Passkey:** use the setup page (bumps `epoch`), then

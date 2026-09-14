@@ -1,6 +1,6 @@
 // Pure host-token helpers (host_token.ts). The golden vector's secret is the
 // same b64u string the Rust client tests parse (src/cf.rs
-// `worker_auth_parses_host_token_and_legacy_master`), so the two suites pin the
+// `worker_auth_parses_host_token_and_rejects_bare_master`), so the two suites pin the
 // identical token shape; only the Worker derives — hosts just hold the result.
 
 import { describe, it, expect } from 'vitest';

@@ -86,7 +86,7 @@ listed for 30 days, then the alarm sweep drops them.
 `vt ssh agent --audit-key vt1.…` uses the Mac's own host token: the secret is
 the HMAC key and `agent_id = t:<token_id>`. The Worker derives the same secret,
 and the DO refuses rows from a revoked/expired token (`isLive`, no sliding — a
-background push is not a use). A bare master still works as before
+background push is not a use). `--audit-key` alone still accepts the master
 (`HKDF(master, hostname)`); see [agent-audit.md](agent-audit.md).
 
 ## 6. Approval-context trim
@@ -130,8 +130,7 @@ would keep an old credential alive).
   token; challenge/dek-cache auth with sliding expiry and structured refusals;
   bare master and token-less DO bodies refused; meta trim; audit ingest with
   `t:`; admin list/revoke; limiter absent → 503; pending cap → 429; master
-  rotation refusing old-master tokens on every route, with or without a stray
-  `VT_AUTH_CF_PREV` binding).
-- Rust: `cf::tests::worker_auth_parses_host_token_and_legacy_master`,
+  rotation refusing old-master tokens on every route).
+- Rust: `cf::tests::worker_auth_parses_host_token_and_rejects_bare_master`,
   `http_post_sends_token_id_header_only_when_given`,
   `config::tests::upsert_*`, `audit::tests::host_token_audit_key_only_for_host_tokens`.

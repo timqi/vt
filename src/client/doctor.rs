@@ -92,18 +92,13 @@ fn doctor_redact(key: &str, value: &str) -> String {
     // prefix in terminal scrollback helps nobody.
     // VT_PASSKEY_TOKEN: say WHICH kind — the token id is public (it travels in
     // a request header) and is what the admin 主机令牌 tab lists, so it is the
-    // one thing worth echoing; a bare master is flagged as the legacy shape.
+    // one thing worth echoing; anything else (malformed, or the Worker master
+    // pasted verbatim) is refused by the Worker and flagged here.
     if key == "VT_PASSKEY_TOKEN" {
         return match crate::cf::WorkerAuth::parse(value) {
-            Ok(auth) => match auth.token_id {
-                Some(id) => format!("set (host token {id})"),
-                None => format!(
-                    "set (len {}) ⚠ legacy shared master — run `vt enroll`",
-                    value.len()
-                ),
-            },
+            Ok(auth) => format!("set (host token {})", auth.token_id),
             Err(_) => format!(
-                "set (len {}) ⚠ malformed host token — run `vt enroll`",
+                "set (len {}) ⚠ not a host token — run `vt enroll`",
                 value.len()
             ),
         };
@@ -388,7 +383,7 @@ mod tests {
         assert_eq!(r, "set (host token AAAAAAAAAAAAAAAA)");
         let r = doctor_redact("VT_PASSKEY_TOKEN", "sharedmaster");
         assert!(
-            !r.contains("sharedmaster") && r.contains("legacy"),
+            !r.contains("sharedmaster") && r.contains("vt enroll"),
             "got {r}"
         );
         // The private-key slot acknowledges a vt:// record but never echoes

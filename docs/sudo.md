@@ -92,11 +92,11 @@ password prompt.
   is not a substitute. The copy is a snapshot: after upgrading `vt`, re-run
   `setup-pam.sh`. A stale copy keeps working until it no longer matches the
   Worker protocol, at which point sudo falls back to the password stack.
-- `VT_PASSKEY_TOKEN` is the Worker master `VT_AUTH_CF`. Putting it on every sudo
-  host increases the blast radius: theft can create approval requests and probe
-  an enabled DEK cache from the same IP context, but it cannot decrypt without
-  a phone approval or matching cache grant. Prefer a small set of bastion hosts
-  for the Worker path.
+- `VT_PASSKEY_TOKEN` is that host's own token from `vt enroll`, revocable on the
+  admin tokens tab. Theft can create approval requests and probe an enabled DEK
+  cache from the same IP context, but it cannot decrypt without a phone
+  approval or matching cache grant. Prefer a small set of bastion hosts for the
+  Worker path.
 - `pam_exec` often exposes stderr but not stdout. The Worker URL is emitted on
   stderr; configure Pushover, Slack, or Feishu if terminal feedback is not
   reliable in your PAM environment.

@@ -9,7 +9,7 @@
 // Key scheme (see docs/agent-audit.md):
 //
 //   agent_audit_key = HKDF-SHA256(
-//       ikm  = VT_AUTH_CF (worker master, == VT_PASSKEY_TOKEN),
+//       ikm  = VT_AUTH_CF (worker master; never a host's VT_PASSKEY_TOKEN),
 //       salt = agent_id   (= the machine hostname, UTF-8 bytes),
 //       info = "vt-agent-audit-v1",
 //       L    = 32)
@@ -43,13 +43,13 @@ pub fn derive_agent_audit_key(master: &[u8], agent_id: &str) -> Zeroizing<[u8; 3
 /// When `--audit-key` is a host token (`vt1.<id>.<secret>`), the audit HMAC key
 /// is the token secret itself and the Worker selects it via `agent_id =
 /// t:<id>`. `None` for anything that is not a well-formed host token (the
-/// caller then treats the value as the legacy master).
+/// caller then treats the value as the Worker master for the hostname-salted
+/// key above).
 pub fn host_token_audit_key(audit_key: &str) -> Option<(String, Zeroizing<[u8; 32]>)> {
     let auth = crate::cf::WorkerAuth::parse(audit_key).ok()?;
-    let token_id = auth.token_id.clone()?;
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(auth.key_bytes());
-    Some((token_id, key))
+    Some((auth.token_id, key))
 }
 
 #[cfg(test)]

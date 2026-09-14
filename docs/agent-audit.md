@@ -47,7 +47,7 @@ agent's own ppid.
 
 ```
 agent_audit_key = HKDF-SHA256(
-    ikm  = VT_AUTH_CF (worker master, == VT_PASSKEY_TOKEN),
+    ikm  = VT_AUTH_CF (worker master; never a host's VT_PASSKEY_TOKEN),
     salt = agent_id   (= the machine hostname, UTF-8 bytes),
     info = "vt-agent-audit-v1",
     L    = 32)
@@ -80,9 +80,9 @@ just `--audit-url` + `--audit-key`. The cost is that the worker master
   same IP binding the CLI already relies on, see `docs/dek-cache.md`).
 
 It does **not** by itself decrypt secrets that aren't currently cached — the
-vault master never leaves the phone. On a Mac that already sets
-`VT_PASSKEY_TOKEN` for the ceremony fallback the master is present anyway, so
-`--audit-key` adds no new exposure.
+vault master never leaves the phone. With the Mac's own host token as
+`--audit-key` (the preferred form below) nothing beyond that host's
+`VT_PASSKEY_TOKEN` is present; only the master form adds exposure.
 
 The per-hostname HKDF is retained (rather than signing with the raw master) so
 the Worker stays unchanged and the wire is per-host-keyed — making it trivial to
@@ -164,9 +164,9 @@ vt ssh agent --run-allow zed,code \
 Preferred: `--audit-key` is the Mac's own host token ([host-token.md](host-token.md)).
 Its secret is the HMAC key and `agent_id = t:<token_id>`, so the Worker
 re-derives the same secret and refuses rows once the token is revoked or has
-lapsed. Legacy: a bare master still works — the agent derives its per-host
-subkey from `--audit-key` + its hostname at startup and the Worker mirrors it.
-Either way the Worker needs **no new secret**. Audit push is fully opt-in: with `--audit-url` unset (or
+lapsed. `--audit-key` alone also accepts the Worker master — the agent derives
+its per-host subkey from it + its hostname at startup and the Worker mirrors it;
+`VT_PASSKEY_TOKEN` never does. Either way the Worker needs **no new secret**. Audit push is fully opt-in: with `--audit-url` unset (or
 `--no-audit-push`, or an empty `--audit-key`, or a non-`https://` URL) the
 agent's `spawn_push` is a no-op.
 

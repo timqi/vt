@@ -50,8 +50,8 @@ pub fn random_salts(n: usize) -> Vec<[u8; 16]> {
 
 pub struct CfConfig<'a> {
     pub worker_url: &'a str,
-    /// Raw `VT_PASSKEY_TOKEN`: a per-host `vt1.<id>.<secret>` token issued by
-    /// `vt enroll`, or (legacy) the Worker master itself. See [`WorkerAuth`].
+    /// Raw `VT_PASSKEY_TOKEN`: the per-host `vt1.<id>.<secret>` token issued
+    /// by `vt enroll`. See [`WorkerAuth`].
     pub worker_auth: &'a str,
     /// Requested WebAuthn user-verification level for the approval ceremony
     /// (`discouraged` | `preferred` | `required`), or `None` to take whatever
@@ -68,22 +68,20 @@ pub struct CfConfig<'a> {
 pub const HOST_TOKEN_PREFIX: &str = "vt1.";
 
 /// The HMAC key material behind `VT_PASSKEY_TOKEN`, plus the token id the
-/// Worker needs to re-derive it (`VT-Token-Id` header). `token_id == None` is
-/// the legacy shape where the value IS the Worker master (accepted by the
-/// Worker during the migration window only).
+/// Worker needs to re-derive it (`VT-Token-Id` header). Nothing but a host
+/// token parses: the Worker has no token-less request path.
 pub struct WorkerAuth {
     key: Zeroizing<Vec<u8>>,
-    pub token_id: Option<String>,
+    pub token_id: String,
 }
 
 impl WorkerAuth {
     pub fn parse(raw: &str) -> Result<Self> {
         let raw = raw.trim();
         let Some(rest) = raw.strip_prefix(HOST_TOKEN_PREFIX) else {
-            return Ok(Self {
-                key: Zeroizing::new(raw.as_bytes().to_vec()),
-                token_id: None,
-            });
+            bail!(
+                "VT_PASSKEY_TOKEN: not a host token (expected vt1.<id>.<secret>) — run `vt enroll`"
+            );
         };
         let (id, secret_b64u) = rest.split_once('.').ok_or_else(|| {
             anyhow!("VT_PASSKEY_TOKEN: malformed host token (expected vt1.<id>.<secret>)")
@@ -98,7 +96,7 @@ impl WorkerAuth {
         let secret: [u8; 32] = decode_b64u_exact(secret_b64u, "VT_PASSKEY_TOKEN secret")?;
         Ok(Self {
             key: Zeroizing::new(secret.to_vec()),
-            token_id: Some(id.to_owned()),
+            token_id: id.to_owned(),
         })
     }
 
@@ -106,7 +104,7 @@ impl WorkerAuth {
         hmac_auth_header_raw(&self.key, body)
     }
 
-    /// Raw HMAC key (32 bytes for a host token; the master's UTF-8 otherwise).
+    /// Raw HMAC key: the token's 32-byte secret.
     pub fn key_bytes(&self) -> &[u8] {
         &self.key
     }
@@ -302,8 +300,8 @@ pub(crate) async fn cf_post(
 /// would let a single retried row stall up to a minute.
 ///
 /// `token_id` (host-token auth) rides in the `VT-Token-Id` header so the Worker
-/// can re-derive the HMAC key; `None` for the legacy master and for the
-/// unauthenticated enroll request (`auth_header` empty).
+/// can re-derive the HMAC key; `None` for the unauthenticated enroll request
+/// (`auth_header` empty) and the agent's hostname-keyed audit push.
 pub(crate) async fn cf_post_with_timeout(
     url: &str,
     auth_header: &str,
@@ -474,10 +472,7 @@ pub async fn enroll(worker_url: &str, host: &str, user: &str) -> Result<Zeroizin
     let token = approved
         .host_token
         .ok_or_else(|| anyhow!("approved message carries no host token"))?;
-    let parsed = WorkerAuth::parse(&token)?;
-    if parsed.token_id.is_none() {
-        bail!("enroll: Worker returned a non-host token");
-    }
+    WorkerAuth::parse(&token).context("enroll: Worker returned a non-host token")?;
     Ok(Zeroizing::new(token))
 }
 
@@ -521,7 +516,7 @@ pub async fn get_deks(
     let resp = cf_post(
         &challenge_url,
         &auth_header,
-        auth.token_id.as_deref(),
+        Some(&auth.token_id),
         &req_body,
     )
     .await
@@ -644,7 +639,7 @@ async fn try_cache_with_timeout(
     // One budget includes both address-family attempts and the entire body read.
     // Keep crypto validation outside the recoverable transport/miss path.
     let bytes = match tokio::time::timeout(timeout, async {
-        let resp = cf_post(&url, &auth_header, auth.token_id.as_deref(), &req_body)
+        let resp = cf_post(&url, &auth_header, Some(&auth.token_id), &req_body)
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -862,7 +857,7 @@ mod tests {
     fn config(url: &str) -> CfConfig<'_> {
         CfConfig {
             worker_url: url,
-            worker_auth: "test-auth",
+            worker_auth: "vt1.AAAAAAAAAAAAAAAA.iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI",
             uv: None,
         }
     }
@@ -1093,18 +1088,22 @@ mod tests {
         assert_eq!(json["user"], "u");
     }
 
-    /// `vt1.<id>.<secret>` parses into the raw 32-byte HMAC key + id; anything
-    /// else is the legacy master used verbatim. Malformed host tokens are
-    /// errors, never silently treated as a master.
+    /// `vt1.<id>.<secret>` parses into the raw 32-byte HMAC key + id. A value
+    /// that is not a host token — the Worker master pasted verbatim, as before
+    /// `vt enroll` — is refused with the enroll hint, never used as a key.
     #[test]
-    fn worker_auth_parses_host_token_and_legacy_master() {
-        let legacy = WorkerAuth::parse("plain-master").unwrap();
-        assert!(legacy.token_id.is_none());
-        assert_eq!(&legacy.key[..], b"plain-master");
+    fn worker_auth_parses_host_token_and_rejects_bare_master() {
+        let err = WorkerAuth::parse("plain-master")
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("vt enroll")),
+            "got: {err:?}"
+        );
 
         let tok = "vt1.AAAAAAAAAAAAAAAA.iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI";
         let parsed = WorkerAuth::parse(tok).unwrap();
-        assert_eq!(parsed.token_id.as_deref(), Some("AAAAAAAAAAAAAAAA"));
+        assert_eq!(parsed.token_id, "AAAAAAAAAAAAAAAA");
         assert_eq!(parsed.key.len(), 32);
         // Same body, same key → same MAC as the Worker computes with the derived
         // secret (crypto-level parity is pinned by the b64u secret above, which

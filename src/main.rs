@@ -15,9 +15,9 @@ use crate::client::VTClient;
 ///
 /// `--audit-key` is preferably this Mac's own host token (`vt1.…`, from
 /// `vt enroll`): its secret is the HMAC key and `agent_id = t:<token_id>`, so
-/// the Worker can also refuse rows from a revoked token. A bare master is still
-/// accepted (legacy): the per-host subkey HKDF(master, hostname) is derived
-/// ONCE here so the raw master is not retained.
+/// the Worker can also refuse rows from a revoked token. The Worker master is
+/// accepted here only (never as `VT_PASSKEY_TOKEN`): the per-host subkey
+/// HKDF(master, hostname) is derived ONCE so the raw master is not retained.
 #[cfg(target_os = "macos")]
 fn build_audit_push_config(
     audit_url: &Option<String>,
@@ -47,7 +47,7 @@ fn build_audit_push_config(
         tracing::warn!("audit push disabled: --audit-key looks like a host token but is malformed");
         return AuditPushConfig::disabled();
     }
-    // Legacy: agent_id = hostname. The Worker re-derives HKDF(VT_AUTH_CF,
+    // Master key: agent_id = hostname. The Worker re-derives HKDF(VT_AUTH_CF,
     // hostname) to verify. Derive the per-host subkey once; pass the
     // Zeroizing<[u8;32]> straight in so no plain heap copy of the key exists.
     let key = audit::derive_agent_audit_key(master.as_bytes(), &hostname);
