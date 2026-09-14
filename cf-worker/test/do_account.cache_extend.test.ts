@@ -332,16 +332,30 @@ describe('extension has no total-lifetime ceiling', () => {
     expect(e.created_ms).toBe(ancient);       // forensic only, never a budget anchor
   });
 
-  it('extends a pre-migration entry that has no created_ms, host or ttl', async () => {
+  it('extends an entry that has no host or ttl', async () => {
     const { keys, ch } = await armCeremony({
-      entries: 1, leftMs: HOUR, ttlS: TTL_1W,
-      over: { created_ms: undefined, host: undefined, user: undefined, ttl_s: undefined },
+      entries: 1, leftMs: HOUR, ttlS: TTL_1W, over: { host: undefined, user: undefined, ttl_s: undefined },
     });
     expect(ch.extend!.host).toBe('');
     expect((await approve(ch)).status).toBe(200);
     const e = (await inDO(h => readEntries(h, keys)))[0]!;
     expect(Math.abs(e.expires_ms - (Date.now() + TTL_1W * 1000))).toBeLessThan(10_000);
-    expect(e.created_ms).toBeUndefined();
+  });
+
+  // created_ms is required (entries written before 2026-05-20 lack it): such a
+  // value is expired at request time and at commit time alike.
+  it('refuses an entry with no created_ms at request and skips it at commit', async () => {
+    const keys = await inDO(h => seedEntries(h, 1, { expires_ms: Date.now() + HOUR, created_ms: undefined }));
+    const res = await requestExtend(keys, TTL_1W);
+    expect(res.status).toBe(409);
+    expect(res.json.rejected.map((r: { reason: string }) => r.reason)).toEqual(['expired']);
+
+    const { keys: armed, ch } = await armCeremony({ entries: 1, leftMs: HOUR, ttlS: TTL_1W });
+    await mutateEntries(armed, { created_ms: undefined });
+    expect((await approve(ch)).status).toBe(200);
+    expect((await inDO(h => readEntries(h, armed)))[0]!.expires_ms).toBeLessThan(Date.now() + 2 * HOUR);
+    const effect = (await inDO(auditRows)).find(r => r.status === 'extended');
+    expect(effect!.reason).toMatch(/expired=1/);
   });
 
   it('rewrites expires_ms and nothing else — created_ms, seal, binding stay put', async () => {

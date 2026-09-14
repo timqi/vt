@@ -136,6 +136,17 @@ describe('opDekCache — batched reads', () => {
   // Rejected input: the v4 layout `dek:{ctx}:{salt}` (ctx = IP + normalized pwd)
   // has no token half. Such entries are never read — no dual-read — but they
   // stay listable and clearable until they lapse.
+  it('never serves an entry with no created_ms', async () => {
+    const salts = await armCache(2);
+    await inDO(async h => {
+      for (const k of await allDekKeys(h)) {
+        const { created_ms: _dropped, ...rest } = (await h.state.storage.get<Record<string, unknown>>(k))!;
+        await h.state.storage.put(k, rest);
+      }
+    });
+    expect((await read(salts)).json).toEqual({ miss: true });
+  });
+
   it('never serves a v4-shaped entry, which stays listable and clearable', async () => {
     const salt = nextSalt();
     await inDO(async h => h.state.storage.put(`dek:${FAKE_CTX}:${salt}`, await makeEntry()));

@@ -4,7 +4,7 @@
 import { Challenge, ChallengeMeta, CacheEntry, CacheEntryRef, CacheExtendIntent } from './types';
 import { b64uEnc, isB64uString, decodeB64uExact, sha256 } from './crypto';
 import { seal, openToCache } from './cache_crypto';
-import { planExtend, isAllowedApproveTtl } from './cache_policy';
+import { planExtend, isAllowedApproveTtl, isLive } from './cache_policy';
 import { isTokenId } from './host_token';
 import { logErr } from './log';
 import { STORAGE_BATCH, deleteKeysBatched, listPrefixPages } from './storage_batch';
@@ -123,13 +123,8 @@ export class AccountCache {
     return { deleted, scanned };
   }
 
-  // Not provably live is expired: a value without a numeric `expires_ms` is
-  // never served (read) nor shown (listLive), so the alarm removes it too.
   sweepExpired(now: number): Promise<{ deleted: number; scanned: number }> {
-    return this.sweepCacheEntries(v => {
-      const e = v as Partial<CacheEntry> | null;
-      return !e || typeof e !== 'object' || typeof e.expires_ms !== 'number' || e.expires_ms <= now;
-    });
+    return this.sweepCacheEntries(v => !isLive(v, now));
   }
 
   clearAll(): Promise<{ deleted: number; scanned: number }> {
@@ -236,7 +231,7 @@ export class AccountCache {
     try {
       for (const key of keys) {
         const entry = map.get(key);
-        if (!entry || entry.expires_ms <= now) continue;
+        if (!isLive(entry, now)) continue;
         const dek = openToCache(entry.sealed_to_cache_b64u, sk);
         if (!dek || dek.length !== 32) {
           dek?.fill(0);
@@ -275,10 +270,10 @@ export class AccountCache {
     const live: Array<[string, CacheEntry]> = [];
     let scanned = 0;
     let truncated = false;
-    for await (const page of listPrefixPages<CacheEntry>(this.storage, 'dek:')) {
+    for await (const page of listPrefixPages<unknown>(this.storage, 'dek:')) {
       for (const [key, e] of page) {
         scanned++;
-        if (!e || typeof e !== 'object' || typeof e.expires_ms !== 'number' || e.expires_ms <= now) continue;
+        if (!isLive(e, now)) continue;
         live.push([key, e]);
       }
       if (scanned >= CACHE_LIST_SCAN_MAX) { truncated = true; break; }

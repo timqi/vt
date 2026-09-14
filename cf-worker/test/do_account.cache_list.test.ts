@@ -281,6 +281,20 @@ describe('清除全部 — exhaustive by contract', () => {
       expect(await allDekKeys(h)).toHaveLength(1);
     });
   });
+
+  // created_ms is required; an entry written before 2026-05-20 lacks it and is
+  // not an entry any more: never listed, swept by the alarm.
+  it('an entry with no created_ms is not listed and is swept', async () => {
+    await inDO(h => seedEntries(h, 1, { expires_ms: Date.now() + HOUR, created_ms: undefined }));
+    const live = await inDO(h => seedEntries(h, 1, { expires_ms: Date.now() + HOUR }));
+    const { body } = await list();
+    expect(body.entries.map(e => e.salt_b64u)).toEqual([refOf(live[0]!).salt_b64u]);
+    expect(body.scanned).toBe(2);
+    await inDO(async h => {
+      expect(await h.inst.cache.sweepExpired(Date.now())).toEqual({ deleted: 1, scanned: 2 });
+      expect(await allDekKeys(h)).toEqual(live);
+    });
+  });
 });
 
 // Removed surfaces (docs/refactor.md rule: a migration's test becomes a

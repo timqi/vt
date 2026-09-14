@@ -76,23 +76,29 @@ export type ExtendPlan =
   | { ok: true; expires_ms: number }
   | { ok: false; skip: ExtendSkip };
 
+/** The one liveness rule for a stored `dek:` value: read, listing and
+ *  extension accept only what passes; the alarm sweeps whatever does not. Not
+ *  provably live is expired, so the wrong shape, a non-numeric `expires_ms` or
+ *  `created_ms`, or a lapsed expiry are all out. Entries written before
+ *  2026-05-20 carry no `created_ms` and drop here. */
+export function isLive(v: unknown, now: number): v is CacheEntry {
+  const e = v as Partial<CacheEntry> | null;
+  return !!e && typeof e === 'object'
+    && typeof e.expires_ms === 'number' && e.expires_ms > now
+    && typeof e.created_ms === 'number';
+}
+
 /** Decide the new absolute expiry for ONE entry, or why it is skipped.
  *
  *  Always measured from NOW — the moment of approval — so "延长 1 天" means one day
  *  from the tap, not one day from whenever the entry happened to be created.
- *  created_ms is deliberately NOT consulted: it is forensic metadata now, which is
- *  what lets pre-migration entries be extended like any other.
+ *  created_ms is forensic metadata: required for the entry to be live at all,
+ *  never an anchor for the new expiry.
  *
  *  Pure: the caller re-reads the entry under the DO gate and applies this to the
  *  fresh copy, so a stale plan can never be written back. */
-export function planExtend(
-  entry: Pick<CacheEntry, 'expires_ms'>,
-  ttlS: number,
-  now: number,
-): ExtendPlan {
-  if (typeof entry.expires_ms !== 'number' || entry.expires_ms <= now) {
-    return { ok: false, skip: 'expired' };
-  }
+export function planExtend(entry: unknown, ttlS: number, now: number): ExtendPlan {
+  if (!isLive(entry, now)) return { ok: false, skip: 'expired' };
   const candidate = now + ttlS * 1000;
   if (candidate <= entry.expires_ms) return { ok: false, skip: 'no_gain' };
   return { ok: true, expires_ms: candidate };

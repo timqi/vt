@@ -109,6 +109,13 @@ TTL, a caller can decrypt the approved records without another phone tap.
   `{token_id, project, salt_b64u}` (`CacheEntryRef`) and the DO re-derives its
   key in `cacheCtx`, so a clear or an extension can only ever reach what a read
   would. Entries written before `host`/`ttl_s` existed list with those blank.
+  `created_ms` is required: `isLive` (`cache_policy.ts`) is the one liveness
+  rule for a stored value — numeric `created_ms`, numeric `expires_ms` in the
+  future — and the read, the listing, the extension request and its commit
+  accept only what passes; the alarm sweeps the rest. Operator step for this
+  release: entries written before 2026-05-20 lack `created_ms` and are dropped
+  (a miss, unlisted, swept); nothing to do unless one is still live, in which
+  case the next decrypt re-prompts once.
 - A hit sends a best-effort Web Push notice (`cache_hit_notify`, 设置 tab) to
   every phone subscribed there — tag `cache:<host>`, TTL 1 h, opening the audit
   tab. Notifications never block DEK delivery and contain no approval URL.
@@ -286,7 +293,7 @@ factory reset also orphans every entry). The cache does not re-key existing
 
 | Concern | Source |
 |---|---|
-| TTL ladders, per-hop cap, extension arithmetic | `cf-worker/src/cache_policy.ts` (+ `test/cache_policy.test.ts`) |
+| TTL ladders, per-hop cap, entry liveness (`isLive`), extension arithmetic | `cf-worker/src/cache_policy.ts` (+ `test/cache_policy.test.ts`) |
 | Cache key binding (`cacheCtx`), writes/reads, live listing, exact-key and exhaustive clears, extension storage batches | `cf-worker/src/account_cache.ts` (`AccountCache`, same DO storage/input gate) |
 | Cache request validation, Passkey authorization, ceremony transitions, audit/notification orchestration | `cf-worker/src/do_account.ts` (`AccountDO`) |
 | Audit persistence and notification lifecycle | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts` |

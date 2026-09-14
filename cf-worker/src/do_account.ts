@@ -894,7 +894,7 @@ export class AccountDO extends DurableObject<Env> {
       host: e.host ?? '',
       user: e.user ?? '',
       ip: e.ip ?? '',
-      created_ms: typeof e.created_ms === 'number' ? e.created_ms : null,
+      created_ms: e.created_ms,
       expires_ms: e.expires_ms,
       ttl_s: typeof e.ttl_s === 'number' ? e.ttl_s : null,
       origin_token_id: e.origin_token_id ?? '',

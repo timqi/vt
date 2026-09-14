@@ -135,7 +135,7 @@ describe('writeCache — creation stamp and metadata', () => {
     expect(entries).toHaveLength(3);
     for (const e of entries) {
       expect(e.created_ms).toBeGreaterThanOrEqual(before);
-      expect(e.expires_ms).toBe(e.created_ms! + TTL_2H * 1000);
+      expect(e.expires_ms).toBe(e.created_ms + TTL_2H * 1000);
       expect(e.ttl_s).toBe(TTL_2H);
       expect(e.origin_token_id).toBe(ch.approve_token);
       expect(e.host).toBe(ch.meta.host);

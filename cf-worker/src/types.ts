@@ -276,9 +276,9 @@ export interface CacheEntrySummary extends CacheEntryRef {
   user: string;
   /** Worker-derived source IP at approval (audit metadata; not bound). */
   ip: string;
-  /** Approval time (epoch ms); null on entries written before it was stored.
-   *  Forensic only — extension is measured from the approval, not creation. */
-  created_ms: number | null;
+  /** Approval time (epoch ms). Forensic only — extension is measured from
+   *  the approval, not creation. */
+  created_ms: number;
   expires_ms: number;
   /** The TTL the approver chose; null before it was stored. */
   ttl_s: number | null;
@@ -509,9 +509,9 @@ export interface CacheEntry {
   ttl_s?: number;
   /** When the phone approval created this entry (epoch ms). Forensic only — an
    *  extension is measured from the approval and moves expires_ms alone, so
-   *  nothing in the policy reads this. ABSENT on pre-migration entries, which are
-   *  extendable like any other. Immutable: never rewrite it. */
-  created_ms?: number;
+   *  nothing in the policy reads this. Immutable: never rewrite it. A stored
+   *  value without it is not an entry (`isLive`). */
+  created_ms: number;
 }
 
 // ── Agent audit push (SSH-agent → Worker) ──────────────────────────────────

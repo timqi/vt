@@ -33,7 +33,7 @@ describe('policy constants', () => {
     const perm = 100 * 365 * 24 * 3600;
     expect(isAllowedExtendTtl(perm)).toBe(true);
     expect(Number.isFinite(perm)).toBe(true);
-    const p = planExtend({ expires_ms: NOW + MIN }, perm, NOW);
+    const p = planExtend({ created_ms: NOW, expires_ms: NOW + MIN }, perm, NOW);
     expect(p).toEqual({ ok: true, expires_ms: NOW + perm * 1000 });
     if (p.ok) {
       expect(p.expires_ms).toBeLessThan(Number.MAX_SAFE_INTEGER);
@@ -118,15 +118,17 @@ describe('planExtend', () => {
     }
   });
 
-  it('extends an entry with no created_ms at all (pre-migration)', () => {
+  // created_ms is required (entries written before 2026-05-20 lack it): a value
+  // without one is not a live entry, so an extension never touches it.
+  it('treats an entry with no created_ms as expired', () => {
     expect(planExtend({ expires_ms: NOW + MIN }, 7 * 24 * 3600, NOW))
-      .toEqual({ ok: true, expires_ms: NOW + 7 * 24 * HOUR });
+      .toEqual({ ok: false, skip: 'expired' });
   });
 
   // Renewal is unbounded in total, but only ever forward and only from a LIVE
   // grant: the moment a window lapses, the capability is gone for good.
   it('renews indefinitely while live, and stops dead once lapsed', () => {
-    let e: { expires_ms: number } = { expires_ms: NOW + 20 * MIN };
+    let e = { created_ms: NOW, expires_ms: NOW + 20 * MIN };
     let t = NOW;
     for (let i = 0; i < 10; i++) {
       t = e.expires_ms - MIN;                    // renew just before each lapse
@@ -134,7 +136,7 @@ describe('planExtend', () => {
       expect(p.ok).toBe(true);
       if (!p.ok) break;
       expect(p.expires_ms).toBe(t + 24 * HOUR);  // exactly now + ttl, no budget
-      e = { expires_ms: p.expires_ms };
+      e = { created_ms: NOW, expires_ms: p.expires_ms };
     }
     // One second past expiry, the same request is refused forever after.
     expect(planExtend(e, 24 * 3600, e.expires_ms + 1000))
