@@ -364,9 +364,9 @@ final class AgentSupervisor {
         let errPipe = Pipe()
         proc.standardInput = stdinPipe
         proc.standardOutput = FileHandle.nullDevice
-        // Capture stderr so a fast-failing agent (e.g. keychain wrap bound to
-        // the old binary path — needs `vt secret rebind`) surfaces a reason
-        // instead of a silent "not running".
+        // Capture stderr so a fast-failing agent (e.g. a keychain store still
+        // on the retired wrap v1) surfaces a reason instead of a silent
+        // "not running".
         proc.standardError = errPipe
         let stderrCapture: AgentStderrCapture
         do {
@@ -645,8 +645,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        // Managed agent failed to start (common cause: keychain wrap still
-        // bound to the old binary path — run `vt secret rebind`).
+        // Managed agent failed to start (e.g. keychain store still on the
+        // retired wrap v1 — docs/app-bundle.md §2).
         if !supervisor.isManaged, !agentReachable, let err = supervisor.lastError, !err.isEmpty {
             menu.addItem(disabled("⚠ agent failed to start:"))
             menu.addItem(disabled("   \(String(err.prefix(120)))"))

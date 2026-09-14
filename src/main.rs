@@ -214,20 +214,6 @@ pub enum SecretCommands {
     Import,
     /// Rotate the passcode for the master secret
     RotatePasscode,
-    /// Migrate the master-key wrap to the path-independent v2 derivation
-    /// (or back to v1 with --to-v1 before rolling back to an old binary)
-    Rebind {
-        #[arg(
-            long,
-            help = "Absolute path of the vt binary that wrote the store, for v1 stores bound to a location this binary no longer occupies. The old binary need not exist — only the path string enters the derivation."
-        )]
-        old_bin_path: Option<String>,
-        #[arg(
-            long,
-            help = "Rewrap back to the legacy v1 derivation bound to THIS binary's current path (escape hatch before downgrading vt)"
-        )]
-        to_v1: bool,
-    },
 }
 
 #[derive(Subcommand, PartialEq)]
@@ -377,10 +363,6 @@ async fn run(cli: Cli, config: config::ResolvedConfig) -> Result<()> {
             SecretCommands::Export => server_macos::admin::export_secret().await,
             SecretCommands::Import => server_macos::admin::import_secret().await,
             SecretCommands::RotatePasscode => server_macos::admin::rotate_passcode().await,
-            SecretCommands::Rebind {
-                old_bin_path,
-                to_v1,
-            } => server_macos::admin::rebind(old_bin_path.clone(), *to_v1).await,
         },
         Commands::Ssh(ssh_command) => match ssh_command {
             SshCommands::Keygen {

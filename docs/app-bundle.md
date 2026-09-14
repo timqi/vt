@@ -51,61 +51,38 @@ Ad-hoc signatures change per build, so upgrades can trigger a new Keychain ACL
 prompt. A stable signing identity reduces this friction. There is no in-app
 auto-updater; installation remains explicit.
 
-## 2. Master-key wrap v2 and `vt secret rebind`
+## 2. Master-key wrap v2
 
-Legacy wrap v1 derives the wrap key from
-`base64url(passcode):$USER:<resolved binary path>`. Moving the binary can make
-AES-GCM unwrap fail. Wrap v2 replaces only the path term with `vt-wrap-v2`;
-`$USER` remains required. Both derivations apply double SHA-256 in
-`src/core/crypto.rs` (`derive_passphrase_secret`, `derive_passphrase_secret_v2`).
-The path was an attacker-knowable soft binding, not a useful reason to make
-bundle or package-prefix moves break access.
+The wrap key is `SHA-256(SHA-256(base64url(passcode):$USER:vt-wrap-v2))`
+(`src/core/crypto.rs`, `derive_passphrase_secret_v2`). The fixed label is the
+only derivation this release reads; the retired wrap v1 put the resolved
+binary path there, an attacker-knowable soft binding that made bundle and
+package-prefix moves break access.
 
-New `KeychainStore` values always use `wrap_v = 2`; absent markers deserialize
-as v1. `STORE_SCHEMA_VERSION` remains 1. At agent startup,
-`upgrade_wrap_v2_if_needed` rechecks a v1 store under `KeychainStore::modify`'s
-`vt-keychain.lock` flock and upgrades it if its current-path unwrap succeeds.
-Running the new agent at the old resolved path therefore upgrades before a
-move. Automatic upgrade is a startup operation, not a promise that every CLI
-store read migrates it.
+`KeychainStore` always writes `wrap_v = 2`. `derive_passcode_cipher`
+(`src/server_macos/security.rs`) is the single unwrap gate: a store whose
+marker is not 2 — an explicit `1`, or the marker-less form older stores
+parse as `0` — fails closed before any unwrap with
 
-For a binary already moved:
-
-```bash
-vt secret rebind --old-bin-path <resolved path of the old vt binary>
+```
+rusty.vault.store has wrap version 1, this release reads only wrap v2 — run `vt secret rebind` on the previous vt release first
 ```
 
-`rebind` requires local authentication and runs under the store flock. It
-first tries the store's recorded wrap: the fixed label for v2, or
-`current_exe()` for v1. For a v1 store it then tries the supplied old path.
-The old binary need not exist; the exact resolved path string is sufficient.
-On success it writes v2 and tells the operator to restart a running agent.
-
-Only `encrypted_passphrase` and `wrap_v` change. The 64-byte
-`passcode_and_auth_token` blob and encrypted SSH keys are preserved
-byte-for-byte. The rewrap mutator must not call
-`create_and_save_passcode_passphrase`, which mints a fresh passcode.
+There is no in-binary upgrade and no `vt secret rebind` in this release. A
+v1 store is migrated by running the previous release's `vt secret rebind`
+(that binary still reads v1) before installing this one; the alternative is
+the `vt secret export` / `vt secret import` route, handling its secret
+material accordingly. `STORE_SCHEMA_VERSION` remains 1, so an older binary
+still parses a v2 store for that route. Only `create_and_save_passcode_passphrase`
+(init/import, which mints a fresh passcode) and `rotate_passcode` write
+`encrypted_passphrase`; both write `wrap_v = 2`.
 
 The blob's second 32 bytes are unread (new stores fill them with random
 bytes); the width stays so existing stores need no migration.
 
-Remove obsolete `vt` binaries after migration. An older binary can parse a v2
-store but cannot unwrap it. Its full-store writers (`init`, `import`,
-`rotate-passcode`) also do not preserve the new marker and can downgrade the
-store back to a path-bound wrap.
-
-Rollback uses the new binary before replacing it with the old one:
-
-```bash
-vt secret rebind --to-v1
-```
-
-This binds v1 to the **rebind binary's current resolved path**, not the
-`--old-bin-path` argument (which only helps read the old wrap). The rollback
-binary must run at that same path. Do not restart a new agent between downgrade
-and replacement: startup would upgrade it again. The existing
-`vt secret export` / `vt secret import` workflow is another recovery route;
-handle its secret material accordingly.
+Remove obsolete `vt` binaries after upgrading. An older binary's full-store
+writers (`init`, `import`, `rotate-passcode`) can rewrite the store as wrap
+v1, which this release then rejects until it is rebound on that binary.
 
 ## 3. Native notifications
 
@@ -249,33 +226,28 @@ after upgrading.
 Managed stderr is drained continuously, retaining only the last 64 KiB in
 memory, not a log file. Exit snapshots do not wait for EOF from descendants.
 A fast (under three seconds) or nonzero exit surfaces the last nonempty stderr
-line (up to 120 characters) and a Doctor shortcut, including old-path wrap
-failures. After installation, running code does not change until restart;
+line (up to 120 characters) and a Doctor shortcut, including a rejected wrap
+version. After installation, running code does not change until restart;
 version comparison uses `agent_version` and the bundled `vt version`.
 
 ## 7. Migration from a non-bundle install
 
-For a pre-v2 store, record the old binary's **resolved** path before replacing
-it; `~/.local/bin/vt` may itself be a symlink. Stop the existing agent and its
-supervisor first, then:
+The store must already be wrap v2 (section 2). If the old install predates
+wrap v2, run its own `vt secret rebind` first — the previous release still
+reads and upgrades v1 — then stop the existing agent and its supervisor and:
 
 ```bash
 just install-app
-vt secret rebind --old-bin-path <resolved path of the old vt binary>
 open /Applications/VT.app
 ```
 
-For example, `/Users/you/.local/bin/vt` is correct only if that was the real
-file, not a symlink to another location. If rebind is skipped and startup cannot
-unwrap v1, the menu surfaces the last nonempty stderr line and a Doctor shortcut
-as described in section 6. The rebind hint is only in the agent's earlier stderr
-warning; the final `Decryption error` line does not include it. After migration,
-future binary moves do not require another rebind. Remove obsolete binaries;
-rollback precautions are in section 2.
+If the store is still v1, startup fails closed and the menu surfaces the last
+nonempty stderr line and a Doctor shortcut as described in section 6; the
+error names the remedy. Binary moves never affect the wrap. Remove obsolete
+binaries; the downgrade caveat is in section 2.
 
 Moving the binary can trigger the legacy Keychain ACL prompt for the
-`rusty.vault.store` generic-password item. The first bundle-path rebind can
-also satisfy that ACL prompt. Stable code signing helps preserve authorization;
+`rusty.vault.store` generic-password item. Stable code signing helps preserve authorization;
 ad-hoc rebuilds can prompt again. Native ACL/notification behavior must be
 verified on the installed, signed bundle, not inferred from unit tests.
 
@@ -305,9 +277,9 @@ cargo test --locked --test agent_socket_owner
 cargo test --locked core::authorization::tests
 ```
 
-On macOS, `test_rewrap_round_trip_preserves_store` in
-`src/server_macos/security.rs` checks v1/v2/v1 recovery and untouched token/SSH
-fields over an in-memory store. `ui_status_token_gate_locked_report_and_revoke`
+On macOS, `test_rewrap_preserves_store` and `test_non_v2_wrap_is_rejected` in
+`src/server_macos/security.rs` check the v2 rewrap, untouched token/SSH fields,
+and the wrap v1/0/unknown rejection over an in-memory store. `ui_status_token_gate_locked_report_and_revoke`
 in `src/server_macos/ssh_agent.rs` checks absent/wrong/correct tokens, unknown
 actions, locked status, labels/expiry, and revoke. The same module tests idle
 dual-clock expiry and lock/wake watcher classification. Run its tests and the

@@ -4,7 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-use crate::core::crypto::{derive_passphrase_secret, derive_passphrase_secret_v2, AesGcmCrypto};
+use crate::core::crypto::{derive_passphrase_secret_v2, AesGcmCrypto};
 use crate::core::session::{
     classify_session, lock_cache_check, throttle_check, AuthMethod, AuthOutcome, NotifyKind,
     SessionState, UnavailableReason,
@@ -531,11 +531,19 @@ pub fn load_mac_cipher(
 }
 
 /// Derive the passphrase cipher from the passcode bytes inside an
-/// already-loaded store, selecting the wrap derivation by `store.wrap_v`.
-/// Pure CPU work; does not touch the keychain.
+/// already-loaded store. Only wrap v2 is readable: a v1 (path-bound) or
+/// unknown marker fails closed here, before any unwrap, with the operator
+/// remedy. Pure CPU work; does not touch the keychain.
 pub fn derive_passcode_cipher(store: &super::store::KeychainStore) -> Result<AesGcmCrypto> {
+    use super::store::WRAP_V2;
+    ensure!(
+        store.wrap_v == WRAP_V2,
+        "rusty.vault.store has wrap version {}, this release reads only wrap v{WRAP_V2} — \
+         run `vt secret rebind` on the previous vt release first (docs/app-bundle.md §2)",
+        store.wrap_v
+    );
     let passcode_arr = split_passcode(store)?;
-    let passphrase_secret = wrap_secret_for(store.wrap_v, &passcode_arr, None)?;
+    let passphrase_secret = derive_passphrase_secret_v2(&passcode_arr)?;
     AesGcmCrypto::new(&passphrase_secret)
 }
 
@@ -549,94 +557,6 @@ fn split_passcode(store: &super::store::KeychainStore) -> Result<[u8; 32]> {
         passcode.len()
     );
     Ok(passcode[..32].try_into()?)
-}
-
-/// Wrap-key derivation for a given `wrap_v`. `bin_path` only applies to v1
-/// (`None` → `current_exe()`); unknown versions error out so a store written
-/// by a newer vt fails loudly instead of mis-deriving.
-fn wrap_secret_for(wrap_v: u32, passcode: &[u8; 32], bin_path: Option<&str>) -> Result<[u8; 32]> {
-    use super::store::{WRAP_V1, WRAP_V2};
-    match wrap_v {
-        WRAP_V1 => derive_passphrase_secret(passcode, bin_path),
-        WRAP_V2 => derive_passphrase_secret_v2(passcode),
-        other => anyhow::bail!(
-            "rusty.vault.store has wrap version {other}, this binary supports up to {WRAP_V2} — upgrade vt"
-        ),
-    }
-}
-
-/// Rewrap `encrypted_passphrase` in place to `target_wrap` (v2 label, or v1
-/// bound to THIS binary's path for `--to-v1`). Pure over the store value —
-/// callers wrap it in `KeychainStore::modify` for the cross-process flock.
-/// Tries, in order: the store's recorded wrap, then (for v1 stores) the
-/// explicit `old_bin_path` string — the old binary need not exist, only its
-/// path enters the derivation. Preserves `passcode_and_auth_token` and
-/// `encrypted_ssh_keys` untouched.
-pub(super) fn rewrap_passphrase(
-    store: &mut super::store::KeychainStore,
-    old_bin_path: Option<&str>,
-    target_wrap: u32,
-) -> Result<()> {
-    use super::store::WRAP_V1;
-    let passcode_arr = split_passcode(store)?;
-    let encrypted = store.encrypted_passphrase_bytes()?;
-
-    let mut candidates: Vec<(u32, Option<String>)> = vec![(store.wrap_v, None)];
-    if store.wrap_v == WRAP_V1 {
-        if let Some(p) = old_bin_path {
-            candidates.push((WRAP_V1, Some(p.to_string())));
-        }
-    }
-
-    let mut passphrase: Option<Zeroizing<Vec<u8>>> = None;
-    for (wrap_v, path) in &candidates {
-        let secret = wrap_secret_for(*wrap_v, &passcode_arr, path.as_deref())?;
-        if let Ok(plain) = AesGcmCrypto::new(&secret)?.decrypt(&encrypted) {
-            passphrase = Some(Zeroizing::new(plain));
-            break;
-        }
-    }
-    let passphrase = passphrase.ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not unwrap the master passphrase with the store's recorded wrap \
-             (v{}){} — pass --old-bin-path <absolute path of the binary that wrote the store>",
-            store.wrap_v,
-            if old_bin_path.is_some() {
-                " or the given --old-bin-path"
-            } else {
-                ""
-            }
-        )
-    })?;
-
-    let new_secret = wrap_secret_for(target_wrap, &passcode_arr, None)?;
-    let rewrapped = AesGcmCrypto::new(&new_secret)?.encrypt(&passphrase)?;
-    store.set_encrypted_passphrase(&rewrapped, target_wrap);
-    Ok(())
-}
-
-/// Transparent wrap v1→v2 upgrade, run at agent startup (docs/app-bundle.md
-/// §2). Under the store flock: re-checks `wrap_v == 1`, rewraps only
-/// `encrypted_passphrase`, never touches the passcode blob or SSH
-/// blobs. Returns Ok(false) if the store is absent or already v2; unwrap
-/// failure (binary already moved before upgrading) is left to
-/// `vt secret rebind` and reported as an error for the caller to log.
-pub fn upgrade_wrap_v2_if_needed() -> Result<bool> {
-    use super::store::{KeychainStore, WRAP_V1, WRAP_V2};
-    if !matches!(KeychainStore::load(), Ok(s) if s.wrap_v == WRAP_V1) {
-        return Ok(false);
-    }
-    let mut upgraded = false;
-    KeychainStore::modify(|store| {
-        // Re-check under the lock: another process may have upgraded first.
-        if store.wrap_v != WRAP_V1 {
-            return Ok(());
-        }
-        rewrap_passphrase(store, None, WRAP_V2)?;
-        upgraded = true;
-        Ok(())
-    })?;
-    Ok(upgraded)
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -653,93 +573,36 @@ mod tests {
         assert!(result.is_ok())
     }
 
-    /// Pure rewrap round-trip over an in-memory store: v1 (explicit old
-    /// path) -> v2 -> v1, asserting the master passphrase survives and the
-    /// non-passphrase fields are byte-for-byte untouched. No keychain access.
-    #[test]
-    fn test_rewrap_round_trip_preserves_store() {
-        use super::super::store::{KeychainStore, WRAP_V1, WRAP_V2};
-        use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
-
-        let passcode = AesGcmCrypto::generate_key();
-        let mut passcode_and_auth_token = Vec::new();
-        passcode_and_auth_token.extend_from_slice(&passcode);
-        passcode_and_auth_token.extend_from_slice(&AesGcmCrypto::generate_key());
-
-        let master = AesGcmCrypto::generate_key();
-        let old_path = "/old/install/location/vt";
-        let v1_secret = derive_passphrase_secret(&passcode, Some(old_path)).unwrap();
-        let v1_wrapped = AesGcmCrypto::new(&v1_secret)
-            .unwrap()
-            .encrypt(&master)
-            .unwrap();
-
-        let mut store = KeychainStore::new(&passcode_and_auth_token, &v1_wrapped);
-        store.set_encrypted_passphrase(&v1_wrapped, WRAP_V1);
-        store.set_encrypted_ssh_keys(b"ssh-blob");
-        let tokens_before = store.passcode_and_auth_token.clone();
-
-        // v1 (old path) -> v2: recorded-wrap candidate fails (current_exe !=
-        // old_path), the explicit old path candidate succeeds.
-        rewrap_passphrase(&mut store, Some(old_path), WRAP_V2).unwrap();
-        assert_eq!(store.wrap_v, WRAP_V2);
-        let v2_secret = derive_passphrase_secret_v2(&passcode).unwrap();
-        let unwrapped = AesGcmCrypto::new(&v2_secret)
-            .unwrap()
-            .decrypt(&store.encrypted_passphrase_bytes().unwrap())
-            .unwrap();
-        assert_eq!(unwrapped, master);
-
-        // v2 -> v1 (current_exe binding), the --to-v1 escape hatch.
-        rewrap_passphrase(&mut store, None, WRAP_V1).unwrap();
-        assert_eq!(store.wrap_v, WRAP_V1);
-        let v1_now = derive_passphrase_secret(&passcode, None).unwrap();
-        let unwrapped = AesGcmCrypto::new(&v1_now)
-            .unwrap()
-            .decrypt(&store.encrypted_passphrase_bytes().unwrap())
-            .unwrap();
-        assert_eq!(unwrapped, master);
-
-        // Everything except the passphrase wrap is untouched.
-        assert_eq!(store.passcode_and_auth_token, tokens_before);
-        assert_eq!(
-            store.encrypted_ssh_keys.as_deref(),
-            Some(BASE64_URL_SAFE_NO_PAD.encode(b"ssh-blob").as_str())
-        );
-    }
-
-    /// A wrap version this binary does not know must fail loudly, and a
-    /// failed unwrap must name the remedy without leaking key material.
-    #[test]
-    fn test_rewrap_unknown_and_wrong_path_errors() {
-        use super::super::store::{KeychainStore, WRAP_V1, WRAP_V2};
-
+    /// In-memory v2 store wrapping `master` under its own passcode. No
+    /// keychain access.
+    fn v2_store(master: &[u8; 32]) -> super::super::store::KeychainStore {
+        use super::super::store::KeychainStore;
         let passcode = AesGcmCrypto::generate_key();
         let mut tokens = Vec::new();
         tokens.extend_from_slice(&passcode);
         tokens.extend_from_slice(&AesGcmCrypto::generate_key());
+        let secret = derive_passphrase_secret_v2(&passcode).unwrap();
+        let wrapped = AesGcmCrypto::new(&secret).unwrap().encrypt(master).unwrap();
+        KeychainStore::new(&tokens, &wrapped)
+    }
 
+    /// Rejected input: the retired path-bound wrap v1 (explicit marker or
+    /// the marker-less form older stores parse as 0) and an unknown version
+    /// fail closed before any unwrap, naming the remedy, and the store is
+    /// not mutated.
+    #[test]
+    fn test_non_v2_wrap_is_rejected() {
         let master = AesGcmCrypto::generate_key();
-        let v1_secret = derive_passphrase_secret(&passcode, Some("/gone/vt")).unwrap();
-        let wrapped = AesGcmCrypto::new(&v1_secret)
-            .unwrap()
-            .encrypt(&master)
-            .unwrap();
-        let mut store = KeychainStore::new(&tokens, &wrapped);
-        store.set_encrypted_passphrase(&wrapped, WRAP_V1);
-
-        // No candidate matches: recorded wrap derives from current_exe, and
-        // the supplied old path is wrong.
-        let err = rewrap_passphrase(&mut store, Some("/also/wrong/vt"), WRAP_V2).unwrap_err();
-        assert!(err.to_string().contains("--old-bin-path"), "{err}");
-        assert_eq!(
-            store.wrap_v, WRAP_V1,
-            "failed rewrap must not mutate the store"
-        );
-
-        store.wrap_v = 99;
-        let err = rewrap_passphrase(&mut store, None, WRAP_V2).unwrap_err();
-        assert!(err.to_string().contains("wrap version 99"), "{err}");
+        for wrap_v in [1u32, 0, 99] {
+            let mut store = v2_store(&master);
+            store.wrap_v = wrap_v;
+            let err = derive_passcode_cipher(&store).err().expect("rejected");
+            assert!(
+                err.to_string().contains(&format!("wrap version {wrap_v}")),
+                "{err}"
+            );
+            assert!(err.to_string().contains("previous vt release"), "{err}");
+        }
     }
 
     #[test]

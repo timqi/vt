@@ -165,10 +165,11 @@ in [src/client/inject.rs](src/client/inject.rs). Keep these implementation bound
   Only `status` and authority-reducing `revoke_all`: never grant/extend/approve,
   reset idle, or audit-push. Grant display labels are memory-only.
   See [docs/app-bundle.md](docs/app-bundle.md).
-- Keychain rewrap changes only `encrypted_passphrase` + `wrap_v`: new stores use
-  wrap v2; upgrades use the flock-guarded mutator, never
-  `create_and_save_passcode_passphrase`. The 64-byte `passcode_and_auth_token`
-  blob keeps its width (second half unread). Manual migration is `vt secret rebind`.
+- The Keychain store is wrap v2 only: `derive_passcode_cipher` rejects any other
+  `wrap_v` before unwrapping (remedy: `vt secret rebind` on the previous
+  release, which this release no longer ships); never re-add a v1 reader, an
+  in-binary upgrade, or a rebind command. The 64-byte `passcode_and_auth_token`
+  blob keeps its width (second half unread).
   See [docs/app-bundle.md](docs/app-bundle.md).
 
 ## Worker cache and admin

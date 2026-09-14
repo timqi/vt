@@ -1,11 +1,10 @@
 //! macOS-only admin command bodies: `init`, `secret
-//! export/import/rotate-passcode/rebind`.
+//! export/import/rotate-passcode`.
 
 use super::security::{
     create_and_save_passcode_passphrase, derive_passcode_cipher, local_authentication,
-    rewrap_passphrase,
 };
-use super::store::{KeychainStore, WRAP_V1, WRAP_V2};
+use super::store::KeychainStore;
 use crate::core::crypto::AesGcmCrypto;
 use anyhow::{Context, Result};
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -99,9 +98,9 @@ pub async fn rotate_passcode() -> Result<()> {
     let store = KeychainStore::load()?;
     let passphrase_cipher = derive_passcode_cipher(&store)?;
     let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
-    let decrypted_passphrase = passphrase_cipher.decrypt(&encrypted_passphrase).context(
-        "Failed to decrypt passphrase. Run `vt secret rebind` first if the binary moved.",
-    )?;
+    let decrypted_passphrase = passphrase_cipher
+        .decrypt(&encrypted_passphrase)
+        .context("Failed to decrypt passphrase (docs/app-bundle.md §2).")?;
     let passphrase_array: [u8; 32] = decrypted_passphrase
         .try_into()
         .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;
@@ -109,34 +108,6 @@ pub async fn rotate_passcode() -> Result<()> {
     eprintln!(
         "Passcode rotated. If `vt ssh agent` is running, restart it — the cached passphrase cipher \
         is now stale and decrypt requests will fail until a fresh process is started."
-    );
-    Ok(())
-}
-
-/// `vt secret rebind`: migrate the master-passphrase wrap to v2 (fixed
-/// label), or back to v1 with `--to-v1` before rolling back to an old
-/// binary. `--old-bin-path` supplies the path term for v1 stores written by
-/// a binary at a different location (docs/app-bundle.md §2). Runs under the
-/// store flock; preserves the passcode blob and SSH keys byte-for-byte.
-pub async fn rebind(old_bin_path: Option<String>, to_v1: bool) -> Result<()> {
-    if !local_authentication("rebind master key wrap") {
-        Err(anyhow::anyhow!(
-            "Local authentication failed for rebind master key wrap"
-        ))?;
-    }
-    let target = if to_v1 { WRAP_V1 } else { WRAP_V2 };
-    let mut from_wrap = 0u32;
-    KeychainStore::modify(|store| {
-        from_wrap = store.wrap_v;
-        rewrap_passphrase(store, old_bin_path.as_deref(), target)
-    })?;
-    eprintln!(
-        "Master key wrap: v{from_wrap} -> v{target}{}. If `vt ssh agent` is running, restart it.",
-        if to_v1 {
-            " (bound to this binary's current path)"
-        } else {
-            " (path-independent)"
-        }
     );
     Ok(())
 }

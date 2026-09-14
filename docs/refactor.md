@@ -17,7 +17,6 @@ with its approve/extend ladders and admin.
 
 | Leaves | Files | Operator step |
 | --- | --- | --- |
-| Keychain wrap v1 | `derive_passphrase_secret` (v1), `upgrade_wrap_v2_if_needed`, `secret rebind --to-v1` | `vt secret rebind` stays one release for v1 stores, then goes with wrap v1 |
 | Audit SQLite rebuilds | `account_audit.ts`: the `DROP TABLE audit` for the per-event table of an early build and `DROP TABLE IF EXISTS cache_audit`, with their comments | none; one deploy after this release has run on every account |
 
 Rule: a compatibility branch is removed, never widened, and its test moves to

@@ -53,9 +53,9 @@ ln -sf /Applications/VT.app/Contents/MacOS/vt ~/.local/bin/vt   # put the CLI on
 
 The release build is **ad-hoc signed**, so each release re-triggers the
 one-time Keychain authorization prompt on first launch. See
-[docs/app-bundle.md](docs/app-bundle.md) — including the one-time
-`vt secret rebind` migration if your keychain store was created by a `vt`
-binary at another path.
+[docs/app-bundle.md](docs/app-bundle.md) — including the wrap v2 requirement:
+a keychain store still on the retired path-bound wrap v1 must be rebound with
+the previous release's `vt secret rebind` before upgrading.
 
 ## Quick Start
 
@@ -120,7 +120,6 @@ file private. Tokens can be revoked per host on the Worker's admin page.
 | `secret export` | (macOS) Export the encrypted master secret |
 | `secret import` | (macOS) Import an encrypted master secret |
 | `secret rotate-passcode` | (macOS) Rotate the passcode for the master secret |
-| `secret rebind` | (macOS) Migrate the master-key wrap after a binary move; see [app-bundle.md](docs/app-bundle.md#2-master-key-wrap-v2-and-vt-secret-rebind) |
 | `ssh agent` | (macOS) Start the SSH agent (supports sign/decrypt auth caches, audit push, and `run@vt` allowlisting) |
 | `ssh add [-f <file>] [-c <comment>]` | (macOS) Add an SSH private key (from file or stdin) |
 | `ssh list` | (macOS) List stored SSH keys (shows fingerprint, algorithm, comment, and public key) |
@@ -330,10 +329,11 @@ VT's macOS store is one Keychain item, `rusty.vault.store`, containing the
 passcode blob plus the encrypted master passphrase and SSH keys.
 Run the agent as the user who initialized it.
 
-New stores use wrap v2, derived from passcode, `$USER`, and a fixed label, not
-the binary path. Legacy wrap v1 is path-bound; use
-[`vt secret rebind`](docs/app-bundle.md#2-master-key-wrap-v2-and-vt-secret-rebind)
-when moving such an installation. Keychain access approval and Touch ID/local
+The store is wrap v2 only, derived from passcode, `$USER`, and a fixed label,
+not the binary path. A store on the retired path-bound wrap v1 is rejected;
+rebind it with the previous release's
+[`vt secret rebind`](docs/app-bundle.md#2-master-key-wrap-v2)
+first. Keychain access approval and Touch ID/local
 operation approval are separate. Signing identity changes can require renewed
 Keychain approval; packaging and migration details belong to
 [app-bundle.md](docs/app-bundle.md).

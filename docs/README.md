@@ -21,7 +21,7 @@ and update the relevant document in the same change.
 | Understand Worker audit and Web Push notifications | [`cf-worker-deploy.md`](cf-worker-deploy.md), [`worker-slim.md`](worker-slim.md) §5 | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts`, `cf-worker/src/webpush.ts`, `cf-worker/src/account_admin.ts` |
 | Tune approval user verification (UV) | [`cf-worker-deploy.md`](cf-worker-deploy.md#6-settings-设置-tab) | `cf-worker/src/uv_policy.ts` (policy), `cf-worker/src/account_admin.ts` (`uv_policy` in the config blob), `cf-worker/src/webauthn.ts` (enforcement), `cf-worker/pwa/approve.js` |
 | Understand DEK caching | [`dek-cache.md`](dek-cache.md) | `cf-worker/src/do_account.ts` (ceremony and audit), `cf-worker/src/account_cache.ts` (cache storage), `cf-worker/src/storage_batch.ts` (shared batch deletion and prefix paging), `src/cf.rs` |
-| Follow the slim refactor (open deletions) | [`refactor.md`](refactor.md) (plan) | `src/server_macos/security.rs` (wrap v1), `cf-worker/src/account_audit.ts` (table rebuilds) |
+| Follow the slim refactor (open deletions) | [`refactor.md`](refactor.md) (plan) | `cf-worker/src/account_audit.ts` (table rebuilds) |
 | Worker trust model: `SECRET`, root key, config blob, rotation, reset | [`worker-slim.md`](worker-slim.md) §2, §4 | `cf-worker/src/account_admin.ts`, `cf-worker/src/types.ts` (`Env`) |
 | Change the PWA's look, controls, or page states (approve and admin shells) | [`design/ui-ux.md`](design/ui-ux.md) | `cf-worker/pwa/approve.js` (`vt.mountApprove`), `cf-worker/pwa/common.js`, `cf-worker/pwa/admin/admin.html` + `admin.js` (shell, tabs, dialog), `cf-worker/pwa/admin/admin.css` |
 | Use SSH identities | [`README.md` — portable identity](../README.md#portable-ssh-identity-for-git-vt) | `src/ssh_sign.rs`, `src/client.rs` |
@@ -32,7 +32,7 @@ and update the relevant document in the same change.
 | Enable agent audit push | [`agent-audit.md`](agent-audit.md) | `src/audit.rs`, `src/server_macos/audit.rs` |
 | Understand prompt/notification fields and audit context | [`approval-transparency.md`](approval-transparency.md) | `src/caller_meta.rs` (client-claimed display fields), `src/server_macos/ssh_agent/handlers.rs` (operation prompts), `src/server_macos/ssh_agent/scopes.rs` (truth lines), `cf-worker/src/notify.ts`, `cf-worker/pwa/approve.js` |
 | Diagnose config/routing/caching (`vt doctor`) | [`diag-design.md`](diag-design.md) | `src/client/doctor.rs`, `src/config/client.rs` (shared routing), `src/server_macos/ssh_agent/handlers.rs` (`handle_diag`) |
-| Build/install VT.app, menu bar UI, native notifications, key-wrap rebind | [`app-bundle.md`](app-bundle.md) | `app/VTShell.swift`, `src/server_macos/security.rs` (`notify_macos`, `upgrade_wrap_v2_if_needed`), `src/core/crypto.rs` (`derive_passphrase_secret_v2`) |
+| Build/install VT.app, menu bar UI, native notifications, key-wrap v2 | [`app-bundle.md`](app-bundle.md) | `app/VTShell.swift`, `src/server_macos/security.rs` (`notify_macos`, `derive_passcode_cipher`), `src/core/crypto.rs` (`derive_passphrase_secret_v2`) |
 
 ## Reading guide
 

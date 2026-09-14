@@ -88,7 +88,6 @@ install-app: app
     rm -f ~/.local/bin/vt
     ln -s /Applications/VT.app/Contents/MacOS/vt ~/.local/bin/vt
     echo "installed: /Applications/VT.app; CLI: ~/.local/bin/vt -> bundle"
-    echo "next: run 'vt secret rebind' once if your keychain store predates wrap v2 and the binary moved (docs/app-bundle.md §2)"
 
 # Type-check for host + linux-gnu targets
 check:

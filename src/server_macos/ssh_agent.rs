@@ -1520,25 +1520,12 @@ pub async fn run_ssh_agent(
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
     let socket_path = home.join(".ssh").join("vt.sock");
-    // Acquire ownership before Keychain reads/migration. The guard survives
-    // every exit path and the signal task, and never removes another socket.
+    // Acquire ownership before Keychain reads. The guard survives every exit
+    // path and the signal task, and never removes another socket.
     let (socket_owner, listener) = socket_owner::SocketOwner::bind(&socket_path)?;
     let socket_owner = Arc::new(socket_owner);
     listener.set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
-
-    // Transparent wrap v1->v2 upgrade (docs/app-bundle.md §2): flock-guarded,
-    // touches only encrypted_passphrase + wrap_v. Failure is non-fatal here —
-    // a store bound to a moved binary path surfaces the same error with a
-    // clearer remedy below when keys are loaded.
-    match super::security::upgrade_wrap_v2_if_needed() {
-        Ok(true) => tracing::info!("master-key wrap upgraded to v2 (path-independent)"),
-        Ok(false) => {}
-        Err(e) => tracing::warn!(
-            "master-key wrap v2 upgrade did not run: {e:#} — run `vt secret rebind` \
-             (with --old-bin-path if the binary moved)"
-        ),
-    }
 
     // Load keys (cipher is loaded and dropped inside load_all_keys)
     let keys = load_all_keys()?;
@@ -1972,7 +1959,6 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     /// In-memory store whose master key unwraps under its own passcode, so
     /// `ssh_keys_cipher` works without the keychain.
     fn test_store() -> KeychainStore {
-        use super::super::store::WRAP_V2;
         let mut tokens = Vec::new();
         tokens.extend_from_slice(&AesGcmCrypto::generate_key());
         tokens.extend_from_slice(&AesGcmCrypto::generate_key());
@@ -1981,7 +1967,7 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             .unwrap()
             .encrypt(&AesGcmCrypto::generate_key())
             .unwrap();
-        store.set_encrypted_passphrase(&wrapped, WRAP_V2);
+        store.set_encrypted_passphrase(&wrapped);
         store
     }
 

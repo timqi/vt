@@ -25,24 +25,21 @@ const STORE_NAME: &str = "store";
 const LOCK_FILE_NAME: &str = "vt-keychain.lock";
 pub const STORE_SCHEMA_VERSION: u32 = 1;
 
-/// Wrap-derivation versions for `encrypted_passphrase` (docs/app-bundle.md §2).
-/// v1 mixes the binary path into the wrap key; v2 uses a fixed label so the
-/// binary can move (VT.app migration). `STORE_SCHEMA_VERSION` intentionally
-/// stays 1: old binaries can still parse a v2 store (they fail the unwrap,
-/// not the parse), preserving the export/import escape hatch.
-pub const WRAP_V1: u32 = 1;
+/// Wrap-derivation version for `encrypted_passphrase` (docs/app-bundle.md §2):
+/// a fixed label, so the binary can move. The retired v1 mixed the binary
+/// path in; `derive_passcode_cipher` rejects anything but v2.
+/// `STORE_SCHEMA_VERSION` intentionally stays 1: old binaries can still parse
+/// a v2 store (they fail the unwrap, not the parse), preserving the
+/// export/import escape hatch.
 pub const WRAP_V2: u32 = 2;
-
-fn default_wrap_v() -> u32 {
-    WRAP_V1
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeychainStore {
     pub v: u32,
-    /// Which derivation wraps `encrypted_passphrase`. Serde default 1 so
-    /// stores written before this field existed read as wrap v1.
-    #[serde(default = "default_wrap_v")]
+    /// Which derivation wraps `encrypted_passphrase`. Stores written before
+    /// the marker existed are wrap v1; they parse (default 0) and are
+    /// rejected at unwrap with the operator remedy.
+    #[serde(default)]
     pub wrap_v: u32,
     /// base64 of 64 bytes: passcode (32B) + 32 unread bytes. The tail held the
     /// retired VT_AUTH token; the field name and width stay so existing
@@ -57,8 +54,6 @@ pub struct KeychainStore {
 }
 
 impl KeychainStore {
-    /// New stores are always wrap v2 (fixed-label derivation); only
-    /// `vt secret rebind --to-v1` produces a v1 wrap after this version.
     pub fn new(passcode_and_auth_token: &[u8], encrypted_passphrase: &[u8]) -> Self {
         Self {
             v: STORE_SCHEMA_VERSION,
@@ -69,9 +64,9 @@ impl KeychainStore {
         }
     }
 
-    pub fn set_encrypted_passphrase(&mut self, bytes: &[u8], wrap_v: u32) {
+    pub fn set_encrypted_passphrase(&mut self, bytes: &[u8]) {
         self.encrypted_passphrase = BASE64_URL_SAFE_NO_PAD.encode(bytes);
-        self.wrap_v = wrap_v;
+        self.wrap_v = WRAP_V2;
     }
 
     /// Read the store from the keychain. Returns an error if the item does
