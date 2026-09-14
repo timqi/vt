@@ -49,7 +49,10 @@ hmac = "0.12"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 # CF ceremony (Linux / macOS fallback)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-dryoc = "0.8"
+# Sealed box v1 (docs/sealed-box-v1.md): X25519 here, HKDF/AES-GCM above.
+# `static_secrets`: the daemon's ephemeral key opens the box AND verifies the
+# binding, so it is used twice (EphemeralSecret is consumed by one exchange).
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 

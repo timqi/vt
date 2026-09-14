@@ -11,7 +11,9 @@ import { seal, openToCache, cachePublicKey, discardedBoxPublicKey } from '../src
 const RSK = new Uint8Array(32).fill(0x11);
 const RPK_B64U = 'e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM';
 const M = new Uint8Array(32).map((_, i) => i);
-// Ephemeral 32 × 0x22, sealing M to RPK.
+// Ephemeral 32 × 0x22, sealing M to RPK. src/cf.rs `seal_with` reproduces
+// this box byte for byte (sealed_box_v1_deterministic_vectors), so opening it
+// here is the Rust → Worker direction of the cross-implementation check.
 const BOX_B64U = 'D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyAXd0g_gjeoLbDGIQ2LVzEYHI8va2j8W808kbRSATfGUrDZFYbWuED_lkx7WVYQ6RQ';
 // Ephemeral 32 × 0x33, sealing 32 × 0xaa ‖ 32 × 0xbb to RPK.
 const BOX2_B64U = 'ew1H2TQn-DERYHgcfHM_2J-IlwrvSQ2KoO4ZpMuKGxSXlmdFkev5R4nHJPIRmjXxGQdFQ-EGDFB48wLpysDwX7HUNqLVWN3JvVscbJ5oum4eKqAPi7jAR3ZV-37Y2_jNfk6rXmjkpUum2vvzfSn-TQ';

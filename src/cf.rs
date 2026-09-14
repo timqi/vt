@@ -9,15 +9,15 @@
 //   4. Print approve_url to stderr.
 //   5. Open WS to /api/dek?poll_token=X.
 //   6. Wait for {"status":"approved","sealed_deks_b64u":"..."}.
-//   7. Open sealed_box → n DEKs (32 bytes each).
+//   7. Open the sealed box (docs/sealed-box-v1.md) → n DEKs (32 bytes each).
 //   8. Return DEKs to caller; ephemeral secret key is wiped on drop.
 //
 // master_key never leaves the user's phone. The daemon never holds it.
 
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use dryoc::classic::crypto_box::{crypto_box_keypair, crypto_box_seal_open, PublicKey, SecretKey};
-use dryoc::classic::crypto_core::crypto_scalarmult;
 use futures_util::StreamExt;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::caller_meta::collect_client_meta;
@@ -501,11 +502,10 @@ pub async fn get_deks(
     salts: &[[u8; 16]],
     meta: ChallengeMeta,
 ) -> Result<Vec<Zeroizing<[u8; 32]>>> {
-    // Ephemeral X25519 keypair (PublicKey / SecretKey are [u8; 32] type aliases).
-    // Wrap the secret in Zeroizing so it is wiped on return (S1).
-    let (pk, sk_raw) = crypto_box_keypair();
-    let sk = Zeroizing::new(sk_raw);
-    let pk_b64u = URL_SAFE_NO_PAD.encode(pk);
+    // Ephemeral X25519 keypair; StaticSecret zeroizes on drop (S1).
+    let sk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let pk = PublicKey::from(&sk);
+    let pk_b64u = URL_SAFE_NO_PAD.encode(pk.as_bytes());
 
     let n_deks = salts.len();
     let salts_b64u: Vec<String> = salts.iter().map(|s| URL_SAFE_NO_PAD.encode(s)).collect();
@@ -543,7 +543,8 @@ pub async fn get_deks(
     let ch: ChallengeResp = serde_json::from_slice(&body).context("challenge response parse")?;
 
     let worker_nonce: [u8; 16] = decode_b64u_exact(&ch.worker_nonce_b64u, "worker_nonce")?;
-    let approve_challenge_hash = compute_approve_challenge_hash(&pk, &worker_nonce, ts_ms, salts);
+    let approve_challenge_hash =
+        compute_approve_challenge_hash(pk.as_bytes(), &worker_nonce, ts_ms, salts);
 
     let ws_url = poll_ws_url(config.worker_url, &ch.poll_token)?;
 
@@ -615,11 +616,10 @@ async fn try_cache_with_timeout(
         return Ok(None); // auth-only / nothing to look up
     }
 
-    let (pk, sk_raw) = crypto_box_keypair();
-    // SecretKey is a bare [u8;32] (no Drop) — wrap so the ephemeral key is wiped
-    // when this fn returns (S1).
-    let sk = Zeroizing::new(sk_raw);
-    let pk_b64u = URL_SAFE_NO_PAD.encode(pk);
+    // Ephemeral X25519 keypair; StaticSecret zeroizes on drop (S1).
+    let sk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let pk = PublicKey::from(&sk);
+    let pk_b64u = URL_SAFE_NO_PAD.encode(pk.as_bytes());
     let salts_b64u: Vec<String> = salts.iter().map(|s| URL_SAFE_NO_PAD.encode(s)).collect();
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -680,13 +680,37 @@ async fn try_cache_with_timeout(
     Ok(Some(deks))
 }
 
+/// X25519 shared secret, refusing the all-zero result of a low-order peer.
+fn x25519_shared(sk: &StaticSecret, peer: &PublicKey) -> Result<x25519_dalek::SharedSecret> {
+    let shared = sk.diffie_hellman(peer);
+    if !shared.was_contributory() {
+        bail!("x25519: all-zero shared secret (low-order point)");
+    }
+    Ok(shared)
+}
+
+/// Sealed box v1 AES-256-GCM key: HKDF-SHA256(ss, salt = epk ‖ rpk,
+/// info = "vt-sealed-box-v1"). `header` is that epk ‖ rpk, also the AAD.
+fn sealed_box_key(shared: &x25519_dalek::SharedSecret, header: &[u8; 64]) -> Result<Aes256Gcm> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(header), shared.as_bytes())
+        .expand(b"vt-sealed-box-v1", &mut *key)
+        .map_err(|_| anyhow!("sealed_box: HKDF expand failed"))?;
+    // Path-qualified: `KeyInit::new_from_slice` in scope would shadow `Mac`'s.
+    Ok(<Aes256Gcm as aes_gcm::KeyInit>::new((&*key).into()))
+}
+
+// One ephemeral key per message, so the key is used once and the nonce is a
+// constant (docs/sealed-box-v1.md, Nonce).
+const SEALED_BOX_NONCE: [u8; 12] = [0u8; 12];
+
 fn open_sealed_deks(
     ct: &[u8],
     pk: &PublicKey,
-    sk: &SecretKey,
+    sk: &StaticSecret,
     n_deks: usize,
 ) -> Result<Vec<Zeroizing<[u8; 32]>>> {
-    // sealed_box overhead = 48 bytes (ephemeral pk 32 + mac 16)
+    // sealed_box overhead = 48 bytes (ephemeral pk 32 + GCM tag 16)
     // plaintext = max(n_deks, 1) * 32 bytes (at least 1 even for auth-only)
     let n = n_deks.max(1);
     let expected_len = n * 32 + 48;
@@ -698,23 +722,34 @@ fn open_sealed_deks(
         );
     }
 
-    let mut pt = vec![0u8; n * 32];
-    crypto_box_seal_open(&mut pt, ct, pk, sk)
+    let epk = PublicKey::from(<[u8; 32]>::try_from(&ct[..32])?);
+    let mut header = [0u8; 64];
+    header[..32].copy_from_slice(epk.as_bytes());
+    header[32..].copy_from_slice(pk.as_bytes());
+    // Any failure — a pre-v1 libsodium box included — is this one error.
+    let pt = x25519_shared(sk, &epk)
+        .and_then(|shared| sealed_box_key(&shared, &header))
+        .and_then(|cipher| {
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&SEALED_BOX_NONCE),
+                    Payload {
+                        msg: &ct[32..],
+                        aad: &header,
+                    },
+                )
+                .map_err(|_| anyhow!("aead"))
+        })
+        .map(Zeroizing::new)
         .map_err(|_| anyhow!("sealed_box open failed — possible MITM or wrong key"))?;
 
     // Auth-only: n_deks == 0, we just needed the approval — return no DEKs.
-    if n_deks == 0 {
-        pt.iter_mut().for_each(|b| *b = 0);
-        return Ok(Vec::new());
-    }
-
     let mut deks: Vec<Zeroizing<[u8; 32]>> = Vec::with_capacity(n_deks);
     for i in 0..n_deks {
         let mut dek = Zeroizing::new([0u8; 32]);
         dek.copy_from_slice(&pt[i * 32..(i + 1) * 32]);
         deks.push(dek);
     }
-    pt.iter_mut().for_each(|b| *b = 0);
     Ok(deks)
 }
 
@@ -741,29 +776,25 @@ fn compute_approve_challenge_hash(
 }
 
 fn verify_binding(
-    daemon_pk: &[u8; 32],
-    daemon_sk: &SecretKey,
+    daemon_pk: &PublicKey,
+    daemon_sk: &StaticSecret,
     pwa_pk: &[u8; 32],
     approve_challenge_hash: &[u8; 32],
     sealed_deks: &[u8],
     received_tag: &[u8; 32],
 ) -> Result<()> {
-    let mut shared = Zeroizing::new([0u8; 32]);
-    crypto_scalarmult(&mut shared, daemon_sk, pwa_pk);
-    // dryoc's crypto_scalarmult does not check for the all-zero output
-    if *shared == [0u8; 32] {
-        bail!("binding: all-zero shared secret (low-order point)");
-    }
+    let shared = x25519_shared(daemon_sk, &PublicKey::from(*pwa_pk))
+        .map_err(|_| anyhow!("binding: all-zero shared secret (low-order point)"))?;
 
     let mut binding_key = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(None, &*shared)
+    Hkdf::<Sha256>::new(None, shared.as_bytes())
         .expand(b"vt-sealed-deks-bind-v1", &mut *binding_key)
         .map_err(|_| anyhow!("binding: HKDF expand failed"))?;
 
     let mut transcript = Vec::with_capacity(10 + 32 + 32 + 32 + sealed_deks.len());
     transcript.extend_from_slice(b"vt-bind-v1");
     transcript.extend_from_slice(approve_challenge_hash);
-    transcript.extend_from_slice(daemon_pk);
+    transcript.extend_from_slice(daemon_pk.as_bytes());
     transcript.extend_from_slice(pwa_pk);
     transcript.extend_from_slice(sealed_deks);
 
@@ -778,7 +809,6 @@ fn verify_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dryoc::classic::crypto_box::{crypto_box_keypair, crypto_box_seal};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -916,8 +946,8 @@ mod tests {
                 "test public key",
             )
             .unwrap();
-            let mut sealed = vec![0; 80];
-            crypto_box_seal(&mut sealed, &[0x42; 32], &pk).unwrap();
+            let eph = StaticSecret::random_from_rng(rand::rngs::OsRng);
+            let sealed = seal_with(&eph, &[0x42; 32], &PublicKey::from(pk));
             serde_json::json!({"source": "cache", "sealed_deks_b64u": URL_SAFE_NO_PAD.encode(sealed)})
         })
         .await;
@@ -1247,24 +1277,53 @@ mod tests {
         s
     }
 
+    fn keypair() -> (PublicKey, StaticSecret) {
+        let sk = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        (PublicKey::from(&sk), sk)
+    }
+
+    fn pk_of(sk_bytes: [u8; 32]) -> (PublicKey, StaticSecret) {
+        let sk = StaticSecret::from(sk_bytes);
+        (PublicKey::from(&sk), sk)
+    }
+
+    /// Mirror of the PWA's / Worker's seal (docs/sealed-box-v1.md) with the
+    /// ephemeral key supplied, so a vector is reproducible.
+    fn seal_with(esk: &StaticSecret, m: &[u8], rpk: &PublicKey) -> Vec<u8> {
+        let epk = PublicKey::from(esk);
+        let mut header = [0u8; 64];
+        header[..32].copy_from_slice(epk.as_bytes());
+        header[32..].copy_from_slice(rpk.as_bytes());
+        let cipher = sealed_box_key(&x25519_shared(esk, rpk).unwrap(), &header).unwrap();
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&SEALED_BOX_NONCE),
+                Payload {
+                    msg: m,
+                    aad: &header,
+                },
+            )
+            .unwrap();
+        [epk.as_bytes().as_slice(), &ct].concat()
+    }
+
     // Mirror of the PWA's binding construction. Returns binding_tag.
     fn pwa_build_tag(
-        daemon_pk: &[u8; 32],
-        pwa_sk: &[u8; 32],
+        daemon_pk: &PublicKey,
+        pwa_sk: &StaticSecret,
         pwa_pk: &[u8; 32],
         approve_challenge_hash: &[u8; 32],
         sealed_deks: &[u8],
     ) -> [u8; 32] {
-        let mut shared = [0u8; 32];
-        crypto_scalarmult(&mut shared, pwa_sk, daemon_pk);
+        let shared = pwa_sk.diffie_hellman(daemon_pk);
         let mut binding_key = [0u8; 32];
-        Hkdf::<Sha256>::new(None, &shared)
+        Hkdf::<Sha256>::new(None, shared.as_bytes())
             .expand(b"vt-sealed-deks-bind-v1", &mut binding_key)
             .unwrap();
         let mut transcript = Vec::new();
         transcript.extend_from_slice(b"vt-bind-v1");
         transcript.extend_from_slice(approve_challenge_hash);
-        transcript.extend_from_slice(daemon_pk);
+        transcript.extend_from_slice(daemon_pk.as_bytes());
         transcript.extend_from_slice(pwa_pk);
         transcript.extend_from_slice(sealed_deks);
         let mut mac = Hmac::<Sha256>::new_from_slice(&binding_key).unwrap();
@@ -1293,27 +1352,55 @@ mod tests {
         assert_eq!(hex_encode(&h), expected);
     }
 
-    /// Cross-impl wire-compat: a sealed box produced by the WORKER's
-    /// tweetnacl + blakejs `crypto_box_seal` (cf-worker/src/cache_crypto.ts)
-    /// MUST open with the Rust client's dryoc `crypto_box_seal_open` — this is
-    /// exactly the cache-hit delivery path (worker seals cached DEKs to the
-    /// daemon pubkey; cf.rs opens). Vector generated by that JS code over a
-    /// fixed secret key (32×0x11) and message bytes 0..32. If this fails, the
-    /// worker's sealed-box construction has drifted from libsodium and cache
-    /// hits will silently fail to decrypt.
-    #[test]
-    fn worker_sealed_box_opens_with_dryoc() {
-        let sk: [u8; 32] =
-            decode_b64u_exact("ERERERERERERERERERERERERERERERERERERERERERE", "sk").unwrap();
-        let pk: [u8; 32] =
-            decode_b64u_exact("e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM", "pk").unwrap();
-        let expected: Vec<u8> = (0u8..32).collect();
-        let sealed = "JEYfUWAkbFlSTgjZD-GXcSHkANGFWCT637UiLWtBRUu-uQjaKW_GFnZplKkhLMm3h0-ch65fczHafJozQnVbdv4F-eyFxUbJuJoIzb9Anvw";
+    // docs/sealed-box-v1.md "Test vectors": recipient scalar 32 × 0x11.
+    const RSK: [u8; 32] = [0x11; 32];
+    const RPK_B64U: &str = "e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM";
+    // Ephemeral 32 × 0x22 sealing bytes 0..32 to RPK (cross-checked against an
+    // independent X25519/HKDF/AES-GCM implementation).
+    const BOX_B64U: &str = "D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyAXd0g_gjeoLbDGIQ2LVzEYHI8va2j8W808kbRSATfGUrDZFYbWuED_lkx7WVYQ6RQ";
+    // Ephemeral 32 × 0x33 sealing 32 × 0xaa ‖ 32 × 0xbb to RPK.
+    const BOX2_B64U: &str = "ew1H2TQn-DERYHgcfHM_2J-IlwrvSQ2KoO4ZpMuKGxSXlmdFkev5R4nHJPIRmjXxGQdFQ-EGDFB48wLpysDwX7HUNqLVWN3JvVscbJ5oum4eKqAPi7jAR3ZV-37Y2_jNfk6rXmjkpUum2vvzfSn-TQ";
+    // The previous release's libsodium crypto_box_seal of bytes 0..32 to RPK.
+    const LIBSODIUM_BOX_B64U: &str = "JEYfUWAkbFlSTgjZD-GXcSHkANGFWCT637UiLWtBRUu-uQjaKW_GFnZplKkhLMm3h0-ch65fczHafJozQnVbdv4F-eyFxUbJuJoIzb9Anvw";
 
+    fn recipient() -> (PublicKey, StaticSecret) {
+        let (pk, sk) = pk_of(RSK);
+        assert_eq!(URL_SAFE_NO_PAD.encode(pk.as_bytes()), RPK_B64U);
+        (pk, sk)
+    }
+
+    /// The deterministic vectors: seal with the fixed ephemeral key reproduces
+    /// the committed box byte for byte, and open returns the message.
+    #[test]
+    fn sealed_box_v1_deterministic_vectors() {
+        let (pk, sk) = recipient();
+        let m: Vec<u8> = (0u8..32).collect();
+        let sealed = seal_with(&StaticSecret::from([0x22; 32]), &m, &pk);
+        assert_eq!(URL_SAFE_NO_PAD.encode(&sealed), BOX_B64U);
+        let deks = open_sealed_deks(&sealed, &pk, &sk, 1).unwrap();
+        assert_eq!(&deks[0][..], &m[..]);
+
+        let m2 = [[0xaa; 32], [0xbb; 32]].concat();
+        let sealed2 = seal_with(&StaticSecret::from([0x33; 32]), &m2, &pk);
+        assert_eq!(URL_SAFE_NO_PAD.encode(&sealed2), BOX2_B64U);
+        let deks = open_sealed_deks(&sealed2, &pk, &sk, 2).unwrap();
+        assert_eq!(*deks[0], [0xaa; 32]);
+        assert_eq!(*deks[1], [0xbb; 32]);
+    }
+
+    /// Cross-impl wire-compat: a box produced by the WORKER's WebCrypto `seal`
+    /// (cf-worker/src/cache_crypto.ts, random ephemeral key) over bytes 0..32
+    /// to RPK MUST open here — this is exactly the cache-hit delivery path
+    /// (worker re-seals cached DEKs to the daemon pubkey; cf.rs opens). The
+    /// reverse direction (this file's `seal_with` → the Worker's `openToCache`)
+    /// is pinned in cf-worker/test/cache_crypto.test.ts.
+    #[test]
+    fn worker_sealed_box_opens_here() {
+        let (pk, sk) = recipient();
+        let sealed = "VSToDyDrhNwFgC2BgvGG5WWrdbkrB5q5ox66M4uozkLMu34oprFNdzgIaiLdaqKwzlJL_mvtuPgo5xrq11a_nlo8O3WRK8Q3q9e5aGzAcBs";
         let ct = URL_SAFE_NO_PAD.decode(sealed).unwrap();
-        let deks =
-            open_sealed_deks(&ct, &pk, &sk, 1).expect("worker-sealed box must open with dryoc");
-        assert_eq!(deks.len(), 1);
+        let deks = open_sealed_deks(&ct, &pk, &sk, 1).expect("worker-sealed box must open");
+        let expected: Vec<u8> = (0u8..32).collect();
         assert_eq!(
             &deks[0][..],
             &expected[..],
@@ -1321,10 +1408,38 @@ mod tests {
         );
     }
 
+    /// Rejected input: the libsodium box of the previous release (right
+    /// length, right recipient), tamper anywhere, the wrong recipient, and a
+    /// low-order ephemeral point all fail as the one opaque error.
+    #[test]
+    fn sealed_box_v1_rejects_libsodium_tamper_and_wrong_key() {
+        let (pk, sk) = recipient();
+        let deny = |ct: &[u8]| {
+            let err = open_sealed_deks(ct, &pk, &sk, 1).unwrap_err().to_string();
+            assert!(err.contains("open failed"), "unexpected: {err}");
+        };
+        deny(&URL_SAFE_NO_PAD.decode(LIBSODIUM_BOX_B64U).unwrap());
+        let sealed = URL_SAFE_NO_PAD.decode(BOX_B64U).unwrap();
+        for i in [0, 31, 32, 79] {
+            let mut t = sealed.clone();
+            t[i] ^= 0x01;
+            deny(&t);
+        }
+        let mut low_order = sealed.clone();
+        low_order[..32].fill(0);
+        deny(&low_order);
+        let (other_pk, other_sk) = pk_of([0x12; 32]);
+        assert!(open_sealed_deks(&sealed, &other_pk, &other_sk, 1).is_err());
+        // Length is checked first and separately, as before.
+        let err = open_sealed_deks(&sealed[..79], &pk, &sk, 1).unwrap_err();
+        assert!(err.to_string().contains("length"), "unexpected: {err}");
+    }
+
     #[test]
     fn verify_binding_happy_path() {
-        let (daemon_pk, daemon_sk) = crypto_box_keypair();
-        let (pwa_pk, pwa_sk) = crypto_box_keypair();
+        let (daemon_pk, daemon_sk) = keypair();
+        let (pwa_pk, pwa_sk) = keypair();
+        let pwa_pk = pwa_pk.to_bytes();
         let ach = [0x42u8; 32];
         let sealed = vec![0xAAu8; 80];
         let tag = pwa_build_tag(&daemon_pk, &pwa_sk, &pwa_pk, &ach, &sealed);
@@ -1338,7 +1453,7 @@ mod tests {
     /// of what tag is provided.
     #[test]
     fn verify_binding_rejects_low_order_point() {
-        let (daemon_pk, daemon_sk) = crypto_box_keypair();
+        let (daemon_pk, daemon_sk) = keypair();
         let pwa_pk = [0u8; 32];
         let ach = [0x42u8; 32];
         let sealed = vec![0xAAu8; 80];
@@ -1355,8 +1470,9 @@ mod tests {
 
     #[test]
     fn verify_binding_rejects_flipped_tag_bit() {
-        let (daemon_pk, daemon_sk) = crypto_box_keypair();
-        let (pwa_pk, pwa_sk) = crypto_box_keypair();
+        let (daemon_pk, daemon_sk) = keypair();
+        let (pwa_pk, pwa_sk) = keypair();
+        let pwa_pk = pwa_pk.to_bytes();
         let ach = [0x42u8; 32];
         let sealed = vec![0xAAu8; 80];
         let mut tag = pwa_build_tag(&daemon_pk, &pwa_sk, &pwa_pk, &ach, &sealed);
@@ -1372,8 +1488,9 @@ mod tests {
 
     #[test]
     fn verify_binding_rejects_tampered_sealed_deks() {
-        let (daemon_pk, daemon_sk) = crypto_box_keypair();
-        let (pwa_pk, pwa_sk) = crypto_box_keypair();
+        let (daemon_pk, daemon_sk) = keypair();
+        let (pwa_pk, pwa_sk) = keypair();
+        let pwa_pk = pwa_pk.to_bytes();
         let ach = [0x42u8; 32];
         let original = vec![0xAAu8; 80];
         let tag = pwa_build_tag(&daemon_pk, &pwa_sk, &pwa_pk, &ach, &original);
