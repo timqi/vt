@@ -51,27 +51,12 @@ export const EXTEND_TTL_WHITELIST = new Set([
 // never swept. There is also no expiry to prompt a future review. Consider
 // cache_hit_notify alongside it so each no-tap decrypt remains visible somewhere.
 
-// The cap is PER OPERATION, not per entry lifetime: one extension may move expiry
-// to at most `now + max(EXTEND_TTL_WHITELIST)`. Total lifetime is deliberately
-// unbounded — each hop costs a fresh Passkey approval, so the human is in the loop
-// every single time rather than once at the start.
-//
-// This replaced an absolute `created_ms + 1w` ceiling. Two reasons:
-//   • It made the feature inert for the common case. Operators cache for 8h, and
-//     the interesting question at hour seven is "another day from now", not "how
-//     much of a week-old budget is left".
-//   • It bought little. The ceiling only constrains someone who can already
-//     complete a WebAuthn ceremony — i.e. holds the Passkey — and against that
-//     adversary nothing here helps. What it did constrain was the legitimate
-//     operator, plus it permanently excluded pre-`created_ms` entries.
-//
-// SECURITY NOTE: an entry can therefore live indefinitely, one approved hop at a
-// time. For each window, possession of the host token that armed it, from any
-// egress IP, decrypts the approved records with no phone tap. The safeguards that
-// remain are the ones that hold without a budget: a lapsed entry is never revived
-// (extension only ever continues a LIVE grant), expiry never moves backwards, the
-// per-hop TTL is laddered, and every hop is audited with the approver's identity.
-// Trim EXTEND_TTL_WHITELIST to shorten the longest single hop.
+// Extension has no lifetime budget: each hop moves expiry to at most
+// `now + max(EXTEND_TTL_WHITELIST)` and costs a fresh Passkey approval, so the
+// human is in the loop every time. An entry can therefore live indefinitely one
+// approved hop at a time; the bounds that hold are that a lapsed entry is never
+// revived, expiry never moves backwards, the per-hop TTL is laddered, and every
+// hop is audited. Trim EXTEND_TTL_WHITELIST to shorten the longest single hop.
 
 /** Why an entry was left untouched by an extension. Tallied across the commit so
  *  the audit row can explain a partial result instead of silently doing nothing. */
