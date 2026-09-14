@@ -50,10 +50,9 @@ export interface AuditRow {
   cache_ttl_s: number | null;
   /** Absolute epoch-ms this row's cache entries currently expire at, mirroring
    *  CacheEntry.expires_ms. Written with the cache and UPDATED by an approved
-   *  extension, so the admin UI can show real liveness instead of inferring
+   *  extension; the admin UI reads liveness from this alone, never from
    *  finalized_ms + cache_ttl_s (which an extension would make a lie). NULL on
-   *  pre-migration rows and on rows that never armed a cache — the UI falls back
-   *  to the old inference there. */
+   *  rows that never armed a cache. */
   cache_expires_ms: number | null;
   /** Numeric parent PID. Set for ceremony rows (from meta) and DEK-cache rows
    *  (op_kind='cache'). */

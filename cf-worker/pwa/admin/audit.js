@@ -232,18 +232,14 @@ vt.tabs.audit = function (panel) {
       && typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0;
   }
 
-  // A row "has a live cache" when it armed one and that window hasn't elapsed.
-  //
-  // Prefer cache_expires_ms — the server's record of the ACTUAL expiry, which an
-  // approved extension updates. Only fall back to finalized_ms + cache_ttl_s for
-  // pre-migration rows (NULL column): that inference is wrong for any extended
-  // entry, which is why the column exists. cache_ttl_s keeps its original meaning
-  // (the TTL the approver chose) and is never rewritten by an extension.
+  // A row "has a live cache" when it armed one and cache_expires_ms — the
+  // server's record of the ACTUAL expiry, which an approved extension moves —
+  // is still ahead. cache_ttl_s keeps its original meaning (the TTL the
+  // approver chose) and is never rewritten by an extension, so it is never
+  // used to infer liveness.
   function hasLiveCache(r) {
-    if (!armedCache(r)) return false;
-    if (typeof r.cache_expires_ms === 'number') return r.cache_expires_ms > Date.now();
-    return typeof r.finalized_ms === 'number'
-      && (r.finalized_ms + r.cache_ttl_s * 1000 > Date.now());
+    return armedCache(r)
+      && typeof r.cache_expires_ms === 'number' && r.cache_expires_ms > Date.now();
   }
 
   // ── Detail dialog (shared, admin.js) ────────────────────────────────────
