@@ -525,7 +525,7 @@ pub fn create_and_save_passcode_passphrase(real_passphrase: &[u8; 32]) -> Result
 /// The passphrase cipher is supplied separately so callers can hold it
 /// long-term (serve) without keeping the decrypted master key in memory.
 ///
-/// Returns both the cipher (for legacy AES-GCM ops) and the raw 32-byte master
+/// Returns both the cipher (SSH key and FIDO2 credential store) and the raw 32-byte master
 /// key (needed as HKDF IKM for v2 envelope DEK derivation). The raw key is
 /// returned in a `Zeroizing` wrapper so it is wiped from memory on drop;
 /// callers should drop it as soon as derivation is complete.
