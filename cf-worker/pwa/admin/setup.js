@@ -1,8 +1,8 @@
 'use strict';
 
-// Pure client-side CREDENTIALS_JSON generator. master_key never leaves this
-// page and is never POSTed anywhere — the user copies the output and deploys it
-// manually via `wrangler secret put CREDENTIALS_JSON`.
+// Passkey tab: pure client-side CREDENTIALS_JSON generator. master_key never
+// leaves this page and is never POSTed anywhere — the user copies the output
+// and deploys it manually via `wrangler secret put CREDENTIALS_JSON`.
 //
 // Byte formats MUST match cf-worker/pwa/approve.js + src/webauthn.ts:
 //   PRF input = SHA-256("vt-passkey-prf-v1")            (common.js)
@@ -12,9 +12,10 @@
 //   p         = COSE public key bytes extracted from authData
 //   h         = b64u(SHA-256(credId))
 
-(function () {
-  var data = vt.bootData();
-  if (!data || !data.rp_id) { vt.setStatus('页面初始化失败：缺少 rp_id', 'error'); return; }
+vt.tabs.setup = function (panel, data) {
+  var $ = function (sel) { return panel.querySelector(sel); };
+  var setStatus = vt.statusLine($('.status'));
+  if (!data.rp_id) { setStatus('页面初始化失败：缺少 rp_id', 'error'); return; }
   var RP_ID = data.rp_id;
   var ENC = new TextEncoder();
 
@@ -174,7 +175,7 @@
   }
 
   function parseExisting() {
-    var raw = (document.getElementById('existing').value || '').trim();
+    var raw = ($('#existing').value || '').trim();
     if (!raw) raw = envCredentials();
     if (!raw) throw new Error('环境变量 CREDENTIALS_JSON 为空，且未手动粘贴；add / revoke 需要现有凭据');
     var blob;
@@ -191,15 +192,15 @@
     // First setup MUST bind to the macOS mac_key — never a fresh random master,
     // otherwise the passkey domain would be a separate vault that can't decrypt
     // macOS-created records.
-    var blobB64 = document.getElementById('master-blob').value;
-    var pass = document.getElementById('master-pass').value;
+    var blobB64 = $('#master-blob').value;
+    var pass = $('#master-pass').value;
     if (!(blobB64 || '').trim()) throw new Error('请先在 Mac 上执行 `vt secret export` 并粘贴其输出');
     if (!pass) throw new Error('请输入 `vt secret export` 时设置的导出口令');
     var masterKey = await importMasterFromExport(blobB64, pass);
     try {
-      vt.setStatus('① 注册新 Passkey…（请完成生物识别）');
+      setStatus('① 注册新 Passkey…（请完成生物识别）');
       var pk = await createPasskey(label);
-      vt.setStatus('② 读取 PRF…（请再次完成生物识别）');
+      setStatus('② 读取 PRF…（请再次完成生物识别）');
       var pr = await assertPrf([pk.credId]);
       var w = await wrapMasterKey(pr.K, pk.credId, masterKey);
       vt.zeroize(pr.K);
@@ -212,7 +213,7 @@
     var blob = parseExisting();
     var masterKey = null;
     try {
-      vt.setStatus('① 用现有 Passkey 解出 master_key…');
+      setStatus('① 用现有 Passkey 解出 master_key…');
       var ids = blob.c.map(function (e) { return vt.b64uDec(e.i); });
       var a = await assertPrf(ids);
       var used = vt.b64uEnc(a.rawId);
@@ -222,9 +223,9 @@
       masterKey = await unwrapMasterKey(a.K, a.rawId, old.k);
       vt.zeroize(a.K);
 
-      vt.setStatus('② 注册新 Passkey…（请完成生物识别）');
+      setStatus('② 注册新 Passkey…（请完成生物识别）');
       var pk = await createPasskey(label);
-      vt.setStatus('③ 读取新 Passkey 的 PRF…（请再次完成生物识别）');
+      setStatus('③ 读取新 Passkey 的 PRF…（请再次完成生物识别）');
       var pr = await assertPrf([pk.credId]);
       var w = await wrapMasterKey(pr.K, pk.credId, masterKey);
       vt.zeroize(pr.K);
@@ -235,7 +236,7 @@
 
   function runRevoke() {
     var blob = parseExisting();
-    var sel = document.getElementById('revoke-pick');
+    var sel = $('#revoke-pick');
     var idx = parseInt(sel.value, 10);
     if (!(idx >= 0 && idx < blob.c.length)) throw new Error('请选择要吊销的条目');
     blob.c.splice(idx, 1);
@@ -249,7 +250,7 @@
     try {
       for (var i = 0; i < blob.c.length; i++) {
         var e = blob.c[i];
-        vt.setStatus('自检 ' + (i + 1) + '/' + blob.c.length + '：' + (e.l || e.i.slice(0, 8)) + '…');
+        setStatus('自检 ' + (i + 1) + '/' + blob.c.length + '：' + (e.l || e.i.slice(0, 8)) + '…');
         var a = await assertPrf([vt.b64uDec(e.i)]);
         var mk = await unwrapMasterKey(a.K, a.rawId, e.k);
         vt.zeroize(a.K);
@@ -259,28 +260,28 @@
           if (!same) throw new Error('条目 “' + (e.l || i) + '” 解出的 master_key 与其它条目不一致');
         }
       }
-      vt.setStatus('✓ 自检通过：所有 ' + blob.c.length + ' 个条目解出同一 master_key', 'ok');
+      setStatus('✓ 自检通过：所有 ' + blob.c.length + ' 个条目解出同一 master_key', 'ok');
     } finally { if (ref) vt.zeroize(ref); }
   }
 
   // ── UI wiring ───────────────────────────────────────────────────────────────
 
   function mode() {
-    var r = document.querySelector('input[name="mode"]:checked');
+    var r = $('input[name="mode"]:checked');
     return r ? r.value : 'bootstrap';
   }
 
   function refreshModeUI() {
     var m = mode();
-    document.getElementById('bootstrap-section').hidden = (m !== 'bootstrap');
-    document.getElementById('existing-section').hidden = (m === 'bootstrap');
-    document.getElementById('label-section').hidden = (m === 'revoke');
-    document.getElementById('revoke-section').hidden = (m !== 'revoke');
+    $('#bootstrap-section').hidden = (m !== 'bootstrap');
+    $('#existing-section').hidden = (m === 'bootstrap');
+    $('#label-section').hidden = (m === 'revoke');
+    $('#revoke-section').hidden = (m !== 'revoke');
     if (m === 'revoke') populateRevoke();
   }
 
   function populateRevoke() {
-    var sel = document.getElementById('revoke-pick');
+    var sel = $('#revoke-pick');
     sel.innerHTML = '';
     try {
       var blob = parseExisting();
@@ -295,63 +296,63 @@
 
   function output(blob) {
     lastBlob = blob;
-    document.getElementById('output').value = JSON.stringify(blob, null, 2);
-    document.getElementById('output-section').hidden = false;
-    document.getElementById('selfcheck').hidden = false;
+    $('#output').value = JSON.stringify(blob, null, 2);
+    $('#output-section').hidden = false;
+    $('#selfcheck').hidden = false;
   }
 
-  document.querySelectorAll('input[name="mode"]').forEach(function (r) {
+  panel.querySelectorAll('input[name="mode"]').forEach(function (r) {
     r.addEventListener('change', refreshModeUI);
   });
-  document.getElementById('existing').addEventListener('input', function () {
+  $('#existing').addEventListener('input', function () {
     if (mode() === 'revoke') populateRevoke();
   });
 
-  document.getElementById('run').addEventListener('click', async function () {
+  $('#run').addEventListener('click', async function () {
     var btn = this; btn.disabled = true;
     try {
-      var label = (document.getElementById('label').value || '').trim();
+      var label = ($('#label').value || '').trim();
       var m = mode();
       var blob;
       if (m === 'bootstrap') blob = await runBootstrap(label);
       else if (m === 'add') blob = await runAdd(label);
       else blob = runRevoke();
       output(blob);
-      vt.setStatus('✓ 已生成。请复制并 `wrangler secret put CREDENTIALS_JSON`。' +
+      setStatus('✓ 已生成。请复制并 `wrangler secret put CREDENTIALS_JSON`。' +
         (m === 'revoke' ? '' : ' 建议点“自检”逐条验证。'), 'ok');
     } catch (e) {
       var msg = (e && e.message) ? e.message : String(e);
       if (/NotAllowed|not allowed/i.test(msg)) msg = '未找到匹配 Passkey 或操作被取消';
-      vt.setStatus('错误：' + msg, 'error');
+      setStatus('错误：' + msg, 'error');
       console.error(e);
     } finally { btn.disabled = false; }
   });
 
-  document.getElementById('selfcheck').addEventListener('click', async function () {
+  $('#selfcheck').addEventListener('click', async function () {
     var btn = this; btn.disabled = true;
     try { await selfCheck(lastBlob); }
     catch (e) {
       var msg = (e && e.message) ? e.message : String(e);
       if (/NotAllowed|not allowed/i.test(msg)) msg = '取消或未匹配 Passkey（自检中止）';
-      vt.setStatus('自检失败：' + msg, 'error');
+      setStatus('自检失败：' + msg, 'error');
       console.error(e);
     } finally { btn.disabled = false; }
   });
 
-  document.getElementById('copy').addEventListener('click', function () {
-    var ta = document.getElementById('output');
+  $('#copy').addEventListener('click', function () {
+    var ta = $('#output');
     ta.select();
     navigator.clipboard.writeText(ta.value).then(
-      function () { vt.setStatus('已复制到剪贴板', 'ok'); },
-      function () { vt.setStatus('复制失败，请手动选择文本', 'error'); }
+      function () { setStatus('已复制到剪贴板', 'ok'); },
+      function () { setStatus('复制失败，请手动选择文本', 'error'); }
     );
   });
 
   // Render the current registered Passkeys from the env-injected blob. Uses
   // textContent everywhere (labels are operator-controlled at registration).
   function renderCurrent() {
-    var host = document.getElementById('current-list');
-    var meta = document.getElementById('current-meta');
+    var host = $('#current-list');
+    var meta = $('#current-meta');
     if (!host) return;
     host.innerHTML = '';
     function emptyRow(text) {
@@ -389,11 +390,11 @@
   (function prefillExisting() {
     var env = envCredentials();
     if (!env) return;
-    var ta = document.getElementById('existing');
+    var ta = $('#existing');
     try { ta.value = JSON.stringify(JSON.parse(env), null, 2); }
     catch (_) { ta.value = env; }
   })();
 
   renderCurrent();
   refreshModeUI();
-})();
+};

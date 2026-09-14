@@ -1,6 +1,6 @@
 'use strict';
 
-// DEK-cache inventory. One row per cache GROUP (all entries one approval wrote
+// DEK 缓存 tab. One row per cache GROUP (all entries one approval wrote
 // under one binding ctx), from /{seg}/api/cache-list. Read-only rendering via
 // textContent; every mutation is an explicit POST.
 //
@@ -14,12 +14,11 @@
 // Countdowns run against the SERVER clock (now_ms from the listing, advanced
 // locally), so a skewed browser clock cannot invent remaining time.
 
-(function () {
-  var seg = location.pathname.split('/')[1] || '';
-  var API = '/' + seg + '/api/cache-list';
-
-  var statusEl = document.getElementById('status');
-  function setStatus(t, kind) { statusEl.textContent = t || ''; statusEl.className = kind || ''; }
+vt.tabs.cache = function (panel) {
+  var $ = function (sel) { return panel.querySelector(sel); };
+  var API = vt.api('cache-list');
+  var setStatus = vt.statusLine($('.status'));
+  var el = vt.el, fmtTime = vt.fmtTime, fmtRemaining = vt.fmtRemaining, ttlLabel = vt.ttlLabel;
 
   var groups = [];            // last listing, newest expiry first
   var byGroup = {};           // group_id -> summary
@@ -33,46 +32,6 @@
   var serverNowMs = 0;
   var localRefMs = 0;
   function now() { return serverNowMs + (Date.now() - localRefMs); }
-
-  function el(tag, cls, text) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text != null) e.textContent = text;
-    return e;
-  }
-
-  function fmtTime(ms) {
-    if (typeof ms !== 'number' || ms <= 0) return '';
-    var d = new Date(ms);
-    var p = function (n) { return (n < 10 ? '0' : '') + n; };
-    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
-      ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
-  }
-
-  // Coarse remaining-time label; the ticker re-renders every 15s so minute
-  // granularity is honest (we never show a second-precision value that is stale).
-  function fmtRemaining(ms) {
-    if (ms <= 0) return '已过期';
-    var mins = Math.floor(ms / 60000);
-    if (mins < 1) return '< 1 分钟';
-    if (mins < 60) return mins + ' 分钟';
-    // Roll over to days past 24h: with a one-week ceiling, "167 小时 47 分" is a
-    // number an operator has to do arithmetic on before they can judge the risk.
-    if (mins >= 1440) {
-      var d = Math.floor(mins / 1440), dh = Math.floor((mins % 1440) / 60);
-      return d + ' 天' + (dh ? ' ' + dh + ' 小时' : '');
-    }
-    var h = Math.floor(mins / 60), m = mins % 60;
-    return h + ' 小时' + (m ? ' ' + m + ' 分' : '');
-  }
-
-  function ttlLabel(s) {
-    if (s % 604800 === 0) return (s / 604800) + ' 周';
-    if (s % 86400 === 0) return (s / 86400) + ' 天';
-    if (s % 3600 === 0) return (s / 3600) + ' 小时';
-    if (s % 60 === 0) return (s / 60) + ' 分钟';
-    return s + ' 秒';
-  }
 
   // A multi-day window is a materially different exposure from a workday one, so
   // the picker says so instead of letting "1 周" read like just another option.
@@ -110,31 +69,6 @@
     gone: '已被清除',
   };
 
-  // Cosmetic, FRONTEND-ONLY (same rule as the audit tab): if the command's leading
-  // program is an absolute path, show just its basename, so a row reads
-  // `gh pr view 1064 …` instead of `/home/qiqi/.local/bin/gh pr view …` — which
-  // ate the whole column. Only argv[0] is trimmed; path-valued arguments stay
-  // intact so the command remains unambiguous.
-  function basenameLeadingProgram(s) {
-    var m = /^(\s*)(\/\S*)(.*)$/.exec(s);
-    if (!m) return s;
-    var prog = m[2];
-    var base = prog.slice(prog.lastIndexOf('/') + 1);
-    if (base === '') return s;
-    return m[1] + base + m[3];
-  }
-
-  function commandSummary(cmd, max) {
-    if (!cmd) return '';
-    var lines = String(cmd).split('\n');
-    var pick = lines[0];
-    for (var i = 0; i < lines.length; i++) {
-      if (lines[i].indexOf('cmd:') === 0) { pick = lines[i].slice(4).trim(); break; }
-    }
-    var v = basenameLeadingProgram(pick);
-    return v.length > max ? v.slice(0, max) + '…' : v;
-  }
-
   // Shorten a long path for the sub-line: keep the last two segments, which is
   // what identifies the working tree (…/code/dev/avibe), not the mount prefix.
   function shortPath(p) {
@@ -144,82 +78,11 @@
     return '…/' + parts.slice(-2).join('/');
   }
 
-  // ── Hover card ────────────────────────────────────────────────────────────
-  // The native `title` tooltip is the wrong tool here: ~1s browser delay, tiny
-  // system font, no wrapping, and it collapses a multi-line command onto one line.
-  // These cells hold the two values an operator most needs to read in full — the
-  // bound working directory and the exact command — so they get a real popup:
-  // ~90ms, wrapping, monospace, and multi-line preserved.
-  //
-  // Positioned by assigning to element.style.* (CSSOM), which is NOT an inline
-  // style attribute and so is allowed under `style-src 'self'` — do not switch this
-  // to setAttribute('style', …), which the CSP would block.
-  var hoverCard = null;
-  var hoverTimer = null;
-
-  function ensureHoverCard() {
-    if (!hoverCard) {
-      hoverCard = el('div', 'hovercard');
-      hoverCard.hidden = true;
-      document.body.appendChild(hoverCard);
-    }
-    return hoverCard;
-  }
-
-  function showHover(target, text) {
-    var card = ensureHoverCard();
-    card.textContent = text;
-    card.hidden = false;
-    // Measure after the text is in, then place: below the cell by default, flipped
-    // above when it would overflow the viewport, and clamped horizontally.
-    var r = target.getBoundingClientRect();
-    var cw = card.offsetWidth, ch = card.offsetHeight;
-    var pad = 8;
-    var left = Math.min(Math.max(pad, r.left), window.innerWidth - cw - pad);
-    var top = r.bottom + 6;
-    if (top + ch > window.innerHeight - pad) top = Math.max(pad, r.top - ch - 6);
-    card.style.left = left + 'px';
-    card.style.top = top + 'px';
-  }
-
-  function hideHover() {
-    if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
-    if (hoverCard) { hoverCard.hidden = true; hoverCard.textContent = ''; }
-  }
-
-  // Delegated, so re-rendering rows every 15s never leaves stale listeners behind.
-  function initHover(scopeId) {
-    var scope = document.getElementById(scopeId);
-    if (!scope) return;
-    scope.addEventListener('mouseover', function (e) {
-      var t = e.target.closest ? e.target.closest('[data-hover]') : null;
-      if (!t) return;
-      var text = t.getAttribute('data-hover');
-      if (!text) return;
-      if (hoverTimer) clearTimeout(hoverTimer);
-      hoverTimer = setTimeout(function () { showHover(t, text); }, 90);
-    });
-    scope.addEventListener('mouseout', function (e) {
-      var t = e.target.closest ? e.target.closest('[data-hover]') : null;
-      if (t) hideHover();
-    });
-    // Tap-to-inspect on touch devices, where there is no hover at all.
-    scope.addEventListener('click', function (e) {
-      var t = e.target.closest ? e.target.closest('[data-hover]') : null;
-      if (!t) { hideHover(); return; }
-      if (hoverCard && !hoverCard.hidden) { hideHover(); return; }
-      showHover(t, t.getAttribute('data-hover') || '');
-    });
-    window.addEventListener('scroll', hideHover, true);
-    window.addEventListener('resize', hideHover);
-    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideHover(); });
-  }
-
   // ── Filtering (client-side; the listing is one bounded snapshot) ───────────
 
   function visibleGroups() {
-    var liveOnly = document.getElementById('f-live').value === 'live';
-    var host = document.getElementById('f-host').value.trim();
+    var liveOnly = $('.f-live').value === 'live';
+    var host = $('.f-host').value.trim();
     var t = now();
     return groups.filter(function (g) {
       if (liveOnly && !(g.max_expires_ms > t)) return false;
@@ -282,7 +145,7 @@
           + '\n\n（缓存绑定该主机的令牌与客户端自报的项目，两者一致才会命中）' });
 
     // 命令: the command over the source IP at approval (audit metadata).
-    cell2(tr, commandSummary(g.command, 120), g.ip,
+    cell2(tr, vt.commandSummary(g.command, 120), g.ip,
       { mainCls: 'trunc-cmd',
         mainHover: (g.command || '—') + (g.ppid_cmd ? '\n\n父进程: ' + g.ppid_cmd : ''),
         subCls: 'mono',
@@ -334,11 +197,11 @@
   }
 
   function render() {
-    var tbody = document.getElementById('rows');
+    var tbody = $('.rows');
     tbody.innerHTML = '';
     var rows = visibleGroups();
     rows.forEach(function (g) { tbody.appendChild(renderRow(g)); });
-    var pickAll = document.getElementById('pick-all');
+    var pickAll = $('#pick-all');
     pickAll.checked = rows.length > 0 && rows.every(function (g) { return selected[g.group_id]; });
     syncBulkBar();
     var liveTotal = groups.reduce(function (n, g) { return n + g.live; }, 0);
@@ -374,10 +237,10 @@
     // button unconditionally.
     var ttl = selectedTtl();
     var ids = selectedIds();
-    var bar = document.getElementById('bulkbar');
-    var countEl = document.getElementById('bulk-count');
-    var extendBtn = document.getElementById('extend-selected');
-    var note = document.getElementById('extend-note');
+    var bar = $('#bulkbar');
+    var countEl = $('#bulk-count');
+    var extendBtn = $('#extend-selected');
+    var note = $('#extend-note');
     bar.hidden = ids.length === 0;
     if (ids.length === 0) return;
     var entries = 0, extendable = 0;
@@ -388,7 +251,7 @@
       if (g.extendable) { extendable++; extGroups.push(g); }
     });
     countEl.textContent = '已选 ' + ids.length + ' 组 / ' + entries + ' 条';
-    var ttlLabelEl = document.getElementById('extend-ttl-label');
+    var ttlLabelEl = $('#extend-ttl-label');
     if (!meta.extend_enabled) {
       // Kill switch off ⇒ the capability does not exist. Hide the controls
       // entirely rather than offer a button that can only 404.
@@ -461,10 +324,7 @@
     setStatus('查询中…');
     try {
       var resp = await fetch(API, { headers: { 'Accept': 'application/json' } });
-      if (resp.status === 403) {
-        setStatus('未授权（Cloudflare Access 会话可能已过期，请刷新登录）', 'error');
-        return;
-      }
+      if (resp.status === 403) { setStatus(vt.AUTH_EXPIRED, 'error'); return; }
       if (!resp.ok) { setStatus('查询失败 HTTP ' + resp.status, 'error'); return; }
       var json = await resp.json();
       groups = (json && json.groups) || [];
@@ -486,7 +346,7 @@
   }
 
   function renderTtlOptions() {
-    var sel = document.getElementById('extend-ttl');
+    var sel = $('#extend-ttl');
     if (sel.options.length === meta.ttl_options_s.length && sel.options.length > 0) return;
     sel.innerHTML = '';
     meta.ttl_options_s.forEach(function (s) {
@@ -498,7 +358,7 @@
   }
 
   function selectedTtl() {
-    var v = parseInt(document.getElementById('extend-ttl').value, 10);
+    var v = parseInt($('#extend-ttl').value, 10);
     return Number.isFinite(v) && v > 0 ? v : 0;
   }
 
@@ -510,7 +370,7 @@
     if (btn) btn.disabled = true;
     setStatus('清除中…');
     try {
-      var resp = await fetch('/' + seg + '/api/cache-clear-groups', {
+      var resp = await fetch(vt.api('cache-clear-groups'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ group_ids: ids }),
@@ -528,23 +388,7 @@
 
   // ── Extend (Passkey-gated) ────────────────────────────────────────────────
 
-  var backdrop = document.getElementById('detail-backdrop');
-
-  function closeDetail() {
-    backdrop.hidden = true;
-    var box = document.getElementById('detail-approve');
-    if (box) box.innerHTML = '';
-  }
-  document.getElementById('detail-close').addEventListener('click', closeDetail);
-  backdrop.addEventListener('click', function (e) { if (e.target === backdrop) closeDetail(); });
-  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeDetail(); });
-
-  function addDetail(dl, label, value) {
-    if (value === null || value === undefined || value === '') return;
-    var dt = el('dt', null, label);
-    var dd = el('dd', null, String(value));
-    dl.appendChild(dt); dl.appendChild(dd);
-  }
+  var addDetail = vt.dialog.addRow;
 
   // Step 1: ask the Worker to mint a ceremony. This grants nothing on its own —
   // the response is a pending challenge that expires in ~5 minutes if untouched.
@@ -569,7 +413,7 @@
     if (btn) btn.disabled = true;
     setStatus('正在创建审批请求…');
     try {
-      var resp = await fetch('/' + seg + '/api/cache-extend-request', {
+      var resp = await fetch(vt.api('cache-extend-request'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ group_ids: targets, ttl_s: ttl }),
@@ -578,10 +422,7 @@
         setStatus('延长功能未启用（CACHE_ADMIN_EXTEND）', 'error');
         return;
       }
-      if (resp.status === 403) {
-        setStatus('未授权（Cloudflare Access 会话可能已过期，请刷新登录）', 'error');
-        return;
-      }
+      if (resp.status === 403) { setStatus(vt.AUTH_EXPIRED, 'error'); return; }
       if (resp.status === 409) {
         // Refresh FIRST, then report — load() re-renders and would otherwise
         // overwrite the message, which is exactly how this failure managed to look
@@ -610,12 +451,16 @@
     }
   }
 
-  // Step 2: mount the standard approval ceremony for that challenge. The data comes
-  // from the public capability endpoint /api/page/:token — exactly what the audit
-  // tab does for a pending row — so there is one ceremony implementation, not two.
+  // Step 2: mount the standard approval ceremony for that challenge in the shared
+  // dialog. The data comes from the public capability endpoint /api/page/:token —
+  // exactly what the audit tab does for a pending row — so there is one ceremony
+  // implementation, not two.
   function openCeremony(req, targets, ttl) {
-    var dl = document.getElementById('detail-dl');
-    dl.innerHTML = '';
+    var d = vt.dialog.open({
+      title: '延长 DEK 缓存',
+      warn: '⚠️ 批准即延长这些缓存的免审批解密窗口。请确认上面的主机、IP 与条目数符合预期。',
+    });
+    var dl = d.dl;
     var entries = (req.targets || []).reduce(function (n, t) { return n + t.live; }, 0);
     addDetail(dl, '范围', (req.targets || []).length + ' 组 / ' + entries + ' 条');
     addDetail(dl, '延长', ttlLabel(ttl) + '（自批准时刻起算）');
@@ -629,10 +474,9 @@
           + '（' + (REASON_TEXT[r.reason] || r.reason) + '）';
       }).join('；'));
     }
-    backdrop.hidden = false;
-    var box = document.getElementById('detail-approve');
+    var box = d.approve;
     box.innerHTML = '';
-    if (!window.vt || !vt.mountApprove) {
+    if (!vt.mountApprove) {
       setStatus('Passkey 组件未加载，无法完成延长', 'error');
       return;
     }
@@ -647,7 +491,7 @@
           showMeta: false,   // the dl above already states the intent
           onSettled: function (outcome) {
             setTimeout(function () {
-              closeDetail();
+              vt.dialog.close();
               if (outcome === 'approved') {
                 selected = {};
                 setStatus('✓ 已批准延长，正在刷新…', 'ok');
@@ -664,13 +508,13 @@
 
   // ── Wiring ────────────────────────────────────────────────────────────────
 
-  document.getElementById('refresh').addEventListener('click', function () { load(); });
-  document.getElementById('f-live').addEventListener('change', render);
-  document.getElementById('f-host').addEventListener('input', render);
+  $('.refresh').addEventListener('click', function () { load(); });
+  $('.f-live').addEventListener('change', render);
+  $('.f-host').addEventListener('input', render);
   // Re-run the note so the multi-day warning appears the moment 1d/2d/1w is picked.
-  document.getElementById('extend-ttl').addEventListener('change', render);
+  $('#extend-ttl').addEventListener('change', render);
 
-  document.getElementById('pick-all').addEventListener('change', function () {
+  $('#pick-all').addEventListener('change', function () {
     var on = this.checked;
     visibleGroups().forEach(function (g) {
       if (on) selected[g.group_id] = true; else delete selected[g.group_id];
@@ -678,23 +522,21 @@
     render();
   });
 
-  document.getElementById('clear-selected').addEventListener('click', function () {
+  $('#clear-selected').addEventListener('click', function () {
     var ids = selectedIds();
     if (!ids.length) { setStatus('未选择任何分组', 'error'); return; }
     clearGroups(ids, this);
   });
 
-  document.getElementById('extend-selected').addEventListener('click', function () {
+  $('#extend-selected').addEventListener('click', function () {
     requestExtend(selectedIds(), this);
   });
 
-  document.getElementById('clear-all-cache').addEventListener('click', async function () {
+  $('.clear-all-cache').addEventListener('click', async function () {
     if (!confirm('删除全部已缓存 DEK？此后解密将重新需要手机审批。')) return;
     setStatus('清空缓存中…');
     try {
-      var resp = await fetch('/' + seg + '/api/clear-cache', {
-        method: 'POST', headers: { 'Accept': 'application/json' },
-      });
+      var resp = await fetch(vt.api('clear-cache'), { method: 'POST', headers: { 'Accept': 'application/json' } });
       if (!resp.ok) { setStatus('清空缓存失败 HTTP ' + resp.status, 'error'); return; }
       var json = await resp.json();
       selected = {};
@@ -709,8 +551,8 @@
   // Re-render every 15s: countdowns tick down and a group that just lapsed turns
   // grey (and drops its 延长 button) without a round trip. Skipped while the
   // ceremony modal is open so a re-render cannot tear down a live WebAuthn prompt.
-  setInterval(function () { if (backdrop.hidden) render(); }, 15000);
+  setInterval(function () { if (!vt.dialog.isOpen()) render(); }, 15000);
 
-  initHover('table-wrap');
+  vt.hovercard.attach($('.table-wrap'));
   load();
-})();
+};

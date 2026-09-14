@@ -37,16 +37,15 @@ head_sampling_rate = 1.0
 
 [assets]
 directory = "pwa"
-# Static PWA assets (CSS, JS, libsodium.js) and the HTML page shells are reached
-# only via ASSETS.fetch() from the worker at /pwa/*, /<ADMIN_SEG>/pwa/*, and the
+# Static PWA assets (CSS, JS, libsodium.js) and the two HTML page shells are
+# reached only via ASSETS.fetch() from the worker: the public /pwa/* route
+# (pwa/admin/* included — a shell on disk is markup plus a {{VT_DATA}} slot,
+# data is rendered in only by the Access-gated /<ADMIN_SEG> route) and the
 # root-scope /sw.js + /manifest.webmanifest that Web Push needs.
-# run_worker_first disables Cloudflare's default static-first routing so all
-# requests hit the worker (admin assets stay behind Cloudflare Access), and the
-# public /pwa/* route additionally refuses to resolve into pwa/admin/ — that
-# folder (admin.css, the per-tab .js, and the admin page shells) is served ONLY
-# by the Access-gated /<ADMIN_SEG>/pwa/* mount. Leave html_handling at its
-# default; src/index.ts reads a shell by both its extensionless and its .html
-# path, so either setting works.
+# run_worker_first disables Cloudflare's default static-first routing so every
+# request hits the worker. Leave html_handling at its default; src/index.ts
+# reads a shell by both its extensionless and its .html path, so either
+# setting works.
 # pwa/libsodium.js is vendored/committed (ISC); see pwa/libsodium.README to refresh it.
 binding = "ASSETS"
 run_worker_first = true

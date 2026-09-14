@@ -8,9 +8,8 @@
 //     Passkey ceremony that issues a host token
 //   • /api/audit-ingest     — HMAC(HKDF(VT_AUTH_CF, agent_id)) over the request body
 //   • /a/:token, approve    — 12-byte (96-bit) unguessable approve/poll tokens + WebAuthn
-//   • /<ADMIN_SEG>/*        — Cloudflare Access (edge) + Worker JWT verification
-//
-// Admin landing redirects to the audit view; Setup is a sibling tab.
+//   • /<ADMIN_SEG>, /<ADMIN_SEG>/api/* — Cloudflare Access (edge) + Worker JWT
+//     verification; the one admin shell (tabs in the URL hash) plus its data API
 
 import { Hono, type Context } from 'hono';
 import { Env } from './types';
@@ -20,10 +19,7 @@ import { deriveHostTokenSecret, isTokenId } from './host_token';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess, type AccessVars } from './access';
 import { effectiveUvLevel, parseUvPolicy } from './uv_policy';
-import {
-  escapeJsonForHtml, renderTemplate, isAdminAssetPath, ADMIN_SEG,
-  pageVars, adminVars, type AdminTab, type PageChrome,
-} from './page';
+import { escapeJsonForHtml, renderTemplate, ADMIN_SEG, pageVars, type PageChrome } from './page';
 import { tokenRefused } from './do_account';
 
 export { AccountDO } from './do_account';
@@ -44,12 +40,12 @@ const FAVICON_TAGS =
   '<link rel="apple-touch-icon" href="/pwa/icon-512.png">' +
   '<link rel="manifest" href="/manifest.webmanifest">';
 
-// Cache-busting token appended (?v=…) to admin/PWA asset URLs. Bump on any
-// change to a shipped .css/.js so browsers fetch the new file instead of a
-// stale far-future-cached copy. (Workers Assets serves static files with a
-// cacheable response; without a versioned URL a changed audit.js can refresh
-// while admin.css stays stale, which desyncs markup from styles. The .html
-// page shells need no token — the Worker reads them server-side per request.)
+// Cache-busting token appended (?v=…) to PWA asset URLs. Bump on any change to
+// a shipped .css/.js so browsers fetch the new file instead of a stale
+// far-future-cached copy. (Workers Assets serves static files with a cacheable
+// response; without a versioned URL a changed audit.js can refresh while
+// admin.css stays stale, which desyncs markup from styles. The .html page
+// shells need no token — the Worker reads them server-side per request.)
 // Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
 const ASSET_VER = '20260914-7f842a0';
 
@@ -131,23 +127,18 @@ app.use('*', async (c, next) => {
 
 app.get('/healthz', c => c.text('ok'));
 
-// Static PWA assets. Strip "/pwa" so ASSETS resolves against the pwa/ root:
-// /pwa/libsodium.js → /libsodium.js → pwa/libsodium.js
-//
-// This route is UNAUTHENTICATED (the approval page's ceremony scripts have to
-// load for anyone holding an approve token), so it must never resolve into the
-// admin asset folder — which now holds the admin page shells as well as
-// admin.css and the per-tab .js. Those are served only by the Access-gated
-// /{ADMIN_SEG}/pwa/* mount below.
+// Static PWA assets, UNAUTHENTICATED — including pwa/admin/*: the shells and
+// scripts carry no data (a raw shell is `{{VT_DATA}}` plus markup); data reaches
+// a page only through the gated admin route or the gated API. Strip "/pwa" so
+// ASSETS resolves against the pwa/ root: /pwa/libsodium.js → pwa/libsodium.js.
 app.get('/pwa/*', async (c) => {
   const url = new URL(c.req.url);
   url.pathname = url.pathname.slice('/pwa'.length) || '/';
-  if (isAdminAssetPath(url.pathname)) return c.text('Not found', 404);
   return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
 });
 
 // Service worker at root scope (a worker under /pwa/ could not control /a/*
-// or the admin pages) and the install manifest. Both public: they hold no data.
+// or the admin shell) and the install manifest. Both public: they hold no data.
 // The manifest's start URL follows ADMIN_SEG, so it is rendered like a shell.
 app.get('/sw.js', (c) => c.env.ASSETS.fetch(new Request(new URL('/sw.js', c.req.url).toString(), c.req.raw)));
 app.get('/manifest.webmanifest', async (c) => new Response(
@@ -165,41 +156,24 @@ app.get('/manifest.webmanifest', async (c) => new Response(
 app.use(`/${ADMIN_SEG}`, requireAccess);
 app.use(`/${ADMIN_SEG}/*`, requireAccess);
 
-// Admin static assets. Map /{ADMIN_SEG}/pwa/X → /admin/X → pwa/admin/X
-// (the single [assets] dir is "pwa"; the on-disk folder stays "admin").
-app.get(`/${ADMIN_SEG}/pwa/*`, async (c) => {
-  const url = new URL(c.req.url);
-  url.pathname = '/admin' + url.pathname.slice(`/${ADMIN_SEG}/pwa`.length);
-  return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
-});
-
-// Admin landing → default to the audit view (Setup is a sibling tab).
-app.get(`/${ADMIN_SEG}`, (c) => c.redirect(`/${ADMIN_SEG}/audit`, 302));
-
-// Audit page (HTML shell; data fetched from the JSON API below).
-app.get(`/${ADMIN_SEG}/audit`, (c) => servePage(c, '/admin/audit', adminShellVars('audit')));
-
-// DEK-cache page (HTML shell; data from /api/cache-list).
-app.get(`/${ADMIN_SEG}/cache`, (c) => servePage(c, '/admin/cache', adminShellVars('cache')));
-
-// Setup page (client-side CREDENTIALS_JSON generator). The current
-// CREDENTIALS_JSON secret is injected into the page so add/revoke read it
-// directly from the env binding (no manual paste). It carries only wrapped
-// (encrypted) master-key material and public credential data, and the route is
-// Cloudflare-Access gated, so embedding it for the admin is acceptable.
-app.get(`/${ADMIN_SEG}/setup`, (c) => servePage(c, '/admin/setup', {
-  ...adminShellVars('setup'),
-  // `credentials` is the raw CREDENTIALS_JSON secret (or '' on very first
-  // setup). The page parses it client-side for add/revoke; bootstrap ignores
-  // it. Only wrapped (encrypted) key material is exposed — never a plaintext
-  // master.
-  VT_DATA: escapeJsonForHtml({ rp_id: c.env.RP_ID, credentials: c.env.CREDENTIALS_JSON ?? '' }),
+// The admin shell (pwa/admin/admin.html): every tab, tab in the URL hash. It
+// renders one state from VT_DATA; with Cloudflare Access in front that state is
+// always `console` (login/setup arrive with docs/worker-slim.md §3). The Passkey
+// tab's CREDENTIALS_JSON rides along so add/revoke read it without a paste: it
+// carries only wrapped (encrypted) master-key material and public credential
+// data, and this route is Access-gated — never a plaintext master.
+app.get(`/${ADMIN_SEG}`, (c) => servePage(c, '/admin/admin', {
+  ...pageVars(CHROME),
+  VT_DATA: escapeJsonForHtml({
+    state: 'console',
+    rp_id: c.env.RP_ID,
+    credentials: c.env.CREDENTIALS_JSON ?? '',
+  }),
 }));
 
-// Push tab (HTML shell; data from /api/push/vapid) and its API: the VAPID public
-// key plus the subscription list, subscribe / unsubscribe / test. Endpoint +
-// keys live under K_cfg in the DO (account_admin.ts); the edge only caps bodies.
-app.get(`/${ADMIN_SEG}/push`, (c) => servePage(c, '/admin/push', adminShellVars('push')));
+// Push API (设置 tab): the VAPID public key plus the subscription list,
+// subscribe / unsubscribe / test. Endpoint + keys live under K_cfg in the DO
+// (account_admin.ts); the edge only caps bodies.
 app.get(`/${ADMIN_SEG}/api/push/vapid`, async (c) => {
   const resp = await accountStub(c).fetch('https://account.do/op/push-vapid');
   const out = new Response(resp.body, resp);
@@ -308,10 +282,7 @@ app.post(`/${ADMIN_SEG}/api/cache-extend-request`, async (c) => {
   return doResp;
 });
 
-// Host tokens page (HTML shell; data from /api/tokens).
-app.get(`/${ADMIN_SEG}/tokens`, (c) => servePage(c, '/admin/tokens', adminShellVars('tokens')));
-
-// Host-token inventory. Read-only; rows carry no secret (the secret is derived
+// Host-token inventory (主机令牌 tab). Read-only; rows carry no secret (the secret is derived
 // from the master + token_id and never stored). `no-store` like cache-list.
 app.get(`/${ADMIN_SEG}/api/tokens`, async (c) => {
   const resp = await accountStub(c).fetch('https://account.do/op/tokens-list');
@@ -771,8 +742,8 @@ app.get('/a/:approve_token', async (c) => {
 });
 
 // GET /api/page/:approve_token — same ApprovePageData as /a/:token but as JSON,
-// so the (Access-gated) audit page can mount the approval ceremony inline in its
-// detail modal instead of opening the standalone page in a new tab. The
+// so the (Access-gated) admin shell can mount the approval ceremony inline in
+// its detail dialog instead of opening the standalone page in a new tab. The
 // approve_token is an unguessable 96-bit capability and the payload holds only
 // public/PRF-wrapped material — this exposes nothing /a/:token doesn't already.
 app.get('/api/page/:approve_token', async (c) => {
@@ -783,11 +754,10 @@ app.get('/api/page/:approve_token', async (c) => {
 
 // ── Page shells (static assets + placeholder substitution) ────────────────
 //
-// The shells are real files under pwa/ (approve.html) and pwa/admin/ (one per
-// admin tab). They are read through the ASSETS binding from INSIDE the route
-// handler, so the admin ones inherit the Cloudflare Access gate registered on
-// /${ADMIN_SEG} and /${ADMIN_SEG}/* above; the public /pwa/* route refuses the
-// admin folder outright (isAdminAssetPath).
+// The shells are real files: pwa/approve.html and pwa/admin/admin.html, both
+// public assets holding no data. They are read through the ASSETS binding from
+// INSIDE the route handler, so the admin one is rendered only behind the
+// Cloudflare Access gate registered on /${ADMIN_SEG} and /${ADMIN_SEG}/* above.
 
 // Read a page shell out of the ASSETS binding.
 //
@@ -796,8 +766,8 @@ app.get('/api/page/:approve_token', async (c) => {
 //    request (If-None-Match from the browser) would come back 304 with an empty
 //    body, and we need the bytes to substitute into.
 //  • Path, then path + ".html". With the default assets `html_handling`
-//    ("auto-trailing-slash") a fetch of "/admin/audit.html" answers 307 →
-//    "/admin/audit", so the extensionless form is the one that returns the file;
+//    ("auto-trailing-slash") a fetch of "/admin/admin.html" answers 307 →
+//    "/admin/admin", so the extensionless form is the one that returns the file;
 //    with html_handling = "none" it is the other way round. Trying both keeps
 //    the pages working under either setting without a build step.
 async function fetchShell(c: Context<{ Bindings: Env; Variables: AccessVars }>, path: string): Promise<string> {
@@ -828,8 +798,7 @@ async function servePage(
 }
 
 // The Worker-owned values every shell interpolates.
-const CHROME: PageChrome = { adminSeg: ADMIN_SEG, assetVer: ASSET_VER, faviconTags: FAVICON_TAGS };
-const adminShellVars = (active: AdminTab) => adminVars(CHROME, active);
+const CHROME: PageChrome = { assetVer: ASSET_VER, faviconTags: FAVICON_TAGS };
 
 // Unhandled exceptions → one structured error event + opaque 500 to caller.
 app.onError((err, c) => {

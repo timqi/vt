@@ -3,13 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
   <title>VT 审批请求</title>
   {{FAVICON_TAGS}}
-  <link rel="stylesheet" href="/pwa/approve.css?v={{ASSET_VER}}">
+  <link rel="stylesheet" href="/pwa/admin/admin.css?v={{ASSET_VER}}">
 </head>
 <body>
   <script type="application/json" id="vt-data">{{VT_DATA}}</script>
-  <main>
+  <main class="approve">
     <header>
       <h1>VT 审批请求</h1>
       <p class="hint">请用 Passkey（iCloud / 1Password / YubiKey）确认下列操作。</p>

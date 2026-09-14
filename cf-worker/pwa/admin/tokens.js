@@ -1,47 +1,20 @@
 'use strict';
 
-// Host-token inventory. One row per enrolled host credential, from
+// 主机令牌 tab. One row per enrolled host credential, from
 // /{seg}/api/tokens. Read-only rendering via textContent; the only mutation is
 // revoke — authority-REDUCING, one POST, immediate (same rule as cache clears).
 // Countdowns run against the SERVER clock (now_ms from the listing).
 
-(function () {
-  var seg = location.pathname.split('/')[1] || '';
-  var API = '/' + seg + '/api/tokens';
-
-  var statusEl = document.getElementById('status');
-  function setStatus(t, kind) { statusEl.textContent = t || ''; statusEl.className = kind || ''; }
+vt.tabs.tokens = function (panel) {
+  var $ = function (sel) { return panel.querySelector(sel); };
+  var API = vt.api('tokens');
+  var setStatus = vt.statusLine($('.status'));
+  var el = vt.el, fmtTime = vt.fmtTime, fmtRemaining = vt.fmtRemaining;
 
   var tokens = [];
   var serverNowMs = 0;
   var localRefMs = 0;
   function now() { return serverNowMs + (Date.now() - localRefMs); }
-
-  function el(tag, cls, text) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text != null) e.textContent = text;
-    return e;
-  }
-
-  function fmtTime(ms) {
-    if (typeof ms !== 'number' || ms <= 0) return '';
-    var d = new Date(ms);
-    var p = function (n) { return (n < 10 ? '0' : '') + n; };
-    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
-      ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
-  }
-
-  function fmtRemaining(ms) {
-    if (ms <= 0) return '已过期';
-    var mins = Math.floor(ms / 60000);
-    if (mins < 60) return mins + ' 分钟';
-    if (mins >= 1440) {
-      var d = Math.floor(mins / 1440), dh = Math.floor((mins % 1440) / 60);
-      return d + ' 天' + (dh ? ' ' + dh + ' 小时' : '');
-    }
-    return Math.floor(mins / 60) + ' 小时';
-  }
 
   function isLive(t) { return t.revoked_ms == null && t.expires_ms > now(); }
 
@@ -53,10 +26,10 @@
   }
 
   function render() {
-    var tbody = document.getElementById('rows');
+    var tbody = $('.rows');
     tbody.innerHTML = '';
-    var onlyLive = document.getElementById('f-live').value === 'live';
-    var hostQ = (document.getElementById('f-host').value || '').trim().toLowerCase();
+    var onlyLive = $('.f-live').value === 'live';
+    var hostQ = ($('.f-host').value || '').trim().toLowerCase();
     var shown = 0;
     tokens.forEach(function (t) {
       if (onlyLive && !isLive(t)) return;
@@ -74,6 +47,7 @@
       var td = document.createElement('td');
       if (isLive(t)) {
         var btn = el('button', 'danger small', '吊销');
+        btn.type = 'button';
         btn.addEventListener('click', function () { revoke(t, btn); });
         td.appendChild(btn);
       }
@@ -94,7 +68,7 @@
     if (!confirm('吊销 ' + (t.host || t.token_id) + ' 的令牌？该主机随后需要重新 vt enroll。')) return;
     btn.disabled = true;
     try {
-      var resp = await fetch('/' + seg + '/api/tokens-revoke', {
+      var resp = await fetch(vt.api('tokens-revoke'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token_id: t.token_id }),
@@ -113,10 +87,7 @@
     setStatus('查询中…');
     try {
       var resp = await fetch(API, { headers: { 'Accept': 'application/json' } });
-      if (resp.status === 403) {
-        setStatus('未授权（Cloudflare Access 会话可能已过期，请刷新登录）', 'error');
-        return;
-      }
+      if (resp.status === 403) { setStatus(vt.AUTH_EXPIRED, 'error'); return; }
       if (!resp.ok) { setStatus('查询失败 HTTP ' + resp.status, 'error'); return; }
       var json = await resp.json();
       tokens = (json && json.tokens) || [];
@@ -131,9 +102,9 @@
     }
   }
 
-  document.getElementById('refresh').addEventListener('click', function () { load(); });
-  document.getElementById('f-live').addEventListener('change', render);
-  document.getElementById('f-host').addEventListener('input', render);
+  $('.refresh').addEventListener('click', function () { load(); });
+  $('.f-live').addEventListener('change', render);
+  $('.f-host').addEventListener('input', render);
   setInterval(render, 60000);
   load();
-})();
+};

@@ -202,10 +202,11 @@ Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
   `audit.cache_ttl_s` stays immutable; only `audit.cache_expires_ms` tracks extension.
   Every multi-key storage `get`/`put`/`delete` is chunked to <= 128 keys.
 - Fixed `ADMIN_SEG` routes require both Cloudflare Access and Worker JWT checks.
-  Serve admin shells/assets only inside gated handlers; public `/pwa/*` must reject
-  paths resolving into `pwa/admin/`, including percent-encoded forms. Preserve
-  `STRICT_CSP`, HTML UTF-8 content type, and global security headers on fresh
-  responses; template JSON uses `escapeJsonForHtml`, never raw interpolation.
+  `pwa/*` (admin included) is public and carries no data: a shell on disk is
+  markup plus `{{VT_DATA}}`; data reaches a page only through the gated shell
+  route or the gated API. Preserve `STRICT_CSP`, HTML UTF-8 content type, and
+  global security headers on fresh responses; template JSON uses
+  `escapeJsonForHtml`, never raw interpolation.
   See [cf-worker/src/index.ts](cf-worker/src/index.ts) and
   [cf-worker/src/page.ts](cf-worker/src/page.ts). Real secrets belong in Wrangler
   secret storage, never TOML examples: [docs/cf-worker-deploy.md](docs/cf-worker-deploy.md).

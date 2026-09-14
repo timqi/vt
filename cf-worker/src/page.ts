@@ -1,9 +1,9 @@
 // Page-shell helpers: the pure string functions behind the HTML the Worker
-// serves. The shells themselves live as real files under pwa/ and pwa/admin/
-// and are read through the ASSETS binding inside the (Access-gated) route
-// handlers; everything the server has to inject is a `{{NAME}}` placeholder
-// substituted here. Kept free of Worker/Hono types so it unit-tests as plain
-// TypeScript (test/page.test.ts).
+// serves. The two shells (pwa/approve.html, pwa/admin/admin.html) are public
+// static assets that carry no data; the Worker reads them through the ASSETS
+// binding inside the route handler and fills every `{{NAME}}` placeholder here
+// — for the admin shell inside the Access-gated route. Kept free of Worker/Hono
+// types so it unit-tests as plain TypeScript (test/page.test.ts).
 
 // Escape a JSON string for safe embedding in a <script type="application/json"> block.
 export function escapeJsonForHtml(obj: unknown): string {
@@ -35,8 +35,7 @@ const PLACEHOLDER_RE = /\{\{([A-Z0-9_]+)\}\}/g;
  *
  * Values are inserted verbatim: this helper does no escaping and must not be
  * given untrusted input. Callers pass either Worker-owned constants
- * (ASSET_VER, the admin base, the tab bar) or `escapeJsonForHtml(...)` output
- * — the same escaping the inline templates used.
+ * (ASSET_VER, the admin base) or `escapeJsonForHtml(...)` output.
  */
 export function renderTemplate(template: string, vars: Readonly<Record<string, string>>): string {
   const used = new Set<string>();
@@ -59,69 +58,20 @@ export function renderTemplate(template: string, vars: Readonly<Record<string, s
 // pwa/admin/ regardless of this value.
 export const ADMIN_SEG = 'kestrel';
 
-// Where a cache-hit push lands: the audit tab is the ledger.
-export const ADMIN_AUDIT_PATH = `/${ADMIN_SEG}/audit`;
+// Where a cache-hit push lands: the admin shell on its audit tab (the ledger).
+export const ADMIN_AUDIT_PATH = `/${ADMIN_SEG}#audit`;
 
 // ── Placeholder values ────────────────────────────────────────────────────
 //
 // The Worker-owned chrome every shell needs. Passed in rather than imported so
-// these builders stay pure and testable (ASSET_VER / FAVICON_TAGS live in
+// this builder stays pure and testable (ASSET_VER / FAVICON_TAGS live in
 // index.ts, next to the routes that depend on them).
 export interface PageChrome {
-  adminSeg: string;
   assetVer: string;
   faviconTags: string;
 }
 
-export type AdminTab = 'audit' | 'cache' | 'tokens' | 'setup' | 'push';
-
-// Placeholders common to every shell, admin or public.
+// Placeholders common to both shells; each adds its own VT_DATA.
 export function pageVars(chrome: PageChrome): Record<string, string> {
   return { FAVICON_TAGS: chrome.faviconTags, ASSET_VER: chrome.assetVer };
-}
-
-// Tab bar shared by all admin pages. Every tab carries equal weight; `active`
-// marks the current one.
-export function adminTabs(chrome: PageChrome, active: AdminTab): string {
-  const seg = chrome.adminSeg;
-  const tab = (href: string, key: AdminTab, label: string) =>
-    `<a class="tab${key === active ? ' active' : ''}" href="${href}"${key === active ? ' aria-current="page"' : ''}>${label}</a>`;
-  return `<nav class="tabs">${tab(`/${seg}/audit`, 'audit', '审计')}${tab(`/${seg}/cache`, 'cache', 'DEK 缓存')}${tab(`/${seg}/tokens`, 'tokens', '主机令牌')}${tab(`/${seg}/setup`, 'setup', 'Passkey')}${tab(`/${seg}/push`, 'push', '推送')}</nav>`;
-}
-
-// Placeholders every admin shell carries.
-export function adminVars(chrome: PageChrome, active: AdminTab): Record<string, string> {
-  return {
-    ...pageVars(chrome),
-    ADMIN_BASE: `/${chrome.adminSeg}`,
-    ADMIN_TABS: adminTabs(chrome, active),
-  };
-}
-
-/**
- * True when an asset path resolves inside the ADMIN asset folder (pwa/admin/).
- *
- * That folder holds admin.css, the per-tab .js, and — since the page shells
- * moved out of TypeScript — the admin HTML itself. It must be reachable ONLY
- * through the Cloudflare-Access-gated /{ADMIN_SEG}/pwa/* mount, so the public
- * /pwa/* route refuses anything this returns true for.
- *
- * The argument is the path already sliced for the ASSETS binding (`/pwa/admin/x`
- * → `/admin/x`). `..` segments are collapsed by the URL parser before the slice,
- * but percent-encoding survives it and Workers Assets decodes when it resolves a
- * path — a plain `startsWith('/admin/')` would let `/pwa/admin%2Fx` through — so
- * the decoded forms are checked too.
- */
-export function isAdminAssetPath(assetPath: string): boolean {
-  const isAdmin = (p: string) => /^\/+admin(\/|$)/i.test(p);
-  let p = assetPath;
-  for (let i = 0; i < 4; i++) {
-    if (isAdmin(p)) return true;
-    let next: string;
-    try { next = decodeURIComponent(p); }
-    catch { return false; } // malformed % — ASSETS won't resolve it either
-    if (next === p) return false;
-    p = next;
-  }
-  return isAdmin(p);
 }

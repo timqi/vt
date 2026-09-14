@@ -134,7 +134,7 @@ describe('AccountNotifications push contract', () => {
       const p = JSON.parse(send.mock.calls[0]![1]) as { kind: string; body: string; url: string; tag: string };
       expect(p.kind).toBe('cache_hit');
       expect(p.body).toContain('缓存命中，免 Touch ID');
-      expect(p.url).toBe('https://vt.test.invalid/kestrel/audit');
+      expect(p.url).toBe('https://vt.test.invalid/kestrel#audit');
       expect(p.tag).toBe(`cache:${op.meta.host}`);
       expect(send.mock.calls[0]!.slice(4)).toEqual([3600, 'normal']);
     });

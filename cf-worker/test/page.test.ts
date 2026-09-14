@@ -1,42 +1,54 @@
 // Unit tests for the page-shell helpers: the placeholder substitution that
 // replaced the inline HTML template literals, the JSON escaping the shells
-// depend on, and the admin-folder guard on the public /pwa/* route. All pure
-// string functions, so they run under plain vitest with no workerd.
+// depend on, and the shells themselves rendering with exactly the variables
+// their routes build. All pure string functions, so they run under plain vitest
+// with no workerd. (That the public /pwa/* route serves pwa/admin/* is a route
+// behaviour, tested in test/do_account.admin_shell.test.ts.)
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import {
-  renderTemplate, escapeJsonForHtml, isAdminAssetPath,
-  pageVars, adminVars, adminTabs, type PageChrome, type AdminTab,
-} from '../src/page';
+import { renderTemplate, escapeJsonForHtml, pageVars, type PageChrome } from '../src/page';
+
+const pwa = (p: string) => readFileSync(new URL(`../pwa/${p}`, import.meta.url), 'utf8');
 
 describe('cache creation time rendering', () => {
   class Element {
     children: Element[] = [];
     textContent = '';
-    classList = { add() {} };
+    className = '';
+    hidden = false;
+    classList = { add() {}, toggle() {} };
     appendChild(child: Element) { this.children.push(child); }
     setAttribute() {}
     addEventListener() {}
+    querySelector() { return new Element(); }
   }
 
-  const source = readFileSync(new URL('../pwa/admin/cache.js', import.meta.url), 'utf8');
-  // Exercise the actual row renderer without starting fetches, timers, or UI wiring.
-  const wiring = source.indexOf("  document.getElementById('refresh').addEventListener");
-  const context = {
-    location: { pathname: '/admin/cache' },
+  // The tab script registers vt.tabs.cache; run it against a stub panel with
+  // the real common.js + admin.js helpers, cut before its wiring so no fetch,
+  // timer or listener starts, and reach the row renderer through the cut.
+  const source = pwa('admin/cache.js');
+  const wiring = source.indexOf("  $('.refresh').addEventListener");
+  expect(wiring).toBeGreaterThan(0);
+  const context: Record<string, unknown> = {
+    location: { pathname: '/kestrel', hash: '' },
     document: {
       getElementById: () => new Element(), createElement: () => new Element(),
-      addEventListener() {},
+      addEventListener() {}, body: new Element(),
     },
-    renderRow: undefined as unknown as (group: Record<string, unknown>) => Element,
+    addEventListener() {},
+    TextEncoder, crypto,
   };
-  expect(wiring).toBeGreaterThan(0);
-  runInNewContext(source.slice(0, wiring) + 'globalThis.renderRow = renderRow; }());', context);
+  context.window = context; // common.js publishes `window.vt`; scripts read the global `vt`
+  runInNewContext(pwa('common.js'), context);
+  runInNewContext(pwa('admin/admin.js'), context);
+  runInNewContext(source.slice(0, wiring) + 'globalThis.renderRow = renderRow; };', context);
+  (context.vt as { tabs: { cache: (panel: Element) => void } }).tabs.cache(new Element());
+  const renderRow = context.renderRow as (group: Record<string, unknown>) => Element;
 
   function creationLine(created: number | null, expires: number) {
-    const row = context.renderRow({
+    const row = renderRow({
       group_id: 'test-group', origin_token_id: 'test-origin',
       live: 1, entries: 1, created_ms: created, max_expires_ms: expires,
     });
@@ -122,101 +134,56 @@ describe('escapeJsonForHtml', () => {
   });
 });
 
-describe('isAdminAssetPath', () => {
-  it('matches the admin asset folder', () => {
-    for (const p of ['/admin/audit', '/admin/audit.html', '/admin/admin.css', '/admin']) {
-      expect(isAdminAssetPath(p)).toBe(true);
-    }
-  });
-
-  // Workers Assets percent-decodes when it resolves a path, so /pwa/admin%2Fx
-  // reaches /admin/x — a plain startsWith('/admin/') would miss it. Case and
-  // repeated leading slashes are covered for the same reason.
-  it('matches encoded and odd-cased forms', () => {
-    for (const p of ['/admin%2Faudit', '/admin%2fadmin.css', '/%61dmin/audit', '//admin/audit', '/ADMIN/audit']) {
-      expect(isAdminAssetPath(p)).toBe(true);
-    }
-  });
-
-  it('does not match the public assets', () => {
-    for (const p of ['/', '/approve', '/common.js', '/libsodium.js', '/icon.svg', '/administrator.js', '/x/admin/y']) {
-      expect(isAdminAssetPath(p)).toBe(false);
-    }
-  });
-
-  it('does not throw on a malformed percent escape', () => {
-    expect(isAdminAssetPath('/%zz/admin')).toBe(false);
-  });
-});
-
 // The shells are real files now, so a typo'd or renamed placeholder is a
 // deploy-time 500 rather than a compile error. Rendering each one with the
 // exact variable map its route builds turns that into a test failure:
 // renderTemplate throws on both an unfilled placeholder and an unused value.
 describe('page shells', () => {
   const CHROME: PageChrome = {
-    adminSeg: 'kestrel',
     assetVer: '20260101-abc1234',
     faviconTags: '<link rel="icon" href="/pwa/icon.svg" type="image/svg+xml">',
   };
-  const shell = (p: string) => readFileSync(new URL(`../${p}`, import.meta.url), 'utf8');
-
-  const render = (path: string, vars: Record<string, string>) => renderTemplate(shell(path), vars);
+  const render = (path: string, vars: Record<string, string>) => renderTemplate(pwa(path), vars);
 
   it('renders the approval page', () => {
-    const html = render('pwa/approve.html', {
+    const html = render('approve.html', {
       ...pageVars(CHROME),
       VT_DATA: escapeJsonForHtml({ approve_token: 'tok', meta: {} }),
     });
     expect(html).toContain('<script type="application/json" id="vt-data">');
     expect(html).toContain('/pwa/approve.js?v=20260101-abc1234');
+    expect(html).toContain('/pwa/admin/admin.css?v=20260101-abc1234');
   });
 
-  it('renders the data-free admin shells', () => {
-    for (const tab of ['audit', 'cache', 'tokens', 'push'] as AdminTab[]) {
-      const html = render(`pwa/admin/${tab}.html`, adminVars(CHROME, tab));
-      expect(html).toContain(`href="/kestrel/${tab}" aria-current="page"`);
-      expect(html).toContain('/kestrel/pwa/admin.css?v=20260101-abc1234');
+  it('renders the admin shell with its state, RP_ID and CREDENTIALS_JSON', () => {
+    const html = render('admin/admin.html', {
+      ...pageVars(CHROME),
+      VT_DATA: escapeJsonForHtml({ state: 'console', rp_id: 'vt.example.com', credentials: '{"v":1,"epoch":0,"c":[]}' }),
+    });
+    expect(html).toContain('"state":"console"');
+    expect(html).toContain('vt.example.com');
+    for (const js of ['admin', 'audit', 'cache', 'tokens', 'setup', 'settings']) {
+      expect(html).toContain(`/pwa/admin/${js}.js?v=20260101-abc1234`);
     }
   });
 
-  it('renders the setup shell with RP_ID + CREDENTIALS_JSON', () => {
-    const html = render('pwa/admin/setup.html', {
-      ...adminVars(CHROME, 'setup'),
-      VT_DATA: escapeJsonForHtml({ rp_id: 'vt.example.com', credentials: '{"v":1,"epoch":0,"c":[]}' }),
-    });
-    expect(html).toContain('vt.example.com');
-    expect(html).toContain('/kestrel/pwa/setup.js?v=20260101-abc1234');
+  // The admin shell is a public asset, so the file on disk must hold nothing
+  // but markup: every value arrives through the gated route's placeholders.
+  it('keeps the raw admin shell data-free', () => {
+    const raw = pwa('admin/admin.html');
+    const placeholders = new Set([...raw.matchAll(/\{\{([A-Z0-9_]+)\}\}/g)].map(m => m[1]));
+    expect([...placeholders].sort()).toEqual(['ASSET_VER', 'FAVICON_TAGS', 'VT_DATA']);
+    expect(raw).toContain('id="vt-data">{{VT_DATA}}</script>');
+    expect(raw).not.toMatch(/\bkestrel\b/);
   });
 
   it('leaves no unsubstituted placeholder in any shell', () => {
     // Sanity net over the renders above: nothing of the form {{NAME}} survives.
     const rendered = [
-      render('pwa/approve.html', { ...pageVars(CHROME), VT_DATA: '{}' }),
-      render('pwa/admin/audit.html', adminVars(CHROME, 'audit')),
-      render('pwa/admin/cache.html', adminVars(CHROME, 'cache')),
-      render('pwa/admin/push.html', adminVars(CHROME, 'push')),
-      render('pwa/manifest.webmanifest', { ADMIN_BASE: '/kestrel' }),
-      render('pwa/admin/setup.html', { ...adminVars(CHROME, 'setup'), VT_DATA: '{}' }),
+      render('approve.html', { ...pageVars(CHROME), VT_DATA: '{}' }),
+      render('admin/admin.html', { ...pageVars(CHROME), VT_DATA: '{}' }),
+      render('manifest.webmanifest', { ADMIN_BASE: '/kestrel' }),
     ];
     for (const html of rendered) expect(html).not.toMatch(/\{\{[A-Z0-9_]+\}\}/);
-  });
-});
-
-describe('adminTabs', () => {
-  it('marks exactly one tab active and links the rest', () => {
-    const nav = adminTabs({ adminSeg: 'kestrel', assetVer: 'v', faviconTags: '' }, 'cache');
-    expect(nav.match(/class="tab active"/g)).toHaveLength(1);
-    expect(nav.match(/aria-current="page"/g)).toHaveLength(1);
-    expect(nav).toContain('href="/kestrel/cache" aria-current="page"');
-    expect(nav.match(/<a /g)).toHaveLength(5);
-    expect(nav).toContain('href="/kestrel/tokens"');
-    expect(nav).toContain('href="/kestrel/push"');
-  });
-
-  it('follows ADMIN_SEG', () => {
-    const nav = adminTabs({ adminSeg: 'other', assetVer: 'v', faviconTags: '' }, 'audit');
-    expect(nav).not.toContain('/kestrel/');
-    expect(nav).toContain('href="/other/audit"');
   });
 });

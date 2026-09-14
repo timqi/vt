@@ -62,3 +62,10 @@ CREDENTIALS_JSON = '{"v":1,"epoch":1,"c":[{"h":"L0JnHXnwlzt3HXjLqjzbrgit2WcsVKLQ
 # positions).
 CACHE_HIT_NOTIFY = "0"
 CACHE_ADMIN_EXTEND = "0"
+
+# The same static-asset binding production uses (directory = pwa/), so a route
+# test can prove which asset paths the Worker actually serves.
+[assets]
+directory = "pwa"
+binding = "ASSETS"
+run_worker_first = true

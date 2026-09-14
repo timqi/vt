@@ -2,9 +2,9 @@
   "name": "VT",
   "short_name": "VT",
   "scope": "/",
-  "start_url": "{{ADMIN_BASE}}/audit",
+  "start_url": "{{ADMIN_BASE}}",
   "display": "standalone",
-  "background_color": "#ffffff",
-  "theme_color": "#ffffff",
+  "background_color": "#f6f7f9",
+  "theme_color": "#f6f7f9",
   "icons": [{ "src": "/pwa/icon-512.png", "sizes": "512x512", "type": "image/png" }]
 }

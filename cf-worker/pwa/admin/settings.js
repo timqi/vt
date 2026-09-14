@@ -1,29 +1,16 @@
 'use strict';
 
-// Push subscriptions: this device subscribes with the Worker's VAPID key and
-// posts the result; every row can be tested or removed. Rendering is
+// 设置 tab, push subscriptions: this device subscribes with the Worker's VAPID
+// key and posts the result; every row can be tested or removed. Rendering is
 // textContent only; the endpoint's keys never come back from the server.
 
-(function () {
-  var seg = location.pathname.split('/')[1] || '';
-  var API = '/' + seg + '/api/push/';
-  var setStatus = window.vt.setStatus;
+vt.tabs.settings = function (panel) {
+  var $ = function (sel) { return panel.querySelector(sel); };
+  var API = vt.api('push/');
+  var setStatus = vt.statusLine($('.status'));
+  var el = vt.el, fmtTime = vt.fmtTime;
   var subs = [];
   var mine = null;
-
-  function el(tag, cls, text) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text != null) e.textContent = text;
-    return e;
-  }
-
-  function fmtTime(ms) {
-    var d = new Date(ms);
-    var p = function (n) { return (n < 10 ? '0' : '') + n; };
-    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
-      ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
-  }
 
   async function post(op, body) {
     var resp = await fetch(API + op, {
@@ -34,7 +21,7 @@
   }
 
   function render() {
-    var tbody = document.getElementById('rows');
+    var tbody = $('.rows');
     tbody.innerHTML = '';
     subs.forEach(function (s) {
       var tr = document.createElement('tr');
@@ -46,6 +33,7 @@
       tr.appendChild(el('td', null, fmtTime(s.created_ms)));
       var td = document.createElement('td');
       var test = el('button', 'ghost small', '测试');
+      test.type = 'button';
       test.addEventListener('click', async function () {
         test.disabled = true;
         try {
@@ -56,6 +44,7 @@
         test.disabled = false;
       });
       var del = el('button', 'danger small', '删除');
+      del.type = 'button';
       del.addEventListener('click', async function () {
         if (!confirm('删除 ' + (s.label || host) + ' 的订阅？')) return;
         try {
@@ -89,19 +78,19 @@
   }
 
   async function subscribe() {
-    var btn = document.getElementById('subscribe');
+    var btn = $('#subscribe');
     btn.disabled = true;
     try {
       var pub = await load();
       if (!pub) return;
       if ((await Notification.requestPermission()) !== 'granted') { setStatus('未授予通知权限', 'error'); return; }
       var reg = await navigator.serviceWorker.ready;
-      var sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: window.vt.b64uDec(pub) });
+      var sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: vt.b64uDec(pub) });
       await post('subscribe', {
         endpoint: sub.endpoint,
-        p256dh: window.vt.b64uEnc(new Uint8Array(sub.getKey('p256dh'))),
-        auth: window.vt.b64uEnc(new Uint8Array(sub.getKey('auth'))),
-        label: document.getElementById('label').value.trim(),
+        p256dh: vt.b64uEnc(new Uint8Array(sub.getKey('p256dh'))),
+        auth: vt.b64uEnc(new Uint8Array(sub.getKey('auth'))),
+        label: $('#push-label').value.trim(),
       });
       mine = sub;
       setStatus('已订阅', 'ok');
@@ -126,9 +115,9 @@
       setStatus('Service worker 注册失败: ' + (e.message || e), 'error');
     }
     await load();
-    document.getElementById('subscribe').disabled = false;
+    $('#subscribe').disabled = false;
   }
 
-  document.getElementById('subscribe').addEventListener('click', subscribe);
+  $('#subscribe').addEventListener('click', subscribe);
   init();
-})();
+};

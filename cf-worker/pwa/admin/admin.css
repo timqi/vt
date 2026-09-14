@@ -1,5 +1,7 @@
-/* Light-first, adaptive theme. Default = Light. Dark only when the device
-   explicitly prefers it (prefers-color-scheme: dark). */
+/* The one stylesheet for both shells (docs/design/ui-ux.md): approve.html is a
+   420px phone column, admin.html the tabbed console. Every control and every
+   .vt-ap-* rule exists once here. Light default; dark only when the device
+   prefers it. */
 :root {
   --bg: #f6f7f9;
   --panel: #ffffff;
@@ -11,7 +13,10 @@
   --err: #c0392b;
   --warn: #b7791f;
   --border: #d8dee6;
+  --hairline: rgba(0, 0, 0, .08);
+  --highlight: rgba(255, 255, 255, .7);
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color-scheme: light dark;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -26,10 +31,12 @@
     --err: #ff5c5c;
     --warn: #ffb648;
     --border: #2a2f3a;
+    --hairline: rgba(255, 255, 255, .12);
+    --highlight: rgba(255, 255, 255, .08);
   }
 }
 
-* { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: border-box; }
 
 body {
   margin: 0;
@@ -37,62 +44,69 @@ body {
   color: var(--fg);
   font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
   -webkit-text-size-adjust: 100%;
+  padding-bottom: env(safe-area-inset-bottom);
 }
 
 main {
   max-width: 1000px;
   margin: 0 auto;
-  padding: 20px 16px 64px;
+  padding: 12px 16px 64px;
 }
+/* The approve shell is one 420px column at every width. */
+main.approve { max-width: 420px; padding-top: 20px; }
 
-.hint { color: var(--muted); margin: 8px 0 16px; font-size: 13px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.hint { color: var(--muted); margin: 8px 0 16px; font-size: 13px; overflow-wrap: anywhere; }
 .warn { color: var(--warn); font-size: 13px; margin: 10px 0 0; }
-code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-h1 { font-size: 20px; margin: 14px 0 4px; }
+code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; font-family: var(--mono); }
+h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -.01em; }
 h2 { font-size: 15px; margin: 18px 0 8px; }
 
-/* Tabs (audit / setup) — equal weight */
-.tabs {
-  display: flex;
-  gap: 4px;
-  border-bottom: 1px solid var(--border);
-  margin: 8px 0 4px;
+/* ── Page head: the only glass surface — a slim inset strip floating over the
+   content, which flows beneath it (sticky keeps it in flow). ──────────────── */
+.page-head {
+  position: sticky; top: 8px; z-index: 5;
+  display: flex; align-items: center; gap: 12px;
+  max-width: 1000px; margin: 8px auto 0; padding: 6px 10px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 72%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(1.4);
+  backdrop-filter: blur(18px) saturate(1.4);
+  border: 1px solid var(--hairline);
+  box-shadow: inset 0 1px 0 var(--highlight), 0 12px 32px rgba(0, 0, 0, .08), 0 1px 2px rgba(0, 0, 0, .08);
 }
+@media (max-width: 1032px) { .page-head { margin-left: 8px; margin-right: 8px; } }
+.page-head h1 { font-size: 15px; margin: 0 6px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 2px; }
 .tab {
-  padding: 9px 18px;
-  text-decoration: none;
-  color: var(--muted);
-  font-weight: 600;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
+  display: inline-flex; align-items: center; min-height: 36px; padding: 0 14px;
+  border-radius: 8px; text-decoration: none;
+  color: var(--muted); font-weight: 600; font-size: 14px;
 }
-.tab:hover { color: var(--fg); }
-.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.tab.active { color: var(--accent); background: var(--panel); box-shadow: 0 1px 2px rgba(0, 0, 0, .10); }
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  .page-head { background: var(--panel); -webkit-backdrop-filter: none; backdrop-filter: none; }
+}
+/* Shell-level status (state errors); invisible while empty. */
+#shell-status { max-width: 1000px; margin: 8px auto 0; padding: 0 16px; }
+#shell-status:empty { display: none; }
 
-/* Forms */
+/* ── Forms ────────────────────────────────────────────────────────────────── */
 section { margin: 14px 0; }
 label { display: inline-flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); margin-right: 14px; }
 
-/* Filter bar: controls + button bottom-aligned on one row */
-#filters { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
-#filters label { margin-right: 0; }
-#filters button { margin: 0; }
-/* Unify the height of every control on the filter bar (selects, text input,
-   buttons) so the left-side inputs and the right-side buttons line up. */
-#filters select, #filters input[type="text"], #filters button {
-  height: 38px; padding-top: 0; padding-bottom: 0;
-}
-#filters .filter-spacer { flex: 1 1 auto; }
-/* Keep the two destructive buttons together as one unit: they wrap to the
-   next line together (right-aligned) instead of one button orphaning onto its
-   own line. */
-#filters .filter-danger { display: flex; gap: 8px; margin-left: auto; }
-#filters .filter-danger button { margin: 0; }
+/* Filter bar: controls + buttons bottom-aligned on one row, one height. */
+.filters { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
+.filters label { margin-right: 0; }
+.filters button { margin: 0; }
+.filters select, .filters input[type="text"], .filters button { height: 40px; padding-top: 0; padding-bottom: 0; }
+.filters .filter-spacer { flex: 1 1 auto; }
+/* The destructive buttons wrap together as one unit, right-aligned. */
+.filters .filter-danger { display: flex; gap: 8px; margin-left: auto; }
+.filters .filter-danger button { margin: 0; }
 td.cache-expired { color: var(--muted); }
-
-/* Page header */
-.page-head { margin-bottom: 4px; }
-.page-head .hint { margin-top: 4px; }
 
 /* Cards */
 .card {
@@ -130,57 +144,49 @@ input[type="text"], input[type="password"], select, textarea {
 textarea { width: 100%; min-width: 0; font-family: var(--mono); font-size: 12px; }
 button {
   background: var(--accent); color: #fff; border: 0; border-radius: 8px;
-  padding: 9px 16px; font: inherit; cursor: pointer; margin-right: 8px;
+  padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer; margin-right: 8px;
+  -webkit-tap-highlight-color: transparent;
+  transition: filter .12s, opacity .12s;
 }
 button:hover { filter: brightness(1.08); }
+button:active { opacity: .8; }
 button:disabled { opacity: .5; cursor: default; }
-button.ghost {
-  background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
-}
+button.ghost { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); }
 button.ghost:hover { filter: none; background: var(--border); }
 button.danger { background: #c0392b; color: #fff; }
-button.danger:hover { filter: brightness(1.08); }
 button.small { padding: 4px 10px; font-size: 12px; margin: 0; }
 
-#actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-#actions #status { margin-top: 0; }
-#status { min-height: 20px; font-size: 13px; margin-top: 12px; }
-#status.ok { color: var(--ok); }
-#status.error { color: var(--err); }
+.actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.actions .status { margin-top: 0; }
+.status { min-height: 20px; font-size: 13px; margin-top: 12px; overflow-wrap: anywhere; }
+.status.ok { color: var(--ok); }
+.status.error { color: var(--err); }
 
-/* Real-time stream indicator (pushed to the actions bar by audit.js). */
+/* Real-time stream indicator (audit.js appends it to the actions bar). */
 #ws-status { margin-left: auto; font-size: 12px; font-variant-numeric: tabular-nums; }
 #ws-status.ws-live { color: var(--ok); }
 #ws-status.ws-sync { color: #b45309; }
 #ws-status.ws-down { color: var(--muted); }
 
-/* Audit table */
-#table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+/* ── Tables ───────────────────────────────────────────────────────────────── */
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel-2); }
 tbody tr:hover { background: var(--panel-2); }
+tbody tr.clickable { cursor: pointer; }
 
-/* Cap the 主机 / 命令 columns so a long host or command truncates with an
-   ellipsis instead of widening the table into horizontal scroll. Fixed px
-   max-width on the inline-block span works regardless of table-layout; the
-   full value is still in the detail dialog + the native title tooltip. */
+/* A long host / command truncates with an ellipsis instead of widening the
+   table; the whole value lives in the detail dialog or hovercard. */
 .trunc { display: inline-block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; max-width: 100%; }
 .trunc.col-host { max-width: 120px; }
 .trunc.col-cmd  { max-width: 240px; }
-@media (max-width: 640px) {
-  .trunc.col-host { max-width: 90px; }
-  .trunc.col-cmd  { max-width: 150px; }
-}
-
-tbody tr.clickable { cursor: pointer; }
 
 .badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; background: var(--panel-2); color: var(--muted); }
 .badge-pending { background: #e7eaef; color: #5b6573; }
 .badge-approved { background: #d7f5e3; color: #15803d; }
 .badge-rejected { background: #fde0e6; color: #be123c; }
 .badge-expired { background: #fdecca; color: #92600c; }
-
 @media (prefers-color-scheme: dark) {
   .badge-pending { background: #2a2f3a; color: #9aa3b2; }
   .badge-approved { background: #1f3d2c; color: #7ee2a8; }
@@ -188,81 +194,10 @@ tbody tr.clickable { cursor: pointer; }
   .badge-expired { background: #3a3320; color: #ffd591; }
 }
 
-/* Detail card (modal) */
-#detail-backdrop {
-  position: fixed; inset: 0; background: rgba(0,0,0,.45);
-  display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10;
-}
-/* `display:flex` above would otherwise override the UA `[hidden]{display:none}`,
-   leaving the modal permanently visible — re-assert hidden with higher specificity. */
-#detail-backdrop[hidden] { display: none; }
-#detail-card {
-  position: relative; background: var(--panel); color: var(--fg);
-  border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px;
-  max-width: 680px; width: 100%; max-height: 85vh; overflow: auto;
-}
-#detail-close {
-  position: absolute; top: 10px; right: 10px; background: transparent; color: var(--muted);
-  font-size: 22px; line-height: 1; padding: 4px 10px; margin: 0;
-}
-#detail-close:hover { color: var(--fg); filter: none; }
-#detail-dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
-#detail-dl dt { color: var(--muted); font-size: 13px; }
-#detail-dl dd { margin: 0; font-size: 13px; word-break: break-word; }
-/* Enrollment pairing code: the one value the approver must read exactly. */
-.vt-ap-pair, dd.vt-ap-pair { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 22px; font-weight: 700; letter-spacing: 2px; }
-#detail-dl dd.mono { font-family: var(--mono); white-space: pre-wrap; }
-
-/* Inline Passkey approval ceremony (built by vt.mountApprove, shared with the
-   standalone /a/:token page). Class-scoped under .vt-approve so it never
-   collides with the audit page's own #actions / #status. */
-#detail-approve:empty { display: none; }
-.vt-approve { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
-.vt-approve h2 {
-  font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
-  color: var(--muted); margin: 0 0 6px;
-}
-.vt-ap-cache-section { margin: 0 0 14px; }
-.vt-ap-cache-section .cache-warn { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
-.vt-ap-cache-section .cache-warn strong { color: var(--err); }
-.vt-ap-cache-opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: 6px; }
-.vt-ap-cache-opts .cache-opt {
-  display: flex; align-items: center; justify-content: center; gap: 4px;
-  padding: 6px 4px; border: 1px solid var(--border); border-radius: 8px;
-  background: var(--panel-2); font-size: 13px; cursor: pointer; margin: 0;
-}
-.vt-ap-cache-opts .cache-opt:has(input:checked) { border-color: var(--accent); background: rgba(127,127,127,.14); }
-.vt-ap-cache-opts .cache-opt input { accent-color: var(--accent); margin: 0; }
-.vt-ap-actions { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; }
-.vt-ap-approve { background: var(--ok); color: #fff; margin: 0; }
-.vt-ap-reject { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); margin: 0; }
-.vt-ap-status { min-height: 20px; font-size: 13px; margin-top: 10px; }
-.vt-ap-status.ok { color: var(--ok); }
-.vt-ap-status.error { color: var(--err); }
-
-/* ── DEK-cache tab ───────────────────────────────────────────────────────── */
-/* Bulk-action bar: appears only once something is selected, so the destructive
-   and authority-granting controls are not permanently on screen. */
-#bulkbar {
-  display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px;
-  padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
-  background: var(--panel-2);
-}
-#bulkbar[hidden] { display: none; }
-#bulkbar label[hidden], #bulkbar button[hidden] { display: none; }
-#bulkbar label { margin-right: 0; }
-#bulkbar select, #bulkbar button { height: 38px; box-sizing: border-box; margin: 0; }
-#bulkbar #bulk-count { align-self: center; }
-#bulkbar #extend-note { margin: 0; align-self: center; }
-/* Selection column: keep it tight so the data columns keep the width. */
-th.col-pick, td.col-pick { width: 1%; padding-right: 0; }
-th.col-pick input, td.col-pick input { accent-color: var(--accent); margin: 0; cursor: pointer; }
-/* Two-line cells (#cache): a primary value with a muted secondary line. This is
-   what lets six columns carry what nine used to, so the action buttons and the
-   extendability reason stay visible without horizontal scrolling. */
+/* Two-line cells: a primary value with a muted secondary line. */
 #cache td, #tokens td { padding-top: 7px; padding-bottom: 7px; vertical-align: top; }
-#cache .cell-main, #tokens .cell-main { font-size: 13px; line-height: 1.35; }
-#cache .cell-sub, #tokens .cell-sub {
+.cell-main { font-size: 13px; line-height: 1.35; }
+.cell-sub {
   font-size: 11.5px; color: var(--muted); line-height: 1.35; margin-top: 2px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -275,10 +210,35 @@ th.col-pick input, td.col-pick input { accent-color: var(--accent); margin: 0; c
 #cache td.col-act { white-space: nowrap; width: 1%; }
 #cache td.col-act button { margin: 0 0 0 6px; }
 #cache td.col-act button:first-child { margin-left: 0; }
-/* Hover card for the directory / command cells. Replaces the native `title`
-   tooltip: readable size, wraps, and keeps a multi-line command multi-line.
-   Positioned from JS via element.style.* (CSSOM), which `style-src 'self'`
-   permits — an inline style ATTRIBUTE would be blocked. */
+/* Selection column: tight, so the data columns keep the width. */
+th.col-pick, td.col-pick { width: 1%; padding-right: 0; }
+th.col-pick input, td.col-pick input { accent-color: var(--accent); margin: 0; cursor: pointer; }
+/* Signal that a cell holds more than it shows, without adding visual noise. */
+.has-hover { cursor: help; }
+.has-hover:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
+/* "Why this group can't be extended" — muted pill, always in view. */
+.reason-badge {
+  display: inline-block; padding: 1px 7px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+  max-width: 100%;
+}
+
+/* Bulk-action bar: appears only once something is selected, so the
+   authority-granting controls are not permanently on screen. */
+#bulkbar {
+  display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel-2);
+}
+#bulkbar[hidden] { display: none; }
+#bulkbar label[hidden], #bulkbar button[hidden] { display: none; }
+#bulkbar label { margin-right: 0; }
+#bulkbar select, #bulkbar button { height: 40px; margin: 0; }
+#bulkbar #bulk-count { align-self: center; }
+#bulkbar #extend-note { margin: 0; align-self: center; }
+
+/* Hover card: positioned from JS via element.style.* (CSSOM), which
+   `style-src 'self'` permits — an inline style ATTRIBUTE would be blocked. */
 .hovercard {
   position: fixed; z-index: 30; max-width: min(620px, 92vw);
   background: var(--panel); color: var(--fg);
@@ -288,43 +248,102 @@ th.col-pick input, td.col-pick input { accent-color: var(--accent); margin: 0; c
   white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none;
 }
 .hovercard[hidden] { display: none; }
-/* Signal that a cell holds more than it shows, without adding visual noise. */
-#cache .has-hover { cursor: help; }
-#cache .has-hover:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
 
-/* "Why this group can't be extended" — muted pill, always in view. */
-#cache .reason-badge {
-  display: inline-block; padding: 1px 7px; border-radius: 999px;
-  background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
-  max-width: 100%;
+/* ── Detail dialog (solid) ────────────────────────────────────────────────── */
+#detail-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.45);
+  display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10;
 }
-@media (max-width: 640px) {
-  #cache .cell-main.trunc-host, #cache .cell-sub.trunc-sub { max-width: 120px; }
-  #cache .cell-main.trunc-cmd { max-width: 160px; }
+/* `display:flex` above would otherwise override the UA `[hidden]{display:none}`. */
+#detail-backdrop[hidden] { display: none; }
+#detail-card {
+  position: relative; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px;
+  max-width: 680px; width: 100%; max-height: 85vh; overflow: auto;
 }
-/* The cache tab's modal has a real heading (the audit tab's starts with a dl). */
-#detail-card > h2 { margin: 0 0 12px; padding-right: 32px; }
+#detail-close {
+  position: absolute; top: 10px; right: 10px; background: transparent; color: var(--muted);
+  font-size: 22px; line-height: 1; padding: 4px 10px; margin: 0; min-width: 44px; min-height: 44px;
+}
+#detail-close:hover { color: var(--fg); filter: none; }
+#detail-title { margin: 0 0 12px; padding-right: 44px; }
+#detail-dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+#detail-dl dt { color: var(--muted); font-size: 13px; }
+#detail-dl dd { margin: 0; font-size: 13px; word-break: break-word; }
+#detail-dl dd.mono { font-family: var(--mono); white-space: pre-wrap; }
+#detail-approve:empty { display: none; }
+#detail-approve .vt-approve { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
 
-/* Setup: current Passkey list + CLI command block */
+/* ── Passkey ceremony (vt.mountApprove): standalone page and inline dialog ── */
+.vt-approve h2 {
+  font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--muted); margin: 0 0 6px;
+}
+.vt-ap-meta {
+  margin: 0; padding: 6px 12px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 10px; font-size: 13px;
+}
+.vt-ap-meta > div { display: grid; grid-template-columns: 6.5em 1fr; gap: 8px; padding: 4px 0; }
+.vt-ap-meta > div + div { border-top: 1px solid var(--border); }
+.vt-ap-meta dt { color: var(--muted); }
+/* Values are identifiers, paths, commands — mono; the labels are UI text. */
+.vt-ap-meta dd { margin: 0; font-family: var(--mono); font-size: 12.5px; word-break: break-all; white-space: pre-wrap; }
+/* Enrollment pairing code: the one value the approver must read exactly. */
+.vt-ap-pair, dd.vt-ap-pair { font-family: var(--mono); font-size: 22px; font-weight: 700; letter-spacing: 2px; }
+.vt-ap-meta-note { margin-top: 8px; }
+.vt-ap-cache-section { margin: 14px 0; }
+.vt-ap-cache-section .cache-warn { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+.vt-ap-cache-section .cache-warn strong { color: var(--err); }
+/* The reuse scope this approval would arm — a path, so it wraps. Sits directly
+   above the duration control. */
+.vt-ap-cache-section .cache-scope { margin: 0 0 8px; font-size: 12px; overflow-wrap: anywhere; }
+.vt-ap-cache-section .cache-scope strong { font-family: var(--mono); }
+.vt-ap-cache-opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: 6px; }
+.vt-ap-cache-opts .cache-opt {
+  display: flex; align-items: center; justify-content: center; gap: 4px;
+  padding: 6px 4px; min-height: 36px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-2); font-size: 13px; cursor: pointer; margin: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+.vt-ap-cache-opts .cache-opt:has(input:checked) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--panel)); }
+.vt-ap-cache-opts .cache-opt input { accent-color: var(--accent); margin: 0; }
+.vt-ap-actions { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; margin-top: 14px; }
+.vt-ap-actions button { min-height: 44px; margin: 0; }
+.vt-ap-approve { background: var(--ok); color: #fff; }
+.vt-ap-reject { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); }
+.vt-ap-status { min-height: 20px; font-size: 13px; margin: 10px 0 0; }
+.vt-ap-status.ok { color: var(--ok); }
+.vt-ap-status.error { color: var(--err); }
+
+/* ── Passkey tab: current list + CLI command block ────────────────────────── */
 .cred-list { list-style: none; margin: 0 0 16px; padding: 0; }
 .cred-list li {
   display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px;
-  padding: 8px 10px; border: 1px solid var(--border, #2a2a2a); border-radius: 8px; margin-bottom: 6px;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px;
 }
 .cred-list li:empty { display: none; }
 .cred-list li.cred-empty { color: var(--muted); font-size: 13px; border-style: dashed; }
 .cred-list .mono { font-family: var(--mono); color: var(--muted); font-size: 12px; }
 pre.cmd {
-  background: rgba(127,127,127,.12); border-radius: 8px; padding: 10px 12px; margin: 8px 0;
+  background: var(--panel-2); border-radius: 8px; padding: 10px 12px; margin: 8px 0;
   overflow-x: auto; font-family: var(--mono); font-size: 13px;
 }
 
-/* Links inside hints and the audit detail list inherit the accent */
 .hint a, #detail-dl a { color: var(--accent); text-decoration: none; }
 .hint a:hover, #detail-dl a:hover { text-decoration: underline; }
 
+/* ── Phone ────────────────────────────────────────────────────────────────── */
 @media (max-width: 640px) {
+  .page-head h1 { display: none; }
   label { display: flex; margin-right: 0; }
+  .trunc.col-host { max-width: 90px; }
+  .trunc.col-cmd  { max-width: 150px; }
+  #cache .cell-main.trunc-host, #cache .cell-sub.trunc-sub { max-width: 120px; }
+  #cache .cell-main.trunc-cmd { max-width: 160px; }
   #detail-dl { grid-template-columns: 1fr; gap: 2px 0; }
   #detail-dl dt { margin-top: 8px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button { transition: none; }
 }
