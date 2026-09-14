@@ -135,16 +135,15 @@ Rust client opens the result with the existing sealed-box implementation.
 
 ## Client network bounds
 
-- `/api/dek-cache` probe: one 3-second budget covering connection setup, the
-  IPv4-to-unpinned fallback attempt, and the full response body. Timeout,
+- `/api/dek-cache` probe: one 3-second budget covering connection setup and
+  the full response body. Timeout,
   transport, HTTP, and JSON failures are misses (fall through to the phone
   ceremony); a `source=cache` response with bad base64 or a bad sealed box is a
   hard error, never a fallback.
-- Worker POSTs share two process-wide reqwest pools (IPv4-pinned, unpinned).
-  Authorization and timeout are set per request (30 s default, 5 s for agent
-  audit pushes), covering the body read. Only connect/builder errors retry on
-  the unpinned pool. Proxy settings are sampled when each pool is first built,
-  so a long-running agent must restart to pick up proxy changes.
+- Worker POSTs share one process-wide reqwest client. Authorization and
+  timeout are set per request (30 s default, 5 s for agent audit pushes),
+  covering the body read. Proxy settings are sampled when the client is first
+  built, so a long-running agent must restart to pick up proxy changes.
 - `/api/dek` WebSocket handshake (DNS, TCP, TLS, upgrade): 10 s, then the
   existing 6-minute approval wait. Failures report fixed messages that exclude
   the poll-token URL and server-controlled error text.

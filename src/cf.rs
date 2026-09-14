@@ -314,33 +314,19 @@ struct DekCacheResp {
 const CACHE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn http_client(ipv4: bool) -> reqwest::Result<&'static reqwest::Client> {
-    static V4: OnceLock<reqwest::Client> = OnceLock::new();
-    static ANY: OnceLock<reqwest::Client> = OnceLock::new();
-    let slot = if ipv4 { &V4 } else { &ANY };
-    if let Some(client) = slot.get() {
+fn http_client() -> reqwest::Result<&'static reqwest::Client> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
         return Ok(client);
     }
-    // Preserve reqwest's proxy defaults, sampled when each pool is first built.
-    // Auth and timeouts belong to requests, never to these shared clients.
-    let mut builder = reqwest::Client::builder();
-    if ipv4 {
-        builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-    }
+    // Preserve reqwest's proxy defaults, sampled when the pool is first built.
+    // Auth and timeouts belong to requests, never to this shared client.
     // Failed builds are not cached; concurrent successful builds use one winner.
-    let _ = slot.set(builder.build()?);
-    Ok(slot.get().expect("HTTP client initialized"))
+    let _ = CLIENT.set(reqwest::Client::builder().build()?);
+    Ok(CLIENT.get().expect("HTTP client initialized"))
 }
 
-/// POST to the worker with the egress IP family pinned to IPv4 (with graceful
-/// fallback). Both the challenge (which writes the DEK-cache entry, ctx bound to
-/// CF-Connecting-IP) and the dek-cache probe (which reads it) go through here,
-/// so a dual-stack host can't flip between its IPv4 and IPv6 egress across the
-/// two separate `vt` processes — that flip would change CF-Connecting-IP, hence
-/// the cache ctx, and cause a permanent miss. Cloudflare always publishes A
-/// records, so IPv4 connects whenever the host has any IPv4 egress; on an
-/// IPv6-only host the IPv4 connect fails and we retry without the pin (both
-/// requests then consistently use IPv6).
+/// POST to the worker on the shared client with a 30 s request timeout.
 pub(crate) async fn cf_post(
     url: &str,
     auth_header: &str,
@@ -350,8 +336,7 @@ pub(crate) async fn cf_post(
     cf_post_with_timeout(url, auth_header, token_id, body, 30).await
 }
 
-/// Same IPv4-pinned-with-fallback POST as [`cf_post`], but with a caller-chosen
-/// timeout (seconds). The fire-and-forget agent audit push needs a short (5 s)
+/// Same POST as [`cf_post`], but with a caller-chosen timeout (seconds). The fire-and-forget agent audit push needs a short (5 s)
 /// budget so it can never block the agent — the default `cf_post` 30 s ceiling
 /// would let a single retried row stall up to a minute.
 ///
@@ -365,36 +350,17 @@ pub(crate) async fn cf_post_with_timeout(
     body: &[u8],
     secs: u64,
 ) -> Result<reqwest::Response> {
-    async fn send_once(
-        client: &reqwest::Client,
-        url: &str,
-        auth_header: &str,
-        token_id: Option<&str>,
-        body: &[u8],
-        secs: u64,
-    ) -> reqwest::Result<reqwest::Response> {
-        let mut req = client
-            .post(url)
-            .timeout(Duration::from_secs(secs))
-            .header("Content-Type", "application/json");
-        if !auth_header.is_empty() {
-            req = req.header("Authorization", auth_header);
-        }
-        if let Some(id) = token_id {
-            req = req.header("VT-Token-Id", id);
-        }
-        req.body(body.to_vec()).send().await
+    let mut req = http_client()?
+        .post(url)
+        .timeout(Duration::from_secs(secs))
+        .header("Content-Type", "application/json");
+    if !auth_header.is_empty() {
+        req = req.header("Authorization", auth_header);
     }
-
-    match send_once(http_client(true)?, url, auth_header, token_id, body, secs).await {
-        Ok(r) => Ok(r),
-        // IPv6-only host (or no IPv4 route): retry without the family pin so both
-        // requests consistently fall back to IPv6.
-        Err(e) if e.is_connect() || e.is_builder() => {
-            Ok(send_once(http_client(false)?, url, auth_header, token_id, body, secs).await?)
-        }
-        Err(e) => Err(e.into()),
+    if let Some(id) = token_id {
+        req = req.header("VT-Token-Id", id);
     }
+    Ok(req.body(body.to_vec()).send().await?)
 }
 
 /// Turn a non-2xx ceremony response into the user-facing error. A structured
@@ -681,10 +647,8 @@ async fn try_cache_with_timeout(
         return Ok(None); // the ceremony path reports the malformed token
     };
     let auth_header = auth.auth_header(&req_body);
-    // Same IPv4-pinned client as the challenge POST so CF-Connecting-IP (half the
-    // cache ctx) is stable across the two processes. Any transport/HTTP failure →
-    // fall back to the ceremony rather than abort.
-    // One budget includes both address-family attempts and the entire body read.
+    // Any transport/HTTP failure → fall back to the ceremony rather than abort.
+    // One budget covers connect, headers, and the entire body read.
     // Keep crypto validation outside the recoverable transport/miss path.
     let bytes = match tokio::time::timeout(timeout, async {
         let resp = cf_post(&url, &auth_header, Some(&auth.token_id), &req_body)
@@ -1016,10 +980,9 @@ mod tests {
         }
     }
 
-    /// The probe's single budget covers headers, body, and the IPv4→unpinned
-    /// fallback (the `[::1]` server rejects the IPv4-pinned attempt first).
+    /// The probe's single budget covers headers and body on either address family.
     #[tokio::test]
-    async fn cache_probe_budget_covers_headers_body_and_ipv6_fallback() {
+    async fn cache_probe_budget_covers_headers_and_body() {
         for addr in ["127.0.0.1:0", "[::1]:0"] {
             for partial_response in [false, true] {
                 let (url, server) = serve(addr, move |mut stream| async move {
