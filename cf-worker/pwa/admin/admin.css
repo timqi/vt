@@ -434,8 +434,8 @@ pre.cmd {
   overflow-x: auto; font-family: var(--mono); font-size: var(--sec);
 }
 
-.hint a, #detail-dl a, .cache-link { color: var(--accent); text-decoration: none; white-space: nowrap; }
-.hint a:hover, #detail-dl a:hover, .cache-link:hover { text-decoration: underline; }
+.hint a, #detail-dl a { color: var(--accent); text-decoration: none; white-space: nowrap; }
+.hint a:hover, #detail-dl a:hover { text-decoration: underline; }
 
 /* ── Reduced motion: opacity only, no movement. ──────────────────────────── */
 @media (prefers-reduced-motion: reduce) {

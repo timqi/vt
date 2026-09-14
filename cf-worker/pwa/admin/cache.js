@@ -14,8 +14,6 @@
 //
 // Countdowns run against the SERVER clock (now_ms from the listing, advanced
 // locally), so a skewed browser clock cannot invent remaining time.
-//
-// `#cache?host=…&project=…` (the audit tab's 查看缓存 link) fills the filter bar.
 
 vt.tabs.cache = function (panel) {
   var $ = function (sel) { return panel.querySelector(sel); };
@@ -80,16 +78,6 @@ vt.tabs.cache = function (panel) {
       if (project && (e.project || '').indexOf(project) === -1) return false;
       return true;
     });
-  }
-
-  // `#cache?host=…&project=…` fills the filter bar; a bare `#cache` leaves it.
-  function applyHash() {
-    var h = location.hash.slice(1).split('?');
-    if (h[0] !== 'cache' || h.length < 2) return;
-    var q = new URLSearchParams(h[1]);
-    $('.f-host').value = q.get('host') || '';
-    $('.f-project').value = q.get('project') || '';
-    render();
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -444,8 +432,6 @@ vt.tabs.cache = function (panel) {
   $('.f-project').addEventListener('input', render);
   // Re-run the note so the multi-day warning appears the moment 1d/2d/1w is picked.
   $('#extend-ttl').addEventListener('change', syncBulkBar);
-  window.addEventListener('hashchange', applyHash);
-  applyHash();
 
   $('#pick-all').addEventListener('change', function () {
     var on = this.checked;

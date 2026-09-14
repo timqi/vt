@@ -223,8 +223,8 @@ Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
   `{token_id, project, salt_b64u}` and the DO re-derives the key in `cacheCtx`
   — and reports `truncated`. A clear of named entries deletes exact keys;
   清除全部 must exhaust the `dek:` prefix; both report actual deletions and
-  fail loudly if incomplete. Revocation happens only on the DEK 缓存 tab: a
-  cache-armed audit row links there (`查看缓存 →`), never clears. The audit
+  fail loudly if incomplete. Revocation happens only on the DEK 缓存 tab; the audit tab has no
+  cache actions. The audit
   table's only deletion is the retention sweep; there is no clear-audit op.
   `audit.cache_ttl_s` stays immutable; only `audit.cache_expires_ms` tracks extension.
   Every multi-key storage `get`/`put`/`delete` is chunked to <= 128 keys.

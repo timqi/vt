@@ -161,9 +161,7 @@ the row's sheet, with IP, TTL and origin approval). The DO filters
 read path and the 5-minute alarm sweep's to delete, so the console never shows
 one and has no 已过期 filter. Extending never changes `created_ms`.
 It is the only view of the real entry set — the audit tab can merely show which
-approvals *armed* a cache, which is an inference, not an inventory; a
-cache-armed audit row links here (`查看缓存 →`, `#cache?host=…&project=…`
-fills the filter bar).
+approvals *armed* a cache, which is an inference, not an inventory.
 
 The listing deliberately carries no secret material: no sealed DEK and **no
 storage key**. The key holds `SHA-256(tag ‖ project)`, so publishing it would
@@ -298,7 +296,7 @@ factory reset also orphans every entry). The cache does not re-key existing
 | PWA TTL selection and sealing | `cf-worker/pwa/approve.js` |
 | CLI cache request, `project` collection, and source check | `src/cf.rs`, `src/client.rs` |
 | Admin cache inventory / 撤销 / 延长 UI | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/cache.js` |
-| Admin audit cache column + 查看缓存 link | `cf-worker/pwa/admin/audit.js` |
+| Admin audit cache column | `cf-worker/pwa/admin/audit.js` |
 | Hit-notify switch, root-key scalar | `cf-worker/src/account_admin.ts` (`Config`, `cacheSeckey`), 设置 tab in `cf-worker/pwa/admin/settings.js` |
 | Record names: table, adopt / rename gates, resolution on read | `cf-worker/src/account_names.ts`, `do_account.ts` (`opApprove`, `opNamesSet`), `account_audit.ts` (`records`), `pwa/admin/admin.js` (`vt.recordList`) |
 | Deployment, secret rotation, reset | [`cf-worker-deploy.md`](cf-worker-deploy.md) |
@@ -313,8 +311,7 @@ factory reset also orphans every entry). The cache does not re-key existing
    ceremony.
 4. Check the admin audit page for the cache grant and hit.
 5. Open the admin `DEK 缓存` tab: the entry appears under its 主机 · 项目
-   header with its remaining time; the approval's audit row shows `查看缓存 →`
-   and lands on the tab filtered to that host and project.
+   header with its remaining time.
 6. Tick the entry (or the header) and pick a duration SHORTER than the time
    remaining: 延长 is disabled and the note names a usable rung — extension is
    absolute, so a shorter rung is a no-op by definition. Pick a longer one,

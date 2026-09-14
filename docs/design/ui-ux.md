@@ -111,9 +111,8 @@ Used on a phone, one hand, under time pressure. Field set and order come from
   TTL and actual expiry.
 - The live indicator has three states, text plus color: `● 实时` `● 同步中`
   `● 已断开`; a live update never disturbs an open dialog's mounted ceremony.
-- A pending row opens its approval inline; every cache-armed row links to the
-  DEK 缓存 tab filtered to its 主机 · 项目 (`查看缓存 →`) — the audit tab
-  revokes nothing.
+- A pending row opens its approval inline; the audit tab has no cache
+  actions — it shows the granted TTL, nothing more.
 
 ## Editing and forms `ported`
 
@@ -176,8 +175,7 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 - 审计: filter bar, list/table (时间 / 状态 / 主机 / 项目 / 记录 / 缓存 / 操作;
   项目 is the directory name, `vt.projectName`, the path in the sheet),
   `加载更多` with `已加载 N 条`, live indicator, detail sheet with inline
-  approval and record rename. DEK 缓存: filter bar (主机 / 项目, filled by
-  `#cache?host=…&project=…`), list/table of live entries (记录 / 剩余 · 到期)
+  approval and record rename. DEK 缓存: filter bar (主机 / 项目), list/table of live entries (记录 / 剩余 · 到期)
   under collapsible `.group-head` rows (主机 · 项目, checkbox selects the
   project), bulk bar (延长 · 撤销), entry sheet, extend sheet. A record name
   is a control (`vt.recordList`): click → input, Enter saves, Escape/blur
@@ -198,7 +196,7 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 | `.badge`, `.badge-*`, `.reason-badge` | `admin.css` |
 | `.glass`, `.switch`, segmented control (`.seg`; its sliding thumb `vt.seg`) | `admin.css`, `common.js` |
 | `.select` (a `span` around every native `<select>`: CSS chevron, ring on the wrapper), `.chip` | `admin.css` |
-| Filter bar, `#bulkbar`, `.row` list + table + `.trunc`/`.cell-*`, `.group-head`, `.cache-link` | `admin.css` |
+| Filter bar, `#bulkbar`, `.row` list + table + `.trunc`/`.cell-*`, `.group-head` | `admin.css` |
 | Row/table switch: `vt.phone`, `vt.onLayout`, `vt.list(wrap)` (`item({cells, row})`, `body`, `clear`, `empty`) | `admin.js` |
 | Detail sheet (`vt.dialog`), hovercard (`vt.hovercard`), `vt.commandSummary`, `vt.api` | `admin.js` |
 | Status line: `vt.statusLine(el)` returns the tab's `setStatus` | `common.js` |

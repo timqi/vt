@@ -101,19 +101,6 @@ vt.tabs.audit = function (panel) {
     var proj = vt.projectName(r.project);
     // 缓存: live → TTL label; armed-but-elapsed → grey 过期; never armed → —.
     var cache = (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) ? (live ? ttlLabel(r.cache_ttl_s) : '过期') : '—';
-    // 操作: every approval that armed a cache links to the DEK 缓存 tab filtered
-    // to its 主机 · 项目 — the only view of the real entry set, and the only place
-    // a cache is revoked. Liveness here is a projection, so the link stays on an
-    // elapsed row too; the cache tab is the truth.
-    var link = null;
-    if (armedCache(r)) {
-      var q = new URLSearchParams();
-      if (r.host) q.set('host', r.host);
-      if (r.project) q.set('project', r.project);
-      link = vt.el('a', 'cache-link', '查看缓存 →');
-      link.href = '#cache?' + q.toString();
-      link.addEventListener('click', function (e) { e.stopPropagation(); });
-    }
     return list.item({
       cls: 'clickable',
       attrs: { id: r.id, 'cache-live': live ? '1' : '0' },
@@ -124,7 +111,7 @@ vt.tabs.audit = function (panel) {
         // Command and IP live in the detail sheet.
         return [cell(fmtTime(r.created_ms)), cell(badge), cellClipped(r.host, 'col-host'),
           cellClipped(proj, 'col-proj'), cellClipped(recs, 'col-rec'),
-          cell(cache, cache === '过期' ? 'cache-expired' : null), cell(link)];
+          cell(cache, cache === '过期' ? 'cache-expired' : null)];
       },
       row: function () {
         // Sub line: the project, then the records; the full path is in the sheet.
@@ -134,7 +121,7 @@ vt.tabs.audit = function (panel) {
           main: r.host || '—',
           sub: [line,
             vt.el('div', null, fmtTime(r.created_ms) + (cache !== '—' ? ' · 缓存 ' + cache : ''))],
-          trail: badge, actions: link ? [link] : [],
+          trail: badge,
         };
       },
     });

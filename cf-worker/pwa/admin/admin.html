@@ -64,7 +64,7 @@
   <main id="console" hidden>
 
     <section class="tab-panel" id="tab-audit" hidden>
-      <p class="hint">每个挑战一行（pending / approved / rejected / expired）。「记录」列显示本次涉及记录的名称（服务端保存；客户端自报的名称标为「自报」，可在详情里点击重命名）。「缓存」列显示该次审批授予的 DEK 缓存时长；「查看缓存 →」跳到 DEK 缓存页并按该主机 · 项目筛选，撤销在那里进行。点击行查看命令、IP 等完整详情。保留 90 天，到期自动删除。</p>
+      <p class="hint">每个挑战一行（pending / approved / rejected / expired）。「记录」列显示本次涉及记录的名称（服务端保存；客户端自报的名称标为「自报」，可在详情里点击重命名）。「缓存」列显示该次审批授予的 DEK 缓存时长；缓存的查看与撤销在「DEK 缓存」页。点击行查看命令、IP 等完整详情。保留 90 天，到期自动删除。</p>
       <section class="filters">
         <label>状态 <span class="select"><select id="f-status">
           <option value="">全部</option>
@@ -77,7 +77,7 @@
         <button id="apply" type="button">查询</button>
       </section>
       <div class="table-wrap"><table id="audit"><thead><tr>
-        <th>时间</th><th>状态</th><th>主机</th><th>项目</th><th>记录</th><th>缓存</th><th>操作</th>
+        <th>时间</th><th>状态</th><th>主机</th><th>项目</th><th>记录</th><th>缓存</th>
       </tr></thead><tbody class="rows"></tbody></table></div>
       <section class="actions">
         <button id="more" type="button">加载更多</button>

@@ -207,3 +207,7 @@ ssh:
     ssh -A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -i .vagrant/machines/default/libvirt/private_key \
       vagrant@192.168.121.242
+
+run-test-cli:
+    docker build -t vt-test .
+    docker run -it --rm --name vt-host -e VT_PASSKEY_URL=https://test-vt.timqi.com -e VT_PASSKEY_TOKEN='vt1.NJN73mOXhMgqLYKt.4XF7zi_8nzjr3EFEJTV97MR9TUHOO6qfN2abAc3jat0' vt-test bash
