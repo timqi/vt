@@ -71,11 +71,12 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 [approval-transparency.md](../approval-transparency.md) §C; this adds presentation.
 
 - One solid card, 420px column at every width. The decision line is first and
-  largest (22px): the operation and the record names (server-owned first; an
+  largest (22px): the operation and the record count (`decrypt · 记录 3 条`);
+  the record names sit directly under it at body size (server-owned first; an
   unnamed record shows the client's claim as `未命名 · 客户端称 X` with an
-  unchecked `采用` box); then `主机（已验证）@用户`
-  and 命令. Everything else sits in a closed `<details>` 详情 (目录, 项目,
-  父进程, IP with 上次, 原因).
+  unchecked `采用` box — a checkbox row cannot be one 22px line); then
+  `主机（已验证）@用户` and 命令. Everything else sits in a closed `<details>`
+  详情 (目录, 项目, 父进程, IP with 上次, 原因).
 - Agent-derived truth lines precede every client-reported line; trust is in
   the label (`主机（已验证）`, `IP（已验证）`) and the footnote under the fields
   names what is client-reported, so a hostile caller pads only its own region.
@@ -84,11 +85,13 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 - The cache scope sentence (`缓存范围（项目）`) sits directly above the duration
   control, a glass segmented control; the first option is `不缓存` and is
   selected by default.
-- `同意` and `拒绝` live in a bottom glass action bar above the safe area:
-  `同意` primary fill at 2fr, `拒绝` muted at 1fr, 50px tall; both disable
-  while a ceremony runs. The card pads its bottom by the bar.
-- One status line (`role="status" aria-live="polite"`) carries progress,
-  success and error; errors name the cause in Chinese and never echo client data.
+- `同意` and `拒绝` live in a bottom glass action bar (`.vt-ap-bar`) above the
+  safe area: `同意` primary fill at 2fr, `拒绝` muted at 1fr, 50px tall; both
+  disable while a ceremony runs. The card pads its bottom by the bar. Inline in
+  the sheet the same bar sticks to the sheet's bottom.
+- One status line (`role="status" aria-live="polite"`) sits in the bar above
+  the buttons, so progress, success and error stay in view while the card
+  scrolls; errors name the cause in Chinese and never echo client data.
 - Every await before `navigator.credentials.get` is resolved at load; iOS
   Safari drops the user gesture at the first real async boundary.
 - A settled decision stays visible ≥ 800ms before the tab or dialog closes.
@@ -169,10 +172,10 @@ Used on a phone, one hand, under time pressure. Field set and order come from
   approval and record rename. DEK 缓存: filter bar, bulk bar, list/table
   (主机 · 项目 / 记录 / 条目 / 剩余 · 到期 / 操作), extend sheet. A record name
   is a control (`vt.recordList`): click → input, Enter saves, Escape/blur
-  cancels. 主机令牌: filter bar, list/table with per-row `吊销`. Passkey: current list,
-  segmented `新增 / 吊销`, `自检`. 设置: session (`退出登录`, `退出所有会话`),
-  hit-notify switch, UV policy JSON, push subscriptions
-  (`开启推送`, per-row test/remove).
+  cancels. 主机令牌: filter bar, list/table with per-row `吊销`. Passkey:
+  current list/table (标签 / 凭据 ID / 注册日期), segmented `新增 / 吊销`,
+  `自检`. 设置: session (`退出登录`, `退出所有会话`), hit-notify switch, UV
+  policy JSON, push subscriptions list/table (`开启推送`, per-row test/remove).
 - A `401` on any admin request returns the shell to the login state with the
   reason on the status line; the console never renders on stale data.
 
@@ -184,8 +187,9 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 | `.hint`, `.warn`, `.card`/`.card-head`, `.field` | `admin.css` |
 | Buttons: primary, `.ghost`, `.danger`, `.small` | `admin.css` |
 | `.badge`, `.badge-*`, `.reason-badge` | `admin.css` |
-| `.glass`, `.switch`, segmented control (`.seg`) | `admin.css` |
+| `.glass`, `.switch`, segmented control (`.seg`; its sliding thumb `vt.seg`) | `admin.css`, `common.js` |
 | Filter bar, `#bulkbar`, `.row` list + table + `.trunc`/`.cell-*` | `admin.css` |
+| Row/table switch: `vt.phone`, `vt.onLayout`, `vt.list(wrap)` (`item({cells, row})`, `body`, `clear`, `empty`) | `admin.js` |
 | Detail sheet (`vt.dialog`), hovercard (`vt.hovercard`), `vt.commandSummary`, `vt.api` | `admin.js` |
 | Status line: `vt.statusLine(el)` returns the tab's `setStatus` | `common.js` |
 | `fmtTime`, `fmtRemaining`, `ttlLabel`, `el` | `common.js` (`vt.*`) |
