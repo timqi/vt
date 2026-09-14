@@ -130,15 +130,12 @@ impl GrantScope {
         let Some(subject) = subject else {
             return Self::fresh(Operation::Sign);
         };
-        let mut h = Sha256::new();
-        h.update(b"vt-authorization-sign-v1");
-        hash_field(&mut h, fingerprint.as_bytes());
-        hash_field(&mut h, pwd.as_bytes());
-        Self::reusable(
+        Self::hashed(
             Operation::Sign,
             ScopeFamily::Connection,
             subject,
-            h.finalize().into(),
+            b"vt-authorization-sign-v1",
+            &[Field(fingerprint.as_bytes()), Field(pwd.as_bytes())],
         )
     }
 
@@ -147,15 +144,12 @@ impl GrantScope {
     /// exact wire-encoded `KeyData` bytes of the destination host key —
     /// string fingerprints are display-only and never hashed here.
     pub fn sign_destination(hostkey_wire: &[u8], fingerprint: &str) -> Self {
-        let mut h = Sha256::new();
-        h.update(b"vt-authz-sign-dest-v1");
-        hash_field(&mut h, hostkey_wire);
-        hash_field(&mut h, fingerprint.as_bytes());
-        Self::reusable(
+        Self::hashed(
             Operation::Sign,
             ScopeFamily::Destination,
             DESTINATION_SUBJECT,
-            h.finalize().into(),
+            b"vt-authz-sign-dest-v1",
+            &[Field(hostkey_wire), Field(fingerprint.as_bytes())],
         )
     }
 
@@ -167,15 +161,12 @@ impl GrantScope {
     /// workspace always has a subject, so unlike the relay constructors
     /// there is no `Option` fallback.
     pub fn sign_workspace(subject: SubjectId, root_path: &str, fingerprint: &str) -> Self {
-        let mut h = Sha256::new();
-        h.update(b"vt-authz-sign-ws-v1");
-        hash_field(&mut h, root_path.as_bytes());
-        hash_field(&mut h, fingerprint.as_bytes());
-        Self::reusable(
+        Self::hashed(
             Operation::Sign,
             ScopeFamily::Workspace,
             subject,
-            h.finalize().into(),
+            b"vt-authz-sign-ws-v1",
+            &[Field(root_path.as_bytes()), Field(fingerprint.as_bytes())],
         )
     }
 
@@ -185,15 +176,12 @@ impl GrantScope {
     /// a distinct digest domain: a directory that later gains a `.git` must
     /// start a new grant family, never silently continue this one.
     pub fn sign_cwd(subject: SubjectId, root_path: &str, fingerprint: &str) -> Self {
-        let mut h = Sha256::new();
-        h.update(b"vt-authz-sign-cwd-v1");
-        hash_field(&mut h, root_path.as_bytes());
-        hash_field(&mut h, fingerprint.as_bytes());
-        Self::reusable(
+        Self::hashed(
             Operation::Sign,
             ScopeFamily::CwdFallback,
             subject,
-            h.finalize().into(),
+            b"vt-authz-sign-cwd-v1",
+            &[Field(root_path.as_bytes()), Field(fingerprint.as_bytes())],
         )
     }
 
@@ -205,16 +193,12 @@ impl GrantScope {
         secret_type: u8,
         salt: &[u8],
     ) -> Self {
-        let mut h = Sha256::new();
-        h.update(b"vt-authz-decrypt-ws-v1");
-        hash_field(&mut h, root_path.as_bytes());
-        h.update([secret_type]);
-        hash_field(&mut h, salt);
-        Self::reusable(
+        Self::hashed(
             Operation::Decrypt,
             ScopeFamily::Workspace,
             subject,
-            h.finalize().into(),
+            b"vt-authz-decrypt-ws-v1",
+            &[Field(root_path.as_bytes()), Tag(secret_type), Field(salt)],
         )
     }
 
@@ -226,45 +210,34 @@ impl GrantScope {
     /// the parent's kernel-verified executable path, never the
     /// client-claimed `ppid_cmd`.
     pub fn sign_app(subject: SubjectId, parent_exe: &str, fingerprint: &str) -> Self {
-        let mut h = Sha256::new();
-        h.update(b"vt-authz-sign-app-v1");
-        hash_field(&mut h, parent_exe.as_bytes());
-        hash_field(&mut h, fingerprint.as_bytes());
-        Self::reusable(
+        Self::hashed(
             Operation::Sign,
             ScopeFamily::ParentApp,
             subject,
-            h.finalize().into(),
+            b"vt-authz-sign-app-v1",
+            &[Field(parent_exe.as_bytes()), Field(fingerprint.as_bytes())],
         )
     }
 
     /// Parent-app decrypt scope. Same rules as [`Self::sign_app`].
     pub fn decrypt_app(subject: SubjectId, parent_exe: &str, secret_type: u8, salt: &[u8]) -> Self {
-        let mut h = Sha256::new();
-        h.update(b"vt-authz-decrypt-app-v1");
-        hash_field(&mut h, parent_exe.as_bytes());
-        h.update([secret_type]);
-        hash_field(&mut h, salt);
-        Self::reusable(
+        Self::hashed(
             Operation::Decrypt,
             ScopeFamily::ParentApp,
             subject,
-            h.finalize().into(),
+            b"vt-authz-decrypt-app-v1",
+            &[Field(parent_exe.as_bytes()), Tag(secret_type), Field(salt)],
         )
     }
 
     /// Cwd-fallback decrypt scope. Same rules as [`Self::sign_cwd`].
     pub fn decrypt_cwd(subject: SubjectId, root_path: &str, secret_type: u8, salt: &[u8]) -> Self {
-        let mut h = Sha256::new();
-        h.update(b"vt-authz-decrypt-cwd-v1");
-        hash_field(&mut h, root_path.as_bytes());
-        h.update([secret_type]);
-        hash_field(&mut h, salt);
-        Self::reusable(
+        Self::hashed(
             Operation::Decrypt,
             ScopeFamily::CwdFallback,
             subject,
-            h.finalize().into(),
+            b"vt-authz-decrypt-cwd-v1",
+            &[Field(root_path.as_bytes()), Tag(secret_type), Field(salt)],
         )
     }
 
@@ -280,18 +253,43 @@ impl GrantScope {
         let Some(subject) = subject else {
             return Self::fresh(Operation::Decrypt);
         };
-        let mut h = Sha256::new();
-        h.update(b"vt-authorization-decrypt-v1");
-        h.update([secret_type]);
-        hash_field(&mut h, salt);
-        hash_field(&mut h, host.as_bytes());
-        hash_field(&mut h, pwd.as_bytes());
-        Self::reusable(
+        Self::hashed(
             Operation::Decrypt,
             ScopeFamily::Connection,
             subject,
-            h.finalize().into(),
+            b"vt-authorization-decrypt-v1",
+            &[
+                Tag(secret_type),
+                Field(salt),
+                Field(host.as_bytes()),
+                Field(pwd.as_bytes()),
+            ],
         )
+    }
+
+    /// The one digest encoder behind every reusable scope: `label` is the
+    /// family's domain separator, `parts` the resource fields in wire order.
+    /// The subject is not hashed — it is a separate key component, so the
+    /// same resource under two callers is two grants.
+    fn hashed(
+        operation: Operation,
+        family: ScopeFamily,
+        subject: SubjectId,
+        label: &[u8],
+        parts: &[Part<'_>],
+    ) -> Self {
+        let mut h = Sha256::new();
+        h.update(label);
+        for part in parts {
+            match part {
+                Tag(byte) => h.update([*byte]),
+                Field(value) => {
+                    h.update((value.len() as u64).to_le_bytes());
+                    h.update(value);
+                }
+            }
+        }
+        Self::reusable(operation, family, subject, h.finalize().into())
     }
 
     fn reusable(
@@ -328,10 +326,14 @@ impl GrantScope {
     }
 }
 
-fn hash_field(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update((value.len() as u64).to_le_bytes());
-    hasher.update(value);
+/// One digest input. `Field` is length-prefixed so adjacent variable-width
+/// inputs cannot shift into each other; `Tag` is the record's fixed-width
+/// `secret_type` byte, which has no prefix on the wire.
+enum Part<'a> {
+    Tag(u8),
+    Field(&'a [u8]),
 }
+use Part::{Field, Tag};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReusePolicy {
