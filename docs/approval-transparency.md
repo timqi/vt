@@ -164,11 +164,13 @@ Worker side (`cf-worker`):
   owns (adopted or typed on the console, keyed by the record's salt) is a
   **truth line** — the Worker resolved it from its own table, the client
   cannot influence it — and precedes every unnamed record. A record with no
-  owned name shows the client's suggestion labeled for what it is,
-  `未命名 · 客户端称 GH_TOKEN`, with an unchecked `采用` box: the label is
-  client-claimed until the approver adopts it, and the adoption itself
-  rides on the verified assertion (`adopt_names`), so a hostile client can
-  propose a misleading name but never make the page state it as fact. The
+  owned name shows an empty name input (`记录名`) and, when the client sent
+  a suggestion, a chip labeled for what it is, `客户端称 GH_TOKEN`, that
+  fills the input on one tap: the label is client-claimed until the approver
+  keeps it, and the name — kept or typed — rides on the verified assertion
+  (`adopt_names: [{index, name}]`, read at the 同意 tap), so a hostile
+  client can propose a misleading name but never make the page state it as
+  fact. Named records are read-only on the page; rename lives in admin. The
   same rule holds on the audit table, the DEK 缓存 tab and the cache-hit
   push: owned name, else `X（自报）`, else `未命名`. The footnote says
   `记录名由服务端保存`.

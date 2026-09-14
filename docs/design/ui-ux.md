@@ -72,9 +72,11 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 
 - One solid card, 420px column at every width. The decision line is first and
   largest (22px): the operation and the record count (`decrypt · 记录 3 条`);
-  the record names sit directly under it at body size (server-owned first; an
-  unnamed record shows the client's claim as `未命名 · 客户端称 X` with an
-  unchecked `采用` box — a checkbox row cannot be one 22px line); then
+  the record names sit directly under it at body size (server-owned first,
+  read-only; an unnamed record is a 44px name input `.vt-ap-name` (`记录名`,
+  40 chars) beside a `.chip` `客户端称 X` that fills it in one tap; inputs are
+  read at the 同意 tap, so they never sit between the gesture and the
+  ceremony); then
   `主机（已验证）@用户` and 命令. Everything else sits in a closed `<details>`
   详情 (目录, 项目, 父进程, IP with 上次, 原因).
 - Agent-derived truth lines precede every client-reported line; trust is in

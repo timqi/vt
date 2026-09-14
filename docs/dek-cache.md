@@ -49,9 +49,13 @@ TTL, a caller can decrypt the approved records without another phone tap.
   unknown — `inject` sends the env var name or the file's basename, `vt read`
   of a bare URL sends `""`) on challenge and dek-cache requests; the edge
   refuses a miscounted or oversize array (400). A suggestion is shown as
-  自报 and stored only when the approver ticks 采用 on the approval page
-  (`adopt_names`, written with `source='client'` after the assertion
-  verifies, never over an owned name) or the console renames the record
+  自报; an unnamed record gets a name input on the approval page, the
+  suggestion a one-tap chip that fills it. Non-empty inputs post with the
+  approval as `adopt_names: [{index, name}]` (≤ 40 chars, control characters
+  stripped; an out-of-range, duplicate or oversize entry is a 400 and nothing
+  is stored) and are written after the assertion verifies, never over an
+  owned name, `source='client'` when the name equals the suggestion, else
+  `'manual'`; or the console renames the record
   (`PUT /api/admin/names {salt_b64u, name}`, session-gated, `""` deletes,
   `source='manual'`). Audit rows store `[salt, claimed]` pairs and resolve
   them on every read, so a rename retitles history; cache entries keep the
@@ -283,8 +287,8 @@ factory reset also orphans every entry). The cache does not re-key existing
 ## Verification
 
 1. Deploy and bootstrap a Worker.
-2. Read a `vt://` record and select `20m` on the approval page; tick 采用 on
-   its 自报 name (or rename it later from the audit dialog).
+2. Read a `vt://` record and select `20m` on the approval page; tap its
+   `客户端称 X` chip or type a name (or rename it later from the audit dialog).
 3. Read the same record again from the same host inside the same repository
    (any worktree, any egress IP); the second read should not open a phone
    ceremony.
