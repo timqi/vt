@@ -93,8 +93,7 @@ fn encode_ssh_keys_into(
 /// The cipher over the SSH-keys blob: the master key unwrapped through the
 /// store's own passcode. Callers drop it as soon as the blob is handled.
 fn ssh_keys_cipher(store: &KeychainStore) -> Result<AesGcmCrypto> {
-    let (mac_cipher, _mac_key) = load_mac_cipher(store, &derive_passcode_cipher(store)?)?;
-    Ok(mac_cipher)
+    load_mac_cipher(store, &derive_passcode_cipher(store)?)
 }
 
 /// Decrypt the SSH keys of a loaded store; empty when none were stored.

@@ -17,10 +17,12 @@ with its approve/extend ladders and admin.
 
 | Leaves | Files | Operator step |
 | --- | --- | --- |
-| Keychain wrap v1 | `derive_passphrase_secret` (v1), `upgrade_wrap_v2_if_needed`, `secret rebind --to-v1`, the now-unused AES `mac_cipher` returned by `load_mac_cipher` | `vt secret rebind` stays one release for v1 stores, then goes with wrap v1 |
+| Keychain wrap v1 | `derive_passphrase_secret` (v1), `upgrade_wrap_v2_if_needed`, `secret rebind --to-v1` | `vt secret rebind` stays one release for v1 stores, then goes with wrap v1 |
 | Audit SQLite rebuilds | `account_audit.ts`: the `DROP TABLE audit` for the per-event table of an early build and `DROP TABLE IF EXISTS cache_audit`, with their comments | none; one deploy after this release has run on every account |
 
-Landed: the audit-ingest master key (hostname-salted HKDF in `src/audit.rs`,
+Landed: `load_mac_cipher` returns the SSH-store cipher alone and the DEK
+handlers call `load_mac_key`; the tuple that made each caller discard half
+is gone. The audit-ingest master key (hostname-salted HKDF in `src/audit.rs`,
 the `--audit-key` master form, the `/api/audit-ingest` master verifier) went
 with worker-slim.md step 5 — the Worker's secret is a KEK now, so there was
 nothing left to derive from; `--audit-key` is the Mac's host token only.

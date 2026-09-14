@@ -500,15 +500,12 @@ pub fn create_and_save_passcode_passphrase(real_passphrase: &[u8; 32]) -> Result
     Ok(())
 }
 
-/// Decrypt the master passphrase from the store and build the mac_cipher.
-/// The passphrase cipher is supplied separately so callers can hold it
-/// long-term (serve) without keeping the decrypted master key in memory.
-///
-/// Returns both the cipher (SSH key store) and the raw 32-byte master
-/// key (needed as HKDF IKM for v2 envelope DEK derivation). The raw key is
-/// returned in a `Zeroizing` wrapper so it is wiped from memory on drop;
-/// callers should drop it as soon as derivation is complete.
-fn load_mac_key(
+/// Decrypt the raw 32-byte master key from the store: the HKDF IKM for v2
+/// envelope DEK derivation. The passphrase cipher is supplied separately so
+/// callers can hold it long-term (serve) without keeping the decrypted
+/// master key in memory; the key comes back `Zeroizing` and callers drop it
+/// as soon as derivation is complete.
+pub(super) fn load_mac_key(
     store: &super::store::KeychainStore,
     passphrase_cipher: &AesGcmCrypto,
 ) -> Result<Zeroizing<[u8; 32]>> {
@@ -530,13 +527,13 @@ pub(crate) fn validate_mac_key_material(
     Ok(())
 }
 
+/// The master key as the AES-GCM cipher over the SSH-keys blob.
 pub fn load_mac_cipher(
     store: &super::store::KeychainStore,
     passphrase_cipher: &AesGcmCrypto,
-) -> Result<(AesGcmCrypto, Zeroizing<[u8; 32]>)> {
+) -> Result<AesGcmCrypto> {
     let key = load_mac_key(store, passphrase_cipher)?;
-    let cipher = AesGcmCrypto::new(&key)?;
-    Ok((cipher, key))
+    AesGcmCrypto::new(&key)
 }
 
 /// Derive the passphrase cipher from the passcode bytes inside an

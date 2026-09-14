@@ -10,7 +10,7 @@ use ssh_agent_lib::proto::{Extension, Unparsed};
 use ssh_key::public::KeyData;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::super::security::{load_mac_cipher, validate_mac_key_material};
+use super::super::security::{load_mac_key, validate_mac_key_material};
 use super::super::store::KeychainStore;
 use super::scopes::append_reuse_line;
 use super::{
@@ -114,7 +114,7 @@ impl VtSshSession {
         if req.types.len() > MAX_CRYPTO_BATCH {
             return Err((ErrKind::BadRequest, Some(DETAIL_BATCH_TOO_LARGE)));
         }
-        let (_mac_cipher, mac_key) = load_mac_cipher(store, passphrase_cipher)
+        let mac_key = load_mac_key(store, passphrase_cipher)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
         let mut result: Vec<EncryptResItem> = Vec::with_capacity(req.types.len());
         for _t in &req.types {
@@ -271,7 +271,7 @@ impl VtSshSession {
                 return Err(authorization_failure_wire(&failure));
             }
         };
-        let (_mac_cipher, mac_key) = load_mac_cipher(store, passphrase_cipher)
+        let mac_key = load_mac_key(store, passphrase_cipher)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
         let mut result: Vec<DecryptResItem> = Vec::with_capacity(req.items.len());
         for DecryptInput::V2 { salt, .. } in req.items {
