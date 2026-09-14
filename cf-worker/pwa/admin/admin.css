@@ -379,13 +379,22 @@ dd.vt-ap-pair { font-size: 28px; font-weight: 700; letter-spacing: 2px; }
 /* Collapsed request details (目录 / 项目 / 父进程 / IP / 原因). */
 .vt-ap-details { margin-top: 8px; border-top: 1px solid var(--border); }
 .vt-ap-details > summary { cursor: pointer; color: var(--muted); font-size: var(--sec); padding: 12px 0; list-style-position: inside; }
-/* Record lines: owned names bold, unnamed muted with the client's claim in code. */
+/* Record lines: owned names bold and read-only; an unnamed record is a name
+   input beside the chip that fills it with the client's claim. */
 .vt-ap-records { list-style: none; margin: 0 0 10px; padding: 0; }
-.vt-ap-records li { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 2px 0; }
+.vt-ap-records li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 0; }
+/* A hairline between records keeps a wrapped chip with its own input. */
+.vt-ap-records li + li { border-top: 1px solid var(--border); }
 .vt-ap-records .rec-text { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-size: var(--body); }
 .vt-ap-records .muted { color: var(--muted); font-size: var(--sec); }
-.vt-ap-adopt { flex-direction: row; align-items: center; gap: 4px; margin: 0; min-height: 44px; cursor: pointer; color: var(--fg); font-size: var(--sec); }
-.vt-ap-adopt input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
+.vt-ap-name { flex: 1 1 140px; min-width: 0; height: 44px; padding: 0 12px; font-size: var(--sec); }
+/* Chip: a pill the size of a control, the lighter layer, text as data. */
+.chip {
+  min-height: 44px; margin: 0; padding: 8px 14px; border-radius: 999px; max-width: 100%;
+  background: var(--panel-2); color: var(--fg); border: 1px solid var(--hairline);
+  font-size: var(--sec); font-weight: 500; text-align: left; overflow-wrap: anywhere;
+}
+.chip:hover { opacity: 1; background: var(--tint); }
 .vt-ap-cache-section { margin: 18px 0 0; }
 .vt-ap-cache-section .cache-warn { margin: 0 0 8px; font-size: var(--cap); color: var(--muted); }
 .vt-ap-cache-section .cache-warn strong { color: var(--err); }

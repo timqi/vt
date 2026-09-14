@@ -122,43 +122,56 @@
         var refs = buildUi(root, showMeta);
         var setStatus = vt.statusLine(refs.status);
 
-        // The 采用 checkboxes: index into salts_b64u of each suggestion the
-        // approver adopts; posted with the approval, written only after it verifies.
-        var adoptBoxes = [];
+        // Name inputs of the unnamed records, keyed by index into salts_b64u.
+        // Read at the 同意 tap (no await in between) and posted with the
+        // approval; the Worker writes them only after the assertion verifies.
+        var nameInputs = [];
 
         // One line per record. Server-owned names are truth lines and come
-        // first; an unnamed record shows the client's claim labeled as such,
-        // with the opt-in 采用 box (omitted when the client sent nothing).
+        // first, read-only (rename lives in admin); an unnamed record gets a
+        // name input and, when the client sent a claim, a chip labeled as the
+        // client's that fills the input in one tap.
         function renderRecords(records) {
             var ul = el('ul', 'vt-ap-records');
             var named = records.filter(function (r) { return r.name; });
             var unnamed = records.filter(function (r) { return !r.name; });
             named.concat(unnamed).forEach(function (r) {
                 var li = document.createElement('li');
-                var text = el('span', 'rec-text');
-                li.appendChild(text);
                 if (r.name) {
+                    var text = el('span', 'rec-text');
                     text.appendChild(el('strong', null, r.name));
                     if (r.claimed && r.claimed !== r.name) {
                         text.appendChild(el('span', 'muted', '（客户端称 ' + r.claimed + '）'));
                     }
+                    li.appendChild(text);
                 } else {
-                    text.appendChild(el('span', 'muted', r.claimed ? '未命名 · 客户端称 ' : '未命名'));
+                    var input = document.createElement('input');
+                    input.type = 'text';
+                    input.className = 'vt-ap-name';
+                    input.placeholder = '记录名';
+                    input.maxLength = 40;
+                    input.autocomplete = 'off';
+                    input.setAttribute('aria-label', '记录名');
+                    input.setAttribute('data-index', String(records.indexOf(r)));
+                    li.appendChild(input);
                     if (r.claimed) {
-                        text.appendChild(el('code', null, r.claimed));
-                        var adopt = el('label', 'vt-ap-adopt');
-                        var box = document.createElement('input');
-                        box.type = 'checkbox';
-                        box.setAttribute('data-index', String(records.indexOf(r)));
-                        adopt.appendChild(box);
-                        adopt.appendChild(el('span', null, '采用'));
-                        li.appendChild(adopt);
-                        adoptBoxes.push(box);
+                        var chip = el('button', 'chip', '客户端称 ' + r.claimed);
+                        chip.type = 'button';
+                        chip.addEventListener('click', function () { input.value = r.claimed; });
+                        li.appendChild(chip);
                     }
+                    nameInputs.push(input);
                 }
                 ul.appendChild(li);
             });
             return ul;
+        }
+
+        // `[{index, name}]` for every non-empty input, in salt order.
+        function typedNames() {
+            return nameInputs.map(function (i) {
+                return { index: parseInt(i.getAttribute('data-index'), 10), name: i.value.trim() };
+            }).filter(function (n) { return n.name; });
         }
 
         function addRow(dl, label, value) {
@@ -263,6 +276,9 @@
             var pwaSk = null, shared = null, bindingKey = null;
             try {
                 setStatus('请触摸 Passkey 完成验证…');
+                // Read before the ceremony: the inputs are what the approver saw
+                // when they tapped 同意, not whatever a later edit made of them.
+                var adoptNames = typedNames();
 
                 var PRF_INPUT = await prfInputReady;
                 await sodiumReady;
@@ -394,8 +410,7 @@
                         binding_tag_b64u: b64uEnc(bindingTag),
                         cache_ttl_s: cacheTtlS,
                         cache_sealed_deks_b64u: cacheSealed,
-                        adopt_names: adoptBoxes.filter(function (b) { return b.checked; })
-                            .map(function (b) { return parseInt(b.getAttribute('data-index'), 10); }),
+                        adopt_names: adoptNames,
                     }),
                 });
                 if (!resp.ok) throw new Error('提交失败（HTTP ' + resp.status + '）');
