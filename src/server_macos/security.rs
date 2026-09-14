@@ -239,13 +239,11 @@ pub enum EvalOutcome {
     /// Policy evaluation succeeded.
     Success,
     /// User actively declined (UserCancel, AuthenticationFailed, AppCancel,
-    /// UserFallback, InvalidContext). Terminal — no fallback per commit
-    /// `1d9d5d1`.
+    /// UserFallback, InvalidContext). Terminal — never falls back to the
+    /// password.
     Rejected,
     /// Biometry was attempted but is locked/unavailable/not-enrolled, or the
     /// device has no passcode. Caller should fall back to the system password.
-    /// This is the fallback path the objc2 refactor unlocks — previously these
-    /// were indistinguishable from Rejected.
     TryFallback,
     /// System couldn't display dialog (NotInteractive, SystemCancel, etc.).
     /// Caller should return `Unavailable`.
@@ -380,13 +378,11 @@ mod la {
 /// either case (physical-presence model).
 ///
 /// **Touch ID** (when `canEvaluatePolicy` for biometrics succeeds): success
-/// → `Biometric`. `EvalOutcome::Rejected` is terminal (per commit `1d9d5d1`)
-/// after a session re-check disambiguates "user rejected" from "screen
-/// locked mid-prompt". `EvalOutcome::TryFallback` (Lockout / NotAvailable /
-/// NotEnrolled / PasscodeNotSet) **falls through to the system password**
-/// (`DeviceOwnerAuthentication` policy) — behavior unlocked by the objc2
-/// refactor; previously these errors were indistinguishable from a user
-/// rejection.
+/// → `Biometric`. `EvalOutcome::Rejected` is terminal after a session
+/// re-check disambiguates "user rejected" from "screen locked mid-prompt".
+/// `EvalOutcome::TryFallback` (Lockout / NotAvailable / NotEnrolled /
+/// PasscodeNotSet) **falls through to the system password**
+/// (`DeviceOwnerAuthentication` policy).
 pub fn authenticate(reason: &str) -> AuthOutcome {
     // Pre-check: screen lock state. Cached for 1s to bound CPU under spammy
     // callers (locked-screen + tight-loop client = naturally O(1)).
@@ -787,9 +783,8 @@ mod tests {
 
     #[test]
     fn classify_la_biometry_lockout_is_try_fallback() {
-        // -8: 3 failures triggered system lockout. THIS is the case the
-        // objc2 refactor unlocks — previously indistinguishable from
-        // AuthenticationFailed and treated as terminal Rejected.
+        // -8: 3 failures triggered system lockout — must not be treated as
+        // a terminal Rejected.
         assert_eq!(classify_la_error(-8), EvalOutcome::TryFallback);
     }
 

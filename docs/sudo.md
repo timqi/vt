@@ -93,12 +93,12 @@ password prompt.
   `setup-pam.sh`. A stale copy keeps working until it no longer matches the
   Worker protocol, at which point sudo falls back to the password stack.
 - `VT_PASSKEY_TOKEN` is that host's own token from `vt enroll`, revocable on the
-  admin tokens tab. Theft can create approval requests and probe an enabled DEK
-  cache from the same IP context, but it cannot decrypt without a phone
-  approval or matching cache grant. Prefer a small set of bastion hosts for the
+  admin tokens tab. Theft can create approval requests and probe the DEK
+  cache for entries this host's token already holds, but it cannot decrypt
+  without a phone approval or a live cache entry. Prefer a small set of bastion hosts for the
   Worker path.
 - `pam_exec` often exposes stderr but not stdout. The Worker URL is emitted on
-  stderr; subscribe the phone to Web Push on the admin 推送 tab if terminal
+  stderr; subscribe the phone to Web Push on the admin 设置 tab if terminal
   feedback is not reliable in your PAM environment.
 - `auth@vt` is never cached. An approval always requires Touch ID or a phone
   Passkey ceremony.
@@ -111,8 +111,8 @@ password prompt.
   client-claimed line after the agent's own truth lines (Touch ID shows 100
   characters, the agent rejects a reason above 8 KiB). Never treat it as an
   authorization fact.
-- That command line is also pushed to notification channels and stored in
-  worker audit rows. The helper blanks `VAR=value` assignments
+- That command line is also pushed to the phone and stored in worker audit
+  rows. The helper blanks `VAR=value` assignments
   (`sudo TOKEN=… cmd`), but a secret passed as a plain argument (`-pSECRET`)
   is still displayed and retained. On a host where that is unacceptable, drop
   the `${SUDO_CMD…}` part of the `--reason` string in

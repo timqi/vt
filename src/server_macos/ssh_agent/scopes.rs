@@ -67,12 +67,11 @@ impl PeerIdentity {
     }
 }
 
-// --- Peer classification (activity scopes V2) --------------------------------
+// --- Peer classification (activity scopes) -----------------------------------
 //
-// The caller-topology cache modes are gone. Grants are keyed by activity:
-// raw SSH signs by session-bind-verified destination (BindState, below),
-// local vt peers by kernel-derived workspace, relay peers per connection.
-// See docs/authorization-scopes-v2.md.
+// Grants are keyed by activity: raw SSH signs by session-bind-verified
+// destination (BindState, below), local vt peers by kernel-derived workspace,
+// relay peers per connection. See docs/authorization-scopes-v2.md.
 
 /// A workspace the peer is operating in: the nearest `.git`-containing
 /// ancestor of its kernel-derived cwd. `subject` is the root directory's

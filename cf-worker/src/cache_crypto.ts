@@ -21,7 +21,7 @@
 // the opened plaintext DEKs live in the Worker process for the duration of a
 // cache op. This layer protects only against a raw DO-storage dump (entries
 // are sealed to the cache public key); it does NOT protect against Worker
-// compromise. See docs/dek-cache.md §2/§3.
+// compromise. See docs/dek-cache.md (Security boundary).
 
 import nacl from 'tweetnacl';
 import { blake2b } from 'blakejs';

@@ -47,8 +47,8 @@ pub struct AgentAuditContext {
 }
 
 /// One agent-side audit record. Serialized as the `entry` field of the ingest
-/// body. `meta` carries the full [`ChallengeMeta`] wire shape (all 11 fields)
-/// so the Worker's `capChallengeMeta` sanitizer has everything it expects;
+/// body. `meta` carries the full [`ChallengeMeta`] wire shape so the
+/// Worker's `capChallengeMeta` sanitizer has everything it expects;
 /// the scalar siblings carry the audit-specific data. `meta.op_kind` and the
 /// sibling `op_kind` hold the same value.
 #[derive(Serialize)]

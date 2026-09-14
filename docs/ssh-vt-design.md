@@ -60,7 +60,7 @@ Backend pins and explicit refusal behavior apply to both paths; do not infer
 unconditional Worker fallback or one approval per signature. See
 [sign-vt-design.md](sign-vt-design.md#4-fallback-contract-and-security-differences).
 
-## 11. Forwarded relay: `vt ssh connect --forward-real-agent`
+## Forwarded relay: `vt ssh connect --forward-real-agent`
 
 Off by default. The flag must precede SSH arguments. It enables a filtering
 extension relay through the ephemeral socket and pins the child's

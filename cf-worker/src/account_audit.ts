@@ -112,7 +112,7 @@ export class AccountAudit {
     // of this branch — its events now live in the unified audit table.
     this.sql.exec(`DROP TABLE IF EXISTS cache_audit`);
     // idx_audit_created serves the retention DELETE (created_ms range); the
-    // /<ADMIN_SEG>/api/audit cursor query uses the implicit primary-key (id) index.
+    // /api/admin/audit cursor query uses the implicit primary-key (id) index.
     this.sql.exec(
       `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit(created_ms)`,
     );

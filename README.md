@@ -211,7 +211,7 @@ eval $(vt ssh agent --ssh-auth-cache-duration 28800 --decrypt-auth-cache-duratio
 export SSH_AUTH_SOCK=~/.ssh/vt.sock
 
 # Now ssh/git commands use vt for authentication
-# Touch ID prompt shows the calling process name (e.g., "SSH sign: key (SHA256:...) by ssh")
+# The Touch ID prompt names the key and the verified destination (OpenSSH >= 8.9)
 ssh git@github.com
 git push origin main
 

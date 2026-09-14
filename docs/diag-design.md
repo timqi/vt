@@ -1,8 +1,7 @@
 # `diag@vt` + `vt doctor` — cache/routing observability
 
-Status: implemented (codex-expert review round folded in; this file is the
-feature's decision record — verify current behavior against `src/client.rs`
-`doctor` and `src/server_macos/ssh_agent.rs` `handle_diag`)
+Status: implemented. Verify current behavior against `src/client/doctor.rs`
+and `src/server_macos/ssh_agent/handlers.rs` (`handle_diag`).
 
 ## 1. Problem
 
@@ -14,7 +13,7 @@ Each rule is individually justified, but the composition is opaque to the
 operator: the observable symptom is just "Touch ID prompted again" or "the
 phone buzzed", and diagnosing *why* otherwise requires reading the
 classification helpers (`sign_basis` / `decrypt_basis`) in
-`src/server_macos/ssh_agent.rs`.
+`src/server_macos/ssh_agent/scopes.rs`.
 
 ## 2. Goal
 
@@ -75,38 +74,33 @@ contexts at `new_session`; the handler reports those plus the *basis* for the
 resolution (§3.2) and counts live entries through
 `AuthorizationEngine::live_len(operation, subject)`. The unified grant store
 uses **both clocks**, the same dual-clock validity predicate as authorization
-lookup (review R3), and filters by typed operation plus the caller's subject.
+lookup, and filters by typed operation plus the caller's subject.
 
-Two hard rules from review:
+Two hard rules:
 
-- **`diag@vt` skips `touch_activity()`** (review R1). `extension()` currently
-  resets the idle clock before dispatch; a pollable no-Touch-ID extension must
-  not keep the agent "active" forever and defeat the idle-timeout cache flush
-  and key clear.
+- **`diag@vt` skips `touch_activity()`.** `extension()` resets the idle clock
+  before dispatch; a pollable no-Touch-ID extension must not keep the agent
+  "active" forever and defeat the idle-timeout cache flush and key clear.
 - **`live_entries` counts only grants the caller's own scope classification
-  could reuse** (review R2), never a global count. A relayed remote (or an
+  could reuse**, never a global count. A relayed remote (or an
   uncacheable local caller) must not learn how many grants other scopes on
   the Mac hold. A basis that never caches → `live_entries = 0`; a
   destination-bound (`session-bind`) caller counts the user-wide destination
   grants because those ARE the grants its own requests would hit.
 
-### 3.2 Basis reporting (activity scopes V2)
+### 3.2 Basis reporting
 
-> The original design described the caller-topology classifier
-> (`resolve_cache_context`, modes, TTY gate). That machinery was replaced by
-> activity scopes — see
-> [`authorization-scopes-v2.md`](authorization-scopes-v2.md). This section
-> describes the current basis surface.
-
-`ContextBasis` still lives in core.rs so the agent's wire tags and the CLI's
-human sentences are one compile-checked mapping. The V2 variants name how the
-connection is scope-classified:
+`ContextBasis` lives in core.rs so the agent's wire tags and the CLI's human
+sentences are one compile-checked mapping
+([`authorization-scopes-v2.md`](authorization-scopes-v2.md) owns the
+classification). The variants name how the connection is scope-classified:
 
 ```rust
 enum ContextBasis {
     Disabled,        // duration 0 (the default): every request prompts
     NoPeerPid,       // peer PID unavailable → Fresh
     RelayConnection, // grants confined to this relay connection
+    SshConnection,   // plain ssh peer (possibly `ssh -A`): vt extensions confined to this connection
     SessionBind,     // sign: destination proven by session-bind@openssh.com
     Forwarding,      // sign: bound connection carries forwarded traffic → Fresh
     Tainted,         // sign: a session-bind failed verification → Fresh
@@ -171,7 +165,7 @@ Sections, in order; never hard-fails — reports and lints:
    unauthenticated commands from running.
 3. **Agent** — socket path used (`$SSH_AUTH_SOCK` vs `~/.ssh/vt.sock`),
    connectable?, then `diag@vt` via a **dedicated helper** (not the generic
-   `try_agent_extension` contract — review R4, the two failure shapes are
+   `try_agent_extension` contract — the two failure shapes are
    distinguishable on the wire and must be reported separately):
    - `Ok(Some(payload))` → print DiagRes (modes, TTLs, live entries, peer
      classification, cacheable + human reason per cache);
@@ -184,27 +178,3 @@ Sections, in order; never hard-fails — reports and lints:
    no token validation in v1), token present/absent.
 
 Exit code 0 always in v1 (diagnostic, not a health gate).
-
-## 5. Testing
-
-- Pure: `ContextBasis` mapping unit tests (all branches of the
-  `sign_basis`/`decrypt_basis` classifiers, asserted by the scope
-  classification tests); DiagReq/DiagRes serde round-trip; basis→human-string
-  mapping total.
-- `route_extension` test updated for `diag@vt`.
-- macOS handler compiles only under `cfg(target_os = "macos")` — verified by
-  CI (macos-latest), not locally on Linux.
-
-## 6. Files touched
-
-| file | change |
-|---|---|
-| `src/core.rs` | DiagReq/DiagRes/DiagCacheReport/DiagPeerReport |
-| `src/core/authorization.rs` | operation/subject-scoped live grant counts |
-| `src/server_macos/ssh_agent.rs` | EXT_DIAG, classification refactor, handle_diag |
-| `src/ssh_sign.rs` | relay `diag@vt` + tests |
-| `src/client/doctor.rs` | doctor body (config/routing/agent/worker sections) |
-| `src/config/client.rs` | resolved snapshot and shared routing policy |
-| `src/config.rs` | hydrate returns populated keys |
-| `src/main.rs` | `vt doctor` subcommand |
-| `README.md`, `docs/README.md` | command row / map row |

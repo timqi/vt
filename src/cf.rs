@@ -157,7 +157,7 @@ struct ChallengeReq<'a> {
 /// ceremony path: the Worker fills both from the host-token record, which is
 /// the only verified source. The macOS agent's audit push still sets them —
 /// there the agent names the session host. tty / ppid / ssh_client were
-/// dropped from the wire entirely (docs/approval-transparency.md §2b).
+/// dropped from the wire entirely (docs/approval-transparency.md §1b).
 #[derive(Serialize, Default)]
 pub struct ChallengeMeta {
     pub op_kind: String,

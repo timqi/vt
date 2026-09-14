@@ -16,7 +16,7 @@
 // approvals is `discouraged`, and a deployment that wants the biometric step
 // back configures it instead of patching the PWA.
 //
-// CAVEAT (docs/cf-worker-deploy.md §Approval user verification): a CTAP2
+// CAVEAT (docs/cf-worker-deploy.md §6, security-key caveat): a CTAP2
 // security key derives the PRF extension from a different secret when it
 // completes without user verification, so a YubiKey enrolled under `required`
 // cannot unwrap its master key from a `discouraged` ceremony. It fails closed —

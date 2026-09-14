@@ -86,10 +86,8 @@ Only `encrypted_passphrase` and `wrap_v` change. The 64-byte
 byte-for-byte. The rewrap mutator must not call
 `create_and_save_passcode_passphrase`, which mints a fresh passcode.
 
-The blob's second 32 bytes were the `VT_AUTH` token; nothing reads them now and
-new stores fill them with random bytes, so no Keychain migration or `rebind`
-follows that removal. Operator step after upgrading: unset `VT_AUTH` in shells
-and `config.toml`; nothing else.
+The blob's second 32 bytes are unread (new stores fill them with random
+bytes); the width stays so existing stores need no migration.
 
 Remove obsolete `vt` binaries after migration. An older binary can parse a v2
 store but cannot unwrap it. Its full-store writers (`init`, `import`,

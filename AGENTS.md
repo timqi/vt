@@ -55,17 +55,16 @@ the rules fail on the thing, not on the number.
 
 | Area | Ceiling | What the size is |
 | --- | --- | --- |
-| `src/core/` | 1.7k | `core.rs` + `core/`: record format, crypto, wire envelopes, authorization engine and session model — platform-blind; `authorization.rs` is half of it, pending step 4 |
+| `src/core/` | 1.7k | `core.rs` + `core/`: record format, crypto, wire envelopes, authorization engine and session model — platform-blind; `authorization.rs` is half of it, pending refactor.md §2 |
 | `src/client/` | 1.8k | `client.rs` + `client/`: transport routing, CLI verbs, `inject` with its recovery supervisor, `doctor`, record parsing |
-| `src/server_macos/` | 4.5k | SSH agent, scopes, Keychain, socket owner check, audit push, UI status; step 4 of refactor.md decides the scopes share |
-| root `src/*.rs` | 2.0k | entry, config, `cf.rs` Worker client, `ssh_sign.rs` relay routing, caller metadata, audit push (its master-key form is an open step 1 row) |
-| `cf-worker/src/` | 4.1k | one DO owning state, routes, host tokens, DEK cache policy, WebAuthn, notifications, admin page; raised from 3.5k when steps 4–5 of worker-slim.md landed: the root key, config blob, passkey admin session and login ceremony (`account_admin.ts` ≈ 450, `admin_auth.ts`) are the right things, and nothing else in the area is a copy; 4.1k adds the operator-owned record `names` table and its adopt/rename validator |
-| one module | 750 | rule 2 before splitting; `core/authorization.rs`, `server_macos/ssh_agent.rs`, `client/inject.rs` are the open tripwires |
+| `src/server_macos/` | 4.5k | SSH agent, scopes, Keychain, socket owner check, audit push, UI status; refactor.md §2 decides the scopes share |
+| root `src/*.rs` | 2.0k | entry, config, `cf.rs` Worker client, `ssh_sign.rs` relay routing, caller metadata, audit push |
+| `cf-worker/src/` | 4.1k | one DO owning state, routes, host tokens, DEK cache policy, WebAuthn, notifications, admin page; raised from 3.5k when the passkey admin session and config-in-DO of worker-slim.md landed: the root key, config blob, passkey admin session and login ceremony (`account_admin.ts` ≈ 450, `admin_auth.ts`) are the right things, and nothing else in the area is a copy; 4.1k adds the operator-owned record `names` table and its adopt/rename validator |
+| one module | 750 | rule 2 before splitting; `core/authorization.rs`, `server_macos/ssh_agent.rs`, `cf-worker/src/do_account.ts` are the open tripwires |
 
 Non-blank, non-comment lines, `#[cfg(test)]` and `*.test.ts` excluded. No
-repo-wide number. Ceilings are the post-slim targets: steps 1–2 of
-[docs/refactor.md](docs/refactor.md) close the current `core` and root
-overages.
+repo-wide number. Ceilings are the post-slim targets; `just size` shows the
+open root overage.
 
 ## Start here
 

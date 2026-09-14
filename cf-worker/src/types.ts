@@ -98,7 +98,7 @@ export interface AuditQueryResponse {
   snapshot_seq: number;
 }
 
-/** Push messages sent to the admin audit page over the '/kestrel/api/audit-stream'
+/** Push messages sent to the admin audit page over the '/api/admin/audit-stream'
  *  WebSocket. A SEPARATE channel from the per-ceremony daemon socket (WsMessage).
  *  'hello' signals (re)connection — the client then runs an `after_seq` catch-up.
  *  'audit' carries one full row (same projection as AuditQueryResponse.rows) so

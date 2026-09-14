@@ -29,13 +29,13 @@ const PLACEHOLDER_RE = /\{\{([A-Z0-9_]+)\}\}/g;
  *  • Function replacement, so `$&` / `$1` / `$'` inside a value stay literal
  *    (the string form of replace() would expand them).
  *  • Fails closed both ways: a placeholder with no value throws (a typo can
- *    never ship `{{RP_ID}}` to a browser) and a value with no placeholder
+ *    never ship `{{ASSET_VER}}` to a browser) and a value with no placeholder
  *    throws (server data silently dropped from a page is the same bug seen
  *    from the other side).
  *
  * Values are inserted verbatim: this helper does no escaping and must not be
  * given untrusted input. Callers pass either Worker-owned constants
- * (ASSET_VER, the admin base) or `escapeJsonForHtml(...)` output.
+ * (ASSET_VER, FAVICON_TAGS) or `escapeJsonForHtml(...)` output.
  */
 export function renderTemplate(template: string, vars: Readonly<Record<string, string>>): string {
   const used = new Set<string>();

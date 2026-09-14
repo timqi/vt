@@ -403,8 +403,7 @@ const MAX_CRYPTO_BATCH: usize = 4096;
 /// (VT_PASSKEY_*), the forwarded SSH agent socket (SSH_AUTH_SOCK,
 /// SSH_AGENT_PID), GPG agent info, or any dynamic-linker injection vector
 /// (DYLD_*, LD_*, PYTHONPATH, RUBYOPT, NODE_OPTIONS, PERL5LIB). Adding a
-/// new entry here is a security-sensitive decision — see codex review in
-/// PR history.
+/// new entry here is a security-sensitive decision.
 const RUN_ENV_PASSTHROUGH: &[&str] = &[
     "HOME", "USER", "LOGNAME", "PATH", "SHELL", "TERM", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
     "DISPLAY",
@@ -1114,8 +1113,7 @@ impl Session for VtSshSession {
         };
         // Same layout as the sign@vt prompt (header, then key/caller/dest/
         // reuse truth lines) so the two sign paths read as one UI — raw signs
-        // just carry no client meta. The caller line replaces the old
-        // `sign: key (proc)` parenthetical.
+        // just carry no client meta.
         let mut auth_message = format!("ssh-sign\nkey: {}", key_label);
         self.append_caller_line(&mut auth_message);
         let (scope, reuse_label) = self.raw_sign_scope(&fp_str);

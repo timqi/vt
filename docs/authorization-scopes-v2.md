@@ -1,13 +1,9 @@
 # Authorization scopes V2 — activity-scoped grants
 
-Status: **implemented; revised after expert review R1, then extended with
-the cwd fallback (§4a)**
-
-V2 replaces the caller-topology cache modes (`none` / `per-session` /
-`per-app` / `global`) with per-operation activity scopes. The unified
-authorization engine (`src/core/authorization.rs`) is unchanged; V2 only
-changes how handlers construct `GrantScope` values, how connections classify
-their peer, and what the operator can configure.
+Status: **implemented**. Grants are per-operation activity scopes. The
+unified authorization engine (`src/core/authorization.rs`) owns permits and
+TTLs; this document owns how handlers construct `GrantScope` values, how
+connections classify their peer, and what the operator can configure.
 
 ## 1. Decision
 
@@ -269,15 +265,11 @@ reach the workspace arm. The prompt states the scope as
 
 ## 5. Configuration
 
-Deleted: `--ssh-auth-cache-mode`, `--decrypt-auth-cache-mode`,
-`AuthCacheMode`, `classify_cache_context`, the TTY gate, and the
-mode-specific `ContextBasis` variants.
-
-Kept, with changed semantics: the two duration flags, because sign and
-decrypt carry deliberately different blast radii (a cached decrypt grant
-releases per-record DEK material; a sign grant concedes single challenges).
-Collapsing them would force an operator who caches signs but keeps decrypt
-always-fresh to widen decrypt exposure.
+There is no cache-mode knob; the only configuration is the two duration
+flags, kept separate because sign and decrypt carry deliberately different
+blast radii (a cached decrypt grant releases per-record DEK material; a sign
+grant concedes single challenges). Collapsing them would force an operator who
+caches signs but keeps decrypt always-fresh to widen decrypt exposure.
 
 ```text
 --ssh-auth-cache-duration <secs>       default 0
@@ -285,8 +277,7 @@ always-fresh to widen decrypt exposure.
 ```
 
 - `0` ⇒ that operation uses the engine's first-class `Fresh` policy (not
-  `StrictTtl(0)`). Defaults preserve V1's out-of-box behavior: always
-  prompt.
+  `StrictTtl(0)`): always prompt.
 - `> 0` ⇒ that operation's reusable scopes use `StrictTtl(n)`. `auth@vt`
   and `run@vt` ignore both flags (existing invariant).
 
@@ -329,7 +320,7 @@ exact directory" / "this app" can never read as a repository scope.
 Fresh operations (`auth@vt`, `run@vt`, unbound-ssh sign)
 show no reuse line. The approved range and the displayed range must be the
 same sentence; handlers build the label from the same fd-derived data the
-scope digest uses (§4.3).
+scope digest uses (§4).
 
 Beyond the reuse line, prompts carry further agent-derived truth lines
 (docs/approval-transparency.md): a kernel-verified `caller:` line on the
@@ -381,8 +372,8 @@ remains read-only, prompt-free, and must still not reset the idle clock.
 - Verifying that a sign request's embedded session id matches the bound
   session (hardening note for a later pass; forwarding exclusion already
   covers the cache-relevant case).
-- Unattended periodic jobs: still a credential-tiering problem (read-only
-  deploy keys), not a caching problem. Document in README/FAQ.
+- Unattended periodic jobs: a credential-tiering problem (read-only deploy
+  keys), not a caching problem; see the README's Auth Caching section.
 - Approval-time scope choice UI ("allow once / allow 8 h"): the prompt text
   states the scope; interactive choice is a later UX pass.
 - Config-file per-scope TTL overrides.
@@ -427,47 +418,3 @@ remains read-only, prompt-free, and must still not reset the idle clock.
   rather than pooling under launchd. Both are the intended fail-narrow
   reading. Within §2, a same-UID process claiming another app's identity
   was never prevented by any scope.
-
-## 11. Test plan
-
-Engine tests are untouched. New/changed coverage:
-
-1. Bind state machine: valid bind, bad signature ⇒ Tainted, duplicate
-   session id with different key ⇒ Tainted, forwarding flag ⇒ never
-   destination-cacheable, >16 ids ⇒ Tainted, Tainted is sticky.
-2. **`Session::extension()` integration test with a real plaintext
-   `session-bind@openssh.com` payload** — asserting it is parsed before the
-   keychain path, answers plain success, and flips the connection state
-   (the seam most likely to be implemented wrong).
-3. Scope derivation: bound ⇒ destination digest over wire KeyData bytes;
-   forwarding/tainted/unbound-ssh ⇒ Fresh; unbound-non-ssh ⇒ workspace;
-   digest domain separation across scope families.
-4. Workspace resolution: `.git` dir and `.git` file roots, no-root ⇒ Fresh,
-   pwd-outside-workspace ⇒ Fresh, fd-derived dev/ino + path binding.
-5. `sign@vt` local=workspace vs relay=per-connection classification; raw
-   commit-sign and sign@vt sharing the workspace scope family.
-6. Decrypt batches: workspace scope per `(type, salt)`, all-of hit.
-7. CLI: duration 0 ⇒ Fresh for that operation; >0 ⇒ StrictTtl; mode flags
-   rejected/absent.
-8. Diag: new basis strings, live counts scoped as specified; doctor
-   version-mismatch warning on `agent_version` skew and on unparsable diag
-   body.
-9. known_hosts display resolution: match, hashed-entry miss, absent file.
-
-## 12. Migration steps
-
-1. Add `proc_info::get_cwd` + fd-based workspace resolution + tests.
-2. Add bind state machine + plaintext `session-bind` interception in
-   `extension()` **before** the keychain path + tests (§3.1).
-3. Add new `GrantScope` constructors with domain-separated digests.
-4. Rewire handlers (raw sign, sign@vt, decrypt) to the new scopes.
-5. Re-semanticize the two duration flags (0 = Fresh default); delete the
-   two mode flags.
-6. Replace diag basis reporting; update `vt doctor` incl. agent-version
-   skew handling.
-7. Add prompt reuse lines.
-8. Delete `AuthCacheMode`, `classify_cache_context`, TTY/app/session
-   helpers that lose their last caller, and V1 `ContextBasis` variants.
-9. Update `docs/README.md`, `docs/diag-design.md`, `docs/sign-vt-design.md`,
-   `CLAUDE.md` invariants, `config.example.toml`, `README.md` FAQ
-   (ControlMaster + read-only-credential guidance + OpenSSH <8.9 note).

@@ -223,7 +223,7 @@ fn write_new_file(path: &std::path::Path, contents: &[u8], mode: u32) -> Result<
 /// With `forward_real_agent` the ephemeral agent additionally acts as a
 /// filtering extension relay to the UPSTREAM real vt agent and is forwarded to
 /// the remote via standard agent forwarding — see `route_extension` and
-/// `docs/ssh-vt-design.md` §11.
+/// `docs/ssh-vt-design.md` (Forwarded relay).
 pub async fn connect(
     vt_client: VTClient,
     args: Vec<String>,

@@ -1,11 +1,11 @@
 //! Optional config-file fallback for VT's environment-based configuration.
 //!
-//! VT has historically been configured purely through environment variables
-//! (`VT_PASSKEY_URL`, `VT_PASSKEY_TOKEN`, the `VT_GIT_SSH_*` pair, …). This module adds a *fallback* layer: a flat TOML file at
-//! `~/.config/vt/config.toml` (override with `$VT_CONFIG`) whose `VT_*` keys
-//! are loaded into the process environment **only when the matching env var is
-//! not already set**. Environment variables therefore always win; the file is
-//! pure fallback.
+//! VT is configured through environment variables (`VT_PASSKEY_URL`,
+//! `VT_PASSKEY_TOKEN`, the `VT_GIT_SSH_*` pair, …). This module adds a
+//! *fallback* layer: a flat TOML file at `~/.config/vt/config.toml` (override
+//! with `$VT_CONFIG`) whose `VT_*` keys are loaded into the process environment
+//! **only when the matching env var is not already set**. Environment
+//! variables therefore always win; the file is pure fallback.
 //!
 //! It hydrates `std::env` before clap parses or any configuration is read.
 //! Client transports and `vt doctor` then share an immutable `ResolvedConfig`

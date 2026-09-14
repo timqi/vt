@@ -20,30 +20,10 @@ with its approve/extend ladders and admin.
 | Keychain wrap v1 | `derive_passphrase_secret` (v1), `upgrade_wrap_v2_if_needed`, `secret rebind --to-v1` | `vt secret rebind` stays one release for v1 stores, then goes with wrap v1 |
 | Audit SQLite rebuilds | `account_audit.ts`: the `DROP TABLE audit` for the per-event table of an early build and `DROP TABLE IF EXISTS cache_audit`, with their comments | none; one deploy after this release has run on every account |
 
-Landed: `load_mac_cipher` returns the SSH-store cipher alone and the DEK
-handlers call `load_mac_key`; the tuple that made each caller discard half
-is gone. The audit-ingest master key (hostname-salted HKDF in `src/audit.rs`,
-the `--audit-key` master form, the `/api/audit-ingest` master verifier) went
-with worker-slim.md step 5 — the Worker's secret is a KEK now, so there was
-nothing left to derive from; `--audit-key` is the Mac's host token only.
-
 Rule: a compatibility branch is removed, never widened, and its test moves to
 a "rejected input" test.
 
-## 2. Landed
-
-The AI-agent hook and the FIDO2 fallback are gone. `just check-darwin`
-type-checks the macOS tree from Linux behind a stub `cc` (ring's C build
-emits empty objects); running it still needs macOS.
-
-## 3. Landed
-
-Cache key v5 (`dek:{token_id}:{project_h}:{salt}`) is in; `cacheScopePwd` is
-gone. Release note: a Worker ahead of the CLI keys every cache on
-`project=''` per token; a CLI ahead of the Worker sends an ignored field. No
-flag day.
-
-## 4. Decide, then do or drop
+## 2. Decide, then do or drop
 
 - **Agent grant scopes.** `src/core/authorization.rs` + `ssh_agent/scopes.rs`
   are 4k lines for four scope families. Candidate shape: two scopes only —
@@ -51,18 +31,3 @@ flag day.
   `session-bind@openssh.com` host key on a forwarded connection). Workspace,
   cwd, and parent-app families would go. Needs a decision on how much prompt
   reuse the local path loses.
-- **Record naming (decided: server-owned map).** A DO `names` table keyed by
-  salt, edited from the console; client-sent names are suggestions the approver
-  adopts. Lands with the approve-page trim; owning doc `docs/dek-cache.md`.
-
-## Order
-
-1 → 2 → 3 landed, each behind `cargo test`, `just check`, `just check-worker`, then
-a macOS native check for the Keychain and agent changes. Step 4 items are
-separate documents when decided.
-
-## Budget
-
-Steps 1–3 remove roughly 5k lines of Rust and 1k of TypeScript and add fewer
-than 300. A step that adds net lines names, in its commit, what could not have
-been done without them.

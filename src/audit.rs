@@ -6,8 +6,8 @@
 // HMAC key and `agent_id = t:<id>` tells the Worker which token to derive it
 // for. The push path itself (HTTP POST, AgentAuditEntry, config) lives in the
 // cfg-gated `server_macos::audit` module, which depends on macOS-only types.
-// The hostname-salted master form is gone (docs/refactor.md §1): the Worker's
-// secret is a KEK that never reaches a host, so there is nothing to derive from.
+// There is no master-keyed form: the Worker's secret is a KEK that never
+// reaches a host, so there is nothing to derive from.
 
 use zeroize::Zeroizing;
 

@@ -9,15 +9,6 @@ and `types.ts` (`Env`). Operator procedures live in
 [cf-worker-deploy.md](cf-worker-deploy.md); the PWA's presentation contract in
 [design/ui-ux.md](design/ui-ux.md).
 
-Landed, in order: Web Push beside the channels, channels deleted, one admin
-shell, passkey admin auth with `root:v1` from bootstrap (Cloudflare Access,
-`ADMIN_SEG`, `CREDENTIALS_JSON` gone), config in the DO with every derivation
-rooted on `R` (`CACHE_SECKEY`, `CACHE_ADMIN_EXTEND`, `CACHE_HIT_NOTIFY`,
-`APPROVAL_UV_JSON`, `WORKER_ORIGIN`, `RP_ID`, `ACCESS_*` gone; `VT_AUTH_CF` →
-`SECRET`, `ENROLL_LIMITER` → `LIMITER`). Every host token was re-issued once
-by `vt enroll` at that last step, and the hostname-keyed agent audit key went
-with it ([refactor.md](refactor.md) §1).
-
 ## 2. Trust model
 
 `SECRET` is a KEK. The root key `R` (32 random bytes, generated at bootstrap)
@@ -28,10 +19,10 @@ each worthless.
 | Key | ikm | salt | info | Protects |
 | --- | --- | --- | --- | --- |
 | `K_kek` AES-256-GCM | `utf8(SECRET)` | empty | `vt-kek-v1` | `R` at rest |
-| host token secret | `R` | `token_id` | `vt-host-token-v1` | daemon HMAC, compared in the DO ([host-token.md](host-token.md) §2) |
+| host token secret | `R` | `token_id` | `vt-host-token-v1` | daemon HMAC, compared in the DO ([host-token.md](host-token.md) §1) |
 | `K_cfg` AES-256-GCM | `R` | empty | `vt-config-key-v1` | the config blob at rest (§4) |
 | `K_sess` HMAC | `R` | empty | `vt-admin-session-v1` | admin session cookie (§3.1) |
-| cache X25519 scalar | `R` | empty | `vt-cache-seckey-v1` | DEK sealed boxes; `cachePublicKey` derives the point as today |
+| cache X25519 scalar | `R` | empty | `vt-cache-seckey-v1` | DEK sealed boxes; `cachePublicKey` derives the point |
 
 HKDF-SHA256, `L = 32`. Not derived: the VAPID key pair (§5.2) — WebCrypto
 cannot turn a derived scalar into its public point, so it is generated once and
@@ -48,7 +39,7 @@ stored under `K_cfg`.
   browser; the two wraps live only in the DO and only during the window.
 - **Factory reset** is `R` compromise (DO storage read) or a lost `SECRET`
   before rotation completes: `wrangler secret put SECRET` with a fresh value
-  *without* rotating. `root:v1` no longer unwraps ⇒ unconfigured (§4.3):
+  *without* rotating. `root:v1` no longer unwraps ⇒ unconfigured (§4.2):
   ceremony routes answer `503 not_configured`, `/admin` shows the setup view
   flagged `reset`, and bootstrap replaces root and blob; every host runs
   `vt enroll`. (Wrangler offers no console for DO keys, so the unreadable root
@@ -81,7 +72,7 @@ Set-Cookie: …; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800
 - Verify: shape, constant-time MAC, `now < exp_s`, `epoch == config.epoch`.
   Any failure → `401 {error: session_invalid}`; the shell shows the login view.
 - The audit-stream WebSocket reads `exp_s` from the verified cookie and closes
-  itself at that time (replaces `?exp=`).
+  itself at that time.
 - CSRF: `SameSite=Strict`, plus every non-GET `/api/admin/*` request and the
   WebSocket upgrade require `Origin == config.origin` (403 otherwise). CSP keeps
   `form-action 'none'`.
@@ -104,13 +95,13 @@ Set-Cookie: …; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800
 | `PUT /api/admin/names` | cookie | record rename, `{salt_b64u, name}`, `""` deletes ([dek-cache.md](dek-cache.md)) |
 | `GET /api/admin/push/vapid`, `POST …/push/subscribe`, `…/push/unsubscribe`, `…/push/test` | cookie | §5 |
 | `POST /api/admin/rotate-secret` | cookie | §2 rotation; returns `{secret}` once |
-| existing `audit`, `audit-stream`, `cache-list`, `cache-clear-entries`, `cache-extend-request`, `clear-cache`, `tokens`, `tokens-revoke` | cookie | the former `admin_email` fields are gone — the cookie carries no credential identity, so extend/revoke rows name no operator; `clear-audit` and the per-approval/per-group cache clears no longer exist ([dek-cache.md](dek-cache.md)) |
+| `audit`, `audit-stream`, `cache-list`, `cache-clear-entries`, `cache-extend-request`, `clear-cache`, `tokens`, `tokens-revoke` | cookie | the cookie carries no credential identity, so extend/revoke rows name no operator ([dek-cache.md](dek-cache.md)) |
 
 - `LIMITER` is the existing 3/min/IP Workers Rate Limiting binding, keyed
   `enroll:<ip>` by `/api/enroll` and `login:<ip>` by bootstrap and
   login-challenge. Absent → `503` on those routes, never unthrottled.
-- Login failures log `admin.login_failed` (throttled like `admin.auth_failed`
-  today); nothing is written to the audit table for them.
+- Login failures log `admin.login_failed` (throttled); nothing is written to
+  the audit table for them.
 - A `Cf-Access-Jwt-Assertion` header has no effect anywhere (rejected-input test).
 
 ### 3.3 Bootstrap
@@ -125,10 +116,10 @@ public and bootstrap right after `just deploy-worker`.
    public PWA assets answers `503 not_configured`.
 2. Open `https://<host>/admin` — the setup view. Fill in a label and the
    `vt secret export` blob + passphrase (the passkey master must equal the
-   macOS `mac_key`, as today; the blob is decrypted in the browser only). The
+   macOS `mac_key`; the blob is decrypted in the browser only). The
    page registers the passkey (`residentKey: 'required'`,
    `userVerification: 'required'`, `prf`), asserts once for PRF, wraps the
-   master and builds the credential entry (`setup.js` byte formats unchanged).
+   master and builds the credential entry (`setup.js`).
 3. `POST /api/admin/bootstrap {entry}`.
 4. DO, serialized with every other write: a readable `root:v1` →
    `409 already_configured` with `{ms, ip}` of the first registration
@@ -154,7 +145,7 @@ until reset. Bootstrap from the canonical hostname.
 - Revoke: `POST …/credentials-revoke {h}` removes the entry and bumps `epoch`
   (all sessions end, including the revoker's). Revoking the last credential is
   refused (`409 last_credential`); reset is `SECRET` rotation.
-- 自检 (per-entry PRF unwrap and compare) stays client-side, unchanged.
+- 自检 (per-entry PRF unwrap and compare) is client-side.
 
 ## 4. Config in the DO
 
@@ -167,10 +158,10 @@ plaintext (JSON) = {
   v: 1,
   origin: "https://vt.example.com",   // §3.3, immutable
   epoch: 1,                           // §3.1
-  credentials: [ {h, i, k, p, l, t} ],// credentials.ts entry, unchanged bytes
+  credentials: [ {h, i, k, p, l, t} ],// credentials.ts entry
   bootstrap: { ms, ip },              // first registration, shown on a 409 (§3.3)
-  cache_hit_notify: false,            // was: CACHE_HIT_NOTIFY
-  uv_policy: null,                    // was: APPROVAL_UV_JSON; same object, validated by parseUvPolicy on PUT
+  cache_hit_notify: false,
+  uv_policy: null,                    // validated by parseUvPolicy on PUT
   vapid: null | { pub_b64u, jwk },    // §5.2; jwk is the exported P-256 private key
   push: [ {endpoint, p256dh, auth, label, created_ms} ]   // §5.1, ≤ 10
 }
@@ -187,21 +178,14 @@ plaintext (JSON) = {
   raise-only rule and the `cache-extend` pin are unchanged. A malformed object
   is refused at PUT (400); a malformed stored one (a bug) reads as `required`.
 - `PUT /api/admin/config` accepts only `cache_hit_notify`, `uv_policy`;
-  anything else in the body is `400` (`cache_enabled` included: the switch is
-  gone, option `0` on the approval page is the no-cache path).
-- Deleted as knobs: `CACHE_ADMIN_EXTEND` and `cache_enabled` (every extension
-  still needs a passkey approval), `WORKER_ORIGIN`, `RP_ID`.
+  anything else in the body is `400` (there is no cache switch: option `0` on
+  the approval page is the no-cache path).
 - Beside the blob, plaintext SQLite tables the DO owns: `audit`, `host_token`
   and `names(salt_b64u PRIMARY KEY, name, source, ms)` — record display names
   ([dek-cache.md](dek-cache.md)); `PUT /api/admin/names` is the one write
   route, session-gated like the rest.
 
-### 4.2 Migration
-
-None. No importer: the operator re-enters. Host tokens and the audit table are
-untouched when `SECRET` keeps the old `VT_AUTH_CF` value.
-
-### 4.3 Unconfigured state
+### 4.2 Unconfigured state
 
 Absent `cfg:v1` and an undecryptable `cfg:v1` are the same state; the latter is
 logged once as `config.unreadable`. In that state: `/admin` = setup view,
@@ -212,8 +196,8 @@ static assets served. There is no defaults fallback for a broken blob — a
 ## 5. Web Push
 
 RFC 8030 delivery, RFC 8291 encryption, RFC 8292 VAPID — `crypto.subtle` only,
-in `webpush.ts` (`encryptPush`, `vapidAuthorization`, `sendPush`). Reference
-shape: pier's `src/web/webpush.ts`; VT ships no dependency and no Node API.
+in `webpush.ts` (`encryptPush`, `vapidAuthorization`, `sendPush`); VT ships
+no dependency and no Node API.
 
 ### 5.1 Subscriptions
 
@@ -259,7 +243,7 @@ shape: pier's `src/web/webpush.ts`; VT ships no dependency and no Node API.
 
 | Event | title/body | url | tag | TTL / Urgency |
 | --- | --- | --- | --- | --- |
-| challenge created (`opCreate`) | `buildApprovalMessage` (kept in `notify.ts`) | approve URL | `a:<approve_token>` | 300 s / high |
+| challenge created (`opCreate`) | `buildApprovalMessage` (`notify.ts`) | approve URL | `a:<approve_token>` | 300 s / high |
 | enrollment requested | same, `op_kind = enroll` | approve URL | `a:<approve_token>` | 300 s / high |
 | Worker DEK-cache hit, agent Touch-ID-cache hit (`cache_hit_notify` on; agent 60 s throttle kept) | `buildCacheHitMessage` | `/admin#audit` | `cache:<host>` | 3600 s / normal |
 

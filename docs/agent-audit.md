@@ -5,24 +5,19 @@ tradeoffs, and provisioning. The implementation is in `src/audit.rs`,
 `src/server_macos/audit.rs`, and `cf-worker/src/crypto.ts`; deferred items at
 the end are intentionally not part of the current feature.
 
-The macOS SSH agent (`src/server_macos/ssh_agent.rs`) historically wrote **no
-durable audit** — every Touch ID approve/reject and every silent auth-cache hit
-went only to `tracing` on stderr and was lost. The Cloudflare passkey ceremony,
-by contrast, writes a rich `audit` table inside the `AccountDO` Durable Object.
-
-This feature gives the agent path the **same admin-audit visibility**: it emits
-one record per decision and POSTs it to the Worker, which inserts it into the
-existing `audit` table marked `source='agent'`, queryable from the admin
-shell's 审计 tab at `/admin#audit` (passkey login).
+The macOS SSH agent (`src/server_macos/ssh_agent.rs`) emits one record per
+decision (Touch ID approve/reject, silent cache hit) and POSTs it to the
+Worker, which inserts it into the ceremony `audit` table marked
+`source='agent'`, queryable from the admin shell's 审计 tab at `/admin#audit`
+(passkey login).
 
 ## Scope — simplified fire-and-forget
 
 - **No local persistence.** After a decision is returned to the caller, the
   agent spawns a one-shot background POST (`audit::spawn_push`). It is never
   awaited → **zero added latency** on the decision path.
-- **Loss semantics = net add.** If the agent has no network at decision time the
-  record is dropped — exactly what `tracing::info!` did before, just with a
-  cloud sink. Online → now queryable; offline → same as before. A local
+- **Loss semantics.** If the agent has no network at decision time the
+  record is dropped (it still reaches `tracing` on stderr). A local
   write-ahead buffer is explicitly out of scope (deferred).
 
 ## What is audited
@@ -39,9 +34,7 @@ unavailable, cache_hit, spawn_failed}`:
 | `sign`    | `Session::sign` (standard SSH auth) | distinct from `auth@vt`; carries no vt ClientMeta, so the prompt label is the audit `command` — the structured `key_fp` / `dest` / `peer_exe` fields carry the key, verified destination, and caller |
 | `ssh-sign`| `handle_sign_vt` (`sign@vt`)         | context-carrying git signing; carries `ClientMeta` and shares the sign auth cache |
 
-`latency_ms` measures prompt-shown → decision; cache hits are `0`. `ppid` is the
-**socket peer PID** (`get_peer_pid`), `0`/absent for forwarded sessions — NOT the
-agent's own ppid.
+`latency_ms` measures prompt-shown → decision; cache hits are `0`.
 
 ## HMAC key scheme
 
@@ -49,8 +42,8 @@ The agent signs with this Mac's own host token (`vt ssh agent --audit-key
 vt1.<id>.<secret>`, the token `vt enroll` writes to the config file): the
 token secret is the HMAC key and `agent_id = t:<id>` names it. The Worker's
 `SECRET` is a KEK that never reaches a host, so there is no master to derive a
-per-host key from; the hostname-salted master form of earlier builds is a
-rejected input (`bad agent token id`) — [refactor.md](refactor.md) §1.
+per-host key from; any other `agent_id` form is a rejected input
+(`bad agent token id`).
 
 - The **agent** keeps only the 32-byte token secret in memory
   (`host_token_audit_key`, `src/audit.rs`); the flag value remains visible in
@@ -59,7 +52,7 @@ rejected input (`bad agent token id`) — [refactor.md](refactor.md) §1.
   `agent_id` (unverified — it only selects the token), and forwards the raw
   bytes plus the MAC to the Durable Object, which derives the token secret
   from the root key (`HKDF(R, token_id, "vt-host-token-v1")`,
-  [host-token.md](host-token.md) §2), compares in constant time, and refuses
+  [host-token.md](host-token.md) §1), compares in constant time, and refuses
   a revoked or lapsed token (`isLive`, no sliding — a background push is not a
   use the operator would count).
 
@@ -91,8 +84,8 @@ POST {audit_url}/api/audit-ingest
               peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s,
               relayed }
       meta = ChallengeMeta wire shape (op_kind, command, host, user, pwd,
-             project — '' from the agent, tty, ppid_cmd, ppid, ssh_client,
-             reason) — NO `ip` (the Worker forces it from CF-Connecting-IP).
+             project — '' from the agent, ppid_cmd, reason) — NO `ip` (the
+             Worker forces it from CF-Connecting-IP).
 ```
 
 The seven trailing fields are agent-authoritative context
@@ -125,12 +118,9 @@ off the decision path regardless.
 
 ## `source` column
 
-Added to the `audit` table via a guarded `ALTER TABLE audit ADD COLUMN source
-TEXT NOT NULL DEFAULT 'ceremony'` (SQLite backfills existing rows from the
-literal default). `auditCreate` sets `'ceremony'` and `auditCacheEvent` sets
-`'cache'` explicitly (not relying on the default) so a future schema change
-can't silently mis-categorize. The admin audit page gains a `source` filter
-(all / ceremony / cache / agent) and column.
+`audit.source` is `'ceremony'` (default), `'cache'` or `'agent'`;
+`auditCreate` and `auditCacheEvent` set theirs explicitly rather than relying
+on the default. The admin audit page has a `source` filter and column.
 
 The 90-day retention sweep (`AUDIT_RETENTION_MS`, by `created_ms`) covers agent
 rows for free.

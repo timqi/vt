@@ -7,13 +7,7 @@ of it. Verify against `cf-worker/src/host_token.ts`, `account_tokens.ts`,
 (`authenticateDaemon`, `opEnrollCreate`, `commitEnroll`), `src/cf.rs`
 (`WorkerAuth`, `enroll`) and `src/client/commands.rs` (`enroll`).
 
-## 1. Problem
-
-Every host used to hold the Worker master. One leaked config meant rotating
-the master everywhere, nothing on the approval page distinguished hosts except
-a client-typed hostname, and there was no way to cut a single host off.
-
-## 2. Token model
+## 1. Token model
 
 ```
 token      = vt1.<token_id>.<secret_b64u>
@@ -39,7 +33,7 @@ wrapped under `SECRET` and unwrapped only into Durable Object memory
   once; the JSON parse and salt validation at the edge run on capped,
   unauthenticated input. The `/api/audit-ingest` route follows the same path.
 - **One root, one derivation.** There is no previous-generation fallback: a
-  factory reset (new `R`) invalidates every token at once (§7); rotating
+  factory reset (new `R`) invalidates every token at once (§6); rotating
   `SECRET` through the console keeps `R` and every token.
 - **Stateful liveness in the DO.** `host_token` (SQLite,
   `account_tokens.ts`) records `host, user, enroll_ip, origin, created_ms,
@@ -54,7 +48,7 @@ wrapped under `SECRET` and unwrapped only into Durable Object memory
   `meta.host` / `meta.user` from the record and sets `meta.ip_prev` when the
   token's previous use came from a different IP. The approval page labels them
   已验证 and `ApprovePageData.host_verified` says which path produced them.
-## 3. Enrollment (`vt enroll [--url]`)
+## 2. Enrollment (`vt enroll [--url]`)
 
 1. CLI `POST /api/enroll {host, user, timestamp_ms}` — **unauthenticated**.
    Three independent bounds because this route can page the phone:
@@ -79,7 +73,7 @@ wrapped under `SECRET` and unwrapped only into Durable Object memory
    comments, creates mode 600, temp+rename). The token value is never printed.
    Everything after that is the ordinary passkey path.
 
-## 4. Admin
+## 3. Admin
 
 The admin shell's 主机令牌 tab (`/admin#tokens`, passkey login —
 [worker-slim.md](worker-slim.md) §3) lists every token (no secret material)
@@ -88,7 +82,7 @@ with host, user, issue IP · origin, last use / IP, remaining window, and a
 suffices (same rule as cache clears); it is immediate and idempotent.
 Revoked/lapsed rows stay listed for 30 days, then the alarm sweep drops them.
 
-## 5. Agent audit push
+## 4. Agent audit push
 
 `vt ssh agent --audit-key vt1.…` uses the Mac's own host token: the secret is
 the HMAC key and `agent_id = t:<token_id>`. The DO derives the same secret and
@@ -96,27 +90,13 @@ refuses rows from a revoked/expired token (`isLive`, no sliding — a background
 push is not a use). Nothing else is accepted as an audit key; see
 [agent-audit.md](agent-audit.md).
 
-## 6. Approval-context trim
+## 5. Approval-context trim
 
-Because host/user now come from the token, the ceremony wire meta shrank to
-`op_kind, command, pwd, ppid_cmd, reason` (+ Worker `ip`). Dropped: `tty`,
-`ppid`, `ssh_client` (never verified, rarely read). Audit columns remain and
-read NULL for new rows. Decision record: [approval-transparency.md §2b](approval-transparency.md#2b-host-token-trim).
+Because host/user come from the token, the ceremony wire meta is
+`op_kind, command, pwd, project, ppid_cmd, reason` (+ Worker `ip`); see
+[approval-transparency.md §1b](approval-transparency.md#1b-host-token-trim).
 
-## 7. Rollout
-
-1. Deploy the Worker with the `LIMITER` binding and bootstrap it
-   ([cf-worker-deploy.md](cf-worker-deploy.md)). A host holding a token from a
-   previous root (the `VT_AUTH_CF` build, or a reset) is refused with
-   `hmac mismatch`; one without a token with `token_missing`.
-2. On each host: upgrade `vt`, run `vt enroll` (pass `--url` if the file has
-   no `VT_PASSKEY_URL` yet), approve on the phone after comparing the pairing
-   code. Unset any `VT_PASSKEY_TOKEN` in the environment — env wins over the
-   file.
-3. Macs running the agent with audit push: `--audit-key` is the host token
-   written by `vt enroll`; nothing else is accepted.
-
-### Rotation and reset
+## 6. Rotation and reset
 
 Rotating `SECRET` (设置 → 轮换 SECRET, then `wrangler secret put SECRET`)
 keeps `R`, so every token keeps verifying. A **factory reset** — a fresh
@@ -127,16 +107,3 @@ would keep an old credential alive). The same day, on each host: `vt enroll`
 (phone approval, pairing code) and switch any `vt ssh agent --audit-key` to the
 token it writes. Revoke the rows of hosts that are gone on the tokens tab; the
 rest lapse in 7 days.
-
-## 8. Tests
-
-- Worker: `test/host_token.test.ts` (derivation golden vector, token shape,
-  pairing code), `test/do_account.host_token.test.ts` (enroll → approve →
-  token; challenge/dek-cache auth with sliding expiry and structured refusals;
-  token-less signatures and auth-less DO bodies refused; meta trim; audit
-  ingest with `t:` and the hostname form rejected; admin list/revoke; limiter
-  absent → 503; pending cap → 429; `SECRET` rotation keeping every token and
-  retiring the old wrap; reset refusing old-root tokens on every route).
-- Rust: `cf::tests::worker_auth_parses_host_token_and_rejects_bare_master`,
-  `http_post_sends_token_id_header_only_when_given`,
-  `config::tests::upsert_*`, `audit::tests::host_token_audit_key_only_for_host_tokens`.
