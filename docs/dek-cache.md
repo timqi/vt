@@ -56,8 +56,9 @@ TTL, a caller can decrypt the approved records without another phone tap.
   radios, next to the literal `目录` row.
 - Normalization is applied inside `cacheCtx`, never at a call site, so a write
   and a read can never key on different halves of the rule. The ctx tag is
-  `vt-dek-ctx-v4`; entries written under the v3 (literal-`pwd`) derivation are
-  unreachable and simply lapse or can be cleared from the admin tab.
+  `vt-dek-ctx-v4`; a change to the derivation bumps it, so entries under an
+  older tag are unreachable and simply lapse or can be cleared from the admin
+  tab.
 - Reads are all-or-nothing for a batch of salts. A partial or expired batch is
   a miss and falls back to the normal phone ceremony. Opened DEK buffers are wiped
   on full hits, partial misses, and failure exits; this minimizes their lifetime,

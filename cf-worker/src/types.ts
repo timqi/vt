@@ -523,9 +523,8 @@ export type DekCacheResponse =
 
 /** A single cached DEK in DO storage, keyed `dek:{ctx}:{salt_b64u}` where
  *  ctx = b64u(SHA-256("vt-dek-ctx-v4" || len(ip) || ip || cacheScopePwd(pwd))).
- *  (v4 normalizes the pwd so git-worktree siblings share one scope; v3 bound the
- *  literal IP + pwd; v2 was IP-only; the v1 ppid component was removed — see
- *  docs/dek-cache.md §2.5.) */
+ *  The pwd is normalized so git-worktree siblings share one scope; see
+ *  docs/dek-cache.md §2.5. */
 export interface CacheEntry {
   /** crypto_box_seal(DEK_raw, CACHE_PUBKEY) — Worker opens with CACHE_SECKEY. */
   sealed_to_cache_b64u: string;

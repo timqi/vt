@@ -27,16 +27,12 @@ const CACHE_LIST_SCAN_MAX = 20000;
 // STABLE across orchestrated callers (Claude Code, CI, make, tmux) that spawn a
 // fresh shell per command from the same project dir, so the cache still hits.
 //
-// History: ctx v1 folded in the client-reported parent PID; that was dropped
-// (v1→v2) because ppid is BOTH spoofable AND unstable (getppid() changes every
-// call under orchestrators, so the cache never hit); it has since left the wire
-// entirely. v2→v3 adds pwd. v3→v4 folds in
-// cacheScopePwd (worktree suffixes stripped) instead of the literal pwd; the tag
-// bump keeps the two derivations from ever sharing a storage key, at the cost of
-// stranding v3 entries (they lapse/sweep normally, and can be cleared from the
-// admin tab). The effective hard guarantee is unchanged: within the TTL,
-// possession of VT_PASSKEY_TOKEN behind the SAME egress IP; the pwd scope only
-// narrows it further, it never widens beyond that IP.
+// The ppid left the ctx because it is BOTH spoofable AND unstable (getppid()
+// changes every call under orchestrators, so the cache never hit); it has
+// since left the wire entirely. The tag names the derivation so a change to
+// it can never share a storage key with the old one. The hard guarantee:
+// within the TTL, possession of VT_PASSKEY_TOKEN behind the SAME egress IP;
+// the pwd scope only narrows it further, it never widens beyond that IP.
 //
 // Normalization happens HERE, not at the call sites, so no future caller can
 // key a write and a read on different halves of the rule.
