@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { env } from 'cloudflare:test';
 import app from '../src/index';
 import { AccountNotifications } from '../src/account_notifications';
+import { AccountAdmin } from '../src/account_admin';
 import { b64uEnc, hmacSha256 } from '../src/crypto';
 import { deriveHostTokenSecret } from '../src/host_token';
 import * as feishu from '../src/feishu';
@@ -36,7 +37,7 @@ async function withNotifications(
     const vars: Env = { ...inst.env, FEISHU_JSON, SLACK_APP_JSON, CACHE_HIT_NOTIFY: '' };
     const notifications = new AccountNotifications({
       storage: state.storage, waitUntil(task: Promise<unknown>) { tasks.push(task); },
-    }, vars);
+    }, vars, new AccountAdmin(state.storage, vars));
     const feishuSend = vi.spyOn(feishu, 'sendApprovalCard').mockResolvedValue('test-message');
     const slackSend = vi.spyOn(slackApp, 'sendApprovalCard').mockResolvedValue({ channel: 'test-channel', ts: '1.0' });
     const feishuEdit = vi.spyOn(feishu, 'editCard').mockResolvedValue('');
@@ -64,7 +65,8 @@ describe('AccountNotifications delivery contract', () => {
       let finishSend!: (id: string) => void;
       feishuSend.mockImplementationOnce(() => new Promise(resolve => { finishSend = resolve; }));
       notifications.approval(ch);
-      expect(tasks).toHaveLength(1);
+      // One push probe (no subscriptions yet) plus the serialized card sends.
+      expect(tasks).toHaveLength(2);
       expect(feishuSend).toHaveBeenCalledOnce();
       expect(slackSend).not.toHaveBeenCalled();
       const approved: Challenge = {
@@ -230,7 +232,7 @@ describe('AccountNotifications delivery contract', () => {
       vars.FEISHU_JSON = '{';
       vars.SLACK_APP_JSON = '{';
       notifications.approval(makeChallenge());
-      expect(tasks).toEqual([]);
+      expect(tasks).toHaveLength(1); // the push probe only
       expect(feishuSend).not.toHaveBeenCalled();
       expect(slackSend).not.toHaveBeenCalled();
     });
@@ -333,5 +335,21 @@ describe('approval route notification contract', () => {
     } finally {
       vi.restoreAllMocks();
     }
+  });
+});
+
+describe('push ops reach the console-owned config through the DO', () => {
+  it('mints the VAPID key once and refuses an unknown push op', async () => {
+    const first = await accountStub().fetch('https://account.do/op/push-vapid');
+    expect(first.status).toBe(200);
+    const a = await first.json() as { pub_b64u: string; subscriptions: unknown[] };
+    expect(a.subscriptions).toEqual([]);
+    const b = await (await accountStub().fetch('https://account.do/op/push-vapid')).json() as { pub_b64u: string };
+    expect(b.pub_b64u).toBe(a.pub_b64u);
+    const bogus = await accountStub().fetch('https://account.do/op/push-bogus', { method: 'POST', body: '{}' });
+    expect([bogus.status, await bogus.text()]).toEqual([400, 'unknown op']);
+    await inDO(async ({ state }) => {
+      expect(JSON.stringify(await state.storage.get('cfg:v1'))).not.toContain(a.pub_b64u);
+    });
   });
 });

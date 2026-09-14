@@ -1,8 +1,11 @@
 // Account-local delivery bookkeeping. Notifications never authorize or finalize
 // a challenge; only message references are merged into freshly read records.
 
-import { Env, Challenge, ChallengeMeta, ChallengeStatus, DoAuditIngestOp } from './types';
-import { notifyCacheHit } from './notify';
+import { Env, Challenge, ChallengeMeta, ChallengeStatus, DoAuditIngestOp, PushPayload } from './types';
+import { notifyCacheHit, metaLines, buildCacheHitMessage } from './notify';
+import { sendPush } from './webpush';
+import { AccountAdmin } from './account_admin';
+import { ADMIN_AUDIT_PATH } from './page';
 import { parseFeishuConfig, sendApprovalCard, editCard, sendCacheHitNotice, FeishuConfig, Kv as FeishuKv } from './feishu';
 import {
   parseSlackAppConfig,
@@ -54,7 +57,27 @@ export class AccountNotifications {
   constructor(
     private readonly ctx: Pick<DurableObjectState, 'storage' | 'waitUntil'>,
     private readonly env: Env,
+    private readonly admin: AccountAdmin,
   ) {}
+
+  // One sendPush per subscription, off the ceremony path, never a warning to
+  // the CLI. The push service's answer decides the row (worker-slim.md §5.5):
+  // 404/410 is dead for good, everything else keeps it and is logged.
+  private push(payload: PushPayload, ttlS: number, urgency: 'normal' | 'high'): void {
+    this.ctx.waitUntil((async () => {
+      const { vapid, push } = await this.admin.pushConfig();
+      if (!vapid || push.length === 0) return;
+      const body = JSON.stringify({ ...payload, body: payload.body.slice(0, 1000) });
+      await Promise.all(push.map(async (sub) => {
+        const r = await sendPush(sub, body, vapid, this.env.WORKER_ORIGIN, ttlS, urgency);
+        if (r.status >= 200 && r.status < 300) return;
+        if (r.status === 404 || r.status === 410) { await this.admin.unsubscribe(sub.endpoint); return; }
+        const event = r.status === 413 ? 'push.too_large'
+          : r.status === 401 || r.status === 403 ? 'push.vapid_rejected' : 'push.failed';
+        logErr(event, new Error(r.error ?? ''), { status: r.status });
+      }));
+    })().catch((e) => logErr('push.failed', e)));
+  }
 
   channels(): NotificationChannels {
     return { feishu: this.feishuCfg(), slackApp: this.slackAppCfg() };
@@ -79,6 +102,15 @@ export class AccountNotifications {
     // belongs — the audit tab receives the request row (op_kind='cache-extend') and
     // the effect row (status='extended') over its real-time stream.
     if (challenge.extend) return;
+
+    const salts = chSalts(challenge);
+    const url = `${this.env.WORKER_ORIGIN}/a/${challenge.approve_token}`;
+    this.push({
+      v: 1, kind: challenge.enroll ? 'enroll' : 'approval',
+      title: challenge.meta.op_kind ? `VT 审批: ${challenge.meta.op_kind}` : 'VT 审批请求',
+      body: metaLines(challenge.meta, salts).join('\n'),
+      url, tag: `a:${challenge.approve_token}`,
+    }, 300, 'high');
 
     // Feishu approval card — fire-and-forget (waitUntil), NOT awaited: this keeps
     // a third-party API's latency out of the singleton DO's serialized op path.
@@ -220,6 +252,11 @@ export class AccountNotifications {
     errTag = 'cachehit_failed',
   ): void {
     if (!cacheHitNotifyEnabled(this.env)) return;
+    const hit = buildCacheHitMessage(meta, salts, note);
+    this.push({
+      v: 1, kind: 'cache_hit', title: hit.title, body: hit.body,
+      url: `${this.env.WORKER_ORIGIN}${ADMIN_AUDIT_PATH}`, tag: `cache:${meta.host}`,
+    }, 3600, 'normal');
     this.ctx.waitUntil(
       notifyCacheHit(this.env, meta, salts, note)
         .then((w) => { if (w) logErr(`notify.${errTag}`, w); })

@@ -173,7 +173,7 @@ describe('page shells', () => {
   });
 
   it('renders the data-free admin shells', () => {
-    for (const tab of ['audit', 'cache'] as AdminTab[]) {
+    for (const tab of ['audit', 'cache', 'tokens', 'push'] as AdminTab[]) {
       const html = render(`pwa/admin/${tab}.html`, adminVars(CHROME, tab));
       expect(html).toContain(`href="/kestrel/${tab}" aria-current="page"`);
       expect(html).toContain('/kestrel/pwa/admin.css?v=20260101-abc1234');
@@ -212,6 +212,8 @@ describe('page shells', () => {
       render('pwa/approve.html', { ...pageVars(CHROME), VT_DATA: '{}' }),
       render('pwa/admin/audit.html', adminVars(CHROME, 'audit')),
       render('pwa/admin/cache.html', adminVars(CHROME, 'cache')),
+      render('pwa/admin/push.html', adminVars(CHROME, 'push')),
+      render('pwa/manifest.webmanifest', { ADMIN_BASE: '/kestrel' }),
       render('pwa/admin/setup.html', { ...adminVars(CHROME, 'setup'), VT_DATA: '{}' }),
       render('pwa/admin/channels.html', {
         ...adminVars(CHROME, 'channels'), VT_DATA: '{}',
@@ -229,8 +231,9 @@ describe('adminTabs', () => {
     expect(nav.match(/class="tab active"/g)).toHaveLength(1);
     expect(nav.match(/aria-current="page"/g)).toHaveLength(1);
     expect(nav).toContain('href="/kestrel/cache" aria-current="page"');
-    expect(nav.match(/<a /g)).toHaveLength(5);
+    expect(nav.match(/<a /g)).toHaveLength(6);
     expect(nav).toContain('href="/kestrel/tokens"');
+    expect(nav).toContain('href="/kestrel/push"');
   });
 
   it('follows ADMIN_SEG', () => {

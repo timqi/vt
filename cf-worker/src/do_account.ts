@@ -30,6 +30,7 @@ import { challengeUvLevel, effectiveUvLevel, parseUvPolicy } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
 import { AccountNotifications, NotificationChannels } from './account_notifications';
+import { AccountAdmin } from './account_admin';
 import { AccountCache } from './account_cache';
 import { deleteKeysBatched, listPrefixPages } from './storage_batch';
 
@@ -150,6 +151,7 @@ export class AccountDO extends DurableObject<Env> {
   private readonly expectedOrigin: string;
   private readonly audit: AccountAudit;
   private readonly notifications: AccountNotifications;
+  private readonly admin: AccountAdmin;
   private readonly cache: AccountCache;
   private readonly tokens: AccountTokens;
 
@@ -157,7 +159,8 @@ export class AccountDO extends DurableObject<Env> {
     super(state, env);
     this.expectedOrigin = new URL(env.WORKER_ORIGIN).origin;
     this.audit = new AccountAudit(this.ctx.storage.sql, () => this.ctx.getWebSockets('admin'));
-    this.notifications = new AccountNotifications(this.ctx, this.env);
+    this.admin = new AccountAdmin(this.ctx.storage, this.env);
+    this.notifications = new AccountNotifications(this.ctx, this.env, this.admin);
     this.cache = new AccountCache(this.ctx.storage, this.env);
     this.tokens = new AccountTokens(this.ctx.storage.sql);
     this.ctx.blockConcurrencyWhile(async () => {
@@ -181,7 +184,10 @@ export class AccountDO extends DurableObject<Env> {
       return this.handleWsUpgrade(url);
     }
 
-    const op = url.pathname.split('/').pop();
+    const op = url.pathname.split('/').pop() ?? '';
+    // push-vapid / push-subscribe / push-unsubscribe / push-test: console-owned
+    // state, gated at the edge like every other admin op.
+    if (op.startsWith('push-')) return this.admin.pushOp(op.slice(5), request);
     switch (op) {
       case 'create':              return this.opCreate(request);
       case 'approve':             return this.opApprove(request);

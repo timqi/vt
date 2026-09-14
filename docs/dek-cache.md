@@ -74,9 +74,11 @@ TTL, a caller can decrypt the approved records without another phone tap.
 - Each write mints one `cache_group_id` (all entries from one approval under one
   key prefix) and stamps an immutable `created_ms`. The group id is the handle
   the admin surface lists, clears, and extends by.
-- A hit sends a best-effort notification through configured Pushover, Slack
-  App, or Feishu channels. Notifications never block DEK
-  delivery and contain no approval URL.
+- A hit sends a best-effort Web Push notice (`CACHE_HIT_NOTIFY = "1"`) to every
+  phone subscribed on the admin 推送 tab — tag `cache:<host>`, TTL 1 h, opening
+  the audit tab — and, until the channels leave (worker-slim.md §7 step 2),
+  through configured Pushover, Slack App, or Feishu. Notifications never block
+  DEK delivery and contain no approval URL.
 
 ## Data flow
 

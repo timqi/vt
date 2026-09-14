@@ -52,18 +52,28 @@ export function renderTemplate(template: string, vars: Readonly<Record<string, s
   return out;
 }
 
+// URL segment for the admin surface. Deliberately non-obvious so scanners that
+// probe /admin, /dashboard, etc. miss it (the real gate is Cloudflare Access —
+// this is just to cut noise). Change to any value you like, but keep it in sync
+// with the Cloudflare Access application's Path. The on-disk asset folder stays
+// pwa/admin/ regardless of this value.
+export const ADMIN_SEG = 'kestrel';
+
+// Where a cache-hit push lands: the audit tab is the ledger.
+export const ADMIN_AUDIT_PATH = `/${ADMIN_SEG}/audit`;
+
 // ── Placeholder values ────────────────────────────────────────────────────
 //
 // The Worker-owned chrome every shell needs. Passed in rather than imported so
-// these builders stay pure and testable (ADMIN_SEG / ASSET_VER / FAVICON_TAGS
-// live in index.ts, next to the routes that depend on them).
+// these builders stay pure and testable (ASSET_VER / FAVICON_TAGS live in
+// index.ts, next to the routes that depend on them).
 export interface PageChrome {
   adminSeg: string;
   assetVer: string;
   faviconTags: string;
 }
 
-export type AdminTab = 'audit' | 'cache' | 'tokens' | 'setup' | 'channels';
+export type AdminTab = 'audit' | 'cache' | 'tokens' | 'setup' | 'channels' | 'push';
 
 // Placeholders common to every shell, admin or public.
 export function pageVars(chrome: PageChrome): Record<string, string> {
@@ -76,7 +86,7 @@ export function adminTabs(chrome: PageChrome, active: AdminTab): string {
   const seg = chrome.adminSeg;
   const tab = (href: string, key: AdminTab, label: string) =>
     `<a class="tab${key === active ? ' active' : ''}" href="${href}"${key === active ? ' aria-current="page"' : ''}>${label}</a>`;
-  return `<nav class="tabs">${tab(`/${seg}/audit`, 'audit', '审计')}${tab(`/${seg}/cache`, 'cache', 'DEK 缓存')}${tab(`/${seg}/tokens`, 'tokens', '主机令牌')}${tab(`/${seg}/setup`, 'setup', 'Passkey')}${tab(`/${seg}/channels`, 'channels', '推送渠道')}</nav>`;
+  return `<nav class="tabs">${tab(`/${seg}/audit`, 'audit', '审计')}${tab(`/${seg}/cache`, 'cache', 'DEK 缓存')}${tab(`/${seg}/tokens`, 'tokens', '主机令牌')}${tab(`/${seg}/setup`, 'setup', 'Passkey')}${tab(`/${seg}/channels`, 'channels', '推送渠道')}${tab(`/${seg}/push`, 'push', '推送')}</nav>`;
 }
 
 // Placeholders every admin shell carries.

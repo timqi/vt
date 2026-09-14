@@ -25,7 +25,7 @@ import { log, logErr, tokenPrefix } from './log';
 import { requireAccess, type AccessVars } from './access';
 import { effectiveUvLevel, parseUvPolicy } from './uv_policy';
 import {
-  escapeJsonForHtml, renderTemplate, isAdminAssetPath,
+  escapeJsonForHtml, renderTemplate, isAdminAssetPath, ADMIN_SEG,
   pageVars, adminVars, channelVars, type AdminTab, type PageChrome,
 } from './page';
 import { tokenRefused } from './do_account';
@@ -38,20 +38,15 @@ export { AccountDO } from './do_account';
 const STRICT_CSP =
   "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
-// Shared favicon / app-icon links. Assets live in pwa/ and are served at /pwa/*.
-// Allowed under CSP `img-src 'self'` (same-origin). Minimal set: a vector
-// favicon (any tab size) + the 512 PNG for iOS home-screen / PWA install
-// (iOS does not accept SVG for apple-touch-icon).
+// Shared favicon / app-icon / manifest links. Assets live in pwa/ and are served
+// at /pwa/*. Allowed under CSP `img-src 'self'` (same-origin). Minimal set: a
+// vector favicon (any tab size), the 512 PNG for iOS home-screen / PWA install
+// (iOS does not accept SVG for apple-touch-icon), and the manifest that makes
+// the installed app standalone so Web Push works on iOS (worker-slim.md §5.6).
 const FAVICON_TAGS =
   '<link rel="icon" href="/pwa/icon.svg" type="image/svg+xml">' +
-  '<link rel="apple-touch-icon" href="/pwa/icon-512.png">';
-
-// URL segment for the admin surface. Deliberately non-obvious so scanners that
-// probe /admin, /dashboard, etc. miss it (the real gate is Cloudflare Access —
-// this is just to cut noise). Change to any value you like, but keep it in sync
-// with the Cloudflare Access application's Path. The on-disk asset folder stays
-// pwa/admin/ regardless of this value.
-const ADMIN_SEG = 'kestrel';
+  '<link rel="apple-touch-icon" href="/pwa/icon-512.png">' +
+  '<link rel="manifest" href="/manifest.webmanifest">';
 
 // Cache-busting token appended (?v=…) to admin/PWA asset URLs. Bump on any
 // change to a shipped .css/.js so browsers fetch the new file instead of a
@@ -60,7 +55,7 @@ const ADMIN_SEG = 'kestrel';
 // while admin.css stays stale, which desyncs markup from styles. The .html
 // page shells need no token — the Worker reads them server-side per request.)
 // Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
-const ASSET_VER = '20260914-3a9d162';
+const ASSET_VER = '20260914-ad992cf';
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
@@ -155,6 +150,15 @@ app.get('/pwa/*', async (c) => {
   return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
 });
 
+// Service worker at root scope (a worker under /pwa/ could not control /a/*
+// or the admin pages) and the install manifest. Both public: they hold no data.
+// The manifest's start URL follows ADMIN_SEG, so it is rendered like a shell.
+app.get('/sw.js', (c) => c.env.ASSETS.fetch(new Request(new URL('/sw.js', c.req.url).toString(), c.req.raw)));
+app.get('/manifest.webmanifest', async (c) => new Response(
+  renderTemplate(await fetchShell(c, '/manifest.webmanifest'), { ADMIN_BASE: `/${ADMIN_SEG}` }),
+  { headers: { 'Content-Type': 'application/manifest+json' } },
+));
+
 // ── Admin surface (Cloudflare Access protected) ───────────────────────────
 //
 // requireAccess verifies the Cf-Access-Jwt-Assertion JWT (RS256, kid, aud, iss,
@@ -217,6 +221,25 @@ app.get(`/${ADMIN_SEG}/channels`, (c) => {
     ...channelVars('PUSHOVER', pushoverSet),
     ...channelVars('SLACKAPP', slackAppSet),
     ...channelVars('FEISHU', feishuSet),
+  });
+});
+
+// Push tab (HTML shell; data from /api/push/vapid) and its API: the VAPID public
+// key plus the subscription list, subscribe / unsubscribe / test. Endpoint +
+// keys live under K_cfg in the DO (account_admin.ts); the edge only caps bodies.
+app.get(`/${ADMIN_SEG}/push`, (c) => servePage(c, '/admin/push', adminShellVars('push')));
+app.get(`/${ADMIN_SEG}/api/push/vapid`, async (c) => {
+  const resp = await accountStub(c).fetch('https://account.do/op/push-vapid');
+  const out = new Response(resp.body, resp);
+  out.headers.set('Cache-Control', 'no-store');
+  return out;
+});
+const PUSH_POST_MAX_BYTES = 4 * 1024;
+app.post(`/${ADMIN_SEG}/api/push/:op{subscribe|unsubscribe|test}`, async (c) => {
+  const raw = await readCappedBody(c, PUSH_POST_MAX_BYTES);
+  if (!raw) return c.text('body too large', 413);
+  return accountStub(c).fetch(`https://account.do/op/push-${c.req.param('op')}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: raw,
   });
 });
 

@@ -358,6 +358,31 @@ export interface CacheListResponse {
   ttl_options_s: number[];
 }
 
+// ── Web Push (docs/worker-slim.md §5) ──────────────────────────────────────
+
+/** One browser subscription, stored under K_cfg (account_admin.ts): endpoint +
+ *  `p256dh` + `auth` together let anyone push readable notifications to that
+ *  phone. Upserted by `endpoint`, newest first, capped at 10. */
+export interface PushSubscription {
+  endpoint: string;
+  /** UA public key, uncompressed P-256 point, base64url (65 bytes). */
+  p256dh: string;
+  /** UA authentication secret, base64url (16 bytes). */
+  auth: string;
+  label: string;
+  created_ms: number;
+}
+
+/** What pwa/sw.js receives. `url` is opened on tap; `tag` collapses repeats. */
+export interface PushPayload {
+  v: 1;
+  kind: 'approval' | 'enroll' | 'cache_hit' | 'test';
+  title: string;
+  body: string;
+  url: string;
+  tag: string;
+}
+
 /** Handle to edit a sent Slack App message in place: `channel` is the resolved
  *  channel ID echoed by chat.postMessage (robust even when config `channel` was
  *  a name), `ts` is the message timestamp. Shared by Challenge.slackapp and
