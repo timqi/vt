@@ -11,13 +11,11 @@ use crate::client::VTClient;
 
 /// Build the agent's audit-push config from the `--audit-*` flags. Returns a
 /// disabled config (audit push is a no-op) when `--audit-url` is unset,
-/// `--no-audit-push` is given, or `--audit-key` is empty.
+/// `--no-audit-push` is given, or `--audit-key` is not a host token.
 ///
-/// `--audit-key` is preferably this Mac's own host token (`vt1.…`, from
-/// `vt enroll`): its secret is the HMAC key and `agent_id = t:<token_id>`, so
-/// the Worker can also refuse rows from a revoked token. The Worker master is
-/// accepted here only (never as `VT_PASSKEY_TOKEN`): the per-host subkey
-/// HKDF(master, hostname) is derived ONCE so the raw master is not retained.
+/// `--audit-key` is this Mac's own host token (`vt1.…`, from `vt enroll`):
+/// its secret is the HMAC key and `agent_id = t:<token_id>`, so the Worker
+/// can also refuse rows from a revoked token. Nothing else is a key.
 #[cfg(target_os = "macos")]
 fn build_audit_push_config(
     audit_url: &Option<String>,
@@ -32,26 +30,27 @@ fn build_audit_push_config(
     if no_audit_push {
         return AuditPushConfig::disabled();
     }
-    let master = match audit_key {
+    let raw = match audit_key {
         Some(k) if !k.trim().is_empty() => k.trim(),
         _ => {
             tracing::warn!("audit push disabled: --audit-key not set");
             return AuditPushConfig::disabled();
         }
     };
-    let hostname = caller_meta::get_hostname();
-    if let Some((token_id, key)) = audit::host_token_audit_key(master) {
-        return AuditPushConfig::new(url.clone(), key, format!("t:{token_id}"), hostname);
+    match audit::host_token_audit_key(raw) {
+        Some((token_id, key)) => AuditPushConfig::new(
+            url.clone(),
+            key,
+            format!("t:{token_id}"),
+            caller_meta::get_hostname(),
+        ),
+        None => {
+            tracing::warn!(
+                "audit push disabled: --audit-key must be this Mac's host token (vt1.…, from `vt enroll`)"
+            );
+            AuditPushConfig::disabled()
+        }
     }
-    if master.starts_with(cf::HOST_TOKEN_PREFIX) {
-        tracing::warn!("audit push disabled: --audit-key looks like a host token but is malformed");
-        return AuditPushConfig::disabled();
-    }
-    // Master key: agent_id = hostname. The Worker re-derives HKDF(VT_AUTH_CF,
-    // hostname) to verify. Derive the per-host subkey once; pass the
-    // Zeroizing<[u8;32]> straight in so no plain heap copy of the key exists.
-    let key = audit::derive_agent_audit_key(master.as_bytes(), &hostname);
-    AuditPushConfig::new(url.clone(), key, hostname.clone(), hostname)
 }
 
 mod audit;
@@ -316,7 +315,7 @@ pub enum SshCommands {
         audit_url: Option<String>,
         #[arg(
             long = "audit-key",
-            help = "Worker master key for agent audit push (VT_AUTH_CF, == VT_PASSKEY_TOKEN). The agent derives its per-host audit subkey from this + the hostname on startup. NOTE: on the command line → visible in the process list; avoid on shared hosts. Unset (the default) disables audit push."
+            help = "This Mac's host token (vt1.…, from `vt enroll`) for agent audit push; its secret signs each row. NOTE: on the command line → visible in the process list; avoid on shared hosts. Unset (the default) disables audit push."
         )]
         audit_key: Option<String>,
         #[arg(

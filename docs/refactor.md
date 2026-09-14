@@ -18,7 +18,11 @@ with its approve/extend ladders and admin.
 | Leaves | Files | Operator step |
 | --- | --- | --- |
 | Keychain wrap v1 | `derive_passphrase_secret` (v1), `upgrade_wrap_v2_if_needed`, `secret rebind --to-v1`, the now-unused AES `mac_cipher` returned by `load_mac_cipher` | `vt secret rebind` stays one release for v1 stores, then goes with wrap v1 |
-| Audit-ingest master key | hostname-salted HKDF in `src/audit.rs`, `--audit-key` master form in `src/main.rs`, `/api/audit-ingest` verifier in `index.ts`; the agent pushes with its host token instead | every agent host runs `vt enroll`; needs a Rust + Worker change landed together |
+
+Landed: the audit-ingest master key (hostname-salted HKDF in `src/audit.rs`,
+the `--audit-key` master form, the `/api/audit-ingest` master verifier) went
+with worker-slim.md step 5 — the Worker's secret is a KEK now, so there was
+nothing left to derive from; `--audit-key` is the Mac's host token only.
 
 Rule: a compatibility branch is removed, never widened, and its test moves to
 a "rejected input" test.

@@ -322,7 +322,7 @@ base64-encoded plaintext.
 |----------|-------------|---------|
 | `VT_AUTH` | SSH-agent authentication token (from `vt init`) | unset |
 | `VT_PASSKEY_URL` | Cloudflare Worker base URL for phone approval | unset |
-| `VT_PASSKEY_TOKEN` | This host's Worker token (`vt1.…`, written by `vt enroll`; the bare `VT_AUTH_CF` master is accepted only during migration) | unset |
+| `VT_PASSKEY_TOKEN` | This host's Worker token (`vt1.…`, written by `vt enroll`; nothing else is accepted) | unset |
 | `VT_PASSKEY_UV` | Requested WebAuthn user-verification level for phone approval (`discouraged`/`preferred`/`required`); same as `--uv`, raise-only — the Worker's policy decides the floor | unset |
 | `VT_BACKEND` | `auto`, `agent`, or `passkey` transport selection | `auto` |
 | `VT_CONFIG` | Override the config-file path | `~/.config/vt/config.toml` |

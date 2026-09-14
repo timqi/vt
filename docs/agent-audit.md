@@ -45,65 +45,47 @@ agent's own ppid.
 
 ## HMAC key scheme
 
-```
-agent_audit_key = HKDF-SHA256(
-    ikm  = VT_AUTH_CF (worker master; never a host's VT_PASSKEY_TOKEN),
-    salt = agent_id   (= the machine hostname, UTF-8 bytes),
-    info = "vt-agent-audit-v1",
-    L    = 32)
-```
+The agent signs with this Mac's own host token (`vt ssh agent --audit-key
+vt1.<id>.<secret>`, the token `vt enroll` writes to the config file): the
+token secret is the HMAC key and `agent_id = t:<id>` names it. The Worker's
+`SECRET` is a KEK that never reaches a host, so there is no master to derive a
+per-host key from; the hostname-salted master form of earlier builds is a
+rejected input (`bad agent token id`) — [refactor.md](refactor.md) §1.
 
-- The **agent** is given the master `VT_AUTH_CF` via `--audit-key` and derives
-  its per-host subkey `agent_audit_key = HKDF(VT_AUTH_CF, hostname, …)` ONCE at
-  startup, keeping only the 32-byte subkey in memory (the raw master is dropped
-  after derivation, though it remains visible in `ps` via the flag).
-- The **Worker** holds `VT_AUTH_CF`. On each ingest it reads `agent_id` (the
-  hostname) from the (still-unverified) body, re-derives the same subkey, then
-  verifies the `VT-HMAC` over the raw body. Parsing `agent_id` before
-  verification is safe — it only selects which key to derive; a forged value
-  yields a key that won't verify. One HKDF per request is negligible; the 64 KB
-  body cap + 401-on-bad-HMAC bound abuse.
-- Derivation is shared and golden-vector-pinned across implementations:
-  Rust `derive_agent_audit_key` (`src/audit.rs`) ⇔ TS `hkdfSha256`
-  (`cf-worker/src/crypto.ts`).
+- The **agent** keeps only the 32-byte token secret in memory
+  (`host_token_audit_key`, `src/audit.rs`); the flag value remains visible in
+  `ps`, as any command-line secret does.
+- The **Worker** edge checks the header shape and the 64 KB cap, reads
+  `agent_id` (unverified — it only selects the token), and forwards the raw
+  bytes plus the MAC to the Durable Object, which derives the token secret
+  from the root key (`HKDF(R, token_id, "vt-host-token-v1")`,
+  [host-token.md](host-token.md) §2), compares in constant time, and refuses
+  a revoked or lapsed token (`isLive`, no sliding — a background push is not a
+  use the operator would count).
 
 ### Security tradeoff (accepted)
 
-This is the zero-token design: no pre-derivation, no per-agent secret file —
-just `--audit-url` + `--audit-key`. The cost is that the worker master
-`VT_AUTH_CF` is present on the agent host. A compromised agent can therefore:
-
-- forge audit rows for **any** hostname;
-- make authenticated `/api/challenge` requests — still gated by a phone approval;
-- make authenticated `/api/dek-cache` requests — these return cached DEKs with
-  **no phone in the loop** for a host token whose project already holds a
-  live entry within the TTL window (see `docs/dek-cache.md`).
-
-It does **not** by itself decrypt secrets that aren't currently cached — the
-vault master never leaves the phone. With the Mac's own host token as
-`--audit-key` (the preferred form below) nothing beyond that host's
-`VT_PASSKEY_TOKEN` is present; only the master form adds exposure.
-
-The per-hostname HKDF is retained (rather than signing with the raw master) so
-the Worker stays unchanged and the wire is per-host-keyed — making it trivial to
-move back to an off-agent pre-derivation model later if the tradeoff stops being
-acceptable.
+Nothing beyond this host's own `VT_PASSKEY_TOKEN` is present on the agent
+host. A compromised agent can therefore forge audit rows **for this host**,
+make authenticated `/api/challenge` requests (still gated by a phone approval),
+and make `/api/dek-cache` requests that return cached DEKs with **no phone in
+the loop** for a project this token already holds a live entry for (see
+[dek-cache.md](dek-cache.md)). It does **not** decrypt secrets that aren't
+currently cached — the vault master never leaves the phone — and revoking the
+token on the 主机令牌 tab ends all of it.
 
 ### `agent_id`
 
-The machine hostname (`hostname::get()`). Stable and unique enough for a small
-fleet; carried in the body and used as the HKDF salt. (If two hosts ever share a
-hostname they'd share a key — fine for single-Mac use.) `get_hostname()` falls
-back to the literal `"unknown"` if the lookup fails, so such a host still pushes
-(rows labelled `unknown`, sharing one key) — a monitoring blind spot, not a
-security gap. The `token_id` prefix is capped at 60 chars so a long hostname
-never crowds out the random suffix (which would collapse dedup).
+`t:<token_id>`, the host token the row is signed with. The display hostname
+(`hostname::get()`, falling back to the literal `"unknown"`) rides along in
+`meta.host` for the audit table. The `token_id` prefix is capped at 60 chars so
+a long hostname never crowds out the random suffix (which would collapse dedup).
 
 ## Wire
 
 ```
 POST {audit_url}/api/audit-ingest
-  Authorization: VT-HMAC b64u(HMAC-SHA256(agent_audit_key, rawBody))
+  Authorization: VT-HMAC b64u(HMAC-SHA256(host_token_secret, rawBody))
   body = { timestamp_ms, agent_id, hostname, entry }
     entry = { op_kind, outcome, salts, latency_ms, ts_ms, token_id, meta,
               peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s,
@@ -121,13 +103,13 @@ always sends them (`''`/`0`/`false` = not applicable); the Worker stores an
 *absent* field (old agent) as SQL NULL — the two stay distinguishable.
 
 Worker `/api/audit-ingest`:
-1. reject body > 64 KB (Content-Length + arrayBuffer length) → 413
-2. parse `agent_id` (unverified — only selects the key)
-3. derive key = HKDF-SHA256(VT_AUTH_CF, agent_id, "vt-agent-audit-v1", 32)
-4. verify `VT-HMAC` over raw body (ctEq) → 401 on mismatch
-5. replay-window check on `timestamp_ms` → 400 on skew
-6. `capChallengeMeta(entry.meta, CF-Connecting-IP)` (reuses the ceremony sanitizer)
-7. forward to `AccountDO /op/audit-ingest`
+1. reject body > 64 KB (Content-Length + streamed length) → 413
+2. parse `agent_id` (unverified — only selects the token); not `t:<token_id>` → 401
+3. replay-window check on `timestamp_ms` → 400 on skew
+4. `capChallengeMeta(entry.meta, CF-Connecting-IP)` (reuses the ceremony sanitizer)
+5. forward to `AccountDO /op/audit-ingest` with the raw bytes and the MAC
+6. DO: derive the token secret from the root key, verify `VT-HMAC` (ctEq) →
+   401 on mismatch; refuse a revoked/lapsed token → 401 `token_unknown`
 
 DO `auditAgent`: `INSERT … ON CONFLICT(token_id) DO NOTHING` with
 `source='agent'`, `created_ms = finalized_ms = ts_ms`. The `token_id`
@@ -161,12 +143,11 @@ vt ssh agent --run-allow zed,code \
   --audit-key "$VT_PASSKEY_TOKEN"      # this Mac's host token (vt1.…, from `vt enroll`)
 ```
 
-Preferred: `--audit-key` is the Mac's own host token ([host-token.md](host-token.md)).
-Its secret is the HMAC key and `agent_id = t:<token_id>`, so the Worker
+`--audit-key` is the Mac's own host token ([host-token.md](host-token.md)):
+its secret is the HMAC key and `agent_id = t:<token_id>`, so the Worker
 re-derives the same secret and refuses rows once the token is revoked or has
-lapsed. `--audit-key` alone also accepts the Worker master — the agent derives
-its per-host subkey from it + its hostname at startup and the Worker mirrors it;
-`VT_PASSKEY_TOKEN` never does. Either way the Worker needs **no new secret**. Audit push is fully opt-in: with `--audit-url` unset (or
+lapsed. Anything else disables audit push with a warning. The Worker needs
+**no new secret**. Audit push is fully opt-in: with `--audit-url` unset (or
 `--no-audit-push`, or an empty `--audit-key`, or a non-`https://` URL) the
 agent's `spawn_push` is a no-op.
 

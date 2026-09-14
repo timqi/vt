@@ -131,14 +131,12 @@ struct IngestBody<'a> {
 pub struct AuditPushConfig {
     /// Worker base URL, e.g. `https://vt-passkey.example.com` (no trailing path).
     url: String,
-    /// The HMAC key: this Mac's host-token secret (`--audit-key vt1.…`), or the
-    /// legacy per-host subkey HKDF(master, hostname) computed at startup in
-    /// `build_audit_push_config`. The raw master is NOT stored here.
+    /// The HMAC key: this Mac's host-token secret (`--audit-key vt1.…`).
     /// `Zeroizing` wipes it on drop; the fixed `[u8; 32]` avoids any transient
     /// un-zeroized heap copy.
     key: Zeroizing<[u8; 32]>,
-    /// Selects the Worker-side key: `t:<token_id>` for a host token, else the
-    /// hostname (HKDF salt). Also the `token_id` prefix of every row.
+    /// Selects the Worker-side key: `t:<token_id>`. Also the `token_id` prefix
+    /// of every row.
     agent_id: String,
     /// Display-only hostname.
     hostname: String,
