@@ -1,66 +1,51 @@
-// CREDENTIALS_JSON parse + credential lookup.
+// Passkey credential entries — the shape the setup page builds and the config
+// blob stores (`config.credentials`, account_admin.ts). Byte formats are those
+// of pwa/admin/setup.js; the Worker never sees the wrapped master in the clear.
 //
-// Schema (same as v1, unchanged):
-// {
-//   "v": 1,
-//   "c": [{
-//     "h": "<b64u(SHA-256(credential_id))>",  // lookup index
-//     "i": "<b64u(credential_id)>",            // for allowCredentials
-//     "k": "<b64u(iv(12)||ct(32)||tag(16))>",  // AES-GCM(K_wrap, master_key)
-//     "p": "<b64u(COSE pubkey)>",              // for signature verify
-//     "l": "label",
-//     "t": 1716105600
-//   }]
-// }
-//
-// The admin setup page also stores an `epoch` counter it bumps on every
-// revocation and shows beside the credential list. It is a page-local operator
-// signal: the Worker never reads it, never writes CREDENTIALS_JSON, and parsing
-// stays tolerant of it (and of any other extra key) rather than declaring a
-// field nothing here consumes.
+//   h  b64u(SHA-256(credential_id))   lookup index
+//   i  b64u(credential_id)            for allowCredentials
+//   k  b64u(iv(12)||ct(32)||tag(16))  AES-GCM(K_wrap, master_key)
+//   p  b64u(COSE pubkey)              for signature verify
+//   l  label
+//   t  unix epoch seconds
 
-import { b64uDec, b64uEnc, sha256 } from './crypto';
+import { b64uEnc, isB64uString, sha256 } from './crypto';
 
 export interface CredentialEntry {
-  h: string;   // b64u(SHA-256(credential_id))
-  i: string;   // b64u(credential_id)
-  k: string;   // b64u(AES-GCM wrapped master_key)
-  p: string;   // b64u(COSE pubkey)
-  l: string;   // label
-  t: number;   // unix epoch seconds
+  h: string;
+  i: string;
+  k: string;
+  p: string;
+  l: string;
+  t: number;
 }
 
-export interface CredentialsBlob {
-  v: number;
-  c: CredentialEntry[];
-}
+const LABEL_MAX = 64;
 
-export function parseCredentials(raw: string): CredentialsBlob {
-  const blob = JSON.parse(raw) as CredentialsBlob;
-  if (blob.v !== 1) throw new Error(`unsupported credentials version ${blob.v}`);
-  // `as CredentialsBlob` is a compile-time-only assertion; validate the runtime
-  // shape so a malformed CREDENTIALS_JSON fails loudly here instead of throwing
-  // an opaque error deep inside assertion verification.
-  if (!Array.isArray(blob.c)) throw new Error('credentials: `c` must be an array');
-  for (const e of blob.c) {
-    if (
-      !e ||
-      typeof e.h !== 'string' ||
-      typeof e.i !== 'string' ||
-      typeof e.k !== 'string' ||
-      typeof e.p !== 'string'
-    ) {
-      throw new Error('credentials: entry missing required string field(s)');
-    }
+/** One entry from an untrusted body; throws on any shape problem. Only what
+ *  the Worker later trusts is validated — `k` is opaque to it. */
+export function parseCredentialEntry(raw: unknown): CredentialEntry {
+  const e = raw as Partial<Record<keyof CredentialEntry, unknown>> | null;
+  if (!e || typeof e !== 'object') throw new Error('credential: not an object');
+  for (const f of ['h', 'i', 'k', 'p'] as const) {
+    if (!isB64uString(e[f]) || (e[f] as string).length > 4096) throw new Error(`credential: bad ${f}`);
   }
-  return blob;
+  if ((e.h as string).length !== 43) throw new Error('credential: h is not a SHA-256');
+  return {
+    h: e.h as string,
+    i: e.i as string,
+    k: e.k as string,
+    p: e.p as string,
+    l: typeof e.l === 'string' ? e.l.slice(0, LABEL_MAX) : '',
+    t: typeof e.t === 'number' && Number.isFinite(e.t) ? Math.floor(e.t) : 0,
+  };
 }
 
 // Locate an entry by credential_id (raw bytes). Returns undefined if not found.
 export async function lookupByCredentialId(
-  blob: CredentialsBlob,
+  entries: readonly CredentialEntry[],
   credentialId: Uint8Array,
 ): Promise<CredentialEntry | undefined> {
   const h = b64uEnc(await sha256(credentialId));
-  return blob.c.find(e => e.h === h);
+  return entries.find(e => e.h === h);
 }

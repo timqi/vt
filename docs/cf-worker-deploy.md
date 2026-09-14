@@ -13,7 +13,7 @@ phone (PWA) ── approve: WebAuthn + PRF ─▶ derives DEKs, seals to CLI pub
 ```
 
 - Ceremony endpoints live at the root (`/api/challenge`, `/api/dek`, `/api/approve`, `/api/reject`, `/a/:token`), secured by a body HMAC keyed on the caller's per-host token (derived from `VT_AUTH_CF`; see [host-token.md](host-token.md)) + unguessable tokens + WebAuthn. `/api/enroll` is the unauthenticated, rate-limited request for such a token.
-- The admin surface — one shell at `/<ADMIN_SEG>` (tabs in the URL hash: `#audit` `#cache` `#tokens` `#setup` `#settings`) and its API under `/<ADMIN_SEG>/api/*`, currently `ADMIN_SEG = "kestrel"` in `cf-worker/src/page.ts` — is gated by **Cloudflare Access** at the edge plus `cf-worker/src/access.ts` JWT verification. The shell's assets under `/pwa/admin/*` are public and hold no data.
+- The admin surface — one shell at `/admin` (tabs in the URL hash: `#audit` `#cache` `#tokens` `#setup` `#settings`) and its API under `/api/admin/*` — is a **passkey login**: the same passkeys that approve ceremonies sign in, the session is an 8-hour `__Host-vt_admin` cookie verified inside the Durable Object ([worker-slim.md](worker-slim.md) §3). No Cloudflare Access application. The shell's assets under `/pwa/admin/*` are public and hold no data.
 
 Request bodies for `/api/challenge`, `/api/dek-cache`, `/api/approve`, and
 `/api/reject` are limited to 256 KiB; `/api/audit-ingest` retains its 64 KiB
@@ -50,7 +50,7 @@ is ever missing, refresh it per `pwa/libsodium.README`.
 
 ## 2. Configure `wrangler.toml`
 
-The real `wrangler.toml` is gitignored (it carries account/Access ids). Copy the
+The real `wrangler.toml` is gitignored (it carries your account id). Copy the
 example and fill in your own values:
 
 ```bash
@@ -64,15 +64,13 @@ Edit these fields:
 | `account_id` | Cloudflare Dashboard → Workers → Account details |
 | `[vars] WORKER_ORIGIN` | Public HTTPS origin, e.g. `https://vt.example.com` |
 | `[vars] RP_ID` | WebAuthn RP id = the bare host, e.g. `vt.example.com` |
-| `[vars] ACCESS_TEAM_DOMAIN` | `<team>.cloudflareaccess.com` (filled in step 3) |
-| `[vars] ACCESS_AUD` | Access Application AUD tag (filled in step 3) |
 | `[vars] APPROVAL_UV_JSON` | Approval user-verification policy (optional; see below) |
 
 Notes already baked into the example:
 - `workers_dev = false` and `preview_urls = false` — the Worker is served **only**
   from your custom domain, never `*.workers.dev`.
 - `[assets]` binds the `pwa/` directory as `ASSETS` with `run_worker_first = true`
-  so every request hits the Worker (admin assets stay behind Access).
+  so every request hits the Worker.
 - `[[durable_objects.bindings]]` + `[[migrations]]` declare the `AccountDO`
   SQLite class — leave these as-is.
 - `[observability]` persists structured audit events (challenge.created /
@@ -117,20 +115,14 @@ APPROVAL_UV_JSON = '{"default":"discouraged","by_op":{"decrypt":"required"},"by_
 > nothing leaks. Deployments approving with a security key should set
 > `{"default":"required"}` (or pass `vt --uv required` from those hosts).
 
-## 3. Create the Cloudflare Access application (admin gate)
+## 3. Admin gate
 
-The admin surface must be gated **before** it is exposed. In Zero Trust →
-Access → Applications, create a **self-hosted** application:
-
-- **Path** = the admin segment, e.g. `vt.example.com/kestrel` (must equal
-  `ADMIN_SEG`).
-- Add a policy that allows only you (email / IdP group).
-- After creating it, copy the **Application AUD** tag and your team domain
-  (`<team>.cloudflareaccess.com`) into `wrangler.toml`
-  (`ACCESS_AUD`, `ACCESS_TEAM_DOMAIN`).
-
-> If either value is empty the Worker **fails closed** (403) on every
-> admin-surface request.
+There is none to create. Until the first passkey is registered (step 6) the
+Worker is **unconfigured**: every ceremony and admin data route answers
+`503 not_configured`, `/admin` shows the setup view, and only the public PWA
+assets and `POST /api/admin/bootstrap` (rate limited per IP) answer. Bootstrap
+right after deploying: a new hostname is public within minutes via certificate
+transparency, and whoever registers first owns the console until you reset it.
 
 ## 4. Set secrets (`wrangler secret put`)
 
@@ -140,10 +132,6 @@ Secrets are never inlined in `wrangler.toml`. Set them per environment:
 # Required — 32-byte base64url master; every host token is HKDF-derived from
 # it at `vt enroll`. Never a host's VT_PASSKEY_TOKEN.
 openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | wrangler secret put VT_AUTH_CF
-
-# Required — passkey credentials blob. Produced by the admin setup page in
-# step 6; on first deploy you may seed an empty set: {"v":1,"epoch":0,"c":[]}
-wrangler secret put CREDENTIALS_JSON
 
 # Optional — enables the opt-in DEK cache (approve-time TTL → approval-free
 # decrypt for the same host token + project). Empty/absent → caching disabled. Rotate to
@@ -166,26 +154,26 @@ Then point the custom domain at the Worker: in the Workers dashboard add a
 **Custom Domain** (or Route) for `vt.example.com`. Because `workers_dev = false`,
 this is the only way to reach it.
 
-## 6. Enroll the first Passkey (bootstrap)
+## 6. Register the first Passkey (bootstrap)
 
-`CREDENTIALS_JSON` holds PRF-wrapped master material. Generate it on the
-Access-gated admin shell's Passkey tab, `https://vt.example.com/kestrel#setup`:
+Open `https://vt.example.com/admin` — from the canonical hostname, since the
+request origin becomes the WebAuthn origin for good — and you get the setup view:
 
 1. On your Mac: `vt secret export` (Touch ID), set a one-time export passphrase,
    copy the base64.
-2. On the setup page (ideally in the Mac's own browser): paste the base64 +
-   passphrase, register the Passkey (phone), and let the page wrap the master
-   under the Passkey's PRF. Run **自检 / self-check** to verify.
-3. Copy the resulting blob out and deploy it:
-   ```bash
-   wrangler secret put CREDENTIALS_JSON   # paste the blob
-   ```
+2. On the setup view (ideally in the Mac's own browser): paste the base64 +
+   passphrase, give the passkey a label, press **注册并登录**. The page decrypts
+   the master locally, registers the passkey (phone), wraps the master under its
+   PRF and posts only the credential entry. The Worker generates its root key,
+   stores the encrypted configuration in the Durable Object and signs you in.
+3. On the Passkey tab run **自检 / self-check** once.
 
-`add` / `revoke` of further Passkeys need no macOS interaction — the Worker
-injects the current `CREDENTIALS_JSON` into the page; still copy the result out
-and re-run `wrangler secret put CREDENTIALS_JSON`. The bootstrap and update
-flow is intentionally kept in this deployment guide so it is usable without
-reading repository-specific agent instructions.
+If the view answers **已被初始化** with a time and IP that are not yours,
+someone bootstrapped first: rotate the secret (`wrangler secret put VT_AUTH_CF`
+with a fresh value) and reload — the old configuration is unreadable and the
+setup view (flagged as a reset) replaces it. Further passkeys are added and
+revoked on the Passkey tab; no secret changes hands. Revoking one ends every
+admin session (yours included); the last passkey cannot be revoked.
 
 ## 7. Wire up the CLI
 
@@ -235,12 +223,12 @@ expiry guard.
 
 - Workers Logs (dashboard) show the structured audit events; retention is
   platform-managed (~3 days Free, ~7 days Paid).
-- The admin **审计** tab (`/kestrel#audit`) shows the SQLite audit table, cache
+- The admin **审计** tab (`/admin#audit`) shows the SQLite audit table, cache
   TTL/expiry columns, and the **“清除 DEK 缓存”** (clear-cache) button.
-- The admin **DEK 缓存** tab (`/kestrel#cache`) is the inventory of entries that
+- The admin **DEK 缓存** tab (`/admin#cache`) is the inventory of entries that
   actually exist right now, grouped by the approval that armed them, with
-  per-group and bulk clear. Extending a group's window is gated on both Access
-  and a fresh phone Passkey approval, and is off unless `CACHE_ADMIN_EXTEND` is
+  per-group and bulk clear. Extending a group's window is gated on both the
+  admin session and a fresh phone Passkey approval, and is off unless `CACHE_ADMIN_EXTEND` is
   set — see [`docs/dek-cache.md`](dek-cache.md).
 
 ## Updates & rotation
@@ -255,8 +243,12 @@ expiry guard.
   every host the same day — every existing token stops verifying at once.
 - **Invalidate all cached DEKs:** rotate `CACHE_SECKEY` (or use the admin
   clear-cache button).
-- **Revoke a Passkey:** use the setup page (bumps `epoch`), then
-  `wrangler secret put CREDENTIALS_JSON`.
+- **Revoke a Passkey:** Passkey tab → 吊销 (bumps the session epoch: every
+  admin session ends). **End all sessions:** 设置 → 退出所有会话.
+- **Upgrading from the Access build:** delete the Access application, drop
+  `ACCESS_TEAM_DOMAIN` / `ACCESS_AUD` from `[vars]`, `wrangler secret delete
+  CREDENTIALS_JSON`, deploy, then bootstrap on `/admin` (step 6) and
+  re-subscribe phones on the 设置 tab (the config blob is re-keyed).
 
 See also: [the documentation map](README.md),
 [`docs/dek-cache.md`](dek-cache.md) (DEK cache design + threat model), and

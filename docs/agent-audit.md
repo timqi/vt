@@ -12,8 +12,8 @@ by contrast, writes a rich `audit` table inside the `AccountDO` Durable Object.
 
 This feature gives the agent path the **same admin-audit visibility**: it emits
 one record per decision and POSTs it to the Worker, which inserts it into the
-existing `audit` table marked `source='agent'`, queryable from the Access-gated
-admin shell's 审计 tab at `/<ADMIN_SEG>#audit`.
+existing `audit` table marked `source='agent'`, queryable from the admin
+shell's 审计 tab at `/admin#audit` (passkey login).
 
 ## Scope — simplified fire-and-forget
 

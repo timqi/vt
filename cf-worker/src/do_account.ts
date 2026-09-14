@@ -20,7 +20,7 @@ import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp
 import { formatHostToken, mintPairCode, mintTokenId } from './host_token';
 import { AccountTokens } from './account_tokens';
 import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, randomBytes, challengeHash } from './crypto';
-import { parseCredentials, lookupByCredentialId } from './credentials';
+import { lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
 import { cachePublicKey, discardedBoxPublicKey } from './cache_crypto';
 import {
@@ -31,7 +31,7 @@ import { challengeUvLevel, effectiveUvLevel, parseUvPolicy } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
 import { AccountNotifications } from './account_notifications';
-import { AccountAdmin } from './account_admin';
+import { AccountAdmin, notConfigured } from './account_admin';
 import { AccountCache } from './account_cache';
 import { deleteKeysBatched, listPrefixPages } from './storage_batch';
 
@@ -100,7 +100,6 @@ function extendSummary(intent: CacheExtendIntent): string {
   for (const t of intent.preview) {
     lines.push(`target: ${t.host || '?'} ${t.ip || '?'} · ${t.live} 条 · 现有效期至 ${fmtTimeZh(t.expires_ms)}`);
   }
-  if (intent.requested_by) lines.push(`by: ${intent.requested_by}`);
   return lines.join('\n');
 }
 
@@ -141,6 +140,13 @@ function enrollSummary(intent: EnrollIntent): string {
   return lines.join('\n');
 }
 
+// Ops the edge reaches on behalf of daemons and the approval page: token- or
+// capability-gated there, never by an admin session. Everything else is an
+// admin op and needs a verified session cookie (docs/worker-slim.md §3).
+const PUBLIC_OPS = new Set(['create', 'approve', 'reject', 'dek-cache', 'audit-ingest', 'page', 'enroll-create']);
+// Reachable before a session exists: the shell state, bootstrap and login.
+const OPEN_ADMIN_OPS = new Set(['admin-state', 'admin-bootstrap', 'admin-login-challenge', 'admin-login']);
+
 // Structured 401 for a missing or dead host token. The body is what the CLI
 // shows the user, so it names the remedy (`vt enroll`) instead of just the
 // status; the edge uses it for a request without VT-Token-Id.
@@ -160,7 +166,7 @@ export class AccountDO extends DurableObject<Env> {
     super(state, env);
     this.expectedOrigin = new URL(env.WORKER_ORIGIN).origin;
     this.audit = new AccountAudit(this.ctx.storage.sql, () => this.ctx.getWebSockets('admin'));
-    this.admin = new AccountAdmin(this.ctx.storage, this.env);
+    this.admin = new AccountAdmin(this.ctx.storage, this.env.VT_AUTH_CF);
     this.notifications = new AccountNotifications(this.ctx, this.env, this.admin);
     this.cache = new AccountCache(this.ctx.storage, this.env);
     this.tokens = new AccountTokens(this.ctx.storage.sql);
@@ -179,15 +185,26 @@ export class AccountDO extends DurableObject<Env> {
 
     // WebSocket upgrade. Two distinct channels:
     //   /ws        — per-ceremony daemon socket (tagged pt:{poll_token})
-    //   /ws-admin  — admin audit stream (tagged 'admin'); Access-gated at the edge
+    //   /ws-admin  — admin audit stream (tagged 'admin'); session-gated below
     if (request.headers.get('Upgrade') === 'websocket') {
-      if (url.pathname === '/ws-admin') return this.handleAdminWsUpgrade(url);
+      if (url.pathname === '/ws-admin') return this.handleAdminWsUpgrade(request);
       return this.handleWsUpgrade(url);
     }
 
     const op = url.pathname.split('/').pop() ?? '';
-    // push-vapid / push-subscribe / push-unsubscribe / push-test: console-owned
-    // state, gated at the edge like every other admin op.
+    switch (op) {
+      case 'admin-state':           return this.admin.state(request);
+      case 'admin-bootstrap':       return this.admin.bootstrap(request);
+      case 'admin-login-challenge': return this.admin.loginChallenge();
+      case 'admin-login':           return this.admin.login(request);
+    }
+    // Unconfigured (§4.3): nothing but the open ops above answers.
+    if (!(await this.admin.load())) return notConfigured();
+    if (!PUBLIC_OPS.has(op)) {
+      const session = await this.admin.session(request);
+      if (session instanceof Response) return session;
+    }
+    if (op.startsWith('admin-')) return this.admin.adminOp(op.slice(6), request);
     if (op.startsWith('push-')) return this.admin.pushOp(op.slice(5), request);
     switch (op) {
       case 'create':              return this.opCreate(request);
@@ -246,19 +263,14 @@ export class AccountDO extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  // Admin audit stream. Access-gated at the Worker edge (requireAccess), which
-  // passes the VERIFIED JWT `exp` (epoch seconds) through as ?exp=. We bind the
-  // socket's lifetime to that exp via serializeAttachment so a hibernating
-  // stream cannot outlive the admin's authenticated session — the alarm() sweep
-  // closes any socket past exp. (REST polling gets a fresh 403 the moment the
-  // session ends; a long-lived socket needs this explicit re-check.)
-  private async handleAdminWsUpgrade(url: URL): Promise<Response> {
-    const expRaw = url.searchParams.get('exp') ?? '';
-    if (!/^\d+$/.test(expRaw)) return new Response('missing exp', { status: 400 });
-    const exp = parseInt(expRaw, 10);
-    // Already-expired token → refuse before accepting (defence in depth; the edge
-    // JWT check already enforces exp, but never trust a stale query param).
-    if (Math.floor(Date.now() / 1000) >= exp) return new Response('expired', { status: 400 });
+  // Admin audit stream. The session cookie is verified here like every admin
+  // op; its `exp_s` bounds the socket via serializeAttachment so a hibernating
+  // stream cannot outlive the session — the alarm() sweep closes any socket
+  // past exp. (REST polling gets a fresh 401 the moment the session ends; a
+  // long-lived socket needs this explicit re-check.)
+  private async handleAdminWsUpgrade(request: Request): Promise<Response> {
+    const exp = await this.admin.session(request);
+    if (exp instanceof Response) return exp;
 
     // Bound concurrent admin sockets so broadcast fan-out and DO memory stay
     // bounded across many tabs / stale hibernated sockets. At the cap, evict the
@@ -336,7 +348,7 @@ export class AccountDO extends DurableObject<Env> {
     // Long-dead host tokens (revoked/lapsed > 30 d ago); live ones are never touched.
     this.tokens.sweep(now);
 
-    // 4. Admin audit-stream sockets: close any whose Access-JWT `exp` has passed,
+    // 4. Admin audit-stream sockets: close any whose session `exp_s` has passed,
     // so a hibernating stream cannot outlive the admin's authenticated session.
     // Bounds staleness to at most one alarm period (TTL_MS) past exp. A socket
     // with no/garbled attachment is treated as expired (fail closed).
@@ -345,7 +357,7 @@ export class AccountDO extends DurableObject<Env> {
       for (const ws of this.ctx.getWebSockets('admin')) {
         let exp = 0;
         try { exp = (ws.deserializeAttachment() as { exp?: number } | null)?.exp ?? 0; } catch {}
-        if (nowSec >= exp) { try { ws.close(4001, 'access session expired'); } catch {} }
+        if (nowSec >= exp) { try { ws.close(4001, 'session expired'); } catch {} }
       }
     } catch (e) {
       logErr('alarm.admin_ws_sweep_failed', e);
@@ -514,15 +526,8 @@ export class AccountDO extends DurableObject<Env> {
     }
 
     // Verify WebAuthn assertion
-    let creds;
-    try {
-      creds = parseCredentials(this.env.CREDENTIALS_JSON);
-    } catch (e) {
-      logErr('credentials.parse_error', e);
-      return new Response('server error', { status: 500 });
-    }
     const credId = b64uDec(body.credential_id_b64u);
-    const entry = await lookupByCredentialId(creds, credId);
+    const entry = await lookupByCredentialId(this.admin.current.credentials, credId);
     if (!entry) {
       this.audit.verifyFailure(ch.approve_token);
       return new Response('unknown credential', { status: 401 });
@@ -757,17 +762,15 @@ export class AccountDO extends DurableObject<Env> {
 
   private async opTokensRevoke(request: Request): Promise<Response> {
     let tokenId: string;
-    let by = '';
     try {
-      const body = await request.json() as { token_id?: unknown; admin_email?: unknown };
+      const body = await request.json() as { token_id?: unknown };
       if (typeof body.token_id !== 'string' || !body.token_id || body.token_id.length > 32) throw new Error('token_id');
       tokenId = body.token_id;
-      if (typeof body.admin_email === 'string') by = body.admin_email;
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
     const revoked = this.tokens.revoke(tokenId, Date.now());
-    log('token.revoked', { token: tokenId, revoked, by });
+    log('token.revoked', { token: tokenId, revoked });
     return Response.json({ revoked });
   }
 
@@ -867,10 +870,10 @@ export class AccountDO extends DurableObject<Env> {
 
   // ── Admin cache inventory + extension ──────────────────────────────────
   //
-  // Design note. Everything below is Cloudflare-Access gated at the edge, but
-  // Access alone is only sufficient for the AUTHORITY-REDUCING actions (list,
+  // Design note. Everything below needs an admin session (fetch dispatch), but
+  // a session alone is only sufficient for the AUTHORITY-REDUCING actions (list,
   // clear): their worst case is "secrets deleted, decrypts re-prompt". Extending
-  // a cache prolongs no-human-in-the-loop DEK delivery, so an Access session must
+  // a cache prolongs no-human-in-the-loop DEK delivery, so a session must
   // NOT be able to do it by itself — opCacheExtendCreate only creates a pending
   // ceremony, and the expiry does not move until a Passkey approves it
   // (opApprove → commitExtend). See docs/dek-cache.md.
@@ -935,7 +938,7 @@ export class AccountDO extends DurableObject<Env> {
   }
 
   // Admin: clear whole groups in one round trip (bulk selection on the cache tab).
-  // Authority-REDUCING, so Access alone is sufficient — no ceremony. Accepts
+  // Authority-REDUCING, so the session alone is sufficient — no ceremony. Accepts
   // `legacy:` handles too, so pre-migration entries stay revocable.
   private async opCacheClearGroups(request: Request): Promise<Response> {
     let ids: string[];
@@ -1022,7 +1025,6 @@ export class AccountDO extends DurableObject<Env> {
     const intent: CacheExtendIntent = {
       group_ids: targets.map(t => t.group_id),
       ttl_s: ttlS,
-      requested_by: op.admin_email ?? '',
       preview: targets,
     };
     const summary = extendSummary(intent);
@@ -1040,11 +1042,11 @@ export class AccountDO extends DurableObject<Env> {
       op_kind: 'cache-extend',
       command: summary,
       host: 'admin',
-      user: op.admin_email ?? '',
+      user: '',
       pwd: '',
       project: '',
       ppid_cmd: '',
-      ip: op.admin_ip ?? '',
+      ip: request.headers.get('CF-Connecting-IP') ?? '',
       reason: '延长已授权的 DEK 缓存有效期',
     };
     const ch: Challenge = {
@@ -1071,7 +1073,6 @@ export class AccountDO extends DurableObject<Env> {
     log('cache.extend_requested', {
       at: tokenPrefix(approveToken), ttl_s: ttlS,
       groups: targets.length, entries: targets.reduce((n, t) => n + t.live, 0),
-      by: op.admin_email ?? '',
     });
     const resp: CacheExtendCreateResponse = {
       approve_token: approveToken,
@@ -1124,12 +1125,11 @@ export class AccountDO extends DurableObject<Env> {
     }, result.extended, 'extended');
     log('cache.extended', {
       at: tokenPrefix(ch.approve_token), ttl_s: intent.ttl_s, groups: result.groups,
-      n: result.extended, by: intent.requested_by,
+      n: result.extended,
     });
   }
 
-  // Admin: wipe ALL audit rows (ceremony + cache events). Destructive,
-  // Cloudflare-Access gated at the edge.
+  // Admin: wipe ALL audit rows (ceremony + cache events). Destructive; session-gated.
   private async opClearAudit(): Promise<Response> {
     try {
       this.audit.clear();
@@ -1143,7 +1143,7 @@ export class AccountDO extends DurableObject<Env> {
 
   // Admin: drop ALL cached DEKs immediately (emergency revocation). After this,
   // every decrypt falls through to a phone approval until new entries are
-  // written. Cloudflare-Access gated at the Worker edge.
+  // written. Session-gated.
   private async opClearCache(): Promise<Response> {
     const { deleted } = await this.cache.clearAll();
     log('cache.cleared', { n: deleted });
@@ -1178,14 +1178,8 @@ export class AccountDO extends DurableObject<Env> {
     }
 
     // Verify WebAuthn assertion (reject also requires physical presence)
-    let creds;
-    try {
-      creds = parseCredentials(this.env.CREDENTIALS_JSON);
-    } catch {
-      return new Response('server error', { status: 500 });
-    }
     const credId = b64uDec(body.credential_id_b64u);
-    const entry = await lookupByCredentialId(creds, credId);
+    const entry = await lookupByCredentialId(this.admin.current.credentials, credId);
     if (!entry) {
       this.audit.verifyFailure(ch.approve_token);
       return new Response('unknown credential', { status: 401 });
@@ -1261,13 +1255,6 @@ export class AccountDO extends DurableObject<Env> {
       return new Response('challenge not pending', { status: 410 });
     }
 
-    let creds;
-    try {
-      creds = parseCredentials(this.env.CREDENTIALS_JSON);
-    } catch {
-      return new Response('server error', { status: 500 });
-    }
-
     // DEK-cache UI data. Only offer caching when CACHE_SECKEY is configured AND
     // the ceremony actually has DEKs to cache (auth-only ceremonies cannot). On
     // any derivation failure, degrade to "caching off" rather than erroring the
@@ -1293,7 +1280,7 @@ export class AccountDO extends DurableObject<Env> {
       daemon_pubkey_b64u: ch.daemon_pubkey_b64u,
       salts_b64u: ch.salts_b64u,
       rp_id: this.env.RP_ID,
-      allow_credentials: creds.c.map(e => ({ id_b64u: e.i, h_b64u: e.h, k_b64u: e.k })),
+      allow_credentials: this.admin.current.credentials.map(e => ({ id_b64u: e.i, h_b64u: e.h, k_b64u: e.k })),
       // What the page asks the authenticator for. Server state, so a tampered
       // page can only make the ceremony fail its own verification, never pass a
       // weaker one.

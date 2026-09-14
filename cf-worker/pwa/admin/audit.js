@@ -4,7 +4,7 @@
 // pagination). Read-only; all rendering via textContent (no HTML injection).
 // Click a row to open the shared detail dialog with the full stored params.
 //
-// Real-time: a WebSocket (/{seg}/api/audit-stream, Access-gated) pushes each
+// Real-time: a WebSocket (/api/admin/audit-stream, session-gated) pushes each
 // audit change (new pending / approved / rejected / expired / verify-fail /
 // cache event / agent decision) as a full row, applied in place — no re-fetch.
 // On (re)connect the client replays anything missed via after_seq catch-up
@@ -245,7 +245,7 @@ vt.tabs.audit = function (panel) {
   async function clearOrigin(tokenId, btn) {
     if (btn) btn.disabled = true;
     try {
-      var resp = await fetch(vt.api('cache-clear-origin'), {
+      var resp = await vt.apiFetch(vt.api('cache-clear-origin'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ token_id: tokenId }),
@@ -374,8 +374,8 @@ vt.tabs.audit = function (panel) {
     }
     setStatus(more ? '加载更多…' : '查询中…');
     try {
-      var resp = await fetch(buildUrl(more), { headers: { 'Accept': 'application/json' } });
-      if (resp.status === 403) { setStatus(vt.AUTH_EXPIRED, 'error'); return; }
+      var resp = await vt.apiFetch(buildUrl(more), { headers: { 'Accept': 'application/json' } });
+      if (resp.status === 401) return; // the shell shows the login view
       if (!resp.ok) { setStatus('查询失败 HTTP ' + resp.status, 'error'); return; }
       var json = await resp.json();
       var rows = (json && json.rows) || [];
@@ -413,7 +413,7 @@ vt.tabs.audit = function (panel) {
     if (!confirm('删除全部已缓存 DEK？此后解密将重新需要手机审批。')) return;
     setStatus('清空缓存中…');
     try {
-      var resp = await fetch(vt.api('clear-cache'), { method: 'POST', headers: { 'Accept': 'application/json' } });
+      var resp = await vt.apiFetch(vt.api('clear-cache'), { method: 'POST', headers: { 'Accept': 'application/json' } });
       if (!resp.ok) { setStatus('清空缓存失败 HTTP ' + resp.status, 'error'); return; }
       var json = await resp.json();
       setStatus('✓ 已清空 ' + (json && json.cleared != null ? json.cleared : '?') + ' 条 DEK 缓存', 'ok');
@@ -426,7 +426,7 @@ vt.tabs.audit = function (panel) {
     if (!confirm('清空全部审计日志？此操作不可恢复。')) return;
     setStatus('清空审计中…');
     try {
-      var resp = await fetch(vt.api('clear-audit'), { method: 'POST', headers: { 'Accept': 'application/json' } });
+      var resp = await vt.apiFetch(vt.api('clear-audit'), { method: 'POST', headers: { 'Accept': 'application/json' } });
       if (!resp.ok) { setStatus('清空审计失败 HTTP ' + resp.status, 'error'); return; }
       oldestId = null; exhausted = false;
       load(false);
@@ -481,7 +481,12 @@ vt.tabs.audit = function (panel) {
       }
     };
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
-    ws.onclose = function () { ws = null; setWsStatus('down'); scheduleReconnect(); };
+    ws.onclose = function (e) {
+      ws = null; setWsStatus('down');
+      // 4001: the DO closed it because the session's exp_s passed.
+      if (e && e.code === 4001) { vt.showLogin('会话已过期，请重新登录'); return; }
+      scheduleReconnect();
+    };
   }
 
   // Reconcile everything that changed since our high-water mark (missed while the
@@ -515,8 +520,8 @@ vt.tabs.audit = function (panel) {
       var u = new URL(API, location.origin);
       u.searchParams.set('after_seq', String(newestSeq));
       u.searchParams.set('limit', '500');
-      var resp = await fetch(u.toString(), { headers: { 'Accept': 'application/json' } });
-      if (!resp.ok) return false; // 403 etc. — leave it to the next reconnect
+      var resp = await vt.apiFetch(u.toString(), { headers: { 'Accept': 'application/json' } });
+      if (!resp.ok) return false; // 401 etc. — the shell handles the session
       var json = await resp.json();
       var rows = (json && json.rows) || [];   // ascending seq
       // applyRow advances newestSeq per row, driving the next page's after_seq

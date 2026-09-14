@@ -68,7 +68,7 @@ vt.tabs.tokens = function (panel) {
     if (!confirm('吊销 ' + (t.host || t.token_id) + ' 的令牌？该主机随后需要重新 vt enroll。')) return;
     btn.disabled = true;
     try {
-      var resp = await fetch(vt.api('tokens-revoke'), {
+      var resp = await vt.apiFetch(vt.api('tokens-revoke'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token_id: t.token_id }),
@@ -86,8 +86,8 @@ vt.tabs.tokens = function (panel) {
   async function load() {
     setStatus('查询中…');
     try {
-      var resp = await fetch(API, { headers: { 'Accept': 'application/json' } });
-      if (resp.status === 403) { setStatus(vt.AUTH_EXPIRED, 'error'); return; }
+      var resp = await vt.apiFetch(API, { headers: { 'Accept': 'application/json' } });
+      if (resp.status === 401) return; // the shell shows the login view
       if (!resp.ok) { setStatus('查询失败 HTTP ' + resp.status, 'error'); return; }
       var json = await resp.json();
       tokens = (json && json.tokens) || [];

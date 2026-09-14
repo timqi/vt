@@ -367,8 +367,9 @@ Cloudflare Worker in `cf-worker/`. The CLI reaches it via `VT_PASSKEY_URL` +
 `VT_PASSKEY_TOKEN`.
 
 See [docs/cf-worker-deploy.md](docs/cf-worker-deploy.md) for the full deployment
-guide (Wrangler config, Cloudflare Access gate, secrets, first-Passkey
-bootstrap, and CLI wiring). See [docs/README.md](docs/README.md) for cache,
+guide (Wrangler config, the secret, first-Passkey bootstrap on `/admin`, and
+CLI wiring). The admin console is passkey login; there is no Cloudflare Access
+application to create. See [docs/README.md](docs/README.md) for cache,
 SSH, error-protocol, audit, and notification documentation.
 
 ## License

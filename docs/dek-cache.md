@@ -116,7 +116,7 @@ client opens the result with the existing sealed-box implementation.
 
 ## Admin surface: the DEK 缓存 tab
 
-The admin shell's DEK 缓存 tab (`/<ADMIN_SEG>#cache`) lists what is **actually
+The admin shell's DEK 缓存 tab (`/admin#cache`) lists what is **actually
 cached right now**, one row per cache group, joined with the approval that
 armed it (host, user, directory, command). Each row shows its original `created_ms` below the remaining time and
 expiry, in the browser's local time. Legacy entries without that timestamp show
@@ -134,9 +134,9 @@ Two classes of action, with deliberately different gates:
 
 | Action | Gate | Why |
 |---|---|---|
-| List | Cloudflare Access | Read-only |
-| Clear (row / selected / all) | Cloudflare Access | Authority-**reducing**: worst case is "decrypts re-prompt" |
-| Extend | Access **+ a fresh phone Passkey approval** | Authority-**granting**: prolongs no-human-in-the-loop decrypts |
+| List | Admin session (passkey login, [worker-slim.md](worker-slim.md) §3) | Read-only |
+| Clear (row / selected / all) | Admin session | Authority-**reducing**: worst case is "decrypts re-prompt" |
+| Extend | Session **+ a fresh phone Passkey approval** | Authority-**granting**: prolongs no-human-in-the-loop decrypts |
 
 The scan cap above applies to the LISTING only. **A clear is exhaustive**: all
 three clear paths (by group, by origin approval, and 清除全部) stream the `dek:`
@@ -193,8 +193,8 @@ until a Passkey approves it, and every one of these holds:
    origin/creation/IP is refused outright rather than guessed at; it stays listable
    and clearable. Pre-`created_ms` entries ARE extendable (their `legacy:` handle
    rests on a full 96-bit origin token), so nothing already cached is stranded.
-7. **Audited twice.** The ceremony row records the authorization (with the
-   verified Cloudflare Access email); a second `op_kind='cache'`,
+7. **Audited twice.** The ceremony row records the authorization (host
+   `admin`, the requesting browser's IP); a second `op_kind='cache'`,
    `status='extended'` row records the effect — how many entries moved, to when,
    and what was skipped. Clears remain CF-logs-only: they reduce authority.
 8. `audit.cache_ttl_s` keeps its original meaning (the TTL the approver chose)
@@ -207,8 +207,8 @@ Worker, and the assertion covers the challenge rather than a hash of the
 displayed text. A compromised Worker could therefore show one intent and hold
 another — but a compromised Worker already holds `CACHE_SECKEY` and can read
 cached DEKs outright, so this adds no new capability to that adversary. Against
-the adversary the gate is actually for — someone holding only a Cloudflare Access
-session — the Passkey requirement is decisive.
+the adversary the gate is actually for — someone holding only an admin session
+cookie — the Passkey requirement is decisive.
 
 ## Security boundary
 

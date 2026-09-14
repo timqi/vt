@@ -6,13 +6,14 @@ export interface Env {
   ACCOUNT: DurableObjectNamespace;
   ASSETS: Fetcher;
   /** Worker master. Host tokens are HKDF-derived from it (host_token.ts) and
-   *  the agent audit key too; it is never accepted directly as a daemon key. */
+   *  the agent audit key too; it is never accepted directly as a daemon key.
+   *  Also the KEK over the root key (account_admin.ts). */
   VT_AUTH_CF: string;
-  /** Workers Rate Limiting binding guarding the UNAUTHENTICATED POST /api/enroll
-   *  (per connecting IP). Absent → enrollment is refused (fail closed): an
-   *  endpoint that can page the operator's phone must never run unthrottled. */
+  /** Workers Rate Limiting binding shared by the unauthenticated POSTs: enroll
+   *  (`enroll:<ip>`), admin bootstrap and login-challenge (`login:<ip>`).
+   *  Absent → those routes refuse (503): an endpoint that can page the phone or
+   *  mint a session must never run unthrottled. */
   ENROLL_LIMITER?: RateLimit;
-  CREDENTIALS_JSON: string;
   /**
    * base64url 32-byte X25519 secret key for the opt-in DEK cache. The PWA seals
    * each cached DEK to the matching public key (derived at runtime via
@@ -44,10 +45,6 @@ export interface Env {
   APPROVAL_UV_JSON?: string;
   WORKER_ORIGIN: string;
   RP_ID: string;
-  /** Cloudflare Access team domain, e.g. "myteam.cloudflareaccess.com". Empty → admin surface fails closed. */
-  ACCESS_TEAM_DOMAIN: string;
-  /** Cloudflare Access Application AUD tag. Empty → admin surface fails closed. */
-  ACCESS_AUD: string;
 }
 
 // ── Audit (DO SQLite) ──────────────────────────────────────────────────────
@@ -268,8 +265,6 @@ export interface CacheExtendIntent {
   /** Requested TTL in seconds; must be an EXTEND_TTL_WHITELIST member. Absolute
    *  from the moment of approval, not additive. */
   ttl_s: number;
-  /** Verified Cloudflare Access email of the admin who requested it (audit). */
-  requested_by: string;
   /** Snapshot of each target group at request time, so the approval page and the
    *  audit row show what the admin was actually looking at. */
   preview: CacheExtendPreview[];
@@ -660,18 +655,13 @@ export interface DoDekCacheOp {
   token_id: string;
 }
 
-/** Internal DO op for POST /{ADMIN_SEG}/api/cache-extend-request. The Worker has
- *  already passed the Cloudflare Access gate; it forwards the VERIFIED admin
- *  identity and the connecting IP, never anything client-claimed. The DO builds
- *  the ceremony (tokens, challenge hashes, immutable intent) itself, so a request
- *  and its approval cannot disagree about what is being extended. */
+/** Internal DO op for POST /api/admin/cache-extend-request. The DO verified the
+ *  admin session and reads the connecting IP from the forwarded headers; it
+ *  builds the ceremony (tokens, challenge hashes, immutable intent) itself, so
+ *  a request and its approval cannot disagree about what is being extended. */
 export interface DoCacheExtendCreateOp {
   group_ids: unknown;
   ttl_s: unknown;
-  /** Verified Cloudflare Access email (access.ts sets it after JWT verify). */
-  admin_email: string;
-  /** CF-Connecting-IP of the admin browser (display/audit only). */
-  admin_ip: string;
 }
 
 /** Response of a successful cache-extend-request: a pending ceremony that does

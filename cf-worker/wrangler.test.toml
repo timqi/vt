@@ -6,10 +6,11 @@
 # SQLite migration as `wrangler.toml.example`, with fixture values for the vars.
 #
 # EVERY secret-shaped value here is an obviously-fake, throwaway test fixture. It
-# authorizes nothing anywhere: CACHE_SECKEY is a counting pattern, and the single
-# enrolled credential's private half lives in `test/do_helpers.ts` (a keypair
-# generated for this test suite alone, so a full WebAuthn ceremony can be driven
-# end-to-end offline). Never point this file at a real deployment.
+# authorizes nothing anywhere: CACHE_SECKEY is a counting pattern, VT_AUTH_CF a
+# literal, and the test credential (registered by `bootstrap()` in
+# `test/do_helpers.ts`) is a keypair generated for this suite alone, so a full
+# WebAuthn ceremony can be driven end-to-end offline. Never point this file at
+# a real deployment.
 
 name = "vt-passkey-test"
 main = "src/index.ts"
@@ -27,9 +28,9 @@ class_name = "AccountDO"
 tag = "v1"
 new_sqlite_classes = ["AccountDO"]
 
-# Enrollment rate limiter, generous so the tests can drive several enrollments
-# per file; the fail-closed "binding absent" path is tested by deleting it from
-# the env the router is invoked with.
+# The one rate limiter (enroll, admin bootstrap, login-challenge), generous so
+# the tests can drive several ceremonies per file; the fail-closed "binding
+# absent" path is tested by deleting it from the env the router is invoked with.
 [[unsafe.bindings]]
 name = "ENROLL_LIMITER"
 type = "ratelimit"
@@ -40,22 +41,13 @@ simple = { limit = 100, period = 60 }
 WORKER_ORIGIN = "https://vt.test.invalid"
 RP_ID = "vt.test.invalid"
 
-# Cloudflare Access is left UNCONFIGURED on purpose: empty values make the admin
-# surface fail closed (403), which is itself an invariant worth exercising.
-ACCESS_TEAM_DOMAIN = ""
-ACCESS_AUD = ""
-
-VT_AUTH_CF = ""
+# KEK over the root key the tests bootstrap; a literal, not a key.
+VT_AUTH_CF = "test-kek-not-a-secret"
 
 # Fake 32-byte X25519 secret (bytes 0x01..0x20, b64u) — a counting pattern, not a
 # key anyone generated for use. The tests derive the matching public key from it
 # at runtime via cachePublicKey(), exactly as the Worker does.
 CACHE_SECKEY = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
-
-# One enrolled test credential. `p` is the COSE public key of the throwaway
-# P-256 keypair in test/do_helpers.ts; `k` is filler (the wrapped master key is
-# never touched by the Worker). No real authenticator ever produced this.
-CREDENTIALS_JSON = '{"v":1,"epoch":1,"c":[{"h":"L0JnHXnwlzt3HXjLqjzbrgit2WcsVKLQIAFOIdeGB3s","i":"dnQtdGVzdC1jcmVkZW50aWFs","k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","p":"pQECAyYgASFYIIM-1_8pVqW7YUwLEF1aZb4dIBZimOydM-fAJpdQX9N8IlggIcsGbg-NW_rShPt68QxCXmBA7dV9v8NEw2B2OqvOW_4","l":"test-passkey","t":1716105600}]}'
 
 # Both cache toggles OFF by default: the tests that need them on set them
 # explicitly, which is the point (a kill switch must be observable in both

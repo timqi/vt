@@ -16,15 +16,18 @@ not need; `dryoc`/`libsodium.js` stay (refactor.md step 4).
 
 | Leaves | Files / symbols | Operator step |
 | --- | --- | --- |
-| Cloudflare Access | `access.ts`, `requireAccess`, `AccessVars`, `accessEmail`/`accessExp`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, the `?exp=` query on `/ws-admin` | delete the Access application; remove both `[vars]` |
-| `ADMIN_SEG` | constant and every `/${ADMIN_SEG}` route → `/admin`, `/api/admin/*`; the `seg` derivation behind `vt.api` in `admin.js` | bookmarks change to `/admin` |
-| `CREDENTIALS_JSON` | `Env.CREDENTIALS_JSON`, `parseCredentials` of the `{v,c}` envelope, the setup page's textarea/copy/`wrangler secret put` loop | re-register passkeys through `/admin` (§3.4); `wrangler secret delete CREDENTIALS_JSON` |
 | `CACHE_SECKEY` | `Env.CACHE_SECKEY`; the scalar is derived (§2) | `wrangler secret delete CACHE_SECKEY`; existing sealed entries become misses — 清除全部 once |
 | `CACHE_ADMIN_EXTEND` | `cacheAdminExtendEnabled`, `extend_enabled` plumbing; extension is available whenever caching is | remove the `[vars]` line |
 | `CACHE_HIT_NOTIFY`, `APPROVAL_UV_JSON` | `Env` fields; values move to the config blob (§4) | remove the `[vars]` lines; re-enter on the 设置 tab |
 | `WORKER_ORIGIN`, `RP_ID` | `Env` fields; origin is captured at bootstrap (§3.3), RP id is its hostname | remove the `[vars]` lines |
 | `VT_AUTH_CF` (name only) | renamed `SECRET`; derivation unchanged, so host tokens survive | `wrangler secret put SECRET` with the **same value**, then `wrangler secret delete VT_AUTH_CF` |
 | `ENROLL_LIMITER` (name only) | renamed `LIMITER`, shared by enroll and login (§3.2) | rename the binding in `wrangler.toml` |
+
+Landed (step 4): Cloudflare Access, `ADMIN_SEG` and `CREDENTIALS_JSON` are
+gone; admin is the passkey session of §3 at `/admin`, and `root:v1` (§2) exists
+from bootstrap on, so `K_cfg` and `K_sess` already derive from `R`. Operator:
+delete the Access application, `wrangler secret delete CREDENTIALS_JSON`,
+re-register passkeys through `/admin`.
 
 Stays untouched: ceremony routes and their HMAC/replay/body caps, host tokens,
 DEK cache ladders and admin actions, audit table and stream, alarm sweep,
@@ -329,12 +332,11 @@ four are distinct data sets already implemented as separate scripts.
 ## 7. Implementation order
 
 Each step: `just check-worker`, then `just bump-assets` + `just deploy-worker`
-where `pwa/` changed. Steps 1–3 (Web Push added, channels deleted, one admin
-shell) have landed; steps 4–5 land after refactor.md step 3 (cache key v5).
+where `pwa/` changed. Steps 1–4 (Web Push added, channels deleted, one admin
+shell, passkey admin auth with `root:v1` from bootstrap) have landed.
 
 | # | Change | Files | Tests moving to rejected-input |
 | --- | --- | --- | --- |
-| 4 | **Passkey admin auth** (after v5; `R` is introduced in step 5, so bootstrap here writes `cfg:v1` under the interim `K_cfg` and the 409 view carries `registered_ms`/`ip`) | new `admin_auth.ts` (cookie mint/verify, pure); `account_admin.ts` gains `credentials`, `origin`, `epoch`, login challenges, bootstrap, add/revoke; `do_account.ts` dispatches `admin-*` ops and verifies the cookie on every admin op and `/ws-admin`; `index.ts` `/admin`, `/api/admin/*`, `LIMITER login:` keys; `access.ts`, `ADMIN_SEG`, `CREDENTIALS_JSON` deleted; `setup.js` → bootstrap/add/revoke over the API; `credentials.ts` parses entries, not the envelope; `host-token.md` §4, `dek-cache.md` gate table, `cf-worker-deploy.md`, AGENTS.md admin lines | `credentials.test.ts` "tolerates epoch" → "`{v,c}` envelope posted to credentials-add is 400"; new `admin_auth.test.ts` (MAC tamper/expiry/epoch → 401, wrong `Origin` → 403, `Cf-Access-Jwt-Assertion` ignored, challenge single-use and 120 s, pending cap 429, limiter absent 503, bootstrap 409 with registered_ms/ip then login 204, last-credential revoke 409) |
 | 5 | **Config in DO**, one secret, root key | `account_admin.ts` gains `root:v1` (generate/wrap/unwrap `R`, 轮换 SECRET op, two-wrap window per §2), every derivation re-rooted on `R` (host tokens re-enrolled once), `cache_enabled`, `cache_hit_notify`, `uv_policy`, `GET/PUT config`; `opCreate` applies UV; `account_cache.ts`/`cache_crypto.ts` derive the scalar; `CACHE_ADMIN_EXTEND`, `CACHE_HIT_NOTIFY`, `APPROVAL_UV_JSON`, `WORKER_ORIGIN`, `RP_ID`, `CACHE_SECKEY` leave `Env`; `VT_AUTH_CF` → `SECRET`, `ENROLL_LIMITER` → `LIMITER`; 设置 tab; `wrangler.toml.example` (no `[vars]`), `cf-worker-deploy.md` rewrite, `dek-cache.md`, AGENTS.md cache lines; `test/do_helpers.ts` env → `{SECRET, LIMITER?, ACCOUNT, ASSETS}` | `do_account.uv.test.ts` reads policy from config; `do_account.dek_cache.test.ts` adds "`cache_enabled=false` with live entries → miss, approve page offers `[0]`, extend routes 404"; `do_account.host_token.test.ts` rotation case keeps its name with `SECRET` |
 
 ## 8. Budget

@@ -8,6 +8,8 @@ import { deleteKeysBatched } from '../src/storage_batch';
 import {
   inDO, setDoVar, makeChallenge, makeMeta, signApproval, seedGroup,
   readEntries, auditRows, nextSalt, sealFakeDek, testEnv, liveTokenId,
+  bootstrap,
+  adminHeaders,
 } from './do_helpers';
 import type { Challenge, CacheExtendIntent } from '../src/types';
 
@@ -15,6 +17,7 @@ const TTL_MS = 5 * 60_000;
 const GROUP = 'g_testgroup00000';
 
 beforeEach(async () => {
+  await bootstrap();
   await setDoVar('CACHE_SECKEY', testEnv.CACHE_SECKEY);
   await setDoVar('CACHE_ADMIN_EXTEND', '1');
 });
@@ -317,7 +320,7 @@ it('keeps cache write, read, extension, and clear within every 128-key storage l
     });
     const post = async (op: string, body: unknown) => {
       const response = await inst.fetch(new Request(`https://account.do/op/${op}`, {
-        method: 'POST', body: JSON.stringify(body),
+        method: 'POST', body: JSON.stringify(body), headers: adminHeaders(),
       }));
       const text = await response.text();
       expect(response.status).toBe(200);
@@ -369,7 +372,7 @@ describe('extension storage failures', () => {
         origin_token_id: origin.approve_token, expires_ms: expiry,
       });
       const intent: CacheExtendIntent = {
-        group_ids: [GROUP], ttl_s: 24 * 3600, requested_by: 'admin@example.invalid', preview: [],
+        group_ids: [GROUP], ttl_s: 24 * 3600, preview: [],
       };
       const ch = makeChallenge({ status: 'approved', extend: intent });
       const put = state.storage.put.bind(state.storage);

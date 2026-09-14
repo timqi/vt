@@ -2,7 +2,7 @@
 // serves. The two shells (pwa/approve.html, pwa/admin/admin.html) are public
 // static assets that carry no data; the Worker reads them through the ASSETS
 // binding inside the route handler and fills every `{{NAME}}` placeholder here
-// — for the admin shell inside the Access-gated route. Kept free of Worker/Hono
+// — for the admin shell with the state the DO reported. Kept free of Worker/Hono
 // types so it unit-tests as plain TypeScript (test/page.test.ts).
 
 // Escape a JSON string for safe embedding in a <script type="application/json"> block.
@@ -51,15 +51,8 @@ export function renderTemplate(template: string, vars: Readonly<Record<string, s
   return out;
 }
 
-// URL segment for the admin surface. Deliberately non-obvious so scanners that
-// probe /admin, /dashboard, etc. miss it (the real gate is Cloudflare Access —
-// this is just to cut noise). Change to any value you like, but keep it in sync
-// with the Cloudflare Access application's Path. The on-disk asset folder stays
-// pwa/admin/ regardless of this value.
-export const ADMIN_SEG = 'kestrel';
-
 // Where a cache-hit push lands: the admin shell on its audit tab (the ledger).
-export const ADMIN_AUDIT_PATH = `/${ADMIN_SEG}#audit`;
+export const ADMIN_AUDIT_PATH = '/admin#audit';
 
 // ── Placeholder values ────────────────────────────────────────────────────
 //

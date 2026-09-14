@@ -12,12 +12,13 @@
 //     calling commitExtend directly.
 //
 // The P-256 keypair below is a throwaway generated for this suite; its public
-// half is the single credential enrolled in wrangler.test.toml. It is not a
+// half is the single credential `bootstrap()` registers. It is not a
 // credential for anything, anywhere.
 
 import { env, runInDurableObject } from 'cloudflare:test';
 import { b64uEnc, b64uDec, sha256 } from '../src/crypto';
 import { seal, cachePublicKey } from '../src/cache_crypto';
+import { sessionCookieValue, SESSION_COOKIE } from '../src/admin_auth';
 import type { CacheEntry, Challenge, ChallengeMeta } from '../src/types';
 
 // ── DO access ──────────────────────────────────────────────────────────────
@@ -25,9 +26,12 @@ import type { CacheEntry, Challenge, ChallengeMeta } from '../src/types';
 export const testEnv = env as unknown as {
   ACCOUNT: DurableObjectNamespace;
   CACHE_SECKEY: string;
-  WORKER_ORIGIN: string;
-  RP_ID: string;
 };
+
+/** The origin `bootstrap()` registers: WebAuthn origin, RP id source and
+ *  approve-URL base for every test. */
+export const TEST_ORIGIN = 'https://vt.test.invalid';
+export const TEST_RP_ID = 'vt.test.invalid';
 
 /** The singleton instance index.ts always talks to (idFromName('account')). */
 export function accountStub(): DurableObjectStub {
@@ -55,6 +59,41 @@ export function inDO<T>(fn: (h: DoHandle) => T | Promise<T>): Promise<T> {
  *  storage) is reused across tests in a file. */
 export async function setDoVar(name: string, value: string): Promise<void> {
   await inDO(({ inst }) => { inst.env[name] = value; });
+}
+
+// ── Admin session ──────────────────────────────────────────────────────────
+
+/** The entry the test authenticator registers: `p` is the COSE public key of
+ *  the throwaway P-256 keypair below; `k` is filler (the wrapped master is
+ *  never touched by the Worker). */
+export const TEST_CREDENTIAL_ENTRY = {
+  h: 'L0JnHXnwlzt3HXjLqjzbrgit2WcsVKLQIAFOIdeGB3s',
+  i: 'dnQtdGVzdC1jcmVkZW50aWFs',
+  k: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+  p: 'pQECAyYgASFYIIM-1_8pVqW7YUwLEF1aZb4dIBZimOydM-fAJpdQX9N8IlggIcsGbg-NW_rShPt68QxCXmBA7dV9v8NEw2B2OqvOW_4',
+  l: 'test-passkey',
+  t: 1716105600,
+};
+
+let adminCookie: string | null = null;
+
+/** Bootstrap the DO (root key + config with the test credential) from
+ *  TEST_ORIGIN and keep the session cookie for every later admin op. Storage
+ *  is isolated per test, so each test's `beforeEach` runs this. */
+export async function bootstrap(): Promise<void> {
+  const resp = await accountStub().fetch('https://account.do/op/admin-bootstrap', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: TEST_ORIGIN, 'CF-Connecting-IP': '203.0.113.1' },
+    body: JSON.stringify({ entry: TEST_CREDENTIAL_ENTRY }),
+  });
+  await resp.text();
+  if (resp.status !== 204) throw new Error(`bootstrap: ${resp.status}`);
+  adminCookie = sessionCookieValue(resp.headers.get('Set-Cookie'));
+}
+
+/** Cookie + Origin the DO's admin gate wants; also what a browser tab sends. */
+export function adminHeaders(): Record<string, string> {
+  return adminCookie ? { Cookie: `${SESSION_COOKIE}=${adminCookie}`, Origin: TEST_ORIGIN } : {};
 }
 
 // ── Storage fixtures ───────────────────────────────────────────────────────
@@ -208,7 +247,7 @@ export async function auditRow(h: DoHandle, tokenId: string): Promise<AuditSnaps
 // ── Software authenticator (throwaway P-256 keypair) ───────────────────────
 
 // TEST FIXTURE ONLY. Generated for this suite; the matching public key is the
-// lone credential in wrangler.test.toml. Grants nothing anywhere.
+// lone credential bootstrap() registers. Grants nothing anywhere.
 const TEST_AUTHENTICATOR_JWK: JsonWebKey = {
   kty: 'EC',
   crv: 'P-256',
@@ -217,8 +256,8 @@ const TEST_AUTHENTICATOR_JWK: JsonWebKey = {
   d: 'zh_7N-Uz6LoAmmbU4iErdP2oTxD3nKuPUY5rbcEiGsU',
 };
 
-/** b64u(credential_id) as enrolled in wrangler.test.toml ("vt-test-credential"). */
-export const TEST_CREDENTIAL_ID_B64U = 'dnQtdGVzdC1jcmVkZW50aWFs';
+/** b64u(credential_id) of TEST_CREDENTIAL_ENTRY ("vt-test-credential"). */
+export const TEST_CREDENTIAL_ID_B64U = TEST_CREDENTIAL_ENTRY.i;
 
 /** The PWA's ephemeral X25519 pubkey. An extension ceremony delivers no key
  *  material, so any 32 bytes will do — it only has to be bound into the
@@ -249,7 +288,7 @@ export const FLAGS_UP_UV = 0x05;
 export const FLAGS_UP_ONLY = 0x01;
 
 /** Sign one assertion over `expectedChallenge` with the fixture credential. */
-async function signChallenge(expectedChallenge: Uint8Array, flags: number): Promise<{
+export async function signChallenge(expectedChallenge: Uint8Array, flags: number): Promise<{
   credential_id_b64u: string;
   client_data_json_b64u: string;
   authenticator_data_b64u: string;
@@ -258,12 +297,12 @@ async function signChallenge(expectedChallenge: Uint8Array, flags: number): Prom
   const clientDataJson = new TextEncoder().encode(JSON.stringify({
     type: 'webauthn.get',
     challenge: b64uEnc(expectedChallenge),
-    origin: new URL(testEnv.WORKER_ORIGIN).origin,
+    origin: TEST_ORIGIN,
     crossOrigin: false,
   }));
 
   // rpIdHash || flags(UP|UV) || signCount
-  const rpIdHash = await sha256(new TextEncoder().encode(testEnv.RP_ID));
+  const rpIdHash = await sha256(new TextEncoder().encode(TEST_RP_ID));
   const authData = new Uint8Array(37);
   authData.set(rpIdHash, 0);
   authData[32] = flags;
@@ -358,14 +397,17 @@ async function consume(resp: Response): Promise<DoResult> {
   return { status: resp.status, text, json };
 }
 
-export async function doPost(op: string, body: unknown): Promise<DoResult> {
+/** Admin headers ride along on every op: the public ops ignore them, the
+ *  admin ops need them. A test that wants an unauthenticated admin call passes
+ *  its own headers. */
+export async function doPost(op: string, body: unknown, headers: Record<string, string> = adminHeaders()): Promise<DoResult> {
   return consume(await accountStub().fetch(`https://account.do/op/${op}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify(body),
   }));
 }
 
-export async function doGet(op: string): Promise<DoResult> {
-  return consume(await accountStub().fetch(`https://account.do/op/${op}`));
+export async function doGet(op: string, headers: Record<string, string> = adminHeaders()): Promise<DoResult> {
+  return consume(await accountStub().fetch(`https://account.do/op/${op}`, { headers }));
 }

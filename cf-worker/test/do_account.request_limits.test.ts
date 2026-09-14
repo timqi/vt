@@ -1,11 +1,13 @@
 // Public route body limits run in workerd, including streams without a truthful
 // Content-Length. Import the router directly to observe cancellation of the body.
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import app from '../src/index';
 import { b64uEnc, hmacSha256 } from '../src/crypto';
 import { deriveHostTokenSecret } from '../src/host_token';
-import { makeMeta } from './do_helpers';
+import { makeMeta, bootstrap } from './do_helpers';
+
+beforeEach(bootstrap);
 
 const CAP = 256 * 1024;
 const MASTER = 'throwaway-request-limit-test-key';

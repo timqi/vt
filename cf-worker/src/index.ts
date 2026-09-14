@@ -8,8 +8,8 @@
 //     Passkey ceremony that issues a host token
 //   • /api/audit-ingest     — HMAC(HKDF(VT_AUTH_CF, agent_id)) over the request body
 //   • /a/:token, approve    — 12-byte (96-bit) unguessable approve/poll tokens + WebAuthn
-//   • /<ADMIN_SEG>, /<ADMIN_SEG>/api/* — Cloudflare Access (edge) + Worker JWT
-//     verification; the one admin shell (tabs in the URL hash) plus its data API
+//   • /admin, /api/admin/* — passkey admin session verified in the DO; the
+//     one admin shell (tabs in the URL hash) plus its data API
 
 import { Hono, type Context } from 'hono';
 import { Env } from './types';
@@ -17,9 +17,8 @@ import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256,
 import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, EnrollRequest, EnrollResponse, DoEnrollCreateOp } from './types';
 import { deriveHostTokenSecret, isTokenId } from './host_token';
 import { log, logErr, tokenPrefix } from './log';
-import { requireAccess, type AccessVars } from './access';
 import { effectiveUvLevel, parseUvPolicy } from './uv_policy';
-import { escapeJsonForHtml, renderTemplate, ADMIN_SEG, pageVars, type PageChrome } from './page';
+import { escapeJsonForHtml, renderTemplate, pageVars, type PageChrome } from './page';
 import { tokenRefused } from './do_account';
 
 export { AccountDO } from './do_account';
@@ -95,16 +94,16 @@ function capChallengeMeta(raw: Partial<ChallengeMeta> | undefined, connectingIp:
 
 // `request.cf` country + AS organisation — Cloudflare-derived, so an enrollment
 // approver gets a second verified origin signal next to the bare IP.
-function requestOrigin(c: Context<{ Bindings: Env; Variables: AccessVars }>): string {
+function requestOrigin(c: Context<{ Bindings: Env }>): string {
   const cf = (c.req.raw as Request & { cf?: { country?: string; asOrganization?: string } }).cf;
   return [cf?.country, cf?.asOrganization].filter(Boolean).map(v => capMeta(v, 60)).join(' · ');
 }
 
-function accountStub(c: Context<{ Bindings: Env; Variables: AccessVars }>): DurableObjectStub {
+function accountStub(c: Context<{ Bindings: Env }>): DurableObjectStub {
   return c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
 }
 
-const app = new Hono<{ Bindings: Env; Variables: AccessVars }>();
+const app = new Hono<{ Bindings: Env }>();
 
 // ── Global security headers ───────────────────────────────────────────────
 
@@ -139,184 +138,111 @@ app.get('/pwa/*', async (c) => {
 
 // Service worker at root scope (a worker under /pwa/ could not control /a/*
 // or the admin shell) and the install manifest. Both public: they hold no data.
-// The manifest's start URL follows ADMIN_SEG, so it is rendered like a shell.
-app.get('/sw.js', (c) => c.env.ASSETS.fetch(new Request(new URL('/sw.js', c.req.url).toString(), c.req.raw)));
-app.get('/manifest.webmanifest', async (c) => new Response(
-  renderTemplate(await fetchShell(c, '/manifest.webmanifest'), { ADMIN_BASE: `/${ADMIN_SEG}` }),
-  { headers: { 'Content-Type': 'application/manifest+json' } },
-));
+for (const p of ['/sw.js', '/manifest.webmanifest']) {
+  app.get(p, (c) => c.env.ASSETS.fetch(new Request(new URL(p, c.req.url).toString(), c.req.raw)));
+}
 
-// ── Admin surface (Cloudflare Access protected) ───────────────────────────
+// ── Admin surface (passkey session) ───────────────────────────────────────
 //
-// requireAccess verifies the Cf-Access-Jwt-Assertion JWT (RS256, kid, aud, iss,
-// exp) and fails closed. It gates BOTH the bare `/${ADMIN_SEG}` entry and
-// everything under `/${ADMIN_SEG}/*` (Hono's `/*` does not match the bare path,
-// so register both). The Cloudflare Access application's Path must equal
-// `${ADMIN_SEG}` (no secret prefix to keep in sync).
-app.use(`/${ADMIN_SEG}`, requireAccess);
-app.use(`/${ADMIN_SEG}/*`, requireAccess);
+// Every request here is verified in the DO, the only place that knows the
+// current epoch (docs/worker-slim.md §3): the edge adds rate limiting and body
+// caps and forwards Cookie, Origin and CF-Connecting-IP. Three POSTs are open
+// (bootstrap, login-challenge, login); everything else needs the session cookie.
 
-// The admin shell (pwa/admin/admin.html): every tab, tab in the URL hash. It
-// renders one state from VT_DATA; with Cloudflare Access in front that state is
-// always `console` (login/setup arrive with docs/worker-slim.md §3). The Passkey
-// tab's CREDENTIALS_JSON rides along so add/revoke read it without a paste: it
-// carries only wrapped (encrypted) master-key material and public credential
-// data, and this route is Access-gated — never a plaintext master.
-app.get(`/${ADMIN_SEG}`, (c) => servePage(c, '/admin/admin', {
-  ...pageVars(CHROME),
-  VT_DATA: escapeJsonForHtml({
-    state: 'console',
-    rp_id: c.env.RP_ID,
-    credentials: c.env.CREDENTIALS_JSON ?? '',
-  }),
-}));
-
-// Push API (设置 tab): the VAPID public key plus the subscription list,
-// subscribe / unsubscribe / test. Endpoint + keys live under K_cfg in the DO
-// (account_admin.ts); the edge only caps bodies.
-app.get(`/${ADMIN_SEG}/api/push/vapid`, async (c) => {
-  const resp = await accountStub(c).fetch('https://account.do/op/push-vapid');
-  const out = new Response(resp.body, resp);
-  out.headers.set('Cache-Control', 'no-store');
-  return out;
-});
-const PUSH_POST_MAX_BYTES = 4 * 1024;
-app.post(`/${ADMIN_SEG}/api/push/:op{subscribe|unsubscribe|test}`, async (c) => {
-  const raw = await readCappedBody(c, PUSH_POST_MAX_BYTES);
-  if (!raw) return c.text('body too large', 413);
-  return accountStub(c).fetch(`https://account.do/op/push-${c.req.param('op')}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: raw,
+// The admin shell (pwa/admin/admin.html) renders one of setup / login / console
+// from the state the DO reports for this request's cookie.
+app.get('/admin', async (c) => {
+  const resp = await accountStub(c).fetch('https://account.do/op/admin-state', { headers: adminHeaders(c) });
+  const data = await resp.json() as { state: string; rp_id: string | null; reset?: boolean };
+  return servePage(c, '/admin/admin', {
+    ...pageVars(CHROME),
+    VT_DATA: escapeJsonForHtml({ ...data, rp_id: data.rp_id ?? new URL(c.req.url).hostname }),
   });
 });
 
-// Audit data API — forwards a read-only cursor query to the DO.
-app.get(`/${ADMIN_SEG}/api/audit`, async (c) => {
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  const u = new URL('https://account.do/op/audit-query');
-  for (const k of ['limit', 'before_id', 'after_seq', 'status', 'host', 'source']) {
-    const v = c.req.query(k);
-    if (v) u.searchParams.set(k, v);
+const ADMIN_OPEN_POST_MAX_BYTES = 4 * 1024;
+const ADMIN_POST_MAX_BYTES = 64 * 1024;
+// URL tail → DO op. Anything not listed is 404; the DO decides on the session.
+const ADMIN_GET: Record<string, string> = {
+  audit: 'audit-query', 'cache-list': 'cache-list', tokens: 'tokens-list',
+  credentials: 'admin-credentials', 'push/vapid': 'push-vapid',
+};
+const ADMIN_POST: Record<string, string> = {
+  'cache-clear-origin': 'cache-clear-origin', 'cache-clear-groups': 'cache-clear-groups',
+  'cache-extend-request': 'cache-extend-create', 'tokens-revoke': 'tokens-revoke',
+  'clear-cache': 'clear-cache', 'clear-audit': 'clear-audit',
+  'push/subscribe': 'push-subscribe', 'push/unsubscribe': 'push-unsubscribe', 'push/test': 'push-test',
+  logout: 'admin-logout', 'sessions-revoke': 'admin-sessions-revoke',
+  'credentials-add': 'admin-credentials-add', 'credentials-revoke': 'admin-credentials-revoke',
+};
+// Open, so rate limited per IP (bootstrap and login-challenge) or gated by the
+// challenge it consumes (login).
+const ADMIN_OPEN_POST: Record<string, string> = {
+  bootstrap: 'admin-bootstrap', 'login-challenge': 'admin-login-challenge', login: 'admin-login',
+};
+
+function adminHeaders(c: Context<{ Bindings: Env }>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const h of ['Cookie', 'Origin', 'CF-Connecting-IP']) {
+    const v = c.req.header(h);
+    if (v !== undefined) out[h] = v;
   }
-  return stub.fetch(u.toString());
-});
+  return out;
+}
 
-// Real-time audit stream (WebSocket). Access-gated by the /${ADMIN_SEG}/* mount
-// above, exactly like the REST audit API — the upgrade is a plain GET, so
-// requireAccess runs and fails closed BEFORE this handler (the DO's /ws-admin is
-// never reached on an auth failure). The verified JWT `exp` is forwarded so the
-// DO can bind the hibernating socket's lifetime to the admin's session.
-app.get(`/${ADMIN_SEG}/api/audit-stream`, async (c) => {
+async function adminPost(c: Context<{ Bindings: Env }>, op: string, maxBytes: number): Promise<Response> {
+  const raw = await readCappedBody(c, maxBytes);
+  if (!raw) return c.text('body too large', 413);
+  return adminResponse(await accountStub(c).fetch(`https://account.do/op/${op}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...adminHeaders(c) }, body: raw,
+  }));
+}
+
+// `no-store` on every admin payload: it is live security state (what is
+// decryptable without a tap, which tokens are alive), never replayable from a
+// cache or the back button.
+function adminResponse(resp: Response): Response {
+  const out = new Response(resp.body, resp);
+  out.headers.set('Cache-Control', 'no-store');
+  return out;
+}
+
+app.get('/api/admin/audit-stream', async (c) => {
   if (c.req.header('Upgrade') !== 'websocket') return c.text('expected websocket', 426);
-  const exp = c.get('accessExp');
-  if (typeof exp !== 'number') return c.text('forbidden', 403); // requireAccess must have set it
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  const wsUrl = `https://account.do/ws-admin?exp=${encodeURIComponent(String(exp))}`;
-  return stub.fetch(new Request(wsUrl, { headers: c.req.raw.headers }));
+  return accountStub(c).fetch(new Request('https://account.do/ws-admin', { headers: c.req.raw.headers }));
 });
 
-// Clear the cached DEKs written by ONE approval (by its audit token_id). Powers
-// the per-row "清除缓存" button on the audit page. Access-gated.
-app.post(`/${ADMIN_SEG}/api/cache-clear-origin`, async (c) => {
-  let body: { token_id?: unknown };
-  try { body = await c.req.json(); }
-  catch { return c.text('invalid json', 400); }
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  return stub.fetch('https://account.do/op/cache-clear-origin', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token_id: body.token_id }),
-  });
+app.get('/api/admin/*', async (c) => {
+  const url = new URL(c.req.url);
+  const op = ADMIN_GET[url.pathname.slice('/api/admin/'.length)];
+  if (!op) return c.text('not found', 404);
+  return adminResponse(await accountStub(c).fetch(`https://account.do/op/${op}${url.search}`, { headers: adminHeaders(c) }));
 });
 
-// Cache inventory — what is actually cached right now, grouped by the approval
-// that armed it. Read-only. `no-store` because the payload is live security state
-// (an intermediary or a back-button replay must not resurrect a stale view of what
-// is decryptable without a phone tap).
-app.get(`/${ADMIN_SEG}/api/cache-list`, async (c) => {
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  const resp = await stub.fetch('https://account.do/op/cache-list');
-  const out = new Response(resp.body, resp);
-  out.headers.set('Cache-Control', 'no-store');
-  return out;
+app.post('/api/admin/*', async (c) => {
+  const tail = new URL(c.req.url).pathname.slice('/api/admin/'.length);
+  const open = ADMIN_OPEN_POST[tail];
+  if (open) {
+    if (tail !== 'login') {
+      const limited = await rateLimit(c, `login:${c.req.header('CF-Connecting-IP') ?? ''}`);
+      if (limited) return limited;
+    }
+    return adminPost(c, open, ADMIN_OPEN_POST_MAX_BYTES);
+  }
+  const op = ADMIN_POST[tail];
+  if (!op) return c.text('not found', 404);
+  return adminPost(c, op, ADMIN_POST_MAX_BYTES);
 });
 
-// Bulk clear by group — authority-REDUCING, so the Access gate alone is enough.
-app.post(`/${ADMIN_SEG}/api/cache-clear-groups`, async (c) => {
-  let body: { group_ids?: unknown };
-  try { body = await c.req.json(); }
-  catch { return c.text('invalid json', 400); }
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  return stub.fetch('https://account.do/op/cache-clear-groups', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ group_ids: body.group_ids }),
-  });
-});
+// The one 3/min/IP binding, keyed by route family. Absent → refuse: neither a
+// phone page nor a session mint may run unthrottled.
+async function rateLimit(c: Context<{ Bindings: Env }>, key: string): Promise<Response | null> {
+  const limiter = c.env.ENROLL_LIMITER;
+  if (!limiter) return c.text('rate limiter not configured', 503);
+  const { success } = await limiter.limit({ key });
+  return success ? null : c.text('rate limited', 429);
+}
 
-// REQUEST a cache extension. Unlike every other admin action this one GRANTS
-// authority (it prolongs no-phone-in-the-loop decrypts), so the Access gate is
-// explicitly NOT sufficient: this endpoint only mints a pending Passkey ceremony,
-// and nothing expires later until that ceremony is approved. The verified Access
-// identity is forwarded for the audit trail — the body cannot claim it.
-app.post(`/${ADMIN_SEG}/api/cache-extend-request`, async (c) => {
-  let body: { group_ids?: unknown; ttl_s?: unknown };
-  try { body = await c.req.json(); }
-  catch { return c.text('invalid json', 400); }
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  const doResp = await stub.fetch('https://account.do/op/cache-extend-create', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      group_ids: body.group_ids,
-      ttl_s: body.ttl_s,
-      admin_email: c.get('accessEmail') ?? '',
-      admin_ip: c.req.header('CF-Connecting-IP') ?? '',
-    }),
-  });
-  // Deliberately NO notification fan-out here. The whole extension flow lives in
-  // the admin console: the operator selects the groups, presses 延长, and the
-  // Passkey ceremony mounts inline on the same page. A pushed approval card would
-  // be noise for a request whose requester is already looking at the result — and
-  // the audit tab still records both the request (op_kind='cache-extend') and its
-  // effect (status='extended') in real time, so the action stays observable there.
-  return doResp;
-});
-
-// Host-token inventory (主机令牌 tab). Read-only; rows carry no secret (the secret is derived
-// from the master + token_id and never stored). `no-store` like cache-list.
-app.get(`/${ADMIN_SEG}/api/tokens`, async (c) => {
-  const resp = await accountStub(c).fetch('https://account.do/op/tokens-list');
-  const out = new Response(resp.body, resp);
-  out.headers.set('Cache-Control', 'no-store');
-  return out;
-});
-
-// Revoke one host token. Authority-REDUCING (the host falls back to "run
-// `vt enroll` again"), so the Access gate alone is sufficient — same rule as
-// cache clears. The revoke is what makes a leaked token recoverable without
-// rotating the master.
-app.post(`/${ADMIN_SEG}/api/tokens-revoke`, async (c) => {
-  let body: { token_id?: unknown };
-  try { body = await c.req.json(); }
-  catch { return c.text('invalid json', 400); }
-  return accountStub(c).fetch('https://account.do/op/tokens-revoke', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token_id: body.token_id, admin_email: c.get('accessEmail') ?? '' }),
-  });
-});
-
-// POST clear-cache — emergency revocation: drop ALL cached DEKs now. Access-gated.
-app.post(`/${ADMIN_SEG}/api/clear-cache`, async (c) => {
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  return stub.fetch('https://account.do/op/clear-cache', { method: 'POST' });
-});
-
-// POST clear-audit — wipe ALL audit rows (ceremony + cache events). Access-gated.
-app.post(`/${ADMIN_SEG}/api/clear-audit`, async (c) => {
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  return stub.fetch('https://account.do/op/clear-audit', { method: 'POST' });
-});
 
 // POST /api/challenge — daemon creates a challenge
 app.post('/api/challenge', async (c) => {
@@ -388,7 +314,8 @@ app.post('/api/challenge', async (c) => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ challenge: ch, token_id: tokenId }),
   });
-  if (doResp.status === 401) return new Response(doResp.body, doResp);
+  // Structured refusals (dead token, unconfigured Worker) reach the CLI as-is.
+  if (doResp.status === 401 || doResp.status === 503) return new Response(doResp.body, doResp);
   if (!doResp.ok) return c.text(`do create: ${await doResp.text()}`, 500);
   const stored = await doResp.json() as { meta?: ChallengeMeta };
   if (stored.meta) ch.meta = stored.meta;
@@ -463,18 +390,16 @@ app.post('/api/dek-cache', async (c) => {
 // POST /api/enroll — a host asks for its own credential. UNAUTHENTICATED by
 // design (a fresh host has nothing to sign with), which makes it the one public
 // route that can page the operator's phone. Three independent bounds:
-//   • per-IP Workers Rate Limiting (ENROLL_LIMITER; absent → refuse outright),
+//   • per-IP Workers Rate Limiting (`enroll:<ip>`; absent → refuse outright),
 //   • the DO's cap on concurrently pending enrollments (ENROLL_PENDING_MAX),
 //   • the usual 5-minute ceremony TTL.
 // Nothing is issued here: the response is a pending Passkey ceremony plus the
 // pairing code the approver compares against the requesting terminal.
 const ENROLL_POST_MAX_BYTES = 4 * 1024;
 app.post('/api/enroll', async (c) => {
-  const limiter = c.env.ENROLL_LIMITER;
-  if (!limiter) return c.text('enrollment not configured', 503);
   const ip = c.req.header('CF-Connecting-IP') ?? '';
-  const { success } = await limiter.limit({ key: ip });
-  if (!success) return c.text('rate limited', 429);
+  const limited = await rateLimit(c, `enroll:${ip}`);
+  if (limited) return limited;
 
   const raw = await readCappedBody(c, ENROLL_POST_MAX_BYTES);
   if (!raw) return c.text('body too large', 413);
@@ -660,7 +585,7 @@ async function readCappedBody(c: Context, maxBytes = CEREMONY_POST_MAX_BYTES): P
 // the remedy is `vt enroll` either way. One master, one derivation: rotating
 // VT_AUTH_CF invalidates every token, and every host re-enrolls.
 async function readAuthenticatedDaemonBody(
-  c: Context<{ Bindings: Env; Variables: AccessVars }>,
+  c: Context<{ Bindings: Env }>,
 ): Promise<{ body: Uint8Array; tokenId: string } | Response> {
   const auth = c.req.header('Authorization') ?? '';
   const prefix = 'VT-HMAC ';
@@ -715,12 +640,13 @@ app.post('/api/reject', async (c) => {
 // url-encoded defensively (it feeds a query param) even though real tokens are
 // b64url and carry no special chars.
 async function fetchApprovePageData(
-  c: Context<{ Bindings: Env; Variables: AccessVars }>,
+  c: Context<{ Bindings: Env }>,
   approveToken: string,
-): Promise<{ ok: true; data: ApprovePageData } | { ok: false; status: 404 | 410 }> {
+): Promise<{ ok: true; data: ApprovePageData } | { ok: false; status: 404 | 410 | 503 }> {
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   const dataResp = await stub.fetch(
     `https://account.do/op/page?approve_token=${encodeURIComponent(approveToken)}`);
+  if (dataResp.status === 503) return { ok: false, status: 503 };
   if (!dataResp.ok) return { ok: false, status: dataResp.status === 410 ? 410 : 404 };
   return { ok: true, data: await dataResp.json() };
 }
@@ -729,7 +655,8 @@ async function fetchApprovePageData(
 app.get('/a/:approve_token', async (c) => {
   const res = await fetchApprovePageData(c, c.req.param('approve_token'));
   if (!res.ok) {
-    return c.text(res.status === 410 ? 'Request already handled or expired' : 'Not found', res.status);
+    return c.text(res.status === 410 ? 'Request already handled or expired'
+      : res.status === 503 ? 'Worker not configured' : 'Not found', res.status);
   }
   // Inject page data into the HTML shell (pwa/approve.html).
   // servePage sets the tight CSP: <script type="application/json"> is
@@ -742,13 +669,13 @@ app.get('/a/:approve_token', async (c) => {
 });
 
 // GET /api/page/:approve_token — same ApprovePageData as /a/:token but as JSON,
-// so the (Access-gated) admin shell can mount the approval ceremony inline in
+// so the admin shell can mount the approval ceremony inline in
 // its detail dialog instead of opening the standalone page in a new tab. The
 // approve_token is an unguessable 96-bit capability and the payload holds only
 // public/PRF-wrapped material — this exposes nothing /a/:token doesn't already.
 app.get('/api/page/:approve_token', async (c) => {
   const res = await fetchApprovePageData(c, c.req.param('approve_token'));
-  if (!res.ok) return c.json({ error: res.status === 410 ? 'gone' : 'not_found' }, res.status);
+  if (!res.ok) return c.json({ error: res.status === 410 ? 'gone' : res.status === 503 ? 'not_configured' : 'not_found' }, res.status);
   return c.json(res.data);
 });
 
@@ -756,8 +683,7 @@ app.get('/api/page/:approve_token', async (c) => {
 //
 // The shells are real files: pwa/approve.html and pwa/admin/admin.html, both
 // public assets holding no data. They are read through the ASSETS binding from
-// INSIDE the route handler, so the admin one is rendered only behind the
-// Cloudflare Access gate registered on /${ADMIN_SEG} and /${ADMIN_SEG}/* above.
+// INSIDE the route handler and filled with what the DO reported.
 
 // Read a page shell out of the ASSETS binding.
 //
@@ -770,7 +696,7 @@ app.get('/api/page/:approve_token', async (c) => {
 //    "/admin/admin", so the extensionless form is the one that returns the file;
 //    with html_handling = "none" it is the other way round. Trying both keeps
 //    the pages working under either setting without a build step.
-async function fetchShell(c: Context<{ Bindings: Env; Variables: AccessVars }>, path: string): Promise<string> {
+async function fetchShell(c: Context<{ Bindings: Env }>, path: string): Promise<string> {
   const origin = new URL(c.req.url).origin;
   const get = (p: string) => c.env.ASSETS.fetch(new Request(origin + p, { method: 'GET' }));
   let resp = await get(path);
@@ -784,7 +710,7 @@ async function fetchShell(c: Context<{ Bindings: Env; Variables: AccessVars }>, 
 // global middleware then rebuilds it again to add HSTS / nosniff /
 // Referrer-Policy — so every page carries the full set.
 async function servePage(
-  c: Context<{ Bindings: Env; Variables: AccessVars }>,
+  c: Context<{ Bindings: Env }>,
   path: string,
   vars: Record<string, string>,
 ): Promise<Response> {

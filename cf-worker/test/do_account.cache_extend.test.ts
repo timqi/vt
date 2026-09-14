@@ -11,7 +11,7 @@ import { SELF } from 'cloudflare:test';
 import type { CacheEntry, Challenge } from '../src/types';
 import {
   inDO, seedGroup, readEntries, setDoVar, doPost, approve, makeMeta, sealFakeDek,
-  auditRows, DoHandle, DoResult,
+  auditRows, bootstrap, adminHeaders, DoHandle, DoResult,
 } from './do_helpers';
 
 const MIN = 60_000;
@@ -27,15 +27,11 @@ const TTL_PERMANENT = 100 * 365 * 24 * 3600;
 
 // The kill switch is a per-instance env read and the DO instance outlives a
 // single test, so put it back to its wrangler.test.toml default every time.
-beforeEach(async () => { await setDoVar('CACHE_ADMIN_EXTEND', '0'); });
+beforeEach(async () => { await bootstrap(); await setDoVar('CACHE_ADMIN_EXTEND', '0'); });
 
 function requestExtend(groupIds: string[], ttlS: number): Promise<DoResult> {
-  return doPost('cache-extend-create', {
-    group_ids: groupIds,
-    ttl_s: ttlS,
-    admin_email: 'admin@example.invalid',
-    admin_ip: '198.51.100.7',
-  });
+  return doPost('cache-extend-create', { group_ids: groupIds, ttl_s: ttlS },
+    { ...adminHeaders(), 'CF-Connecting-IP': '198.51.100.7' });
 }
 
 /** The pending ceremony a request minted, read straight out of DO storage. */
@@ -93,7 +89,6 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
     expect(ch.extend).toBeTruthy();
     expect(ch.extend!.ttl_s).toBe(TTL_1D);
     expect(ch.extend!.group_ids).toEqual([GROUP]);
-    expect(ch.extend!.requested_by).toBe('admin@example.invalid');
   });
 
   it('is unreachable while CACHE_ADMIN_EXTEND is off — a kill switch, not an authorization', async () => {
@@ -145,21 +140,19 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
     expect(res.json.rejected.map((r: { reason: string }) => r.reason)).toContain('no_gain');
   });
 
-  it('is not reachable over HTTP without a Cloudflare Access session', async () => {
-    // The Worker route in front of this op (ADMIN_SEG is the fixed 'kestrel'
-    // segment in src/index.ts). wrangler.test.toml leaves ACCESS_TEAM_DOMAIN and
-    // ACCESS_AUD empty, so the gate fails closed — Access is necessary for the
-    // request, and (per the ceremony tests below) still not sufficient for the
-    // effect.
+  it('is not reachable over HTTP without an admin session', async () => {
+    // The Worker route in front of this op forwards the cookie; the DO refuses
+    // without one. A session is necessary for the request, and (per the
+    // ceremony tests below) still not sufficient for the effect.
     await setDoVar('CACHE_ADMIN_EXTEND', '1');
     const keys = await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
-    const resp = await SELF.fetch('https://vt.test.invalid/kestrel/api/cache-extend-request', {
+    const resp = await SELF.fetch('https://vt.test.invalid/api/admin/cache-extend-request', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Origin: 'https://vt.test.invalid' },
       body: JSON.stringify({ group_ids: [GROUP], ttl_s: TTL_1W }),
     });
-    expect(resp.status).toBe(403);
-    expect(await resp.text()).toBe('forbidden');
+    expect(resp.status).toBe(401);
+    expect(await resp.json()).toEqual({ error: 'session_invalid' });
 
     const chs = await inDO(async h => [...(await h.state.storage.list({ prefix: 'ch:' })).keys()]);
     expect(chs).toEqual([]);

@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { parseCredentials, lookupByCredentialId } from '../src/credentials';
+import { parseCredentialEntry, lookupByCredentialId } from '../src/credentials';
 import { b64uEnc, sha256 } from '../src/crypto';
 
 const entry = (over: Record<string, unknown> = {}) => ({
-  h: 'aGFzaA',
+  h: 'L0JnHXnwlzt3HXjLqjzbrgit2WcsVKLQIAFOIdeGB3s',
   i: 'aWQ',
   k: 'a2V5',
   p: 'cHVi',
@@ -12,26 +12,26 @@ const entry = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-describe('parseCredentials', () => {
-  it('accepts a well-formed v1 blob, tolerating the setup page\'s `epoch`', () => {
-    // The Worker declares no `epoch` (nothing here consumes it), but a stored
-    // blob written by the setup page carries one and must still parse.
-    const blob = parseCredentials(JSON.stringify({ v: 1, epoch: 3, c: [entry()] }));
-    expect(blob.c).toHaveLength(1);
-    expect((blob as unknown as { epoch?: number }).epoch).toBe(3);
+describe('parseCredentialEntry', () => {
+  it('accepts a well-formed entry and normalizes label and time', () => {
+    const e = parseCredentialEntry(entry({ l: 'x'.repeat(100), t: 12.7 }));
+    expect(e.l).toHaveLength(64);
+    expect(e.t).toBe(12);
+    expect(parseCredentialEntry(entry({ l: undefined, t: undefined }))).toMatchObject({ l: '', t: 0 });
   });
 
-  it('rejects an unsupported version', () => {
-    expect(() => parseCredentials(JSON.stringify({ v: 2, c: [] }))).toThrow(/version/);
+  it('rejects the old {v,c} envelope and anything but an entry', () => {
+    // The Worker parses entries, not the CREDENTIALS_JSON envelope, so the
+    // envelope posted where an entry belongs is a bad request.
+    expect(() => parseCredentialEntry({ v: 1, c: [entry()] })).toThrow(/bad h/);
+    expect(() => parseCredentialEntry(null)).toThrow(/not an object/);
+    expect(() => parseCredentialEntry('{}')).toThrow(/not an object/);
   });
 
-  it('rejects a non-array `c`', () => {
-    expect(() => parseCredentials(JSON.stringify({ v: 1, c: {} }))).toThrow(/`c` must be an array/);
-  });
-
-  it('rejects an entry missing a required string field', () => {
-    expect(() => parseCredentials(JSON.stringify({ v: 1, c: [entry({ k: undefined })] })))
-      .toThrow(/missing required string field/);
+  it('rejects a missing, non-b64u or wrong-length field', () => {
+    expect(() => parseCredentialEntry(entry({ k: undefined }))).toThrow(/bad k/);
+    expect(() => parseCredentialEntry(entry({ p: 'not base64!' }))).toThrow(/bad p/);
+    expect(() => parseCredentialEntry(entry({ h: 'aGFzaA' }))).toThrow(/not a SHA-256/);
   });
 });
 
@@ -39,12 +39,10 @@ describe('lookupByCredentialId', () => {
   it('finds the entry whose h == b64u(sha256(credId))', async () => {
     const credId = new Uint8Array([9, 8, 7, 6, 5]);
     const h = b64uEnc(await sha256(credId));
-    const blob = parseCredentials(JSON.stringify({ v: 1, c: [entry({ h })] }));
-    expect(await lookupByCredentialId(blob, credId)).toBeDefined();
+    expect(await lookupByCredentialId([parseCredentialEntry(entry({ h }))], credId)).toBeDefined();
   });
 
   it('returns undefined for an unknown credId', async () => {
-    const blob = parseCredentials(JSON.stringify({ v: 1, c: [entry()] }));
-    expect(await lookupByCredentialId(blob, new Uint8Array([1, 2, 3]))).toBeUndefined();
+    expect(await lookupByCredentialId([parseCredentialEntry(entry())], new Uint8Array([1, 2, 3]))).toBeUndefined();
   });
 });

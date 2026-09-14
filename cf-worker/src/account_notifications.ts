@@ -18,7 +18,7 @@ const AGENT_CACHE_NOTIFY_MIN_INTERVAL_MS = 60 * 1000;
 // no-human-in-the-loop decrypt and bury the approval messages that do need a
 // tap. Set CACHE_HIT_NOTIFY = "1" | "true" | "on" | "yes" in wrangler.toml
 // [vars] to restore the push. The audit row is written either way.
-function cacheHitNotifyEnabled(env: Env): boolean {
+function cacheHitNotifyEnabled(env: Pick<Env, 'CACHE_HIT_NOTIFY'>): boolean {
   const v = (env.CACHE_HIT_NOTIFY ?? '').trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'on' || v === 'yes';
 }
@@ -32,7 +32,7 @@ export class AccountNotifications {
 
   constructor(
     private readonly ctx: Pick<DurableObjectState, 'waitUntil'>,
-    private readonly env: Env,
+    private readonly env: Pick<Env, 'CACHE_HIT_NOTIFY'>,
     private readonly admin: AccountAdmin,
   ) {}
 
@@ -41,11 +41,11 @@ export class AccountNotifications {
   // and is logged.
   private push(payload: PushPayload, ttlS: number, urgency: 'normal' | 'high'): void {
     this.ctx.waitUntil((async () => {
-      const { vapid, push } = await this.admin.pushConfig();
+      const { vapid, push, origin } = await this.admin.pushConfig();
       if (!vapid || push.length === 0) return;
       const body = JSON.stringify({ ...payload, body: payload.body.slice(0, 1000) });
       await Promise.all(push.map(async (sub) => {
-        const r = await sendPush(sub, body, vapid, this.env.WORKER_ORIGIN, ttlS, urgency);
+        const r = await sendPush(sub, body, vapid, origin, ttlS, urgency);
         if (r.status >= 200 && r.status < 300) return;
         if (r.status === 404 || r.status === 410) { await this.admin.unsubscribe(sub.endpoint); return; }
         const event = r.status === 413 ? 'push.too_large'
@@ -65,7 +65,7 @@ export class AccountNotifications {
     const { title, body } = buildApprovalMessage(challenge.meta.op_kind, challenge.meta, chSalts(challenge));
     this.push({
       v: 1, kind: challenge.enroll ? 'enroll' : 'approval', title, body,
-      url: `${this.env.WORKER_ORIGIN}/a/${challenge.approve_token}`,
+      url: `${this.admin.current.origin}/a/${challenge.approve_token}`,
       tag: `a:${challenge.approve_token}`,
     }, 300, 'high');
   }
@@ -79,7 +79,7 @@ export class AccountNotifications {
     const { title, body } = buildCacheHitMessage(meta, salts, note);
     this.push({
       v: 1, kind: 'cache_hit', title, body,
-      url: `${this.env.WORKER_ORIGIN}${ADMIN_AUDIT_PATH}`, tag: `cache:${meta.host}`,
+      url: `${this.admin.current.origin}${ADMIN_AUDIT_PATH}`, tag: `cache:${meta.host}`,
     }, 3600, 'normal');
   }
 

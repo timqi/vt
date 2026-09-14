@@ -1,6 +1,6 @@
-// The console-owned config blob and the push fan-out that reads it. Storage is
-// a Map standing in for DO storage (the class takes get/put only), so this runs
-// on plain vitest; fetch is stubbed per push service answer.
+// The console-owned root key + config blob and the push fan-out that reads
+// them. Storage is a Map standing in for DO storage, so this runs on plain
+// vitest; fetch is stubbed per push service answer.
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { AccountAdmin } from '../src/account_admin';
@@ -8,14 +8,32 @@ import { AccountNotifications } from '../src/account_notifications';
 import { b64uEnc } from '../src/crypto';
 import type { Challenge, Env } from '../src/types';
 
-const ENV = { VT_AUTH_CF: 'synthetic-test-master', WORKER_ORIGIN: 'https://vt.test.invalid' } as Env;
+const SECRET = 'synthetic-test-kek';
+const ORIGIN = 'https://vt.test.invalid';
+const ENV = { CACHE_HIT_NOTIFY: '' } as Env;
+const ENTRY = { h: 'L0JnHXnwlzt3HXjLqjzbrgit2WcsVKLQIAFOIdeGB3s', i: 'aWQ', k: 'a2V5', p: 'cHVi', l: 'unit', t: 1 };
 
 function fakeStorage(map = new Map<string, unknown>()) {
   return {
     map,
     get: async <T>(k: string) => map.get(k) as T | undefined,
-    put: async (k: string, v: unknown) => { map.set(k, v); },
+    put: async (k: string | Record<string, unknown>, v?: unknown) => {
+      if (typeof k === 'string') map.set(k, v);
+      else for (const [kk, vv] of Object.entries(k)) map.set(kk, vv);
+    },
+    delete: async (k: string | string[]) => { for (const kk of Array.isArray(k) ? k : [k]) map.delete(kk); },
+    list: async (o: { prefix: string }) => new Map([...map].filter(([k]) => k.startsWith(o.prefix))),
   } as unknown as DurableObjectStorage & { map: Map<string, unknown> };
+}
+
+/** A bootstrapped admin over `storage`. */
+async function configured(storage = fakeStorage(), secret = SECRET) {
+  const admin = new AccountAdmin(storage, secret);
+  const resp = await admin.bootstrap(new Request('https://account.do/op/x', {
+    method: 'POST', headers: { Origin: ORIGIN, 'CF-Connecting-IP': '203.0.113.1' }, body: JSON.stringify({ entry: ENTRY }),
+  }));
+  expect(resp.status).toBe(204);
+  return admin;
 }
 
 // A real UA key pair so the encryption step accepts the subscription.
@@ -39,7 +57,7 @@ async function listed(admin: AccountAdmin): Promise<Array<{ endpoint: string; la
 
 describe('AccountAdmin config blob', () => {
   it('upserts by endpoint, newest first, and caps at 10', async () => {
-    const admin = new AccountAdmin(fakeStorage(), ENV);
+    const admin = await configured();
     const a = await browserSub(1, 'first');
     expect((await admin.pushOp('subscribe', post(a))).status).toBe(200);
     expect((await admin.pushOp('subscribe', post(await browserSub(2)))).status).toBe(200);
@@ -55,7 +73,7 @@ describe('AccountAdmin config blob', () => {
   });
 
   it('refuses a malformed subscription', async () => {
-    const admin = new AccountAdmin(fakeStorage(), ENV);
+    const admin = await configured();
     const ok = await browserSub(1);
     for (const bad of [
       { ...ok, endpoint: 'http://push.test.invalid/s/1' },
@@ -66,25 +84,31 @@ describe('AccountAdmin config blob', () => {
     expect((await admin.pushOp('bogus', get())).status).toBe(400);
   });
 
-  it('seals the blob under K_cfg: same master reads it back, another cannot', async () => {
+  it('seals the blob under K_cfg from R: the same SECRET reads it back, another is unconfigured', async () => {
     const storage = fakeStorage();
-    const admin = new AccountAdmin(storage, ENV);
+    const admin = await configured(storage);
     const sub = await browserSub(7);
     await admin.pushOp('subscribe', post(sub));
     const vapid = ((await (await admin.pushOp('vapid', get())).json()) as { pub_b64u: string }).pub_b64u;
-    const stored = JSON.stringify(storage.map.get('cfg:v1'));
+    const stored = JSON.stringify([storage.map.get('cfg:v1'), storage.map.get('root:v1')]);
     expect(stored).not.toContain('push.test.invalid');
     expect(stored).not.toContain(sub.auth);
+    expect(stored).not.toContain(ORIGIN);
+    expect((storage.map.get('root:v1') as { wraps: unknown[] }).wraps).toHaveLength(1);
 
-    const again = new AccountAdmin(storage, ENV);
+    const again = new AccountAdmin(storage, SECRET);
     expect((await listed(again)).map(s => s.endpoint)).toEqual([sub.endpoint]);
     expect(((await (await again.pushOp('vapid', get())).json()) as { pub_b64u: string }).pub_b64u).toBe(vapid);
+    expect(again.current.origin).toBe(ORIGIN);
 
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const rotated = new AccountAdmin(storage, { ...ENV, VT_AUTH_CF: 'another-master' });
-    expect(await listed(rotated)).toEqual([]);
-    expect(err.mock.calls.some(c => String(c[0]).includes('config.unreadable'))).toBe(true);
+    const rotated = new AccountAdmin(storage, 'another-secret');
+    expect(await rotated.load()).toBeNull();
+    expect(await rotated.load()).toBeNull();
+    expect(err.mock.calls.filter(c => String(c[0]).includes('config.unreadable'))).toHaveLength(1);
     err.mockRestore();
+    // Unreadable root ⇒ the setup view, flagged as a reset.
+    expect(await (await rotated.state(get())).json()).toEqual({ state: 'setup', rp_id: null, reset: true });
   });
 });
 
@@ -102,7 +126,7 @@ describe('push fan-out', () => {
   }
 
   it('drops a subscription on 410, keeps it on 5xx, and never touches the ceremony path', async () => {
-    const admin = new AccountAdmin(fakeStorage(), ENV);
+    const admin = await configured();
     const dead = await browserSub(1, 'dead');
     const flaky = await browserSub(2, 'flaky');
     await admin.pushOp('subscribe', post(dead));
@@ -133,7 +157,7 @@ describe('push fan-out', () => {
     const tasks: Promise<unknown>[] = [];
     const notifications = new AccountNotifications(
       { waitUntil: (t: Promise<unknown>) => { tasks.push(t); } },
-      ENV, new AccountAdmin(fakeStorage(), ENV));
+      ENV, await configured());
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
     notifications.approval(challenge());

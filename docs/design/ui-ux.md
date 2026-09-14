@@ -131,17 +131,19 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 - **`pwa/approve.html`** at `/a/:token`: header, `#vt-approve-root`, the
   ceremony. Unchanged by the slim.
 - **`pwa/admin/admin.html`** at `/admin` renders one of three states from
-  `VT_DATA.state` (today only `console` exists; `setup`/`login` land with
-  worker-slim §3): **setup** — the bootstrap form of worker-slim §3.3 (setup
-  token, label, `vt secret export` blob + passphrase, one `生成` action);
+  `VT_DATA.state`: **setup** — the bootstrap form of worker-slim §3.3 (label,
+  `vt secret export` blob + passphrase, one `注册并登录` action; a `409` shows
+  the first registration's time and IP with the one-line reset hint; a
+  `reset` flag warns that an unreadable configuration will be replaced);
   **login** — one primary button `使用 Passkey 登录` and the status line;
   **console** — the tab strip 审计 · DEK 缓存 · 主机令牌 · Passkey · 设置, tab
   in the URL hash (`/admin#audit`), first tab default.
 - 审计: filter bar, table, `加载更多`, live indicator, detail dialog with
   inline approval. DEK 缓存: filter bar, bulk bar, table, extend dialog.
   主机令牌: filter bar, table with per-row `吊销`. Passkey: current list,
-  segmented `新增 / 吊销`, `自检`. 设置: caching and hit-notify switches, UV
-  policy JSON, push subscriptions (`开启推送`, per-row test/remove), `退出所有会话`.
+  segmented `新增 / 吊销`, `自检`. 设置: session (`退出登录`, `退出所有会话`),
+  caching and hit-notify switches, UV policy JSON, push subscriptions
+  (`开启推送`, per-row test/remove).
 - A `401` on any admin request returns the shell to the login state with the
   reason on the status line; the console never renders on stale data.
 

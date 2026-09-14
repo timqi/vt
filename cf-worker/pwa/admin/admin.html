@@ -18,6 +18,47 @@
     <nav class="tabs" id="tabs" aria-label="控制台"></nav>
   </header>
   <p id="shell-status" class="status" role="status" aria-live="polite"></p>
+
+  <!-- setup: no root key yet. The bootstrap form of docs/worker-slim.md §3.3;
+       the master is decrypted in this browser only and never posted. -->
+  <section id="setup-view" class="view" hidden>
+    <section class="card">
+      <div class="card-head"><h2>初始化：注册首个 Passkey</h2></div>
+      <p id="setup-reset" class="warn" hidden>⚠️ 检测到已有配置无法用当前 <code>SECRET</code> 解密（SECRET 已更换或丢失）。继续引导将覆盖它：Passkey、推送订阅与设置需重新配置，每台主机需重新 <code>vt enroll</code>。</p>
+      <p class="hint">此服务尚未初始化。首个 Passkey 的 master 必须等于 macOS <code>mac_key</code>：在 <strong>Mac 本机</strong>执行（Touch ID 门控），按提示设置一个一次性导出口令：</p>
+      <pre class="cmd"><code>vt secret export</code></pre>
+      <p class="hint">把输出的 base64 与导出口令填入下方——解密只在本浏览器进行，<code>mac_key</code> 不上传。注册完成后本页即登录；请从正式域名打开本页，它将成为 WebAuthn origin。</p>
+      <div class="field">
+        <label for="master-blob">导出串（base64）</label>
+        <textarea id="master-blob" rows="3" placeholder="vt secret export 的输出，60 字节 base64url"></textarea>
+      </div>
+      <div class="field">
+        <label for="master-pass">导出口令</label>
+        <input id="master-pass" type="password" placeholder="export 时设置的一次性口令">
+      </div>
+      <div class="field">
+        <label for="bootstrap-label">标签</label>
+        <input id="bootstrap-label" type="text" placeholder="便于识别，如 iphone-icloud" maxlength="64">
+      </div>
+      <section class="actions">
+        <button id="bootstrap-run" type="button">注册并登录</button>
+        <span class="status" role="status" aria-live="polite"></span>
+      </section>
+      <p id="setup-taken" class="warn" hidden></p>
+    </section>
+  </section>
+
+  <!-- login: configured, no valid session. -->
+  <section id="login-view" class="view" hidden>
+    <section class="card">
+      <div class="card-head"><h2>登录</h2></div>
+      <section class="actions">
+        <button id="login-run" type="button">使用 Passkey 登录</button>
+        <span class="status" role="status" aria-live="polite"></span>
+      </section>
+    </section>
+  </section>
+
   <main id="console" hidden>
 
     <section class="tab-panel" id="tab-audit" hidden>
@@ -102,7 +143,7 @@
     </section>
 
     <section class="tab-panel" id="tab-setup" hidden>
-      <p class="hint">管理 phone 审批 ceremony 用的 Passkey（<code>CREDENTIALS_JSON</code>）。首个 Passkey 的 master 必须等于 macOS <code>mac_key</code>；新增 / 吊销自动读取当前环境变量。生成后手动 <code>wrangler secret put CREDENTIALS_JSON</code> 并 <code>deploy</code>。</p>
+      <p class="hint">审批 ceremony 与本控制台登录共用这些 Passkey。新增时用现有 Passkey 的 PRF 解出 master 再为新 Passkey 包装，master 不离开本浏览器；吊销会结束所有会话（含本会话），最后一个 Passkey 不可吊销。</p>
 
       <section id="current-section" class="card">
         <div class="card-head">
@@ -113,38 +154,13 @@
       </section>
 
       <div id="modes" role="radiogroup" aria-label="操作模式">
-        <label><input type="radio" name="mode" value="bootstrap" checked><span>首个（bootstrap）</span></label>
-        <label><input type="radio" name="mode" value="add"><span>新增</span></label>
+        <label><input type="radio" name="mode" value="add" checked><span>新增</span></label>
         <label><input type="radio" name="mode" value="revoke"><span>吊销</span></label>
       </div>
 
-      <section id="bootstrap-section" class="card">
-        <div class="card-head"><h2>从 macOS Master Key 引导</h2></div>
-        <p class="hint">浏览器无法独立完成这一步：master 必须取自 Mac keychain 的 <code>mac_key</code>。在 <strong>Mac 本机</strong> 执行（Touch ID 门控），按提示设置一个一次性导出口令：</p>
-        <pre class="cmd"><code>vt secret export</code></pre>
-        <p class="hint">把输出的 base64 与导出口令填入下方——解密只在本浏览器进行，<code>mac_key</code> 不上传。建议直接在 Mac 的浏览器里完成本页，避免跨设备复制。</p>
-        <div class="field">
-          <label for="master-blob">导出串（base64）</label>
-          <textarea id="master-blob" rows="3" placeholder="vt secret export 的输出，60 字节 base64url"></textarea>
-        </div>
-        <div class="field">
-          <label for="master-pass">导出口令</label>
-          <input id="master-pass" type="password" placeholder="export 时设置的一次性口令">
-        </div>
-      </section>
-
-      <section id="existing-section" class="card" hidden>
-        <div class="card-head">
-          <h2>现有 CREDENTIALS_JSON</h2>
-          <span class="badge">自动读取自环境变量</span>
-        </div>
-        <p class="hint">已从环境变量预填，通常无需改动；为空时可手动粘贴。</p>
-        <textarea id="existing" rows="6" placeholder="环境变量 CREDENTIALS_JSON 为空；如需可手动粘贴"></textarea>
-      </section>
-
       <section id="label-section" class="field">
         <label for="label">标签</label>
-        <input id="label" type="text" placeholder="便于识别，如 iphone-icloud">
+        <input id="label" type="text" placeholder="便于识别，如 iphone-icloud" maxlength="64">
       </section>
 
       <section id="revoke-section" class="card" hidden>
@@ -156,22 +172,22 @@
       </section>
 
       <section class="actions">
-        <button id="run" type="button">生成</button>
-        <button id="selfcheck" type="button" class="ghost" hidden>自检（逐条验证）</button>
+        <button id="run" type="button">执行</button>
+        <button id="selfcheck" type="button" class="ghost">自检（逐条验证）</button>
         <span class="status" role="status" aria-live="polite"></span>
-      </section>
-
-      <section id="output-section" class="card" hidden>
-        <div class="card-head">
-          <h2>输出</h2>
-          <button id="copy" type="button" class="ghost">复制</button>
-        </div>
-        <textarea id="output" rows="10" readonly></textarea>
-        <p class="hint">复制后执行 <code>wrangler secret put CREDENTIALS_JSON</code> 再 <code>wrangler deploy</code> 生效。</p>
       </section>
     </section>
 
     <section class="tab-panel" id="tab-settings" hidden>
+      <section class="card">
+        <div class="card-head"><h2>会话</h2></div>
+        <p class="hint">登录会话 8 小时后到期。「退出登录」只清除本浏览器的 cookie；「退出所有会话」使每个已登录设备立即失效（吊销 Passkey 也会如此）。</p>
+        <section class="actions">
+          <button id="logout" type="button" class="ghost">退出登录</button>
+          <button id="sessions-revoke" type="button" class="danger">退出所有会话</button>
+          <span id="session-status" class="status" role="status" aria-live="polite"></span>
+        </section>
+      </section>
       <section class="card">
         <div class="card-head"><h2>推送</h2></div>
         <p class="hint">Web Push 直接送达本设备，无第三方。iOS 16.4+：Safari → 分享 → 添加到主屏幕，从图标打开本页再点「开启推送」；移除图标即停止推送。审批、enroll 与缓存命中（需 <code>CACHE_HIT_NOTIFY</code>）都走这里。</p>

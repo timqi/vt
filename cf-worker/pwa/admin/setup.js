@@ -1,8 +1,9 @@
 'use strict';
 
-// Passkey tab: pure client-side CREDENTIALS_JSON generator. master_key never
-// leaves this page and is never POSTed anywhere — the user copies the output
-// and deploys it manually via `wrangler secret put CREDENTIALS_JSON`.
+// Passkey ceremonies of the admin shell: the setup view (bootstrap, the first
+// credential) and the Passkey tab (add / revoke / 自检). The master never
+// leaves this page: only a credential entry — wrapped master, public key, ids,
+// label — is POSTed, to /api/admin/bootstrap or /api/admin/credentials-add.
 //
 // Byte formats MUST match cf-worker/pwa/approve.js + src/webauthn.ts:
 //   PRF input = SHA-256("vt-passkey-prf-v1")            (common.js)
@@ -12,11 +13,8 @@
 //   p         = COSE public key bytes extracted from authData
 //   h         = b64u(SHA-256(credId))
 
-vt.tabs.setup = function (panel, data) {
-  var $ = function (sel) { return panel.querySelector(sel); };
-  var setStatus = vt.statusLine($('.status'));
-  if (!data.rp_id) { setStatus('页面初始化失败：缺少 rp_id', 'error'); return; }
-  var RP_ID = data.rp_id;
+// The WebAuthn + wrap helpers, bound to the RP id the Worker reported.
+function vtPasskeyCeremony(RP_ID) {
   var ENC = new TextEncoder();
 
   // Pre-warm the PRF input (a SHA-256) so the WebAuthn calls land on a resolved
@@ -25,10 +23,6 @@ vt.tabs.setup = function (panel, data) {
 
   function randomBytes(n) { var a = new Uint8Array(n); crypto.getRandomValues(a); return a; }
   function concat(a, b) { var o = new Uint8Array(a.length + b.length); o.set(a, 0); o.set(b, a.length); return o; }
-  function bytesEq(a, b) {
-    if (a.length !== b.length) return false;
-    var d = 0; for (var i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0;
-  }
 
   // ── WebAuthn ──────────────────────────────────────────────────────────────
 
@@ -167,92 +161,142 @@ vt.tabs.setup = function (panel, data) {
     };
   }
 
-  // Current CREDENTIALS_JSON injected by the Worker from its env binding (or
-  // '' on first setup). add/revoke read this directly — no manual paste.
-  function envCredentials() {
-    // Worker always injects a string (or undefined on first setup).
-    return (data.credentials || '').trim();
-  }
+  return {
+    createPasskey: createPasskey, assertPrf: assertPrf, wrapMasterKey: wrapMasterKey,
+    unwrapMasterKey: unwrapMasterKey, importMasterFromExport: importMasterFromExport,
+    buildEntry: buildEntry,
+  };
+}
 
-  function parseExisting() {
-    var raw = ($('#existing').value || '').trim();
-    if (!raw) raw = envCredentials();
-    if (!raw) throw new Error('环境变量 CREDENTIALS_JSON 为空，且未手动粘贴；add / revoke 需要现有凭据');
-    var blob;
-    try { blob = JSON.parse(raw); } catch (e) { throw new Error('JSON 解析失败: ' + (e.message || e)); }
-    if (blob.v !== 1 || !Array.isArray(blob.c)) throw new Error('CREDENTIALS_JSON 格式不符 (需 v=1, c[])');
-    return blob;
-  }
+function vtPasskeyError(e, cancelled) {
+  var msg = (e && e.message) ? e.message : String(e);
+  if (/NotAllowed|not allowed/i.test(msg)) msg = cancelled;
+  return msg;
+}
 
-  // ── Flows ──────────────────────────────────────────────────────────────────
+// ── Setup view: bootstrap ────────────────────────────────────────────────────
 
-  var lastBlob = null;
+vt.views.setup = function (view, data) {
+  var $ = function (sel) { return view.querySelector(sel); };
+  var setStatus = vt.statusLine($('.status'));
+  var pk = vtPasskeyCeremony(data.rp_id);
+  $('#setup-reset').hidden = !data.reset;
 
-  async function runBootstrap(label) {
-    // First setup MUST bind to the macOS mac_key — never a fresh random master,
-    // otherwise the passkey domain would be a separate vault that can't decrypt
-    // macOS-created records.
+  // First setup MUST bind to the macOS mac_key — never a fresh random master,
+  // otherwise the passkey domain would be a separate vault that can't decrypt
+  // macOS-created records.
+  async function buildFirstEntry(label) {
     var blobB64 = $('#master-blob').value;
     var pass = $('#master-pass').value;
     if (!(blobB64 || '').trim()) throw new Error('请先在 Mac 上执行 `vt secret export` 并粘贴其输出');
     if (!pass) throw new Error('请输入 `vt secret export` 时设置的导出口令');
-    var masterKey = await importMasterFromExport(blobB64, pass);
+    var masterKey = await pk.importMasterFromExport(blobB64, pass);
     try {
       setStatus('① 注册新 Passkey…（请完成生物识别）');
-      var pk = await createPasskey(label);
+      var c = await pk.createPasskey(label);
       setStatus('② 读取 PRF…（请再次完成生物识别）');
-      var pr = await assertPrf([pk.credId]);
-      var w = await wrapMasterKey(pr.K, pk.credId, masterKey);
+      var pr = await pk.assertPrf([c.credId]);
+      var w = await pk.wrapMasterKey(pr.K, c.credId, masterKey);
       vt.zeroize(pr.K);
-      var blob = { v: 1, epoch: 1, c: [buildEntry(pk.credId, pk.cose, w.k, w.h, label)] };
-      return blob;
+      return pk.buildEntry(c.credId, c.cose, w.k, w.h, label);
     } finally { vt.zeroize(masterKey); }
   }
 
+  $('#bootstrap-run').addEventListener('click', async function () {
+    var btn = this; btn.disabled = true;
+    $('#setup-taken').hidden = true;
+    try {
+      var entry = await buildFirstEntry(($('#bootstrap-label').value || '').trim());
+      setStatus('③ 提交…');
+      var resp = await vt.postJson('bootstrap', { entry: entry });
+      if (resp.status === 204) { setStatus('✓ 已注册并登录', 'ok'); location.reload(); return; }
+      if (resp.status === 409) {
+        // Someone registered first (§3.3 step 5). Not you ⇒ factory reset.
+        var info = await resp.json();
+        var taken = $('#setup-taken');
+        taken.textContent = '此服务已于 ' + vt.fmtTime(info.ms) + ' 由 IP ' + (info.ip || '?') +
+          ' 完成初始化。如果不是你：换一个新的 SECRET（wrangler secret put SECRET）后重新打开本页引导；旧配置随即作废。';
+        taken.hidden = false;
+        setStatus('已被初始化', 'error');
+        return;
+      }
+      throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()));
+    } catch (e) {
+      setStatus('错误：' + vtPasskeyError(e, '未找到匹配 Passkey 或操作被取消'), 'error');
+      console.error(e);
+    } finally { btn.disabled = false; }
+  });
+};
+
+// ── Passkey tab: add / revoke / 自检 ─────────────────────────────────────────
+
+vt.tabs.setup = function (panel, data) {
+  var $ = function (sel) { return panel.querySelector(sel); };
+  var setStatus = vt.statusLine($('.status'));
+  var pk = vtPasskeyCeremony(data.rp_id);
+  var entries = [];
+  var epoch = 0;
+
+  function bytesEq(a, b) {
+    if (a.length !== b.length) return false;
+    var d = 0; for (var i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0;
+  }
+
+  async function load() {
+    var resp = await vt.apiFetch(vt.api('credentials'), { headers: { 'Accept': 'application/json' } });
+    if (!resp.ok) { setStatus('查询失败 HTTP ' + resp.status, 'error'); return; }
+    var json = await resp.json();
+    entries = json.credentials || [];
+    epoch = json.epoch;
+    renderCurrent();
+    populateRevoke();
+  }
+
+  // Unwrap the master with one of the existing passkeys, register the new one,
+  // wrap for it and post only the entry.
   async function runAdd(label) {
-    var blob = parseExisting();
+    if (!entries.length) throw new Error('没有现有 Passkey');
     var masterKey = null;
     try {
       setStatus('① 用现有 Passkey 解出 master_key…');
-      var ids = blob.c.map(function (e) { return vt.b64uDec(e.i); });
-      var a = await assertPrf(ids);
+      var a = await pk.assertPrf(entries.map(function (e) { return vt.b64uDec(e.i); }));
       var used = vt.b64uEnc(a.rawId);
-      var old = null;
-      for (var i = 0; i < blob.c.length; i++) { if (blob.c[i].i === used) { old = blob.c[i]; break; } }
+      var old = entries.filter(function (e) { return e.i === used; })[0];
       if (!old) { vt.zeroize(a.K); throw new Error('使用的 Passkey 不在现有列表中'); }
-      masterKey = await unwrapMasterKey(a.K, a.rawId, old.k);
+      masterKey = await pk.unwrapMasterKey(a.K, a.rawId, old.k);
       vt.zeroize(a.K);
-
       setStatus('② 注册新 Passkey…（请完成生物识别）');
-      var pk = await createPasskey(label);
+      var c = await pk.createPasskey(label);
       setStatus('③ 读取新 Passkey 的 PRF…（请再次完成生物识别）');
-      var pr = await assertPrf([pk.credId]);
-      var w = await wrapMasterKey(pr.K, pk.credId, masterKey);
+      var pr = await pk.assertPrf([c.credId]);
+      var w = await pk.wrapMasterKey(pr.K, c.credId, masterKey);
       vt.zeroize(pr.K);
-      blob.c.push(buildEntry(pk.credId, pk.cose, w.k, w.h, label)); // existing entries untouched
-      return blob;
+      var resp = await vt.postJson('credentials-add', { entry: pk.buildEntry(c.credId, c.cose, w.k, w.h, label) });
+      if (resp.status === 409) throw new Error('该 Passkey 已注册');
+      if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()));
     } finally { if (masterKey) vt.zeroize(masterKey); }
   }
 
-  function runRevoke() {
-    var blob = parseExisting();
-    var sel = $('#revoke-pick');
-    var idx = parseInt(sel.value, 10);
-    if (!(idx >= 0 && idx < blob.c.length)) throw new Error('请选择要吊销的条目');
-    blob.c.splice(idx, 1);
-    blob.epoch = (typeof blob.epoch === 'number' ? blob.epoch : 1) + 1;
-    return blob;
+  async function runRevoke() {
+    var h = $('#revoke-pick').value;
+    var e = entries.filter(function (x) { return x.h === h; })[0];
+    if (!e) throw new Error('请选择要吊销的条目');
+    if (!confirm('吊销 “' + (e.l || e.i.slice(0, 12)) + '”？所有已登录会话（含本会话）将立即结束。')) return false;
+    var resp = await vt.postJson('credentials-revoke', { h: h });
+    if (resp.status === 409) throw new Error('这是最后一个 Passkey，不能吊销');
+    if (resp.status !== 204) throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()));
+    return true;
   }
 
-  async function selfCheck(blob) {
-    if (!blob || !blob.c.length) throw new Error('无可校验条目');
+  async function selfCheck() {
+    if (!entries.length) throw new Error('无可校验条目');
     var ref = null;
     try {
-      for (var i = 0; i < blob.c.length; i++) {
-        var e = blob.c[i];
-        setStatus('自检 ' + (i + 1) + '/' + blob.c.length + '：' + (e.l || e.i.slice(0, 8)) + '…');
-        var a = await assertPrf([vt.b64uDec(e.i)]);
-        var mk = await unwrapMasterKey(a.K, a.rawId, e.k);
+      for (var i = 0; i < entries.length; i++) {
+        var e = entries[i];
+        setStatus('自检 ' + (i + 1) + '/' + entries.length + '：' + (e.l || e.i.slice(0, 8)) + '…');
+        var a = await pk.assertPrf([vt.b64uDec(e.i)]);
+        var mk = await pk.unwrapMasterKey(a.K, a.rawId, e.k);
         vt.zeroize(a.K);
         if (ref === null) { ref = mk; }
         else {
@@ -260,7 +304,7 @@ vt.tabs.setup = function (panel, data) {
           if (!same) throw new Error('条目 “' + (e.l || i) + '” 解出的 master_key 与其它条目不一致');
         }
       }
-      setStatus('✓ 自检通过：所有 ' + blob.c.length + ' 个条目解出同一 master_key', 'ok');
+      setStatus('✓ 自检通过：所有 ' + entries.length + ' 个条目解出同一 master_key', 'ok');
     } finally { if (ref) vt.zeroize(ref); }
   }
 
@@ -268,107 +312,64 @@ vt.tabs.setup = function (panel, data) {
 
   function mode() {
     var r = $('input[name="mode"]:checked');
-    return r ? r.value : 'bootstrap';
+    return r ? r.value : 'add';
   }
 
   function refreshModeUI() {
     var m = mode();
-    $('#bootstrap-section').hidden = (m !== 'bootstrap');
-    $('#existing-section').hidden = (m === 'bootstrap');
     $('#label-section').hidden = (m === 'revoke');
     $('#revoke-section').hidden = (m !== 'revoke');
-    if (m === 'revoke') populateRevoke();
   }
 
   function populateRevoke() {
     var sel = $('#revoke-pick');
     sel.innerHTML = '';
-    try {
-      var blob = parseExisting();
-      blob.c.forEach(function (e, i) {
-        var o = document.createElement('option');
-        o.value = String(i);
-        o.textContent = (e.l || '(无标签)') + ' — ' + e.i.slice(0, 12) + '…';
-        sel.appendChild(o);
-      });
-    } catch (e) { /* ignore until valid JSON pasted */ }
-  }
-
-  function output(blob) {
-    lastBlob = blob;
-    $('#output').value = JSON.stringify(blob, null, 2);
-    $('#output-section').hidden = false;
-    $('#selfcheck').hidden = false;
+    entries.forEach(function (e) {
+      var o = document.createElement('option');
+      o.value = e.h;
+      o.textContent = (e.l || '(无标签)') + ' — ' + e.i.slice(0, 12) + '…';
+      sel.appendChild(o);
+    });
   }
 
   panel.querySelectorAll('input[name="mode"]').forEach(function (r) {
     r.addEventListener('change', refreshModeUI);
   });
-  $('#existing').addEventListener('input', function () {
-    if (mode() === 'revoke') populateRevoke();
-  });
 
   $('#run').addEventListener('click', async function () {
     var btn = this; btn.disabled = true;
     try {
-      var label = ($('#label').value || '').trim();
-      var m = mode();
-      var blob;
-      if (m === 'bootstrap') blob = await runBootstrap(label);
-      else if (m === 'add') blob = await runAdd(label);
-      else blob = runRevoke();
-      output(blob);
-      setStatus('✓ 已生成。请复制并 `wrangler secret put CREDENTIALS_JSON`。' +
-        (m === 'revoke' ? '' : ' 建议点“自检”逐条验证。'), 'ok');
+      if (mode() === 'add') {
+        await runAdd(($('#label').value || '').trim());
+        setStatus('✓ 已新增。建议点“自检”逐条验证。', 'ok');
+        await load();
+      } else if (await runRevoke()) {
+        // The epoch bump ended this session too; the 401 on the next request
+        // shows the login view, so go there now.
+        vt.showLogin('已吊销，所有会话已结束，请重新登录');
+      }
     } catch (e) {
-      var msg = (e && e.message) ? e.message : String(e);
-      if (/NotAllowed|not allowed/i.test(msg)) msg = '未找到匹配 Passkey 或操作被取消';
-      setStatus('错误：' + msg, 'error');
+      setStatus('错误：' + vtPasskeyError(e, '未找到匹配 Passkey 或操作被取消'), 'error');
       console.error(e);
     } finally { btn.disabled = false; }
   });
 
   $('#selfcheck').addEventListener('click', async function () {
     var btn = this; btn.disabled = true;
-    try { await selfCheck(lastBlob); }
+    try { await selfCheck(); }
     catch (e) {
-      var msg = (e && e.message) ? e.message : String(e);
-      if (/NotAllowed|not allowed/i.test(msg)) msg = '取消或未匹配 Passkey（自检中止）';
-      setStatus('自检失败：' + msg, 'error');
+      setStatus('自检失败：' + vtPasskeyError(e, '取消或未匹配 Passkey（自检中止）'), 'error');
       console.error(e);
     } finally { btn.disabled = false; }
   });
 
-  $('#copy').addEventListener('click', function () {
-    var ta = $('#output');
-    ta.select();
-    navigator.clipboard.writeText(ta.value).then(
-      function () { setStatus('已复制到剪贴板', 'ok'); },
-      function () { setStatus('复制失败，请手动选择文本', 'error'); }
-    );
-  });
-
-  // Render the current registered Passkeys from the env-injected blob. Uses
   // textContent everywhere (labels are operator-controlled at registration).
   function renderCurrent() {
     var host = $('#current-list');
     var meta = $('#current-meta');
-    if (!host) return;
     host.innerHTML = '';
-    function emptyRow(text) {
-      var li = document.createElement('li');
-      li.className = 'cred-empty';
-      li.textContent = text;
-      host.appendChild(li);
-    }
-    var raw = envCredentials();
-    if (!raw) { if (meta) meta.textContent = '尚未 bootstrap'; emptyRow('还没有任何 Passkey，请用「首个（bootstrap）」注册。'); return; }
-    var blob;
-    try { blob = JSON.parse(raw); }
-    catch (e) { if (meta) meta.textContent = '解析失败'; return; }
-    if (blob.v !== 1 || !Array.isArray(blob.c)) { if (meta) meta.textContent = '格式不符'; return; }
-    if (meta) meta.textContent = blob.c.length + ' 个 · epoch ' + (blob.epoch != null ? blob.epoch : 1);
-    blob.c.forEach(function (e) {
+    meta.textContent = entries.length + ' 个 · epoch ' + epoch;
+    entries.forEach(function (e) {
       var li = document.createElement('li');
       var name = document.createElement('strong');
       name.textContent = e.l || '(无标签)';
@@ -385,16 +386,6 @@ vt.tabs.setup = function (panel, data) {
     });
   }
 
-  // Pre-fill the existing-credentials box from the env-injected blob so
-  // add/revoke work without manual paste. Pretty-print when parseable.
-  (function prefillExisting() {
-    var env = envCredentials();
-    if (!env) return;
-    var ta = $('#existing');
-    try { ta.value = JSON.stringify(JSON.parse(env), null, 2); }
-    catch (_) { ta.value = env; }
-  })();
-
-  renderCurrent();
   refreshModeUI();
+  load();
 };

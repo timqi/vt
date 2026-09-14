@@ -1,24 +1,34 @@
 'use strict';
 
-// 设置 tab, push subscriptions: this device subscribes with the Worker's VAPID
-// key and posts the result; every row can be tested or removed. Rendering is
-// textContent only; the endpoint's keys never come back from the server.
+// 设置 tab: the session (logout / 退出所有会话) and push subscriptions — this
+// device subscribes with the Worker's VAPID key and posts the result; every
+// row can be tested or removed. Rendering is textContent only; the endpoint's
+// keys never come back from the server.
 
 vt.tabs.settings = function (panel) {
   var $ = function (sel) { return panel.querySelector(sel); };
-  var API = vt.api('push/');
-  var setStatus = vt.statusLine($('.status'));
+  var setStatus = vt.statusLine($('#subs').parentNode.parentNode.querySelector('.status'));
+  var sessionStatus = vt.statusLine($('#session-status'));
   var el = vt.el, fmtTime = vt.fmtTime;
   var subs = [];
   var mine = null;
 
   async function post(op, body) {
-    var resp = await fetch(API + op, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
+    var resp = await vt.postJson('push/' + op, body);
     if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()));
     return resp.json();
   }
+
+  $('#logout').addEventListener('click', async function () {
+    await vt.postJson('logout');
+    vt.showLogin('已退出登录');
+  });
+  $('#sessions-revoke').addEventListener('click', async function () {
+    if (!confirm('结束所有设备上的登录会话？')) return;
+    var resp = await vt.postJson('sessions-revoke');
+    if (resp.status !== 204 && resp.status !== 401) { sessionStatus('失败 HTTP ' + resp.status, 'error'); return; }
+    vt.showLogin('所有会话已结束，请重新登录');
+  });
 
   function render() {
     var tbody = $('.rows');
@@ -69,7 +79,7 @@ vt.tabs.settings = function (panel) {
   }
 
   async function load() {
-    var resp = await fetch(API + 'vapid', { headers: { 'Accept': 'application/json' } });
+    var resp = await vt.apiFetch(vt.api('push/vapid'), { headers: { 'Accept': 'application/json' } });
     if (!resp.ok) { setStatus('查询失败 HTTP ' + resp.status, 'error'); return null; }
     var json = await resp.json();
     subs = json.subscriptions || [];

@@ -1,7 +1,9 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AccountAudit, auditKey } from '../src/account_audit';
 import type { AdminWsMessage, DoAuditIngestOp } from '../src/types';
-import { inDO, makeChallenge, makeMeta, nextToken, liveTokenId } from './do_helpers';
+import { inDO, makeChallenge, makeMeta, nextToken, liveTokenId, bootstrap } from './do_helpers';
+
+beforeEach(bootstrap);
 
 function agentOp(): DoAuditIngestOp {
   return {

@@ -32,7 +32,7 @@ describe('cache creation time rendering', () => {
   const wiring = source.indexOf("  $('.refresh').addEventListener");
   expect(wiring).toBeGreaterThan(0);
   const context: Record<string, unknown> = {
-    location: { pathname: '/kestrel', hash: '' },
+    location: { pathname: '/admin', hash: '' },
     document: {
       getElementById: () => new Element(), createElement: () => new Element(),
       addEventListener() {}, body: new Element(),
@@ -155,10 +155,10 @@ describe('page shells', () => {
     expect(html).toContain('/pwa/admin/admin.css?v=20260101-abc1234');
   });
 
-  it('renders the admin shell with its state, RP_ID and CREDENTIALS_JSON', () => {
+  it('renders the admin shell with its state and rp_id', () => {
     const html = render('admin/admin.html', {
       ...pageVars(CHROME),
-      VT_DATA: escapeJsonForHtml({ state: 'console', rp_id: 'vt.example.com', credentials: '{"v":1,"epoch":0,"c":[]}' }),
+      VT_DATA: escapeJsonForHtml({ state: 'console', rp_id: 'vt.example.com' }),
     });
     expect(html).toContain('"state":"console"');
     expect(html).toContain('vt.example.com');
@@ -174,7 +174,6 @@ describe('page shells', () => {
     const placeholders = new Set([...raw.matchAll(/\{\{([A-Z0-9_]+)\}\}/g)].map(m => m[1]));
     expect([...placeholders].sort()).toEqual(['ASSET_VER', 'FAVICON_TAGS', 'VT_DATA']);
     expect(raw).toContain('id="vt-data">{{VT_DATA}}</script>');
-    expect(raw).not.toMatch(/\bkestrel\b/);
   });
 
   it('leaves no unsubstituted placeholder in any shell', () => {
@@ -182,7 +181,7 @@ describe('page shells', () => {
     const rendered = [
       render('approve.html', { ...pageVars(CHROME), VT_DATA: '{}' }),
       render('admin/admin.html', { ...pageVars(CHROME), VT_DATA: '{}' }),
-      render('manifest.webmanifest', { ADMIN_BASE: '/kestrel' }),
+      render('manifest.webmanifest', {}),
     ];
     for (const html of rendered) expect(html).not.toMatch(/\{\{[A-Z0-9_]+\}\}/);
   });

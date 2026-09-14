@@ -6,7 +6,7 @@
 //
 // Two classes of action, deliberately asymmetric:
 //   • clear (per row / selected / all) — authority-REDUCING, one POST, immediate.
-//   • extend — authority-GRANTING, so the Access session alone cannot do it: the
+//   • extend — authority-GRANTING, so the admin session alone cannot do it: the
 //     POST only opens a pending Passkey ceremony, which is then mounted inline via
 //     the SAME vt.mountApprove() the approval page uses. Nothing expires later
 //     until that ceremony is approved on a Passkey.
@@ -323,8 +323,8 @@ vt.tabs.cache = function (panel) {
   async function load() {
     setStatus('查询中…');
     try {
-      var resp = await fetch(API, { headers: { 'Accept': 'application/json' } });
-      if (resp.status === 403) { setStatus(vt.AUTH_EXPIRED, 'error'); return; }
+      var resp = await vt.apiFetch(API, { headers: { 'Accept': 'application/json' } });
+      if (resp.status === 401) return; // the shell shows the login view
       if (!resp.ok) { setStatus('查询失败 HTTP ' + resp.status, 'error'); return; }
       var json = await resp.json();
       groups = (json && json.groups) || [];
@@ -370,7 +370,7 @@ vt.tabs.cache = function (panel) {
     if (btn) btn.disabled = true;
     setStatus('清除中…');
     try {
-      var resp = await fetch(vt.api('cache-clear-groups'), {
+      var resp = await vt.apiFetch(vt.api('cache-clear-groups'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ group_ids: ids }),
@@ -413,7 +413,7 @@ vt.tabs.cache = function (panel) {
     if (btn) btn.disabled = true;
     setStatus('正在创建审批请求…');
     try {
-      var resp = await fetch(vt.api('cache-extend-request'), {
+      var resp = await vt.apiFetch(vt.api('cache-extend-request'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ group_ids: targets, ttl_s: ttl }),
@@ -422,7 +422,7 @@ vt.tabs.cache = function (panel) {
         setStatus('延长功能未启用（CACHE_ADMIN_EXTEND）', 'error');
         return;
       }
-      if (resp.status === 403) { setStatus(vt.AUTH_EXPIRED, 'error'); return; }
+      if (resp.status === 401) return; // the shell shows the login view
       if (resp.status === 409) {
         // Refresh FIRST, then report — load() re-renders and would otherwise
         // overwrite the message, which is exactly how this failure managed to look
@@ -536,7 +536,7 @@ vt.tabs.cache = function (panel) {
     if (!confirm('删除全部已缓存 DEK？此后解密将重新需要手机审批。')) return;
     setStatus('清空缓存中…');
     try {
-      var resp = await fetch(vt.api('clear-cache'), { method: 'POST', headers: { 'Accept': 'application/json' } });
+      var resp = await vt.apiFetch(vt.api('clear-cache'), { method: 'POST', headers: { 'Accept': 'application/json' } });
       if (!resp.ok) { setStatus('清空缓存失败 HTTP ' + resp.status, 'error'); return; }
       var json = await resp.json();
       selected = {};

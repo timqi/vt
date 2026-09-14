@@ -7,15 +7,29 @@
 // tab (.status, .rows, .filters, .f-host, …) is a class the tab script looks up
 // inside its own panel. Loaded before the tab scripts; boots on DOMContentLoaded.
 //
-// Shared here (admin-only): the API base, the detail dialog, the hovercard and
-// the command summariser. Cross-shell helpers live in common.js (vt.*).
+// Shared here (admin-only): the API base and its 401 handling, the login
+// ceremony, the detail dialog, the hovercard and the command summariser.
+// Cross-shell helpers live in common.js (vt.*).
 
 (function () {
-  // The admin segment from the current path (/{seg}); Cloudflare Access gates it.
-  var seg = location.pathname.split('/')[1] || '';
-  vt.api = function (path) { return '/' + seg + '/api/' + path; };
-  vt.AUTH_EXPIRED = '未授权（Cloudflare Access 会话可能已过期，请刷新登录）';
+  vt.api = function (path) { return '/api/admin/' + path; };
   vt.tabs = {};
+  vt.views = {};
+
+  // Every admin request goes through here: a 401 means the session is gone
+  // (expired, epoch bumped by a revocation, cookie cleared), and the shell
+  // returns to the login view rather than any tab rendering on stale data.
+  vt.apiFetch = async function (url, init) {
+    var resp = await fetch(url, init);
+    if (resp.status === 401) vt.showLogin('会话已失效，请重新登录');
+    return resp;
+  };
+  vt.postJson = function (path, body) {
+    return vt.apiFetch(vt.api(path), {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(body == null ? {} : body),
+    });
+  };
 
   // ── Command summary (audit + cache list columns) ──────────────────────────
   // Cosmetic, FRONTEND-ONLY: if the command's leading program is an absolute
@@ -197,15 +211,66 @@
     activate(data);
   }
 
+  // ── Shell states ──────────────────────────────────────────────────────────
+  // Exactly one of setup / login / console is visible. A 401 anywhere flips to
+  // login; a successful login or bootstrap reloads so the console renders from
+  // the state the Worker reports, never from what the page assumed.
+  function show(id) {
+    ['setup-view', 'login-view', 'console', 'page-head'].forEach(function (v) {
+      document.getElementById(v).hidden = (v !== id && !(id === 'console' && v === 'page-head'));
+    });
+  }
+
+  var loginShown = false;
+  vt.showLogin = function (reason) {
+    show('login-view');
+    vt.dialog.close();
+    var view = document.getElementById('login-view');
+    var setStatus = vt.statusLine(view.querySelector('.status'));
+    if (reason) setStatus(reason, 'error');
+    if (loginShown) return;
+    loginShown = true;
+    var btn = document.getElementById('login-run');
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      try {
+        var ch = await vt.postJson('login-challenge');
+        if (!ch.ok) throw new Error(ch.status === 429 ? '登录尝试过多，请稍后再试' : 'HTTP ' + ch.status);
+        var c = await ch.json();
+        setStatus('请完成 Passkey 验证…');
+        // No allowCredentials: registration required resident keys, so the
+        // authenticator discovers the credential and the page lists nothing.
+        var a = await navigator.credentials.get({ publicKey: {
+          challenge: vt.b64uDec(c.challenge_b64u), rpId: c.rp_id, userVerification: 'required',
+        } });
+        if (!a) throw new Error('验证被取消');
+        var r = a.response;
+        var resp = await vt.postJson('login', {
+          challenge_id: c.challenge_id,
+          credential_id_b64u: vt.b64uEnc(new Uint8Array(a.rawId)),
+          client_data_json_b64u: vt.b64uEnc(new Uint8Array(r.clientDataJSON)),
+          authenticator_data_b64u: vt.b64uEnc(new Uint8Array(r.authenticatorData)),
+          signature_b64u: vt.b64uEnc(new Uint8Array(r.signature)),
+        });
+        if (resp.status !== 204) throw new Error(resp.status === 401 ? '登录失败：Passkey 未注册或验证未通过' : 'HTTP ' + resp.status);
+        setStatus('已登录', 'ok');
+        location.reload();
+      } catch (e) {
+        var msg = (e && e.message) ? e.message : String(e);
+        if (/NotAllowed|not allowed/i.test(msg)) msg = '未找到匹配 Passkey 或操作被取消';
+        setStatus(msg, 'error');
+      } finally { btn.disabled = false; }
+    });
+  };
+
   document.addEventListener('DOMContentLoaded', function () {
     var shellStatus = vt.statusLine(document.getElementById('shell-status'));
     var data = vt.bootData();
     if (!data) { shellStatus('页面初始化失败：缺少或无法解析 vt-data', 'error'); return; }
-    // The shell renders exactly one state. `setup` and `login` arrive with the
-    // passkey admin auth of docs/worker-slim.md §3; until then Cloudflare Access
-    // gates the page and the Worker only ever sends `console`.
     switch (data.state) {
-      case 'console': bootConsole(data); break;
+      case 'console': show('console'); bootConsole(data); break;
+      case 'login': vt.showLogin(''); break;
+      case 'setup': show('setup-view'); vt.views.setup(document.getElementById('setup-view'), data); break;
       default: shellStatus('未知页面状态：' + String(data.state), 'error');
     }
   });

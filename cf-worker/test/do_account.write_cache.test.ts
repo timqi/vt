@@ -17,6 +17,7 @@ import {
 import {
   inDO, setDoVar, doPost, approve, makeChallenge, sealFakeDek, nextSalt,
   allDekKeys, auditRows, testEnv, DoHandle, liveTokenId,
+  bootstrap,
 } from './do_helpers';
 
 const TTL_20M = 20 * 60;
@@ -28,6 +29,7 @@ const TTL_PERMANENT = 100 * 365 * 24 * 3600;
 
 // The DO instance survives a test; its env does not get rolled back with storage.
 beforeEach(async () => {
+  await bootstrap();
   await setDoVar('CACHE_SECKEY', testEnv.CACHE_SECKEY);
   await setDoVar('CACHE_ADMIN_EXTEND', '0');
 });

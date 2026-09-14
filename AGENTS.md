@@ -189,8 +189,8 @@ Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
 - Caching is opt-in and requires `CACHE_SECKEY`. A hit is not a phone approval:
   always audit it. `CACHE_HIT_NOTIFY` independently enables best-effort hit pushes
   and is off by default. Group IDs and creation stamps are immutable.
-- Access-gated list/clear need no Passkey; extension requires a verified Passkey
-  via `opApprove` -> `commitExtend`, never Access alone. `CACHE_ADMIN_EXTEND` is
+- Session-gated list/clear need no Passkey; extension requires a verified Passkey
+  via `opApprove` -> `commitExtend`, never a session alone. `CACHE_ADMIN_EXTEND` is
   only a kill switch. Never resurrect expired entries, shorten expiry, or extend
   drifted/no-gain groups; re-read entries with no await before the write, and audit
   authorization plus actual effects. Expiry is approval-time + TTL, not a lifetime
@@ -201,10 +201,18 @@ Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
   and fail loudly if incomplete. Keep every cache-armed audit row's revoke button.
   `audit.cache_ttl_s` stays immutable; only `audit.cache_expires_ms` tracks extension.
   Every multi-key storage `get`/`put`/`delete` is chunked to <= 128 keys.
-- Fixed `ADMIN_SEG` routes require both Cloudflare Access and Worker JWT checks.
+- Admin is a passkey session: `/admin` and every `/api/admin/*` op are verified
+  in the DO (`AccountAdmin.session`), never at the edge; the cookie is
+  `__Host-vt_admin` (8 h absolute, MAC'd under `K_sess` from `R`, bound to
+  `config.epoch`); every non-GET and the audit-stream upgrade also require
+  `Origin == config.origin`. Only bootstrap, login-challenge and login are open,
+  and the first two sit behind `LIMITER login:<ip>` (absent → 503). Revoking a
+  passkey or 退出所有会话 bumps the epoch; the last credential is never revoked.
+  Unconfigured (no readable `root:v1`) fails closed everywhere but `/admin`,
+  bootstrap and public assets. A `Cf-Access-Jwt-Assertion` header means nothing.
   `pwa/*` (admin included) is public and carries no data: a shell on disk is
-  markup plus `{{VT_DATA}}`; data reaches a page only through the gated shell
-  route or the gated API. Preserve `STRICT_CSP`, HTML UTF-8 content type, and
+  markup plus `{{VT_DATA}}`; data reaches a page only through the shell route
+  (state for this cookie) or the gated API. Preserve `STRICT_CSP`, HTML UTF-8 content type, and
   global security headers on fresh responses; template JSON uses
   `escapeJsonForHtml`, never raw interpolation.
   See [cf-worker/src/index.ts](cf-worker/src/index.ts) and

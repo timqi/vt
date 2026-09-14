@@ -11,7 +11,7 @@ import app from '../src/index';
 import { b64uEnc, hkdfSha256, hmacSha256 } from '../src/crypto';
 import { deriveHostTokenSecret, HOST_TOKEN_TTL_MS } from '../src/host_token';
 import type { Challenge, HostTokenRow } from '../src/types';
-import { inDO, setDoVar, doPost, doGet, approve, reject, makeMeta, auditRow } from './do_helpers';
+import { inDO, setDoVar, doPost, doGet, approve, reject, makeMeta, auditRow, bootstrap } from './do_helpers';
 
 const MASTER = 'throwaway-host-token-test-master';
 const ORIGIN = 'https://vt.test.invalid';
@@ -22,7 +22,7 @@ const routerEnv = (): Env => ({ ...(env as unknown as Env), VT_AUTH_CF: MASTER }
 
 // The DO derives token secrets from ITS env's master, which is a different
 // object from the one the router is invoked with.
-beforeEach(async () => { await setDoVar('VT_AUTH_CF', MASTER); });
+beforeEach(async () => { await bootstrap(); await setDoVar('VT_AUTH_CF', MASTER); });
 
 async function post(path: string, body: unknown, headers: Record<string, string> = {}, e: Env = routerEnv()) {
   const resp = await app.fetch(new Request(`${ORIGIN}${path}`, {

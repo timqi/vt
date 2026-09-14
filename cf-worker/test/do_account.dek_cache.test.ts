@@ -18,6 +18,7 @@ import { b64uEnc } from '../src/crypto';
 import {
   inDO, setDoVar, doPost, approve, makeChallenge, makeMeta, makeEntry, FAKE_CTX,
   sealFakeDek, nextSalt, allDekKeys, auditRows, testEnv, liveTokenId,
+  bootstrap,
 } from './do_helpers';
 
 const TTL_8H = 8 * 3600;
@@ -30,6 +31,7 @@ const DAEMON_PK_B64U = b64uEnc(new Uint8Array(32).fill(11));
 let tokenId: string;
 
 beforeEach(async () => {
+  await bootstrap();
   await setDoVar('CACHE_SECKEY', testEnv.CACHE_SECKEY);
   tokenId = await liveTokenId();
 });

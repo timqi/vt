@@ -1,7 +1,7 @@
 # wrangler.toml.example — vt-passkey v2 TypeScript Worker
 #
 # Copy this file to `wrangler.toml` and fill in your own values.
-# The real `wrangler.toml` is gitignored (it carries account/Access ids).
+# The real `wrangler.toml` is gitignored (it carries your account id).
 #
 #   cp cf-worker/wrangler.toml.example cf-worker/wrangler.toml
 
@@ -40,7 +40,7 @@ directory = "pwa"
 # Static PWA assets (CSS, JS, libsodium.js) and the two HTML page shells are
 # reached only via ASSETS.fetch() from the worker: the public /pwa/* route
 # (pwa/admin/* included — a shell on disk is markup plus a {{VT_DATA}} slot,
-# data is rendered in only by the Access-gated /<ADMIN_SEG> route) and the
+# data is rendered in only by the /admin route for this request's session) and the
 # root-scope /sw.js + /manifest.webmanifest that Web Push needs.
 # run_worker_first disables Cloudflare's default static-first routing so every
 # request hits the worker. Leave html_handling at its default; src/index.ts
@@ -58,11 +58,12 @@ class_name = "AccountDO"
 tag = "v1"
 new_sqlite_classes = ["AccountDO"]
 
-# Per-IP throttle on POST /api/enroll — the ONE unauthenticated route that can
-# page the operator's phone (a host asking for its own VT_PASSKEY_TOKEN; see
-# docs/host-token.md). Without this binding the Worker refuses enrollment (503)
-# rather than run it unthrottled. `namespace_id` is any integer unique among the
-# rate limits in this account. 3 attempts / minute / IP is plenty for a human.
+# Per-IP throttle on the unauthenticated POSTs: /api/enroll (a host asking for
+# its own VT_PASSKEY_TOKEN, which pages the phone; docs/host-token.md) and the
+# admin bootstrap / login-challenge routes (docs/worker-slim.md §3). Without
+# this binding the Worker refuses them (503) rather than run them unthrottled.
+# `namespace_id` is any integer unique among the rate limits in this account.
+# 3 attempts / minute / IP is plenty for a human.
 [[unsafe.bindings]]
 name = "ENROLL_LIMITER"
 type = "ratelimit"
@@ -93,14 +94,6 @@ RP_ID = "vt.example.com"
 # admin cache-extension ceremony is pinned to `required` and ignores any attempt
 # here to lower it. See src/uv_policy.ts.
 APPROVAL_UV_JSON = ""
-# Cloudflare Access (Zero Trust) gates the /<ADMIN_SEG>/* surface (ADMIN_SEG is
-# a constant in src/index.ts). Fill these in after creating the Access
-# Application whose Path equals ADMIN_SEG (e.g. <origin>/kestrel):
-#   ACCESS_TEAM_DOMAIN  your "<team>.cloudflareaccess.com" (no scheme)
-#   ACCESS_AUD          the Access Application's AUD tag
-# Both empty → the Worker fails closed (403) on every admin-surface request.
-ACCESS_TEAM_DOMAIN = "<your-team>.cloudflareaccess.com"
-ACCESS_AUD = "<YOUR_ACCESS_APPLICATION_AUD_TAG>"
 # Cache-hit (免审批) Web Push notices. Off unless set to 1/true/on/yes — they
 # fire on every DEK-cache and agent Touch-ID-cache hit and bury the approval
 # messages that need a tap. Audit rows are written either way, so cache hits
@@ -133,8 +126,9 @@ CACHE_ADMIN_EXTEND = "0"
 #   VT_AUTH_CF        32-byte base64url master. Per-host VT_PASSKEY_TOKENs are
 #                     HKDF-derived from it at enrollment (docs/host-token.md), so
 #                     rotating it invalidates every token: re-enroll each host the
-#                     same day. NEVER hand it to a host.
-#   CREDENTIALS_JSON  JSON blob with passkey credentials (schema in src/credentials.ts)
+#                     same day. NEVER hand it to a host. Also the KEK over the
+#                     Durable Object's root key (passkeys, config, push
+#                     subscriptions live there, registered on /admin).
 #   CACHE_SECKEY      32-byte base64url X25519 secret key enabling the opt-in DEK
 #                     cache (approve-time TTL → 免审批解密 within IP+pwd scope).
 #                     Generate: `openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'`.

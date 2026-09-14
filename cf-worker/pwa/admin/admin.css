@@ -54,6 +54,8 @@ main {
 }
 /* The approve shell is one 420px column at every width. */
 main.approve { max-width: 420px; padding-top: 20px; }
+/* setup / login: one centred column, no tab strip above it. */
+.view { max-width: 560px; margin: 24px auto 0; padding: 0 16px; }
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 

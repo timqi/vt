@@ -2,7 +2,7 @@
 // never do (await a push, report one to the CLI) and what fan-out does with
 // the push service's answers, inside the real DO (docs/worker-slim.md §5).
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import app from '../src/index';
 import { AccountNotifications } from '../src/account_notifications';
@@ -11,7 +11,9 @@ import { b64uEnc, hmacSha256 } from '../src/crypto';
 import { deriveHostTokenSecret } from '../src/host_token';
 import * as webpush from '../src/webpush';
 import type { Env, DoAuditIngestOp } from '../src/types';
-import { accountStub, inDO, makeChallenge, makeMeta, liveTokenId } from './do_helpers';
+import { accountStub, inDO, makeChallenge, makeMeta, liveTokenId, bootstrap, doGet, doPost } from './do_helpers';
+
+beforeEach(bootstrap);
 
 async function browserSub(n: number) {
   const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']) as CryptoKeyPair;
@@ -37,7 +39,7 @@ async function withPush(
 ): Promise<void> {
   await inDO(async ({ inst, state }) => {
     const vars: Env = { ...inst.env, CACHE_HIT_NOTIFY: '' };
-    const admin = new AccountAdmin(state.storage, vars);
+    const admin = new AccountAdmin(state.storage, vars.VT_AUTH_CF);
     for (const n of [1, 2]) expect((await admin.pushOp('subscribe', post(await browserSub(n)))).status).toBe(200);
     await admin.pushOp('vapid', new Request('https://account.do/op/x'));
     const tasks: Promise<unknown>[] = [];
@@ -82,7 +84,7 @@ describe('AccountNotifications push contract', () => {
   it('marks enrollment pushes and keeps extension ceremonies console-only', async () => {
     await withPush(async ({ notifications, tasks, send }) => {
       notifications.approval(makeChallenge({ extend: {
-        group_ids: [], ttl_s: 1200, requested_by: 'admin@example.invalid', preview: [],
+        group_ids: [], ttl_s: 1200, preview: [],
       } }));
       expect(tasks).toEqual([]);
       notifications.approval(makeChallenge({ enroll: {
@@ -134,7 +136,7 @@ describe('AccountNotifications push contract', () => {
       const p = JSON.parse(send.mock.calls[0]![1]) as { kind: string; body: string; url: string; tag: string };
       expect(p.kind).toBe('cache_hit');
       expect(p.body).toContain('缓存命中，免 Touch ID');
-      expect(p.url).toBe('https://vt.test.invalid/kestrel#audit');
+      expect(p.url).toBe('https://vt.test.invalid/admin#audit');
       expect(p.tag).toBe(`cache:${op.meta.host}`);
       expect(send.mock.calls[0]!.slice(4)).toEqual([3600, 'normal']);
     });
@@ -173,14 +175,14 @@ describe('ceremony routes and push', () => {
   });
 
   it('push ops reach the console-owned blob through the DO; unknown ops are refused', async () => {
-    const first = await accountStub().fetch('https://account.do/op/push-vapid');
+    const first = await doGet('push-vapid');
     expect(first.status).toBe(200);
-    const a = await first.json() as { pub_b64u: string; subscriptions: unknown[] };
+    const a = first.json as { pub_b64u: string; subscriptions: unknown[] };
     expect(a.subscriptions).toEqual([]);
-    const b = await (await accountStub().fetch('https://account.do/op/push-vapid')).json() as { pub_b64u: string };
+    const b = (await doGet('push-vapid')).json as { pub_b64u: string };
     expect(b.pub_b64u).toBe(a.pub_b64u);
-    const bogus = await accountStub().fetch('https://account.do/op/push-bogus', { method: 'POST', body: '{}' });
-    expect([bogus.status, await bogus.text()]).toEqual([400, 'unknown op']);
+    const bogus = await doPost('push-bogus', {});
+    expect([bogus.status, bogus.text]).toEqual([400, 'unknown op']);
     await inDO(async ({ state }) => {
       expect(JSON.stringify(await state.storage.get('cfg:v1'))).not.toContain(a.pub_b64u);
     });

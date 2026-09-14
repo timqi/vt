@@ -11,12 +11,14 @@ import type { Challenge } from '../src/types';
 import {
   inDO, doPost, doGet, setDoVar, makeChallenge, approve, reject, seedGroup,
   FLAGS_UP_ONLY, FLAGS_UP_UV, liveTokenId,
+  bootstrap,
 } from './do_helpers';
 
 const HOUR = 60 * 60_000;
 const GROUP = 'g_testgroup00000';
 
 beforeEach(async () => {
+  await bootstrap();
   await setDoVar('APPROVAL_UV_JSON', '');
   await setDoVar('CACHE_ADMIN_EXTEND', '0');
 });
@@ -118,7 +120,6 @@ describe('the cache-extension ceremony keeps its biometric step', () => {
     await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
     const res = await doPost('cache-extend-create', {
       group_ids: [GROUP], ttl_s: 24 * 3600,
-      admin_email: 'admin@example.invalid', admin_ip: '198.51.100.7',
     });
     expect(res.status).toBe(200);
     const ch = await inDO(h =>
