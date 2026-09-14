@@ -671,7 +671,6 @@ impl ssh_agent_lib::agent::Session for SignerSession {
                 &self.inner.command,
                 &pubkey_bytes,
                 &request.data,
-                request.flags,
             )
             .await;
         let vt_url = match decide_sign_route(outcome, vt_url_opt.is_some()) {

@@ -81,16 +81,16 @@ inside the standard extension envelope protocol:
 
 | Type | Fields |
 |---|---|
-| `SignReq` | `host`, `command`, `pubkey`, `data`, `flags` (default 0), `meta` (default empty) |
+| `SignReq` | `host`, `command`, `pubkey`, `data`, `meta` (default empty) |
 | `SignRes` | `algorithm`, `signature` |
 
 Byte vectors use JSON number arrays. `pubkey` is SSH wire-encoded public
-`KeyData`; `data` is the SSH request's bytes to sign. `flags` selects RSA SHA-2
-behavior; Ed25519 and ECDSA do not use it. Responses are algorithm-tagged rather
-than assuming Ed25519. The shared `sign_data_with_privkey` core supports
-Ed25519, RSA-SHA2, and ECDSA P-256/P-384. Do not rely on legacy SHA-1 `ssh-rsa`
-success with the current `ssh-key` dependency; the RSA regression tests
-explicitly cover SHA-2.
+`KeyData`; `data` is the SSH request's bytes to sign. Responses are
+algorithm-tagged. The agent key store is Ed25519-only: `require_ed25519` refuses
+any other key type at `vt ssh add`, at protocol add-identity, and at Keychain
+load (a stored RSA/ECDSA key fails the load with its fingerprint and the
+`vt ssh remove` remedy, never a silent skip), and the shared
+`sign_data_with_privkey` core signs nothing else.
 
 The dispatcher recognizes `EXT_SIGN` both in its extension allowlist and its
 handler match. After the lock/Keychain checks, `handle_sign_vt`:
@@ -231,11 +231,12 @@ cargo check --target x86_64-unknown-linux-gnu
 `resolved_routes_control_agent_probes_and_fallbacks` in `src/client.rs` covers
 shared resolved-route behavior. The macOS-only
 `sign_data_with_privkey_ed25519_signs_and_verifies` and
-`sign_data_with_privkey_rsa_signs_and_verifies` tests in
+`non_ed25519_keys_are_refused_at_ingestion_and_by_the_signing_core` tests in
 `src/server_macos/ssh_agent.rs` exercise the shared signing core:
 
 ```bash
 cargo test --locked sign_data_with_privkey_
+cargo test --locked non_ed25519_
 ```
 
 These tests do not establish end-to-end Keychain/Touch ID or system-SSH behavior.

@@ -431,15 +431,35 @@ pub struct AuthCacheTtls {
     pub decrypt_secs: u64,
 }
 
+/// The store signs Ed25519 only. Every ingestion path (`vt ssh add`,
+/// protocol add-identity) and the Keychain load call this so a key the agent
+/// cannot sign with is never stored or advertised as an identity.
+pub fn require_ed25519(privkey: &PrivateKey) -> Result<()> {
+    match privkey.algorithm() {
+        Algorithm::Ed25519 => Ok(()),
+        alg => Err(anyhow::anyhow!(
+            "{alg} key refused: vt stores and signs Ed25519 keys only"
+        )),
+    }
+}
+
 /// Load all SSH keys from the keychain store into a HashMap. The store and
 /// derived ciphers are dropped after this returns so the master key does not
-/// linger in memory.
+/// linger in memory. A stored key of another type fails the whole load, with
+/// its fingerprint and the `vt ssh remove` remedy; it is never skipped.
 fn load_all_keys() -> Result<HashMap<String, PrivateKey>> {
     let entries = load_ssh_keys(&KeychainStore::load()?)?;
     let mut keys = HashMap::new();
     for entry in &entries {
         match PrivateKey::from_openssh(entry.key_data.as_bytes()) {
             Ok(privkey) => {
+                require_ed25519(&privkey).map_err(|e| {
+                    anyhow::anyhow!(
+                        "stored SSH key {}: {e}; remove it with `vt ssh remove {}`",
+                        entry.fingerprint,
+                        entry.fingerprint
+                    )
+                })?;
                 tracing::info!("Loaded SSH key: {} ({})", entry.fingerprint, entry.comment);
                 keys.insert(entry.fingerprint.clone(), privkey);
             }
@@ -456,15 +476,12 @@ fn fingerprint_str(key_data: &KeyData) -> String {
     fp.to_string()
 }
 
-/// Pure signing core: given an unlocked `PrivateKey`, sign `data` honoring the
-/// SSH `flags` (RSA SHA2 selection). No auth, no lookup, no cache — callers do
-/// that. Shared by the standard `Session::sign` and the `sign@vt` extension so
-/// their algorithm coverage cannot drift.
-fn sign_data_with_privkey(
-    privkey: &PrivateKey,
-    data: &[u8],
-    flags: u32,
-) -> Result<Signature, AgentError> {
+/// Pure signing core: given an unlocked Ed25519 `PrivateKey`, sign `data`.
+/// No auth, no lookup, no cache — callers do that. Shared by the standard
+/// `Session::sign` and the `sign@vt` extension so their algorithm coverage
+/// cannot drift. Any other key type is refused here too, so a key that
+/// bypassed `require_ed25519` still cannot produce a signature.
+fn sign_data_with_privkey(privkey: &PrivateKey, data: &[u8]) -> Result<Signature, AgentError> {
     match privkey.key_data() {
         KeypairData::Ed25519(ref key) => {
             use ed25519_dalek::Signer;
@@ -472,91 +489,6 @@ fn sign_data_with_privkey(
                 key.try_into().map_err(AgentError::other)?;
             let sig = signing_key.sign(data);
             Signature::new(Algorithm::Ed25519, sig.to_bytes().to_vec()).map_err(AgentError::other)
-        }
-        KeypairData::Rsa(ref key) => {
-            use rsa::pkcs1v15::SigningKey;
-            use rsa::signature::{RandomizedSigner, SignatureEncoding};
-            use rsa::BigUint;
-            use ssh_agent_lib::proto::signature;
-
-            // Build the rsa key from its components directly rather than via
-            // ssh-key's `TryFrom<&RsaKeypair> for rsa::RsaPrivateKey`: that
-            // conversion (ssh-key 0.6.7) rejects otherwise-valid OpenSSH RSA
-            // keys with `Error::Crypto`, while `from_components` (which itself
-            // validates + precomputes) accepts the exact same n/e/d/p/q. An
-            // Mpint stores a signed big-endian integer; `as_positive_bytes`
-            // strips the leading sign byte so `from_bytes_be` sees the raw
-            // magnitude.
-            let mp = |m: &ssh_key::Mpint| {
-                m.as_positive_bytes()
-                    .map(BigUint::from_bytes_be)
-                    .ok_or_else(|| {
-                        agent_err(anyhow::anyhow!("RSA component is not a positive integer"))
-                    })
-            };
-            let private_key = rsa::RsaPrivateKey::from_components(
-                mp(&key.public.n)?,
-                mp(&key.public.e)?,
-                mp(&key.private.d)?,
-                vec![mp(&key.private.p)?, mp(&key.private.q)?],
-            )
-            .map_err(AgentError::other)?;
-            let mut rng = rand::thread_rng();
-
-            if flags & signature::RSA_SHA2_512 != 0 {
-                let sig =
-                    SigningKey::<sha2::Sha512>::new(private_key).sign_with_rng(&mut rng, data);
-                Signature::new(
-                    Algorithm::new("rsa-sha2-512").map_err(AgentError::other)?,
-                    sig.to_bytes().to_vec(),
-                )
-                .map_err(AgentError::other)
-            } else if flags & signature::RSA_SHA2_256 != 0 {
-                let sig =
-                    SigningKey::<sha2::Sha256>::new(private_key).sign_with_rng(&mut rng, data);
-                Signature::new(
-                    Algorithm::new("rsa-sha2-256").map_err(AgentError::other)?,
-                    sig.to_bytes().to_vec(),
-                )
-                .map_err(AgentError::other)
-            } else {
-                let sig = SigningKey::<sha1::Sha1>::new(private_key).sign_with_rng(&mut rng, data);
-                Signature::new(
-                    Algorithm::new("ssh-rsa").map_err(AgentError::other)?,
-                    sig.to_bytes().to_vec(),
-                )
-                .map_err(AgentError::other)
-            }
-        }
-        KeypairData::Ecdsa(ref key) => {
-            use ssh_key::EcdsaCurve;
-            match key.curve() {
-                EcdsaCurve::NistP256 => {
-                    use p256::ecdsa::{signature::Signer, SigningKey};
-                    let secret_key = p256::SecretKey::from_slice(key.private_key_bytes())
-                        .map_err(AgentError::other)?;
-                    let signing_key = SigningKey::from(secret_key);
-                    let sig: p256::ecdsa::DerSignature = signing_key.sign(data);
-                    Signature::new(
-                        Algorithm::new("ecdsa-sha2-nistp256").map_err(AgentError::other)?,
-                        sig.as_bytes().to_vec(),
-                    )
-                    .map_err(AgentError::other)
-                }
-                EcdsaCurve::NistP384 => {
-                    use p384::ecdsa::{signature::Signer, SigningKey};
-                    let secret_key = p384::SecretKey::from_slice(key.private_key_bytes())
-                        .map_err(AgentError::other)?;
-                    let signing_key = SigningKey::from(secret_key);
-                    let sig: p384::ecdsa::DerSignature = signing_key.sign(data);
-                    Signature::new(
-                        Algorithm::new("ecdsa-sha2-nistp384").map_err(AgentError::other)?,
-                        sig.as_bytes().to_vec(),
-                    )
-                    .map_err(AgentError::other)
-                }
-                _ => Err(AgentError::Failure),
-            }
         }
         _ => Err(AgentError::Failure),
     }
@@ -1169,7 +1101,7 @@ impl Session for VtSshSession {
             }
         };
 
-        let signature = sign_data_with_privkey(&privkey, &request.data, request.flags)?;
+        let signature = sign_data_with_privkey(&privkey, &request.data)?;
         let cache_hit_note = cache_hit_note_for(&permit, "sign", &reuse_label);
         let reuse_remaining = permit.reuse_remaining();
         permit.commit().await.map_err(|_| AgentError::Failure)?;
@@ -1334,6 +1266,7 @@ impl Session for VtSshSession {
             Credential::Key { privkey, comment } => {
                 let private_key =
                     PrivateKey::new(privkey, comment.clone()).map_err(AgentError::other)?;
+                require_ed25519(&private_key).map_err(agent_err)?;
                 let pubkey = private_key.public_key();
                 let fp_str = fingerprint_str(pubkey.key_data());
 
@@ -1768,7 +1701,7 @@ mod tests {
         let privkey =
             PrivateKey::random(&mut rand::rngs::OsRng, Algorithm::Ed25519).expect("gen key");
         let data = b"sign@vt test payload";
-        let sig = sign_data_with_privkey(&privkey, data, 0).expect("sign");
+        let sig = sign_data_with_privkey(&privkey, data).expect("sign");
         assert_eq!(sig.algorithm().to_string(), "ssh-ed25519");
 
         let pub_bytes: [u8; 32] = match privkey.public_key().key_data() {
@@ -1781,24 +1714,11 @@ mod tests {
             .expect("signature must verify under the key's own public key");
     }
 
-    // Regression test for the ssh-key 0.6.7 `TryFrom<&RsaKeypair> for
-    // rsa::RsaPrivateKey` bug (passes `p` twice, omits `q` → `Πprimes = p² ≠ n`
-    // → `validate()` fails with `InvalidModulus` → `Error::Crypto`). Before the
-    // `from_components`-with-correct-p/q fix, this `.expect("sign")` panicked and
-    // every RSA identity was unusable ("agent refused operation"). We build the
-    // key from a fixed 2048-bit OpenSSH RSA key (no slow keygen), sign under
-    // each SHA2 variant OpenSSH requests, and verify each signature under the
-    // key's own public modulus so a correct-but-wrong-key regression can't slip
-    // through either.
-    #[test]
-    fn sign_data_with_privkey_rsa_signs_and_verifies() {
-        use rsa::signature::Verifier;
-        use rsa::{BigUint, RsaPublicKey};
-        use ssh_agent_lib::proto::signature;
-        use ssh_key::private::PrivateKey;
-
-        // Throwaway key generated solely for this test (never used elsewhere).
-        const RSA_TEST_KEY: &str = "\
+    // Throwaway keys generated solely for these tests (never used elsewhere).
+    // The store is Ed25519-only: an RSA or ECDSA key parses (ssh-key still
+    // decodes every OpenSSH key type) but is refused at ingestion, at load,
+    // and by the signing core itself.
+    const RSA_TEST_KEY: &str = "\
 -----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
 NhAAAAAwEAAQAAAQEAv1DuBUp4HN3VKYb7f/4iMGxx3pC0r3AEql67eYoT+J5dm21EuOQE
@@ -1827,50 +1747,44 @@ zlOx88YIANh/5p3Kf6SlADCbea0TJ9bpUQf3BhkzN6cE8RF04Uc3VtvUG1CKcyBr2Tj0TW
 d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
 -----END OPENSSH PRIVATE KEY-----
 ";
+    const P256_TEST_KEY: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
+1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQ8SEwHnGWp3jkZ10nFiJgHSkTAsH+e
+dVOLeiwTSHjPUHS8NUfND2VMSGSC1hB2CoFy1AMTwored9gatdEykBfwAAAAsNaUigLWlI
+oCAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBDxITAecZaneORnX
+ScWImAdKRMCwf551U4t6LBNIeM9QdLw1R80PZUxIZILWEHYKgXLUAxPCit532Bq10TKQF/
+AAAAAga3exz4MaBCcorLJrgB8QU3u4ZYvcU8jqwFHh66Ukzj8AAAAWdnQtZWNkc2EtcmVq
+ZWN0ZWQtdGVzdAEC
+-----END OPENSSH PRIVATE KEY-----
+";
 
-        let privkey = PrivateKey::from_openssh(RSA_TEST_KEY).expect("parse RSA test key");
-        let data = b"sign@vt rsa regression payload";
+    #[test]
+    fn non_ed25519_keys_are_refused_at_ingestion_and_by_the_signing_core() {
+        use ssh_key::private::PrivateKey;
 
-        // Public modulus for verification, rebuilt from the ssh public key's
-        // Mpint components the same way the signing core rebuilds the private key.
-        let mp = |m: &ssh_key::Mpint| {
-            BigUint::from_bytes_be(m.as_positive_bytes().expect("positive component"))
-        };
-        let pubkey = match privkey.public_key().key_data() {
-            KeyData::Rsa(k) => RsaPublicKey::new(mp(&k.n), mp(&k.e)).expect("rsa pubkey"),
-            _ => unreachable!("embedded key is RSA"),
-        };
+        for (pem, alg) in [
+            (RSA_TEST_KEY, "ssh-rsa"),
+            (P256_TEST_KEY, "ecdsa-sha2-nistp256"),
+        ] {
+            let privkey = PrivateKey::from_openssh(pem).expect("parse test key");
+            assert_eq!(privkey.algorithm().to_string(), alg);
+            let err = require_ed25519(&privkey)
+                .expect_err("must be refused")
+                .to_string();
+            assert!(err.starts_with(alg), "{err}");
+            assert!(err.contains("Ed25519 keys only"), "{err}");
+            assert!(
+                matches!(
+                    sign_data_with_privkey(&privkey, b"x"),
+                    Err(AgentError::Failure)
+                ),
+                "{alg} must not sign"
+            );
+        }
 
-        // rsa-sha2-256
-        let sig =
-            sign_data_with_privkey(&privkey, data, signature::RSA_SHA2_256).expect("sign 256");
-        assert_eq!(sig.algorithm().to_string(), "rsa-sha2-256");
-        rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(pubkey.clone())
-            .verify(
-                data,
-                &rsa::pkcs1v15::Signature::try_from(sig.as_bytes()).expect("sig256"),
-            )
-            .expect("rsa-sha2-256 signature must verify");
-
-        // rsa-sha2-512
-        let sig =
-            sign_data_with_privkey(&privkey, data, signature::RSA_SHA2_512).expect("sign 512");
-        assert_eq!(sig.algorithm().to_string(), "rsa-sha2-512");
-        rsa::pkcs1v15::VerifyingKey::<sha2::Sha512>::new(pubkey)
-            .verify(
-                data,
-                &rsa::pkcs1v15::Signature::try_from(sig.as_bytes()).expect("sig512"),
-            )
-            .expect("rsa-sha2-512 signature must verify");
-
-        // NOTE: the legacy ssh-rsa (SHA-1, `flags == 0`) branch is intentionally
-        // NOT asserted here. ssh-key 0.6.7 `Signature::new` only accepts RSA
-        // signatures with `Algorithm::Rsa { hash: Some(_) }`; a plain `ssh-rsa`
-        // (hash: None) hits the catch-all arm and returns `Encoding(Length)`, so
-        // that branch of `sign_data_with_privkey` can never succeed on this
-        // ssh-key version. That is a pre-existing limitation orthogonal to the
-        // from_components fix (which the SHA-2 paths above fully exercise), and
-        // SHA-1 ssh-rsa is deprecated (OpenSSH disables it by default ≥ 8.8).
+        let ed = PrivateKey::random(&mut rand::rngs::OsRng, Algorithm::Ed25519).expect("gen key");
+        require_ed25519(&ed).expect("Ed25519 is the accepted type");
     }
 
     #[test]
@@ -2035,7 +1949,7 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         session_id: &[u8],
         forwarding: bool,
     ) -> SessionBind {
-        let signature = sign_data_with_privkey(privkey, session_id, 0).expect("sign session id");
+        let signature = sign_data_with_privkey(privkey, session_id).expect("sign session id");
         SessionBind {
             host_key: privkey.public_key().key_data().clone(),
             session_id: session_id.to_vec(),

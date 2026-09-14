@@ -430,14 +430,12 @@ impl VTClient {
         command: &str,
         pubkey: &[u8],
         data: &[u8],
-        flags: u32,
     ) -> Result<Option<(String, Vec<u8>)>> {
         let req = SignReq {
             host: host.to_string(),
             command: command.to_string(),
             pubkey: pubkey.to_vec(),
             data: data.to_vec(),
-            flags,
             meta: collect_client_meta(),
         };
         // With a passkey pin, skip the agent socket and return the fallback

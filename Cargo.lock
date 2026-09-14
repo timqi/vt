@@ -515,7 +515,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid 0.9.6",
- "pem-rfc7468",
  "zeroize",
 ]
 
@@ -633,8 +632,6 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
- "hkdf",
- "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
  "sec1",
@@ -2756,16 +2753,12 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation",
  "objc2-local-authentication",
- "p256",
- "p384",
  "rand 0.8.5",
  "reqwest",
  "rpassword",
- "rsa",
  "security-framework",
  "serde",
  "serde_json",
- "sha1",
  "sha2 0.10.9",
  "ssh-agent-lib",
  "ssh-key",

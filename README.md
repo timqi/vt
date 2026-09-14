@@ -121,7 +121,7 @@ file private. Tokens can be revoked per host on the Worker's admin page.
 | `secret import` | (macOS) Import an encrypted master secret |
 | `secret rotate-passcode` | (macOS) Rotate the passcode for the master secret |
 | `ssh agent` | (macOS) Start the SSH agent (supports sign/decrypt auth caches, audit push, and `run@vt` allowlisting) |
-| `ssh add [-f <file>] [-c <comment>]` | (macOS) Add an SSH private key (from file or stdin) |
+| `ssh add [-f <file>] [-c <comment>]` | (macOS) Add an Ed25519 SSH private key (from file or stdin); other key types are refused |
 | `ssh list` | (macOS) List stored SSH keys (shows fingerprint, algorithm, comment, and public key) |
 | `ssh comment <fingerprint> -c <comment>` | (macOS) Change the comment of a stored key |
 | `ssh remove <fingerprint>` | (macOS) Remove an SSH key by fingerprint |
@@ -186,7 +186,7 @@ and requiring Touch ID by default for every signing operation. Opt-in auth
 caching can reduce repeated prompts; see [Auth Caching](#auth-caching).
 
 ```bash
-# Add a key from file (supports Ed25519, RSA, ECDSA P-256/P-384)
+# Add a key from file (Ed25519 only; an RSA or ECDSA key is refused)
 vt ssh add -f ~/.ssh/id_ed25519
 # Optionally override the key's embedded comment
 vt ssh add -f ~/.ssh/id_ed25519 -c "work laptop"

@@ -744,7 +744,7 @@ impl VtSshSession {
             }
         };
 
-        let sig = sign_data_with_privkey(&privkey, &req.data, req.flags)
+        let sig = sign_data_with_privkey(&privkey, &req.data)
             .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_FAILED)))?;
         let res = SignRes {
             algorithm: sig.algorithm().to_string(),

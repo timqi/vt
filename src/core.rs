@@ -257,9 +257,6 @@ pub struct SignReq {
     pub pubkey: Vec<u8>,
     /// Bytes to sign (the blob from the system ssh SIGN_REQUEST).
     pub data: Vec<u8>,
-    /// SSH-agent signature flags (RSA SHA2 selection). Ed25519/ECDSA ignore.
-    #[serde(default)]
-    pub flags: u32,
     #[serde(default)]
     pub meta: ClientMeta,
 }
@@ -268,7 +265,7 @@ pub struct SignReq {
 /// rebuilds an `ssh_key::Signature` without assuming the key type. Not secret.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct SignRes {
-    /// e.g. "ssh-ed25519", "rsa-sha2-512", "ecdsa-sha2-nistp256".
+    /// "ssh-ed25519": the agent key store signs Ed25519 only.
     pub algorithm: String,
     pub signature: Vec<u8>,
 }
@@ -769,7 +766,6 @@ mod tests {
             command: "ssh-sign: push -> github.com".into(),
             pubkey: vec![0u8, 1, 2, 3, 255],
             data: vec![9u8; 40],
-            flags: 4,
             meta: ClientMeta::default(),
         };
         let bytes = serde_json::to_vec(&req).unwrap();
@@ -778,14 +774,12 @@ mod tests {
         assert_eq!(back.command, req.command);
         assert_eq!(back.pubkey, req.pubkey);
         assert_eq!(back.data, req.data);
-        assert_eq!(back.flags, req.flags);
 
-        // `flags` and `meta` default when absent (older client compatibility).
+        // `meta` defaults when absent.
         let minimal = serde_json::json!({
             "host": "g1", "command": "x", "pubkey": [1,2], "data": [3,4]
         });
         let parsed: SignReq = serde_json::from_value(minimal).unwrap();
-        assert_eq!(parsed.flags, 0);
         assert!(parsed.meta.user.is_empty());
 
         let res = SignRes {

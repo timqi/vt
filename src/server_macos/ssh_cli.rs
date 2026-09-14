@@ -3,7 +3,7 @@ use ssh_key::private::PrivateKey;
 use ssh_key::HashAlg;
 
 use super::security::local_authentication;
-use super::ssh_agent::{load_ssh_keys, with_ssh_keys, SshKeyEntry};
+use super::ssh_agent::{load_ssh_keys, require_ed25519, with_ssh_keys, SshKeyEntry};
 use super::store::KeychainStore;
 
 pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
@@ -36,6 +36,7 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
             .decrypt(passphrase.as_bytes())
             .context("Failed to decrypt key (wrong passphrase?)")?;
     }
+    require_ed25519(&privkey)?;
 
     let comment = comment.unwrap_or_else(|| {
         if interactive {
