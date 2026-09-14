@@ -5,8 +5,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::Backend;
-
 pub const CLIENT_CONFIG_KEYS: &[&str] = &[
     "VT_BACKEND",
     "VT_PASSKEY_URL",
@@ -16,17 +14,39 @@ pub const CLIENT_CONFIG_KEYS: &[&str] = &[
     "VT_PASSKEY_UV",
 ];
 
-/// Transport route decided by `VT_BACKEND` alone. The agent socket is the
-/// kernel-owned boundary, so `auto` always probes it; a missing socket or a
-/// non-vt agent is the recoverable fallback to the Worker.
+/// Transport route decided by `VT_BACKEND` alone (env var, or config.toml via
+/// hydration). The agent socket is the kernel-owned boundary, so nothing a
+/// client holds makes it more or less trustworthy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientRoute {
+    /// SSH agent only — never fall back to the passkey ceremony. Errors out
+    /// when the agent is unreachable instead of silently paging the phone.
     Agent,
+    /// Try the SSH agent socket when it exists; fall back to the passkey
+    /// ceremony on recoverable errors (socket missing, non-vt agent, agent
+    /// cannot deliver). The default.
     Auto,
+    /// Passkey ceremony only — never probe the agent socket (e.g. hosts where
+    /// `$SSH_AUTH_SOCK` is an unrelated ssh-agent).
     Passkey,
 }
 
 impl ClientRoute {
+    /// Parse a `VT_BACKEND` value. Empty/whitespace counts as unset (`Auto`);
+    /// anything else must match exactly, so a typo fails loudly instead of
+    /// silently routing to the wrong path.
+    fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "agent" => Ok(Self::Agent),
+            "passkey" => Ok(Self::Passkey),
+            other => Err(format!(
+                "invalid VT_BACKEND '{}': expected auto, agent, or passkey",
+                other
+            )),
+        }
+    }
+
     pub fn uses_agent(self) -> bool {
         matches!(self, Self::Agent | Self::Auto)
     }
@@ -157,16 +177,15 @@ impl ResolvedConfig {
         self.raw_value(key).ok()
     }
 
+    /// Lazy: an invalid or incomplete `VT_BACKEND` setup is reported here,
+    /// never at construction, so `doctor` can describe it.
     pub fn route(&self) -> Result<ClientRoute, RoutingError> {
-        let backend = Backend::parse(self.value("VT_BACKEND").unwrap_or_default())
+        let route = ClientRoute::parse(self.value("VT_BACKEND").unwrap_or_default())
             .map_err(RoutingError::InvalidBackend)?;
-        let has_url = self.value("VT_PASSKEY_URL").is_some();
-        match backend {
-            Backend::Passkey if !has_url => Err(RoutingError::PasskeyUrlMissing),
-            Backend::Agent => Ok(ClientRoute::Agent),
-            Backend::Passkey => Ok(ClientRoute::Passkey),
-            Backend::Auto => Ok(ClientRoute::Auto),
+        if route == ClientRoute::Passkey && self.value("VT_PASSKEY_URL").is_none() {
+            return Err(RoutingError::PasskeyUrlMissing);
         }
+        Ok(route)
     }
 
     pub fn passkey_state(&self) -> PasskeyState {
@@ -237,6 +256,20 @@ mod tests {
             None,
             Some(PathBuf::from("/test-home")),
         )
+    }
+
+    #[test]
+    fn backend_parse() {
+        assert_eq!(ClientRoute::parse("auto"), Ok(ClientRoute::Auto));
+        assert_eq!(ClientRoute::parse("agent"), Ok(ClientRoute::Agent));
+        assert_eq!(ClientRoute::parse("passkey"), Ok(ClientRoute::Passkey));
+        // Case-insensitive + trimmed; empty counts as unset.
+        assert_eq!(ClientRoute::parse(" Passkey "), Ok(ClientRoute::Passkey));
+        assert_eq!(ClientRoute::parse(""), Ok(ClientRoute::Auto));
+        assert_eq!(ClientRoute::parse("  "), Ok(ClientRoute::Auto));
+        // Typos fail loudly instead of silently routing to the wrong path.
+        assert!(ClientRoute::parse("pass-key").is_err());
+        assert!(ClientRoute::parse("cf").is_err());
     }
 
     #[test]

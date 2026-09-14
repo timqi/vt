@@ -304,56 +304,6 @@ pub fn load_agent_file_config() -> AgentFileConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Transport-path routing preference (VT_BACKEND)
-// ---------------------------------------------------------------------------
-
-/// Routing preference between the two transport paths, read from
-/// `VT_BACKEND` (env var, or config.toml via the hydration above). The only
-/// routing input: the agent socket is kernel-owned, so nothing a client holds
-/// makes the agent path more or less trustworthy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Backend {
-    /// Try the SSH agent socket when it exists; fall back to the passkey
-    /// ceremony on recoverable errors (socket missing, non-vt agent, agent
-    /// cannot deliver). The default.
-    #[default]
-    Auto,
-    /// SSH agent only — never fall back to the passkey ceremony. Errors out
-    /// when the agent is unreachable instead of silently paging the phone.
-    Agent,
-    /// Passkey ceremony only — never probe the agent socket (e.g. hosts where
-    /// `$SSH_AUTH_SOCK` is an unrelated ssh-agent).
-    Passkey,
-}
-
-impl Backend {
-    /// Parse a `VT_BACKEND` value. Empty/whitespace counts as unset (`Auto`);
-    /// anything else must match exactly, so a typo fails loudly instead of
-    /// silently routing to the wrong path.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "" | "auto" => Ok(Backend::Auto),
-            "agent" => Ok(Backend::Agent),
-            "passkey" => Ok(Backend::Passkey),
-            other => Err(format!(
-                "invalid VT_BACKEND '{}': expected auto, agent, or passkey",
-                other
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for Backend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Backend::Auto => write!(f, "auto"),
-            Backend::Agent => write!(f, "agent"),
-            Backend::Passkey => write!(f, "passkey"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,20 +311,6 @@ mod tests {
     /// `VT_CONFIG` is process-global; the tests that set it run in parallel,
     /// so they take this lock for the whole set/remove span.
     static VT_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn backend_parse() {
-        assert_eq!(Backend::parse("auto"), Ok(Backend::Auto));
-        assert_eq!(Backend::parse("agent"), Ok(Backend::Agent));
-        assert_eq!(Backend::parse("passkey"), Ok(Backend::Passkey));
-        // Case-insensitive + trimmed; empty counts as unset.
-        assert_eq!(Backend::parse(" Passkey "), Ok(Backend::Passkey));
-        assert_eq!(Backend::parse(""), Ok(Backend::Auto));
-        assert_eq!(Backend::parse("  "), Ok(Backend::Auto));
-        // Typos fail loudly instead of silently routing to the wrong path.
-        assert!(Backend::parse("pass-key").is_err());
-        assert!(Backend::parse("cf").is_err());
-    }
 
     #[test]
     fn upsert_replaces_top_level_key_and_keeps_comments_and_sections() {
