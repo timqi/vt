@@ -17,7 +17,7 @@ and update the relevant document in the same change.
 | Understand record parsing and decrypt batches | [`README.md` — protocol](../README.md#vt-protocol-format) | `src/core.rs` (`VtUrl`), `src/client/records.rs` (`DecryptBatch`), `src/core/crypto.rs` |
 | Use VT for Linux sudo/PAM | [`sudo.md`](sudo.md) | `setup-pam.sh`, `src/client.rs` |
 | Deploy the phone approval Worker | [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/index.ts`, `cf-worker/src/do_account.ts` |
-| Understand Worker audit and notification lifecycle | [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts` |
+| Understand Worker audit and Web Push notifications | [`cf-worker-deploy.md`](cf-worker-deploy.md), [`worker-slim.md`](worker-slim.md) §5 | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts`, `cf-worker/src/webpush.ts`, `cf-worker/src/account_admin.ts` |
 | Tune approval user verification (UV) | [`cf-worker-deploy.md`](cf-worker-deploy.md#approval-user-verification-approval_uv_json) | `cf-worker/src/uv_policy.ts` (policy), `cf-worker/src/webauthn.ts` (enforcement), `cf-worker/pwa/approve.js` |
 | Understand DEK caching | [`dek-cache.md`](dek-cache.md) | `cf-worker/src/do_account.ts` (ceremony and audit), `cf-worker/src/account_cache.ts` (cache storage), `cf-worker/src/storage_batch.ts` (shared batch deletion and prefix paging), `src/cf.rs` |
 | Follow the slim refactor (deletions, cache key v5) | [`refactor.md`](refactor.md) (plan) | `cf-worker/src/account_cache.ts` |
@@ -32,8 +32,6 @@ and update the relevant document in the same change.
 | Understand prompt/notification fields and audit context | [`approval-transparency.md`](approval-transparency.md) | `src/caller_meta.rs` (client-claimed display fields), `src/server_macos/ssh_agent/handlers.rs` (operation prompts), `src/server_macos/ssh_agent/scopes.rs` (truth lines), `cf-worker/src/notify.ts`, `cf-worker/pwa/approve.js` |
 | Diagnose config/routing/caching (`vt doctor`) | [`diag-design.md`](diag-design.md) | `src/client/doctor.rs`, `src/config/client.rs` (shared routing), `src/server_macos/ssh_agent/handlers.rs` (`handle_diag`) |
 | Build/install VT.app, menu bar UI, native notifications, key-wrap rebind | [`app-bundle.md`](app-bundle.md) | `app/VTShell.swift`, `src/server_macos/security.rs` (`notify_macos`, `upgrade_wrap_v2_if_needed`), `src/core/crypto.rs` (`derive_passphrase_secret_v2`) |
-| Configure Slack App notifications | [`slack-app.md`](slack-app.md) | `cf-worker/src/slack_app.ts` |
-| Configure Feishu/Lark notifications | [`feishu.md`](feishu.md) | `cf-worker/src/feishu.ts` |
 
 ## Reading guide
 
@@ -42,8 +40,6 @@ do not imply pending work. In particular:
 
 - [`sign-vt-design.md`](sign-vt-design.md) owns SSH identity selection and fallback;
   [`ssh-vt-design.md`](ssh-vt-design.md) covers portable storage and relay rationale.
-- [`feishu.md`](feishu.md) owns setup;
-  [`feishu-design.md`](feishu-design.md) covers delivery lifecycle and API boundaries.
 
 Implementation history belongs in Git. Verify older decision notes against code
 before treating them as current requirements.

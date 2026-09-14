@@ -1,55 +1,51 @@
-import { describe, it, expect, vi } from 'vitest';
+// Web Push is the only channel. These tests pin what the ceremony path must
+// never do (await a push, report one to the CLI) and what fan-out does with
+// the push service's answers, inside the real DO (docs/worker-slim.md §5).
+
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import app from '../src/index';
 import { AccountNotifications } from '../src/account_notifications';
 import { AccountAdmin } from '../src/account_admin';
 import { b64uEnc, hmacSha256 } from '../src/crypto';
 import { deriveHostTokenSecret } from '../src/host_token';
-import * as feishu from '../src/feishu';
-import * as slackApp from '../src/slack_app';
-import * as pushover from '../src/pushover';
-import * as notify from '../src/notify';
-import type { Challenge, Env, DoAuditIngestOp } from '../src/types';
+import * as webpush from '../src/webpush';
+import type { Env, DoAuditIngestOp } from '../src/types';
 import { accountStub, inDO, makeChallenge, makeMeta, liveTokenId } from './do_helpers';
 
-const FEISHU_JSON = JSON.stringify({
-  app_id: 'test-app', app_secret: 'synthetic-test-value', receive_id: 'test-user',
-});
-const SLACK_APP_JSON = JSON.stringify({ bot_token: 'synthetic-test-value', channel: 'test-channel' });
+async function browserSub(n: number) {
+  const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']) as CryptoKeyPair;
+  return {
+    endpoint: `https://push.test.invalid/s/${n}`, label: `dev${n}`,
+    p256dh: b64uEnc(new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey) as ArrayBuffer)),
+    auth: b64uEnc(new Uint8Array(16).fill(n)),
+  };
+}
 
-async function withNotifications(
+const post = (body: unknown) => new Request('https://account.do/op/x', { method: 'POST', body: JSON.stringify(body) });
+
+// Two subscriptions in the DO's own config blob, a notifications instance whose
+// waitUntil tasks the test can await, and sendPush spied so no network is touched.
+async function withPush(
   test: (h: {
     notifications: AccountNotifications;
-    state: DurableObjectState;
+    admin: AccountAdmin;
     vars: Env;
     tasks: Promise<unknown>[];
-    feishuSend: ReturnType<typeof vi.spyOn<typeof feishu, 'sendApprovalCard'>>;
-    slackSend: ReturnType<typeof vi.spyOn<typeof slackApp, 'sendApprovalCard'>>;
-    feishuEdit: ReturnType<typeof vi.spyOn<typeof feishu, 'editCard'>>;
-    slackEdit: ReturnType<typeof vi.spyOn<typeof slackApp, 'editCard'>>;
-    statelessHit: ReturnType<typeof vi.spyOn<typeof notify, 'notifyCacheHit'>>;
-    feishuHit: ReturnType<typeof vi.spyOn<typeof feishu, 'sendCacheHitNotice'>>;
-    slackHit: ReturnType<typeof vi.spyOn<typeof slackApp, 'sendCacheHitNotice'>>;
-  }) => Promise<void> | void,
+    send: ReturnType<typeof vi.spyOn<typeof webpush, 'sendPush'>>;
+  }) => Promise<void>,
 ): Promise<void> {
   await inDO(async ({ inst, state }) => {
+    const vars: Env = { ...inst.env, CACHE_HIT_NOTIFY: '' };
+    const admin = new AccountAdmin(state.storage, vars);
+    for (const n of [1, 2]) expect((await admin.pushOp('subscribe', post(await browserSub(n)))).status).toBe(200);
+    await admin.pushOp('vapid', new Request('https://account.do/op/x'));
     const tasks: Promise<unknown>[] = [];
-    const vars: Env = { ...inst.env, FEISHU_JSON, SLACK_APP_JSON, CACHE_HIT_NOTIFY: '' };
-    const notifications = new AccountNotifications({
-      storage: state.storage, waitUntil(task: Promise<unknown>) { tasks.push(task); },
-    }, vars, new AccountAdmin(state.storage, vars));
-    const feishuSend = vi.spyOn(feishu, 'sendApprovalCard').mockResolvedValue('test-message');
-    const slackSend = vi.spyOn(slackApp, 'sendApprovalCard').mockResolvedValue({ channel: 'test-channel', ts: '1.0' });
-    const feishuEdit = vi.spyOn(feishu, 'editCard').mockResolvedValue('');
-    const slackEdit = vi.spyOn(slackApp, 'editCard').mockResolvedValue('');
-    const statelessHit = vi.spyOn(notify, 'notifyCacheHit').mockResolvedValue('');
-    const feishuHit = vi.spyOn(feishu, 'sendCacheHitNotice').mockResolvedValue('');
-    const slackHit = vi.spyOn(slackApp, 'sendCacheHitNotice').mockResolvedValue('');
+    const notifications = new AccountNotifications(
+      { waitUntil(task: Promise<unknown>) { tasks.push(task); } }, vars, admin);
+    const send = vi.spyOn(webpush, 'sendPush').mockResolvedValue({ status: 201 });
     try {
-      await test({
-        notifications, state, vars, tasks, feishuSend, slackSend,
-        feishuEdit, slackEdit, statelessHit, feishuHit, slackHit,
-      });
+      await test({ notifications, admin, vars, tasks, send });
       await Promise.all(tasks);
     } finally {
       vi.restoreAllMocks();
@@ -57,209 +53,63 @@ async function withNotifications(
   });
 }
 
-describe('AccountNotifications delivery contract', () => {
-  it('serializes reference writes and follows a decision that raced ahead of sending', async () => {
-    await withNotifications(async ({ notifications, state, tasks, feishuSend, slackSend, feishuEdit, slackEdit }) => {
+const labels = async (admin: AccountAdmin) =>
+  ((await (await admin.pushOp('vapid', new Request('https://account.do/op/x'))).json()) as
+    { subscriptions: Array<{ label: string }> }).subscriptions.map(s => s.label);
+
+describe('AccountNotifications push contract', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('pushes one approval per subscription with the approve URL in the payload, not the body', async () => {
+    await withPush(async ({ notifications, tasks, send }) => {
       const ch = makeChallenge();
-      await state.storage.put(`ch:${ch.approve_token}`, ch);
-      let finishSend!: (id: string) => void;
-      feishuSend.mockImplementationOnce(() => new Promise(resolve => { finishSend = resolve; }));
       notifications.approval(ch);
-      // One push probe (no subscriptions yet) plus the serialized card sends.
-      expect(tasks).toHaveLength(2);
-      expect(feishuSend).toHaveBeenCalledOnce();
-      expect(slackSend).not.toHaveBeenCalled();
-      const approved: Challenge = {
-        ...ch, status: 'approved', finalized_ms: ch.created_ms + 123,
-        sealed_deks_b64u: 'synthetic-sealed-result', pwa_pk_b64u: 'synthetic-public-key',
-        binding_tag_b64u: 'synthetic-binding-tag',
-      };
-      await state.storage.put(`ch:${ch.approve_token}`, approved);
-      finishSend('test-message');
+      expect(send).not.toHaveBeenCalled(); // nothing inline
       await Promise.all(tasks);
-      expect(slackSend).toHaveBeenCalledOnce();
-      expect(await state.storage.get(`ch:${ch.approve_token}`)).toEqual({
-        ...approved, feishu_message_id: 'test-message', slackapp: { channel: 'test-channel', ts: '1.0' },
-      });
-      expect(feishuEdit.mock.calls[0]![4]).toBe('approved');
-      expect(slackEdit.mock.calls[0]![2]).toBe('approved');
-      expect(state.storage.sql.exec('SELECT * FROM audit').toArray()).toEqual([]);
+      expect(send).toHaveBeenCalledTimes(2);
+      const [, payload, , subject, ttl, urgency] = send.mock.calls[0]!;
+      const p = JSON.parse(payload) as { kind: string; url: string; body: string; tag: string; title: string };
+      expect([subject, ttl, urgency]).toEqual(['https://vt.test.invalid', 300, 'high']);
+      expect(p.kind).toBe('approval');
+      expect(p.url).toBe(`https://vt.test.invalid/a/${ch.approve_token}`);
+      expect(p.tag).toBe(`a:${ch.approve_token}`);
+      expect(p.title).toBe('VT 审批: decrypt');
+      expect(p.body).not.toContain('https://');
+      expect(p.body).toContain(`${ch.meta.user}@${ch.meta.host}`);
     });
   });
 
-  it.each(['feishu', 'slackapp'] as const)('merges only the %s reference into the latest terminal challenge', async (channel) => {
-    await withNotifications(async ({ notifications, state, vars, tasks, feishuSend, slackSend, feishuEdit, slackEdit }) => {
-      if (channel === 'feishu') vars.SLACK_APP_JSON = '';
-      else vars.FEISHU_JSON = '';
-      const ch = makeChallenge({
-        feishu_message_id: 'previous-feishu', slackapp: { channel: 'previous-channel', ts: '0.0' },
-      });
-      const key = `ch:${ch.approve_token}`;
-      await state.storage.put(key, ch);
-      let finishSend!: () => void;
-      if (channel === 'feishu') {
-        feishuSend.mockImplementationOnce(() => new Promise(resolve => {
-          finishSend = () => resolve('test-message');
-        }));
-      } else {
-        slackSend.mockImplementationOnce(() => new Promise(resolve => {
-          finishSend = () => resolve({ channel: 'test-channel', ts: '1.0' });
-        }));
-      }
-      notifications.approval(ch);
-      const latest: Challenge = {
-        ...ch, status: 'rejected', finalized_ms: ch.created_ms + 456,
-        meta: { ...ch.meta, command: 'latest command', host: 'latest-host' },
-      };
-      await state.storage.put(key, latest);
-      finishSend();
-      await Promise.all(tasks);
-      const reference = channel === 'feishu'
-        ? { feishu_message_id: 'test-message' }
-        : { slackapp: { channel: 'test-channel', ts: '1.0' } };
-      expect(await state.storage.get(key)).toEqual({ ...latest, ...reference });
-      if (channel === 'feishu') {
-        expect(slackEdit).not.toHaveBeenCalled();
-        expect(feishuEdit).toHaveBeenCalledOnce();
-        expect(feishuEdit.mock.calls[0]!.slice(4)).toEqual([
-          'rejected', latest.meta.op_kind, latest.meta, { latencyMs: 456 }, latest.salts_b64u.length,
-        ]);
-      } else {
-        expect(feishuEdit).not.toHaveBeenCalled();
-        expect(slackEdit).toHaveBeenCalledOnce();
-        expect(slackEdit.mock.calls[0]!.slice(2)).toEqual([
-          'rejected', latest.meta.op_kind, latest.meta, { latencyMs: 456 }, latest.salts_b64u.length,
-        ]);
-      }
-    });
-  });
-
-  it.each([
-    ['feishu', 'get'], ['feishu', 'put'], ['slackapp', 'get'], ['slackapp', 'put'],
-  ] as const)('isolates %s reference %s failures from the sibling channel', async (channel, operation) => {
-    await withNotifications(async ({ notifications, state, tasks, feishuSend, slackSend, feishuEdit, slackEdit }) => {
-      const ch = makeChallenge();
-      const key = `ch:${ch.approve_token}`;
-      await state.storage.put(key, ch);
-      const failReference = () => {
-        vi.spyOn(state.storage, operation).mockRejectedValueOnce(new Error(`synthetic reference ${operation} failure`));
-      };
-      if (channel === 'feishu') {
-        feishuSend.mockImplementationOnce(async () => { failReference(); return 'test-message'; });
-      } else {
-        slackSend.mockImplementationOnce(async () => {
-          failReference();
-          return { channel: 'test-channel', ts: '1.0' };
-        });
-      }
-      notifications.approval(ch);
-      await expect(Promise.all(tasks)).resolves.toBeDefined();
-      expect(feishuSend).toHaveBeenCalledOnce();
-      expect(slackSend).toHaveBeenCalledOnce();
-      const siblingReference = channel === 'feishu'
-        ? { slackapp: { channel: 'test-channel', ts: '1.0' } }
-        : { feishu_message_id: 'test-message' };
-      expect(await state.storage.get(key)).toEqual({ ...ch, ...siblingReference });
-      expect(feishuEdit).not.toHaveBeenCalled();
-      expect(slackEdit).not.toHaveBeenCalled();
-    });
-  });
-
-  it('does not block the sibling channel when one send fails', async () => {
-    await withNotifications(async ({ notifications, state, tasks, feishuSend, slackSend }) => {
-      const ch = makeChallenge();
-      await state.storage.put(`ch:${ch.approve_token}`, ch);
-      feishuSend.mockRejectedValueOnce(new Error('synthetic send failure'));
-      notifications.approval(ch);
-      await expect(Promise.all(tasks)).resolves.toBeDefined();
-      expect(slackSend).toHaveBeenCalledOnce();
-      expect(await state.storage.get(`ch:${ch.approve_token}`)).toEqual({
-        ...ch, slackapp: { channel: 'test-channel', ts: '1.0' },
-      });
-    });
-  });
-
-  it('isolates a synchronous terminal catch-up failure and still stores the sibling reference', async () => {
-    await withNotifications(async ({ notifications, state, tasks, feishuEdit, slackEdit }) => {
-      const ch = makeChallenge();
-      const terminal = { ...ch, status: 'expired' as const, finalized_ms: ch.created_ms + 500 };
-      await state.storage.put(`ch:${ch.approve_token}`, terminal);
-      feishuEdit.mockImplementationOnce(() => { throw new Error('synthetic synchronous edit failure'); });
-      notifications.approval(ch);
-      await expect(Promise.all(tasks)).resolves.toBeDefined();
-      expect(slackEdit).toHaveBeenCalledOnce();
-      expect(await state.storage.get(`ch:${ch.approve_token}`)).toEqual({
-        ...terminal, feishu_message_id: 'test-message', slackapp: { channel: 'test-channel', ts: '1.0' },
-      });
-    });
-  });
-
-  it.each(['feishu', 'slackapp'] as const)('never recreates a challenge swept while %s delivery was pending', async (channel) => {
-    await withNotifications(async ({ notifications, state, tasks, feishuSend, slackSend, feishuEdit, slackEdit }) => {
-      const ch = makeChallenge();
-      await state.storage.put(`ch:${ch.approve_token}`, ch);
-      let finishSend!: () => void;
-      let markStarted!: () => void;
-      const sendStarted = new Promise<void>(resolve => { markStarted = resolve; });
-      if (channel === 'feishu') {
-        feishuSend.mockImplementationOnce(() => new Promise(resolve => {
-          finishSend = () => resolve('test-message');
-          markStarted();
-        }));
-      } else {
-        slackSend.mockImplementationOnce(() => new Promise(resolve => {
-          finishSend = () => resolve({ channel: 'test-channel', ts: '1.0' });
-          markStarted();
-        }));
-      }
-      notifications.approval(ch);
-      await sendStarted;
-      await state.storage.delete(`ch:${ch.approve_token}`);
-      finishSend();
-      await Promise.all(tasks);
-      expect(await state.storage.get(`ch:${ch.approve_token}`)).toBeUndefined();
-      expect(feishuEdit).not.toHaveBeenCalled();
-      expect(slackEdit).not.toHaveBeenCalled();
-    });
-  });
-
-  it('keeps extension ceremonies console-only and malformed channels disabled', async () => {
-    await withNotifications(({ notifications, vars, tasks, feishuSend, slackSend }) => {
+  it('marks enrollment pushes and keeps extension ceremonies console-only', async () => {
+    await withPush(async ({ notifications, tasks, send }) => {
       notifications.approval(makeChallenge({ extend: {
         group_ids: [], ttl_s: 1200, requested_by: 'admin@example.invalid', preview: [],
       } }));
       expect(tasks).toEqual([]);
-      vars.FEISHU_JSON = '{';
-      vars.SLACK_APP_JSON = '{';
+      notifications.approval(makeChallenge({ enroll: {
+        host: 'h', user: 'u', ip: '203.0.113.9', origin: '', pair_code: '123-456',
+      } }));
+      await Promise.all(tasks);
+      expect((JSON.parse(send.mock.calls[0]![1]) as { kind: string }).kind).toBe('enroll');
+    });
+  });
+
+  it('drops a subscription on 410, keeps it on 5xx and network failure', async () => {
+    await withPush(async ({ notifications, admin, tasks, send }) => {
+      send.mockImplementation(async (sub) => ({ status: sub.endpoint.endsWith('/1') ? 410 : 503, error: 'x' }));
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
       notifications.approval(makeChallenge());
-      expect(tasks).toHaveLength(1); // the push probe only
-      expect(feishuSend).not.toHaveBeenCalled();
-      expect(slackSend).not.toHaveBeenCalled();
+      await Promise.all(tasks);
+      expect(await labels(admin)).toEqual(['dev2']);
+      expect(err.mock.calls.map(c => (JSON.parse(String(c[0])) as { event: string }).event)).toEqual(['push.failed']);
+      send.mockResolvedValue({ status: 0, error: 'timeout' });
+      notifications.approval(makeChallenge());
+      await Promise.all(tasks);
+      expect(await labels(admin)).toEqual(['dev2']);
     });
   });
 
-  it('reuses sweep configuration and isolates edit failures', async () => {
-    await withNotifications(async ({ notifications, vars, tasks, feishuEdit, slackEdit }) => {
-      const channels = notifications.channels();
-      const ch = makeChallenge({ feishu_message_id: 'test-message', slackapp: { channel: 'test-channel', ts: '1.0' } });
-      vars.FEISHU_JSON = '';
-      vars.SLACK_APP_JSON = '';
-      feishuEdit.mockRejectedValueOnce(new Error('synthetic edit failure'));
-      notifications.edit(ch, 'expired', {}, channels);
-      await expect(Promise.all(tasks)).resolves.toBeDefined();
-      expect(feishuEdit).toHaveBeenCalledOnce();
-      expect(slackEdit).toHaveBeenCalledOnce();
-      const disabled = notifications.channels();
-      vars.FEISHU_JSON = FEISHU_JSON;
-      vars.SLACK_APP_JSON = SLACK_APP_JSON;
-      notifications.edit(ch, 'expired', {}, disabled);
-      expect(feishuEdit).toHaveBeenCalledOnce();
-      expect(slackEdit).toHaveBeenCalledOnce();
-    });
-  });
-
-  it('keeps cache-hit delivery opt-in, isolated, and throttled by operation and host', async () => {
-    await withNotifications(async ({ notifications, vars, tasks, statelessHit, feishuHit, slackHit }) => {
+  it('keeps cache-hit pushes opt-in, and throttles agent hits by operation and host', async () => {
+    await withPush(async ({ notifications, vars, tasks, send }) => {
       notifications.cacheHit(makeMeta(), 2);
       expect(tasks).toEqual([]);
       vars.CACHE_HIT_NOTIFY = 'yes';
@@ -270,41 +120,38 @@ describe('AccountNotifications delivery contract', () => {
         peer_exe: null, key_fp: null, dest: null, scope_family: null,
         scope_label: null, grant_ttl_s: null, relayed: null,
       };
-      statelessHit.mockRejectedValue(new Error('synthetic delivery failure'));
       notifications.agentCacheHit(op);
       notifications.agentCacheHit(op);
-      expect(statelessHit).toHaveBeenCalledTimes(1);
+      expect(tasks).toHaveLength(1);
       notifications.agentCacheHit({ ...op, meta: { ...op.meta, host: 'another-host' } });
       notifications.agentCacheHit({ ...op, meta: { ...op.meta, op_kind: 'decrypt' } });
-      expect(statelessHit).toHaveBeenCalledTimes(3);
+      expect(tasks).toHaveLength(3);
       clock.mockReturnValue(180_000);
       notifications.agentCacheHit(op);
-      await expect(Promise.all(tasks)).resolves.toBeDefined();
-      expect(statelessHit).toHaveBeenCalledTimes(4);
-      expect(feishuHit).toHaveBeenCalledTimes(4);
-      expect(slackHit).toHaveBeenCalledTimes(4);
-      expect(statelessHit.mock.calls[0]![3]).toBe('缓存命中，免 Touch ID');
+      expect(tasks).toHaveLength(4);
+      await Promise.all(tasks);
+      expect(send).toHaveBeenCalledTimes(8);
+      const p = JSON.parse(send.mock.calls[0]![1]) as { kind: string; body: string; url: string; tag: string };
+      expect(p.kind).toBe('cache_hit');
+      expect(p.body).toContain('缓存命中，免 Touch ID');
+      expect(p.url).toBe('https://vt.test.invalid/kestrel/audit');
+      expect(p.tag).toBe(`cache:${op.meta.host}`);
+      expect(send.mock.calls[0]!.slice(4)).toEqual([3600, 'normal']);
     });
   });
 });
 
-describe('approval route notification contract', () => {
-  it('awaits stateless delivery and returns push_warning without failing the created ceremony', async () => {
+describe('ceremony routes and push', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('/api/challenge returns before any push settles and carries no push_warning', async () => {
     const key = 'synthetic-notification-route-key';
     const tokenId = await liveTokenId();
-    const encoder = new TextEncoder();
-    const body = encoder.encode(JSON.stringify({
+    const body = new TextEncoder().encode(JSON.stringify({
       daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
       timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta(),
     }));
     const tag = await hmacSha256(await deriveHostTokenSecret(key, tokenId), body);
-    let finishSend!: (warning: string) => void;
-    let markStarted!: () => void;
-    const started = new Promise<void>(resolve => { markStarted = resolve; });
-    vi.spyOn(pushover, 'notifyPushover').mockImplementationOnce(() => new Promise(resolve => {
-      finishSend = resolve;
-      markStarted();
-    }));
     // Drain the internal create response so workerd's isolated storage stack
     // does not retain an open DO response stream after the public route returns.
     const account = {
@@ -314,32 +161,18 @@ describe('approval route notification contract', () => {
         return new Response(await response.text(), { status: response.status });
       } }),
     };
-    try {
-      let completed = false;
-      const pending = app.fetch(new Request('https://vt.test.invalid/api/challenge', {
-        method: 'POST', body, headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}`, 'VT-Token-Id': tokenId },
-      }), {
-        ...env, VT_AUTH_CF: key, ACCOUNT: account,
-        PUSHOVER_JSON: JSON.stringify({ app_token: 'synthetic-token', user_key: 'synthetic-user' }),
-      }).then(response => { completed = true; return response; });
-      await started;
-      expect(completed).toBe(false);
-      finishSend('synthetic delivery warning');
-      const response = await pending;
-      expect(response.status).toBe(200);
-      const result = await response.json() as { approve_token: string; push_warning: string };
-      expect(result.push_warning).toContain('pushover: synthetic delivery warning');
-      await inDO(async ({ state }) => {
-        expect(await state.storage.get(`ch:${result.approve_token}`)).toMatchObject({ status: 'pending' });
-      });
-    } finally {
-      vi.restoreAllMocks();
-    }
+    const response = await app.fetch(new Request('https://vt.test.invalid/api/challenge', {
+      method: 'POST', body, headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}`, 'VT-Token-Id': tokenId },
+    }), { ...env, VT_AUTH_CF: key, ACCOUNT: account });
+    expect(response.status).toBe(200);
+    const result = await response.json() as Record<string, unknown>;
+    expect(result).not.toHaveProperty('push_warning');
+    await inDO(async ({ state }) => {
+      expect(await state.storage.get(`ch:${result.approve_token as string}`)).toMatchObject({ status: 'pending' });
+    });
   });
-});
 
-describe('push ops reach the console-owned config through the DO', () => {
-  it('mints the VAPID key once and refuses an unknown push op', async () => {
+  it('push ops reach the console-owned blob through the DO; unknown ops are refused', async () => {
     const first = await accountStub().fetch('https://account.do/op/push-vapid');
     expect(first.status).toBe(200);
     const a = await first.json() as { pub_b64u: string; subscriptions: unknown[] };

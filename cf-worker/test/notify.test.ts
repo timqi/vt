@@ -1,9 +1,8 @@
-// Unit tests for the shared notification builders — the context block every
-// channel (Pushover / Slack webhook / Slack App / Feishu) renders. These are
-// pure string builders, so they run under plain vitest with no workerd.
+// Unit tests for the notification text builders behind the Web Push payload.
+// Pure string builders, so they run under plain vitest with no workerd.
 
 import { describe, it, expect } from 'vitest';
-import { metaLines, buildApprovalMessage, buildCacheHitLines } from '../src/notify';
+import { metaLines, buildApprovalMessage, buildCacheHitMessage } from '../src/notify';
 
 const meta = {
   op_kind: 'decrypt',
@@ -51,19 +50,20 @@ describe('metaLines', () => {
 });
 
 describe('buildApprovalMessage', () => {
-  it('carries the batch size and ends with the approve URL', () => {
-    const { title, body } = buildApprovalMessage('decrypt', meta, 'https://w/a/tok', 5);
+  it('carries the batch size and no URL (the payload carries it separately)', () => {
+    const { title, body } = buildApprovalMessage('decrypt', meta, 5);
     expect(title).toBe('VT 审批: decrypt');
     expect(body.startsWith('qiqi@devbox · 5 条\n')).toBe(true);
-    expect(body.endsWith('\nhttps://w/a/tok')).toBe(true);
+    expect(body).not.toMatch(/https?:/);
+    expect(buildApprovalMessage('', meta).title).toBe('VT 审批请求');
   });
 });
 
-describe('buildCacheHitLines', () => {
+describe('buildCacheHitMessage', () => {
   it('stays compact: who · N 条 · note, pwd, cmd — no via/ssh/ip/reason', () => {
-    const { title, lines } = buildCacheHitLines(meta, 2);
+    const { title, body } = buildCacheHitMessage(meta, 2);
     expect(title).toBe('VT 缓存命中(免审批): decrypt');
-    expect(lines[0]).toBe('qiqi@devbox · 2 条 · 缓存命中，无手机审批');
-    expect(lines.join('\n')).not.toMatch(/via:|ssh:|ip:|reason:/);
+    expect(body.split('\n')[0]).toBe('qiqi@devbox · 2 条 · 缓存命中，无手机审批');
+    expect(body).not.toMatch(/via:|ssh:|ip:|reason:/);
   });
 });

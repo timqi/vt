@@ -227,8 +227,6 @@ struct ChallengeResp {
     poll_token: String,
     approve_url: String,
     worker_nonce_b64u: String,
-    #[serde(default)]
-    push_warning: String,
 }
 
 #[derive(Deserialize)]
@@ -256,8 +254,6 @@ struct EnrollResp {
     approve_url: String,
     poll_token: String,
     pair_code: String,
-    #[serde(default)]
-    push_warning: String,
 }
 
 /// Structured 401 body the Worker returns for a dead host token.
@@ -494,9 +490,6 @@ pub async fn enroll(worker_url: &str, host: &str, user: &str) -> Result<Zeroizin
         serde_json::from_slice(&resp.bytes().await.context("enroll response read")?)
             .context("enroll response parse")?;
     let ws_url = poll_ws_url(worker_url, &er.poll_token)?;
-    if !er.push_warning.is_empty() {
-        eprintln!("vt: push warning: {}", er.push_warning);
-    }
     eprintln!("vt: approve on your phone: {}", er.approve_url);
     eprintln!(
         "vt: pairing code: {}  (approve only if the page shows this code)",
@@ -569,9 +562,6 @@ pub async fn get_deks(
 
     let ws_url = poll_ws_url(config.worker_url, &ch.poll_token)?;
 
-    if !ch.push_warning.is_empty() {
-        eprintln!("vt: push warning: {}", ch.push_warning);
-    }
     eprintln!("vt: approve on your phone: {}", ch.approve_url);
     eprintln!("vt: waiting for approval…");
 

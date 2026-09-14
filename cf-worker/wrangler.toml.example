@@ -38,7 +38,8 @@ head_sampling_rate = 1.0
 [assets]
 directory = "pwa"
 # Static PWA assets (CSS, JS, libsodium.js) and the HTML page shells are reached
-# only via ASSETS.fetch() from the worker at /pwa/* and /<ADMIN_SEG>/pwa/*.
+# only via ASSETS.fetch() from the worker at /pwa/*, /<ADMIN_SEG>/pwa/*, and the
+# root-scope /sw.js + /manifest.webmanifest that Web Push needs.
 # run_worker_first disables Cloudflare's default static-first routing so all
 # requests hit the worker (admin assets stay behind Cloudflare Access), and the
 # public /pwa/* route additionally refuses to resolve into pwa/admin/ — that
@@ -101,7 +102,7 @@ APPROVAL_UV_JSON = ""
 # Both empty → the Worker fails closed (403) on every admin-surface request.
 ACCESS_TEAM_DOMAIN = "<your-team>.cloudflareaccess.com"
 ACCESS_AUD = "<YOUR_ACCESS_APPLICATION_AUD_TAG>"
-# Cache-hit (免审批) real-time notices. Off unless set to 1/true/on/yes — they
+# Cache-hit (免审批) Web Push notices. Off unless set to 1/true/on/yes — they
 # fire on every DEK-cache and agent Touch-ID-cache hit and bury the approval
 # messages that need a tap. Audit rows are written either way, so cache hits
 # stay visible on the admin audit page.
@@ -140,12 +141,7 @@ CACHE_ADMIN_EXTEND = "0"
 #                     Generate: `openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'`.
 #                     Empty/absent → caching disabled (every decrypt needs phone).
 #                     Rotate to instantly invalidate all cached DEKs. NEVER inline.
-#   PUSHOVER_JSON     {"app_token":"…","user_key":"…"}  — optional Pushover channel
-#   SLACK_APP_JSON    {"bot_token":"xoxb-…","channel":"C…","mention"?:["U…"]}
-#                     — optional Slack App channel (bot token): @-mentions approvers
-#                     + edits the message in place on the decision. See docs/slack-app.md.
-#   FEISHU_JSON       {"app_id","app_secret","receive_id","receive_id_type"?,"mention"?,"base"?}
-#                     — optional 飞书/Lark channel (self-built app bot): @-mentions
-#                     approvers + edits the card in place on the decision. See docs/feishu.md.
-# All notification secrets are independent and opt-in; generate them on the
-# admin "推送渠道" tab. Empty/absent → that channel is simply disabled.
+# Notifications need no secret: phones subscribe to Web Push on the admin 推送
+# tab, and the VAPID key pair lives encrypted in the Durable Object
+# (docs/worker-slim.md §5). Upgrading from the channel builds:
+#   wrangler secret delete PUSHOVER_JSON SLACK_APP_JSON FEISHU_JSON

@@ -16,12 +16,10 @@ not need; `dryoc`/`libsodium.js` stay (refactor.md step 4).
 
 | Leaves | Files / symbols | Operator step |
 | --- | --- | --- |
-| Pushover, Slack App, Feishu | `pushover.ts`, `slack_app.ts`, `feishu.ts`; `fanOut`/`notifyApproval`/`notifyCacheHit` in `notify.ts`; `EditableChannel`, `feishuKv`, `sendAndStore` in `account_notifications.ts`; `Challenge.feishu_message_id`, `Challenge.slackapp`, `SlackAppMsgRef`; `push_warning` on `ChallengeResponse`/`EnrollResponse` and in `src/cf.rs`; `docs/slack-app.md`, `docs/feishu.md`, `docs/feishu-design.md` | `wrangler secret delete PUSHOVER_JSON SLACK_APP_JSON FEISHU_JSON`; subscribe the phone on the 设置 tab |
-| Channels admin page | `pwa/admin/channels.html`, `channels.js`, `channelVars` in `page.ts`, `/<seg>/channels` route | none |
 | Cloudflare Access | `access.ts`, `requireAccess`, `AccessVars`, `accessEmail`/`accessExp`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, the `?exp=` query on `/ws-admin` | delete the Access application; remove both `[vars]` |
 | `ADMIN_SEG` | constant and every `/${ADMIN_SEG}` route → `/admin`, `/api/admin/*`; `PageChrome.adminSeg`; `seg` derivation in `audit.js`/`cache.js`/`tokens.js` | bookmarks change to `/admin` |
 | Admin asset gate | `isAdminAssetPath`, the `/<seg>/pwa/*` mount; `pwa/admin/*` served by the public `/pwa/*` route (shells carry no data until rendered) | none; flips one AGENTS.md line (§9 Q1) |
-| Per-tab admin shells | `pwa/admin/{audit,cache,tokens,setup}.html`, `adminTabs` | none |
+| Per-tab admin shells | `pwa/admin/{audit,cache,tokens,setup,push}.html`, `adminTabs` | none |
 | `CREDENTIALS_JSON` | `Env.CREDENTIALS_JSON`, `parseCredentials` of the `{v,c}` envelope, the setup page's textarea/copy/`wrangler secret put` loop | re-register passkeys through `/admin` (§3.4); `wrangler secret delete CREDENTIALS_JSON` |
 | `CACHE_SECKEY` | `Env.CACHE_SECKEY`; the scalar is derived (§2) | `wrangler secret delete CACHE_SECKEY`; existing sealed entries become misses — 清除全部 once |
 | `CACHE_ADMIN_EXTEND` | `cacheAdminExtendEnabled`, `extend_enabled` plumbing; extension is available whenever caching is | remove the `[vars]` line |
@@ -32,8 +30,7 @@ not need; `dryoc`/`libsodium.js` stay (refactor.md step 4).
 
 Stays untouched: ceremony routes and their HMAC/replay/body caps, host tokens,
 DEK cache ladders and admin actions, audit table and stream, alarm sweep,
-`approve.js` ceremony, `libsodium.js`. refactor.md §4 "Notification channels"
-is decided here; that bullet goes when §7 step 2 lands.
+`approve.js` ceremony, `libsodium.js`.
 
 ## 2. Trust model
 
@@ -323,14 +320,13 @@ four are distinct data sets already implemented as separate scripts.
 ## 7. Implementation order
 
 Each step: `just check-worker`, then `just bump-assets` + `just deploy-worker`
-where `pwa/` changed. Steps 1–3 are independent of refactor.md step 3 (cache
-key v5); steps 4–5 land after it.
+where `pwa/` changed. Steps 1–2 (Web Push added, channels deleted) have landed;
+step 3 is independent of refactor.md step 3 (cache key v5); steps 4–5 land
+after it.
 
 | # | Change | Files | Tests moving to rejected-input |
 | --- | --- | --- | --- |
-| 1 | **Web Push added** beside the existing channels | new `webpush.ts`, `account_admin.ts` (config blob under `K_cfg` — `vapid` + `push` only for now, key derived from `env.VT_AUTH_CF`), `pwa/sw.js`, `pwa/manifest.webmanifest`; `account_notifications.ts` (push fan-out, 410 drop), `index.ts` (`/sw.js`, `/manifest.webmanifest`, `/<seg>/api/push/*`), a 推送 tab; `types.ts`; `dek-cache.md` cache-hit paragraph | none; new `webpush.test.ts` (RFC 8291 vector, VAPID header, 3993 cap), `account_admin.test.ts` (upsert, cap 10, 410 → drop, 5xx → keep) |
-| 2 | **Channels deleted** | rows 1–2 of §1; `src/cf.rs` `push_warning`; `wrangler.toml.example`; `cf-worker-deploy.md`; AGENTS.md notification line; refactor.md §4 bullet | `do_account.notifications.test.ts`: Feishu/Slack cases deleted, cache-hit opt-in/throttle re-targets push, "returns push_warning" → asserts the key is absent; `page.test.ts` channels shell case deleted |
-| 3 | **One admin shell**, assets public, ui-ux doc | `pwa/admin/admin.html` + `admin.js` replace four shells and `adminTabs`; `isAdminAssetPath` and the `/<seg>/pwa/*` mount go; `docs/design/ui-ux.md`; `docs/README.md`; AGENTS.md asset line (Q1) | `page.test.ts` `isAdminAssetPath` cases → "public `/pwa/admin/admin.js` serves 200"; `adminTabs follows ADMIN_SEG` deleted |
+| 3 | **One admin shell**, assets public, ui-ux doc | `pwa/admin/admin.html` + `admin.js` replace five shells (`push.js` folds into the 设置 tab) and `adminTabs`; `isAdminAssetPath` and the `/<seg>/pwa/*` mount go; `docs/design/ui-ux.md`; `docs/README.md`; AGENTS.md asset line (Q1) | `page.test.ts` `isAdminAssetPath` cases → "public `/pwa/admin/admin.js` serves 200"; `adminTabs follows ADMIN_SEG` deleted |
 | 4 | **Passkey admin auth** (after v5) | new `admin_auth.ts` (cookie mint/verify, setup token, pure); `account_admin.ts` gains `credentials`, `origin`, `epoch`, login challenges, bootstrap, add/revoke; `do_account.ts` dispatches `admin-*` ops and verifies the cookie on every admin op and `/ws-admin`; `index.ts` `/admin`, `/api/admin/*`, `LIMITER login:` keys; `access.ts`, `ADMIN_SEG`, `CREDENTIALS_JSON` deleted; `setup.js` → bootstrap/add/revoke over the API; `credentials.ts` parses entries, not the envelope; `host-token.md` §4, `dek-cache.md` gate table, `cf-worker-deploy.md`, AGENTS.md admin lines | `credentials.test.ts` "tolerates epoch" → "`{v,c}` envelope posted to credentials-add is 400"; new `admin_auth.test.ts` (MAC tamper/expiry/epoch → 401, wrong `Origin` → 403, `Cf-Access-Jwt-Assertion` ignored, challenge single-use and 120 s, pending cap 429, limiter absent 503, bootstrap 403/409 then login 204, last-credential revoke 409) |
 | 5 | **Config in DO**, one secret | `account_admin.ts` gains `cache_enabled`, `cache_hit_notify`, `uv_policy`, `GET/PUT config`; `opCreate` applies UV; `account_cache.ts`/`cache_crypto.ts` derive the scalar; `CACHE_ADMIN_EXTEND`, `CACHE_HIT_NOTIFY`, `APPROVAL_UV_JSON`, `WORKER_ORIGIN`, `RP_ID`, `CACHE_SECKEY` leave `Env`; `VT_AUTH_CF` → `SECRET`, `ENROLL_LIMITER` → `LIMITER`; 设置 tab; `wrangler.toml.example` (no `[vars]`), `cf-worker-deploy.md` rewrite, `dek-cache.md`, AGENTS.md cache lines; `test/do_helpers.ts` env → `{SECRET, LIMITER?, ACCOUNT, ASSETS}` | `do_account.uv.test.ts` reads policy from config; `do_account.dek_cache.test.ts` adds "`cache_enabled=false` with live entries → miss, approve page offers `[0]`, extend routes 404"; `do_account.host_token.test.ts` rotation case keeps its name with `SECRET` |
 

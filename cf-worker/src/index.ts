@@ -15,18 +15,14 @@
 import { Hono, type Context } from 'hono';
 import { Env } from './types';
 import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, hkdfSha256, inReplayWindow } from './crypto';
-import { notifyApproval } from './notify';
-import { parsePushoverConfig } from './pushover';
-import { parseSlackAppConfig } from './slack_app';
-import { parseFeishuConfig } from './feishu';
-import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, EnrollRequest, DoEnrollCreateOp } from './types';
+import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, EnrollRequest, EnrollResponse, DoEnrollCreateOp } from './types';
 import { deriveHostTokenSecret, isTokenId } from './host_token';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess, type AccessVars } from './access';
 import { effectiveUvLevel, parseUvPolicy } from './uv_policy';
 import {
   escapeJsonForHtml, renderTemplate, isAdminAssetPath, ADMIN_SEG,
-  pageVars, adminVars, channelVars, type AdminTab, type PageChrome,
+  pageVars, adminVars, type AdminTab, type PageChrome,
 } from './page';
 import { tokenRefused } from './do_account';
 
@@ -55,7 +51,7 @@ const FAVICON_TAGS =
 // while admin.css stays stale, which desyncs markup from styles. The .html
 // page shells need no token — the Worker reads them server-side per request.)
 // Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
-const ASSET_VER = '20260914-ad992cf';
+const ASSET_VER = '20260914-7f842a0';
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
@@ -199,30 +195,6 @@ app.get(`/${ADMIN_SEG}/setup`, (c) => servePage(c, '/admin/setup', {
   // master.
   VT_DATA: escapeJsonForHtml({ rp_id: c.env.RP_ID, credentials: c.env.CREDENTIALS_JSON ?? '' }),
 }));
-
-// Channels page (client-side notification-secret generator). Unlike Passkey,
-// the live PUSHOVER_JSON / SLACK_APP_JSON / FEISHU_JSON secrets are plaintext credentials and are
-// NEVER injected — only booleans indicating whether each is currently set, so
-// the page can show a configured/not-configured badge without echoing tokens.
-// The badge runs the SAME parser the dispatch paths use (config !== null), so a
-// present-but-malformed secret reads as "not configured" here too — matching
-// what actually fires, instead of the old presence-only `&& trim()` check that
-// would show ✓ for a secret that silently never delivers.
-app.get(`/${ADMIN_SEG}/channels`, (c) => {
-  const pushoverSet = parsePushoverConfig(c.env.PUSHOVER_JSON).config !== null;
-  const slackAppSet = parseSlackAppConfig(c.env.SLACK_APP_JSON).config !== null;
-  const feishuSet = parseFeishuConfig(c.env.FEISHU_JSON).config !== null;
-  return servePage(c, '/admin/channels', {
-    ...adminShellVars('channels'),
-    VT_DATA: escapeJsonForHtml({
-      pushover_set: pushoverSet,
-      slackapp_set: slackAppSet, feishu_set: feishuSet,
-    }),
-    ...channelVars('PUSHOVER', pushoverSet),
-    ...channelVars('SLACKAPP', slackAppSet),
-    ...channelVars('FEISHU', feishuSet),
-  });
-});
 
 // Push tab (HTML shell; data from /api/push/vapid) and its API: the VAPID public
 // key plus the subscription list, subscribe / unsubscribe / test. Endpoint +
@@ -450,15 +422,8 @@ app.post('/api/challenge', async (c) => {
   const stored = await doResp.json() as { meta?: ChallengeMeta };
   if (stored.meta) ch.meta = stored.meta;
 
-  // 9. Notifications — the stateless Pushover channel, opt-in and non-fatal.
-  const origin = c.env.WORKER_ORIGIN;
-  const approveUrl = `${origin}/a/${approveToken}`;
-
-  const pushWarning = await notifyApproval(
-    c.env, ch.meta.op_kind, ch.meta, approveUrl,
-    Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0,
-  );
-  if (pushWarning) logErr('notify.failed', pushWarning, { at: tokenPrefix(approveToken) });
+  // 9. The DO already pushed the phone (storeAndAnnounce); nothing to await.
+  const approveUrl = `${c.env.WORKER_ORIGIN}/a/${approveToken}`;
 
   log('challenge.created', {
     at: tokenPrefix(approveToken),
@@ -475,7 +440,6 @@ app.post('/api/challenge', async (c) => {
     worker_nonce_b64u: b64uEnc(workerNonce),
     timestamp_ms: body.timestamp_ms,
     approve_url: approveUrl,
-    ...(pushWarning ? { push_warning: pushWarning } : {}),
   };
   return c.json(resp);
 });
@@ -562,17 +526,14 @@ app.post('/api/enroll', async (c) => {
     body: JSON.stringify(op),
   });
   if (!doResp.ok) return new Response(doResp.body, doResp);
-  const created = await doResp.json() as { approve_token: string; poll_token: string; pair_code: string; meta: ChallengeMeta };
+  const created = await doResp.json() as { approve_token: string; poll_token: string; pair_code: string };
   const approveUrl = `${c.env.WORKER_ORIGIN}/a/${created.approve_token}`;
-  const pushWarning = await notifyApproval(c.env, 'enroll', created.meta, approveUrl, 0);
-  if (pushWarning) logErr('notify.failed', pushWarning, { at: tokenPrefix(created.approve_token) });
   log('enroll.requested', { at: tokenPrefix(created.approve_token), host: op.host, user: op.user, ip: op.ip });
   return c.json({
     approve_url: approveUrl,
     poll_token: created.poll_token,
     pair_code: created.pair_code,
-    ...(pushWarning ? { push_warning: pushWarning } : {}),
-  });
+  } satisfies EnrollResponse);
 });
 
 // POST /api/audit-ingest — the SSH agent pushes one audit record per decision.

@@ -21,21 +21,11 @@ export interface Env {
    * ephemeral pubkey. Empty/absent → DEK caching is disabled and every decrypt
    * requires a phone approval (the historical behaviour). NEVER logged. */
   CACHE_SECKEY: string;
-  /** JSON: {"app_token":"…","user_key":"…"}. Empty/invalid → Pushover disabled. */
-  PUSHOVER_JSON: string;
-  /** JSON: {"bot_token","channel","mention"?}. Slack self-built-app (bot token)
-   *  channel: @-mentions approvers + edits the message in place on the decision
-   *  (like Feishu). Empty/invalid → Slack App disabled. See slack_app.ts. */
-  SLACK_APP_JSON: string;
-  /** JSON: {"app_id","app_secret","receive_id","receive_id_type"?,"mention"?,"base"?}.
-   *  Feishu/Lark self-built-app bot channel: @-mentions approvers + edits the
-   *  card in place on the decision. Empty/invalid → Feishu disabled. See feishu.ts. */
-  FEISHU_JSON: string;
-  /** "1" | "true" | "on" | "yes" → push the 免审批 cache-hit notices (Pushover /
-   *  Slack App / Feishu). Anything else, including absent, keeps them
-   *  off: a cache hit can fire many times a minute and the stream buries the
-   *  approval messages that need a human. The audit row is written regardless,
-   *  so cache hits remain fully visible on the admin audit page. */
+  /** "1" | "true" | "on" | "yes" → Web Push the 免审批 cache-hit notices.
+   *  Anything else, including absent, keeps them off: a cache hit can fire many
+   *  times a minute and the stream buries the approval messages that need a
+   *  human. The audit row is written regardless, so cache hits remain fully
+   *  visible on the admin audit page. */
   CACHE_HIT_NOTIFY?: string;
   /** "1" | "true" | "on" | "yes" → the admin cache tab may REQUEST a DEK-cache
    *  extension. A kill switch, NOT an authorization: even when on, extending
@@ -188,14 +178,6 @@ export interface Challenge {
   created_ms: number;
   /** ms epoch when status transitioned to a terminal state (approved/rejected/expired) */
   finalized_ms?: number;
-  /** Feishu card message_id (present once the approval card was sent), so the DO
-   *  can PATCH the card to its terminal state on approve/reject/expire. Absent
-   *  when the Feishu channel is off or the send failed. */
-  feishu_message_id?: string;
-  /** Slack App message reference, present once the approval message was sent, so
-   *  the DO can chat.update it to its terminal state on approve/reject/expire.
-   *  Absent when the Slack App channel is off or the send failed. */
-  slackapp?: SlackAppMsgRef;
   /** Present ONLY on a cache-extension ceremony (op_kind='cache-extend'): the
    *  immutable intent this approval authorizes. Written once by
    *  opCacheExtendCreate and never mutated, so the thing the approver's assertion
@@ -241,7 +223,6 @@ export interface EnrollResponse {
   approve_url: string;
   poll_token: string;
   pair_code: string;
-  push_warning?: string;
 }
 
 /** Internal DO op for POST /api/enroll. The Worker has already rate-limited
@@ -383,15 +364,6 @@ export interface PushPayload {
   tag: string;
 }
 
-/** Handle to edit a sent Slack App message in place: `channel` is the resolved
- *  channel ID echoed by chat.postMessage (robust even when config `channel` was
- *  a name), `ts` is the message timestamp. Shared by Challenge.slackapp and
- *  slack_app.ts's send return type. */
-export interface SlackAppMsgRef {
-  channel: string;
-  ts: string;
-}
-
 /** Display context for one approval. Trust levels differ per field and the
  *  surfaces label them accordingly (docs/approval-transparency.md):
  *   - `ip` — Worker-derived (CF-Connecting-IP), always.
@@ -442,7 +414,6 @@ export interface ChallengeResponse {
   worker_nonce_b64u: string;
   timestamp_ms: number;
   approve_url: string;
-  push_warning?: string;
 }
 
 // ── Inbound from PWA via POST /api/approve ─────────────────────────────────

@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import {
   renderTemplate, escapeJsonForHtml, isAdminAssetPath,
-  pageVars, adminVars, adminTabs, channelVars, type PageChrome, type AdminTab,
+  pageVars, adminVars, adminTabs, type PageChrome, type AdminTab,
 } from '../src/page';
 
 describe('cache creation time rendering', () => {
@@ -189,23 +189,6 @@ describe('page shells', () => {
     expect(html).toContain('/kestrel/pwa/setup.js?v=20260101-abc1234');
   });
 
-  it('renders the channels shell for every configured/not-configured combination', () => {
-    for (let bits = 0; bits < 8; bits++) {
-      const [po, sa, fs] = [1, 2, 4].map(m => (bits & m) !== 0) as [boolean, boolean, boolean];
-      const html = render('pwa/admin/channels.html', {
-        ...adminVars(CHROME, 'channels'),
-        VT_DATA: escapeJsonForHtml({ pushover_set: po, slackapp_set: sa, feishu_set: fs }),
-        ...channelVars('PUSHOVER', po),
-        ...channelVars('SLACKAPP', sa), ...channelVars('FEISHU', fs),
-      });
-      const configured = [po, sa, fs].filter(Boolean).length;
-      expect(html.match(/已配置<\/span>/g) ?? []).toHaveLength(configured);
-      expect(html.match(/ checked>/g) ?? []).toHaveLength(configured);
-      // A not-configured card starts collapsed.
-      expect(html.match(/class="channel-body"[^>]* hidden>/g) ?? []).toHaveLength(3 - configured);
-    }
-  });
-
   it('leaves no unsubstituted placeholder in any shell', () => {
     // Sanity net over the renders above: nothing of the form {{NAME}} survives.
     const rendered = [
@@ -215,11 +198,6 @@ describe('page shells', () => {
       render('pwa/admin/push.html', adminVars(CHROME, 'push')),
       render('pwa/manifest.webmanifest', { ADMIN_BASE: '/kestrel' }),
       render('pwa/admin/setup.html', { ...adminVars(CHROME, 'setup'), VT_DATA: '{}' }),
-      render('pwa/admin/channels.html', {
-        ...adminVars(CHROME, 'channels'), VT_DATA: '{}',
-        ...channelVars('PUSHOVER', true),
-        ...channelVars('SLACKAPP', true), ...channelVars('FEISHU', false),
-      }),
     ];
     for (const html of rendered) expect(html).not.toMatch(/\{\{[A-Z0-9_]+\}\}/);
   });
@@ -231,7 +209,7 @@ describe('adminTabs', () => {
     expect(nav.match(/class="tab active"/g)).toHaveLength(1);
     expect(nav.match(/aria-current="page"/g)).toHaveLength(1);
     expect(nav).toContain('href="/kestrel/cache" aria-current="page"');
-    expect(nav.match(/<a /g)).toHaveLength(6);
+    expect(nav.match(/<a /g)).toHaveLength(5);
     expect(nav).toContain('href="/kestrel/tokens"');
     expect(nav).toContain('href="/kestrel/push"');
   });

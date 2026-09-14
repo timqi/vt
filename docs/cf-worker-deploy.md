@@ -149,12 +149,12 @@ wrangler secret put CREDENTIALS_JSON
 # decrypt for the same host token + project). Empty/absent → caching disabled. Rotate to
 # instantly invalidate all cached DEKs. See docs/dek-cache.md.
 openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | wrangler secret put CACHE_SECKEY
-
-# Optional notification channels (independent, opt-in):
-wrangler secret put PUSHOVER_JSON   # {"app_token":"…","user_key":"…"}
-wrangler secret put SLACK_APP_JSON  # {"bot_token":"xoxb-…","channel":"C…","mention"?:["U…"]}: @mention + editable msg — see docs/slack-app.md
-wrangler secret put FEISHU_JSON     # 飞书/Lark bot: @mention + editable card — see docs/feishu.md
 ```
+
+Notifications need no secret: after deploying, open the admin 推送 tab on the
+phone and tap 开启推送 (Web Push; on iOS 16.4+ add the site to the home screen
+first and open it from the icon). Upgrading from a build with channels:
+`wrangler secret delete PUSHOVER_JSON SLACK_APP_JSON FEISHU_JSON`.
 
 ## 5. Deploy
 

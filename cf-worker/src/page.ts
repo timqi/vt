@@ -73,7 +73,7 @@ export interface PageChrome {
   faviconTags: string;
 }
 
-export type AdminTab = 'audit' | 'cache' | 'tokens' | 'setup' | 'channels' | 'push';
+export type AdminTab = 'audit' | 'cache' | 'tokens' | 'setup' | 'push';
 
 // Placeholders common to every shell, admin or public.
 export function pageVars(chrome: PageChrome): Record<string, string> {
@@ -86,7 +86,7 @@ export function adminTabs(chrome: PageChrome, active: AdminTab): string {
   const seg = chrome.adminSeg;
   const tab = (href: string, key: AdminTab, label: string) =>
     `<a class="tab${key === active ? ' active' : ''}" href="${href}"${key === active ? ' aria-current="page"' : ''}>${label}</a>`;
-  return `<nav class="tabs">${tab(`/${seg}/audit`, 'audit', '审计')}${tab(`/${seg}/cache`, 'cache', 'DEK 缓存')}${tab(`/${seg}/tokens`, 'tokens', '主机令牌')}${tab(`/${seg}/setup`, 'setup', 'Passkey')}${tab(`/${seg}/channels`, 'channels', '推送渠道')}${tab(`/${seg}/push`, 'push', '推送')}</nav>`;
+  return `<nav class="tabs">${tab(`/${seg}/audit`, 'audit', '审计')}${tab(`/${seg}/cache`, 'cache', 'DEK 缓存')}${tab(`/${seg}/tokens`, 'tokens', '主机令牌')}${tab(`/${seg}/setup`, 'setup', 'Passkey')}${tab(`/${seg}/push`, 'push', '推送')}</nav>`;
 }
 
 // Placeholders every admin shell carries.
@@ -95,22 +95,6 @@ export function adminVars(chrome: PageChrome, active: AdminTab): Record<string, 
     ...pageVars(chrome),
     ADMIN_BASE: `/${chrome.adminSeg}`,
     ADMIN_TABS: adminTabs(chrome, active),
-  };
-}
-
-// Per-channel placeholders on the channels shell. The live secrets are NEVER
-// injected — only whether each parses as configured, which decides a badge, the
-// enable switch's checked state, whether the card body starts expanded, and the
-// "already configured" note.
-export function channelVars(
-  key: 'PUSHOVER' | 'SLACKAPP' | 'FEISHU',
-  set: boolean,
-): Record<string, string> {
-  return {
-    [`${key}_BADGE`]: set ? `<span class="badge badge-approved">已配置</span>` : `<span class="badge">未配置</span>`,
-    [`${key}_CHECKED`]: set ? ' checked' : '',
-    [`${key}_HIDDEN`]: set ? '' : ' hidden',
-    [`${key}_KEEP_NOTE`]: set ? '<p class="hint keep-note">✓ 当前已配置：留空点「生成」保持不变，填入新值则覆盖。</p>' : '',
   };
 }
 

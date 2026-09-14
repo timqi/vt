@@ -94,7 +94,9 @@ repo-wide number. Ceilings are the post-slim targets: steps 1–2 of
   as transient injection.
   Notifications must never block or fail protected operations; agent cache-hit
   notifications run only after `permit.commit()` returns, fire-and-forget.
-  See [docs/app-bundle.md](docs/app-bundle.md).
+  Web Push is the Worker's only channel: fan-out runs via `waitUntil` after the
+  ceremony write, never on the ceremony path, never a warning to the CLI.
+  See [docs/app-bundle.md](docs/app-bundle.md), [docs/worker-slim.md](docs/worker-slim.md) §5.
 - Preserve structured extension envelopes and stable exit codes; error details
   must not reflect client data. See [docs/structured-errors.md](docs/structured-errors.md).
 

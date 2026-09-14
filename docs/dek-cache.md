@@ -76,9 +76,8 @@ TTL, a caller can decrypt the approved records without another phone tap.
   the admin surface lists, clears, and extends by.
 - A hit sends a best-effort Web Push notice (`CACHE_HIT_NOTIFY = "1"`) to every
   phone subscribed on the admin 推送 tab — tag `cache:<host>`, TTL 1 h, opening
-  the audit tab — and, until the channels leave (worker-slim.md §7 step 2),
-  through configured Pushover, Slack App, or Feishu. Notifications never block
-  DEK delivery and contain no approval URL.
+  the audit tab. Notifications never block DEK delivery and contain no approval
+  URL.
 
 ## Data flow
 

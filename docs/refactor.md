@@ -44,8 +44,6 @@ flag day.
   `session-bind@openssh.com` host key on a forwarded connection). Workspace,
   cwd, and parent-app families would go. Needs a decision on how much prompt
   reuse the local path loses.
-- **Notification channels.** Feishu and Pushover stay until one is unused for
-  a release; Slack App likewise.
 - **Record naming.** Not part of this plan; reopen as its own document if
   still wanted after step 3.
 

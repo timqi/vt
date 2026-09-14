@@ -111,7 +111,7 @@ describe('push fan-out', () => {
 
     const tasks: Promise<unknown>[] = [];
     const notifications = new AccountNotifications(
-      { storage: fakeStorage(), waitUntil: (t: Promise<unknown>) => { tasks.push(t); } }, ENV, admin);
+      { waitUntil: (t: Promise<unknown>) => { tasks.push(t); } }, ENV, admin);
     const posted: string[] = [];
     vi.stubGlobal('fetch', async (url: string) => {
       posted.push(url);
@@ -132,7 +132,7 @@ describe('push fan-out', () => {
   it('sends nothing before a subscription exists', async () => {
     const tasks: Promise<unknown>[] = [];
     const notifications = new AccountNotifications(
-      { storage: fakeStorage(), waitUntil: (t: Promise<unknown>) => { tasks.push(t); } },
+      { waitUntil: (t: Promise<unknown>) => { tasks.push(t); } },
       ENV, new AccountAdmin(fakeStorage(), ENV));
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);

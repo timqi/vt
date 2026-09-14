@@ -57,11 +57,6 @@ CACHE_SECKEY = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
 # never touched by the Worker). No real authenticator ever produced this.
 CREDENTIALS_JSON = '{"v":1,"epoch":1,"c":[{"h":"L0JnHXnwlzt3HXjLqjzbrgit2WcsVKLQIAFOIdeGB3s","i":"dnQtdGVzdC1jcmVkZW50aWFs","k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","p":"pQECAyYgASFYIIM-1_8pVqW7YUwLEF1aZb4dIBZimOydM-fAJpdQX9N8IlggIcsGbg-NW_rShPt68QxCXmBA7dV9v8NEw2B2OqvOW_4","l":"test-passkey","t":1716105600}]}'
 
-# Channels off — the DO must never need a third party to run its cache logic.
-PUSHOVER_JSON = ""
-SLACK_APP_JSON = ""
-FEISHU_JSON = ""
-
 # Both cache toggles OFF by default: the tests that need them on set them
 # explicitly, which is the point (a kill switch must be observable in both
 # positions).

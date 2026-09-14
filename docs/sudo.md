@@ -98,8 +98,8 @@ password prompt.
   approval or matching cache grant. Prefer a small set of bastion hosts for the
   Worker path.
 - `pam_exec` often exposes stderr but not stdout. The Worker URL is emitted on
-  stderr; configure Pushover, Slack, or Feishu if terminal feedback is not
-  reliable in your PAM environment.
+  stderr; subscribe the phone to Web Push on the admin 推送 tab if terminal
+  feedback is not reliable in your PAM environment.
 - `auth@vt` is never cached. An approval always requires Touch ID or a phone
   Passkey ceremony.
 - The approval reason carries the command sudo was asked to run

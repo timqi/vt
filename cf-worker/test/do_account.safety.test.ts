@@ -128,11 +128,9 @@ describe('challenge alarm sweep', () => {
         if (Array.isArray(keys)) expect(keys.length).toBeLessThanOrEqual(128);
         return del(keys);
       });
-      const channels = vi.spyOn(inst.notifications, 'channels');
       try {
         await inst.alarm();
         expect(pages.map(page => page.length)).toEqual([65, 1000, 38, 0]);
-        expect(channels).toHaveBeenCalledOnce();
         expect([...await list({ prefix: 'ch:' })].map(([key]) => key)).toEqual(
           [pending, recent, expired].map(ch => `ch:${ch.approve_token}`),
         );
@@ -150,7 +148,6 @@ describe('challenge alarm sweep', () => {
       } finally {
         lists.mockRestore();
         deletes.mockRestore();
-        channels.mockRestore();
       }
     });
   });
@@ -179,7 +176,6 @@ describe('challenge alarm sweep', () => {
         }
         return page;
       });
-      const edits = vi.spyOn(inst.notifications, 'edit');
       const gets = vi.spyOn(state.storage, 'get');
       try {
         await inst.alarm();
@@ -189,11 +185,8 @@ describe('challenge alarm sweep', () => {
         expect(await state.storage.get(`pt:${approved.poll_token}`)).toBe(approved.approve_token);
         expect(await state.storage.get(`pt:${expired.poll_token}`)).toBeUndefined();
         expect((await auditRows({ inst, state })).map(row => row.status)).toEqual(['expired', 'approved']);
-        expect(edits).toHaveBeenCalledOnce();
-        expect(edits.mock.calls[0]![0]).toMatchObject({ approve_token: expired.approve_token, status: 'expired' });
       } finally {
         lists.mockRestore();
-        edits.mockRestore();
         gets.mockRestore();
       }
     });

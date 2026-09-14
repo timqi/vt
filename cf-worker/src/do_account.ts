@@ -1,5 +1,6 @@
 // AccountDO — singleton ceremony state machine. AccountCache owns DEK storage;
-// AccountAudit and AccountNotifications own audit persistence and delivery.
+// AccountAudit owns audit persistence, AccountNotifications the Web Push fan-out,
+// AccountAdmin the console-owned config blob.
 //
 // Storage keys:
 //   ch:{approve_token}        →  Challenge JSON
@@ -29,7 +30,7 @@ import {
 import { challengeUvLevel, effectiveUvLevel, parseUvPolicy } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
-import { AccountNotifications, NotificationChannels } from './account_notifications';
+import { AccountNotifications } from './account_notifications';
 import { AccountAdmin } from './account_admin';
 import { AccountCache } from './account_cache';
 import { deleteKeysBatched, listPrefixPages } from './storage_batch';
@@ -118,7 +119,7 @@ function extendOutcomeSummary(
 // A challenge is effectively expired once TTL_MS has elapsed since creation,
 // EVEN IF the alarm sweep has not yet flipped its stored status to 'expired'.
 // The alarm (every TTL_MS) is best-effort cleanup + notification (WS close,
-// audit finalize, Feishu edit); THIS read-time check is the AUTHORITATIVE expiry
+// audit finalize); THIS read-time check is the AUTHORITATIVE expiry
 // guard, mirroring opDekCache which likewise treats read-time expiry as
 // authoritative and the sweep as mere storage bounding. Without it, a stalled or
 // late alarm leaves a past-TTL challenge both visible on the approval page AND
@@ -299,19 +300,14 @@ export class AccountDO extends DurableObject<Env> {
 
     // 1. Challenges: expire pending past TTL_MS; delete finalized past RETENTION_MS.
     try {
-      // Parse the Feishu + Slack App configs ONCE for the whole sweep (they
-      // can't change mid-sweep) — avoids re-parsing the secrets and re-logging
-      // any config error per expiring challenge.
-      const channels = this.notifications.channels();
       for await (const page of listPrefixPages<Challenge>(this.ctx.storage, 'ch:')) {
         const toDelete: string[] = [];
         for (const [key, ch] of page) {
           if (ch.status === 'pending' && now - ch.created_ms >= TTL_MS) {
             // `ch` is a stale list snapshot; a decision may have committed after
             // it. expireChallenge re-reads atomically and no-ops if terminal,
-            // preserving the decision, audit row, and notification state. It
-            // drops pt: itself and dispatches notification edits via waitUntil.
-            await this.expireChallenge(ch.approve_token, now, channels);
+            // preserving the decision and audit row. It drops pt: itself.
+            await this.expireChallenge(ch.approve_token, now);
           } else if (
             ch.status !== 'pending'
             && ch.finalized_ms != null
@@ -376,21 +372,14 @@ export class AccountDO extends DurableObject<Env> {
 
   // Atomically expire ONE past-TTL pending challenge and fire all the terminal
   // side-effects: flip status→expired, notify the polling WS, finalize the audit
-  // row, broadcast to admin streams, edit the Feishu card, and drop the pt:
-  // routing key. Idempotent — a no-op if the challenge is already terminal or
+  // row, broadcast to admin streams, and drop the pt: routing key. Idempotent — a no-op if the challenge is already terminal or
   // gone. Re-reads under the DO gate (no await between get and put) so it cannot
   // clobber a decision that landed after the caller's snapshot, mirroring the
   // sweep's atomicity. SHARED by the alarm sweep AND the read-time expiry guards
   // (opPageData / opApprove / opReject), so a stale challenge is fully finalized
-  // the moment anyone touches it — the audit row and Feishu card update even when
-  // the alarm is not running, instead of waiting on (or depending on) the sweep.
-  // The alarm passes once-parsed channel configs for the whole sweep.
-  // One-shot expiry paths let notifications parse on demand.
-  private async expireChallenge(
-    approveToken: string,
-    now: number,
-    channels?: NotificationChannels,
-  ): Promise<void> {
+  // the moment anyone touches it — the audit row updates even when the alarm is
+  // not running, instead of waiting on (or depending on) the sweep.
+  private async expireChallenge(approveToken: string, now: number): Promise<void> {
     const key = `ch:${approveToken}`;
     const fresh = await this.ctx.storage.get<Challenge>(key);
     if (!fresh || fresh.status !== 'pending') return; // already terminal / gone
@@ -417,7 +406,6 @@ export class AccountDO extends DurableObject<Env> {
     });
     this.audit.finalize(fresh.approve_token, 'expired', now - fresh.created_ms);
     this.audit.broadcastRow(auditKey(fresh.approve_token), 'update');
-    this.notifications.edit(fresh, 'expired', {}, channels);
     // Retain `ch:` for RETENTION_MS so an in-flight WS reconnect still sees the
     // terminal status; drop only the routing key now (a later RETENTION sweep
     // drops `ch:`).
@@ -514,7 +502,7 @@ export class AccountDO extends DurableObject<Env> {
     // Fail closed on a past-TTL pending challenge even if the alarm has not yet
     // finalized it — a request may never be approved once its window has passed.
     // Finalize it here too so a decision attempt on a stale request still flips
-    // the audit row + Feishu card, independent of the sweep.
+    // the audit row, independent of the sweep.
     {
       const nowMs = Date.now();
       if (isPendingExpired(ch, nowMs)) {
@@ -574,14 +562,12 @@ export class AccountDO extends DurableObject<Env> {
     }
 
     // `ch` was read before the (non-storage) crypto/verify awaits, during which
-    // the DO input gate is open — so (a) the fire-and-forget notification send
-    // may have written feishu_message_id, and (b) a concurrent expiry
-    // (read-time expireChallenge from another tab/device, or the alarm) or a
-    // racing decision may have finalized this challenge. Re-read once: bail if it
-    // is no longer pending rather than clobber a terminal status (which would
-    // double-finalize the audit row and emit a ✅ that contradicts the stored
-    // ⌛/❌), else merge feishu_message_id forward. The get→put pair has no
-    // intervening await, so nothing can slip between the check and the put.
+    // the DO input gate is open — so a concurrent expiry (read-time
+    // expireChallenge from another tab/device, or the alarm) or a racing decision
+    // may have finalized this challenge. Re-read once: bail if it is no longer
+    // pending rather than clobber a terminal status (which would double-finalize
+    // the audit row). The get→put pair has no intervening await, so nothing can
+    // slip between the check and the put.
     const latest = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
     if (!latest || latest.status !== 'pending') {
       // If a duplicate approve already sealed this, re-deliver idempotently.
@@ -607,8 +593,6 @@ export class AccountDO extends DurableObject<Env> {
     ch.pwa_pk_b64u = body.pwa_pk_b64u;
     ch.binding_tag_b64u = body.binding_tag_b64u;
     ch.finalized_ms = finalizedMs;
-    ch.feishu_message_id = latest.feishu_message_id;
-    ch.slackapp = latest.slackapp;
     // Enrollment: mint the token in the SAME synchronous step as the status
     // flip (the SQL insert and the put have no await between them), so an
     // approved enrollment always has its token and a token always has its
@@ -624,9 +608,6 @@ export class AccountDO extends DurableObject<Env> {
       latency_ms: ch.finalized_ms - ch.created_ms,
     });
     this.audit.finalize(ch.approve_token, 'approved', ch.finalized_ms - ch.created_ms);
-
-    // Edit the Feishu / Slack App message to ✅ 已批准, naming the Passkey that approved.
-    this.notifications.edit(ch, 'approved', { approverLabel: entry.l, latencyMs: ch.finalized_ms - ch.created_ms });
 
     // Opt-in DEK cache write. Best-effort: a failure here must never break the
     // approval (the daemon already has its sealed DEKs via the WS path below).
@@ -765,7 +746,6 @@ export class AccountDO extends DurableObject<Env> {
       approve_token: approveToken,
       poll_token: pollToken,
       pair_code: intent.pair_code,
-      meta,
     });
   }
 
@@ -834,10 +814,9 @@ export class AccountDO extends DurableObject<Env> {
     this.audit.cacheEvent(meta, salts.length, 'approved');
     log('cache.hit', { n: salts.length, ip });
 
-    // Real-time notice: a cache hit serves a decrypt with NO phone in the loop,
-    // so push the same opt-in channels used for approvals. Fire-and-forget —
-    // delivery is best-effort and must never delay or fail the DEK response
-    // (the audit row above is the durable record).
+    // Real-time notice: a cache hit serves a decrypt with NO phone in the loop.
+    // Fire-and-forget — delivery must never delay or fail the DEK response (the
+    // audit row above is the durable record).
     this.notifications.cacheHit(meta, salts.length);
     return Response.json({ source: 'cache', sealed_deks_b64u: sealedB64u } satisfies DekCacheResponse);
   }
@@ -861,8 +840,8 @@ export class AccountDO extends DurableObject<Env> {
     }
     this.audit.agent(op);
     // An agent cache hit (sign / decrypt@vt served from the Touch ID auth
-    // cache) had no human in the loop, so surface it on the same channels as
-    // the Worker DEK-cache 免审批 notice. Throttled; fire-and-forget.
+    // cache) had no human in the loop, so surface it like the Worker DEK-cache
+    // 免审批 notice. Throttled; fire-and-forget.
     if (op.outcome === 'cache_hit') this.notifications.agentCacheHit(op);
     return Response.json({ ok: true });
   }
@@ -1049,7 +1028,7 @@ export class AccountDO extends DurableObject<Env> {
     const summary = extendSummary(intent);
 
     // Build the ceremony. Reuses the normal challenge shape so the standard PWA,
-    // the alarm sweep, the audit lifecycle, and the notification channels all work
+    // the alarm sweep, the audit lifecycle, and the push fan-out all work
     // unchanged. salts=[] (an extension mints no DEKs), and the daemon pubkey is a
     // key whose secret was destroyed at birth, so the PWA's placeholder seal is
     // undecryptable by anyone rather than merely ignored.
@@ -1233,14 +1212,11 @@ export class AccountDO extends DurableObject<Env> {
     ch.finalized_ms = Date.now();
     // See opApprove: re-read once after the verify awaits. Bail if no longer
     // pending (a concurrent expiry or decision landed) rather than clobber the
-    // terminal status; else merge feishu_message_id forward. No await between the
-    // check and the put.
+    // terminal status. No await between the check and the put.
     const latest = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
     if (!latest || latest.status !== 'pending') {
       return new Response('challenge not pending', { status: 410 });
     }
-    ch.feishu_message_id = latest.feishu_message_id;
-    ch.slackapp = latest.slackapp;
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 
     const wss = this.ctx.getWebSockets(`pt:${ch.poll_token}`);
@@ -1257,10 +1233,6 @@ export class AccountDO extends DurableObject<Env> {
     });
     this.audit.finalize(ch.approve_token, 'rejected', ch.finalized_ms - ch.created_ms);
     this.audit.broadcastRow(auditKey(ch.approve_token), 'update');
-
-    // Edit the Feishu / Slack App message to ❌ 已拒绝.
-    this.notifications.edit(ch, 'rejected', {});
-
     return new Response('ok');
   }
 
@@ -1276,11 +1248,11 @@ export class AccountDO extends DurableObject<Env> {
     if (!ch) return new Response('not found', { status: 404 });
     // Non-pending OR past-TTL → gone. The read-time TTL check is the fallback
     // for a stalled alarm: the page shows "expired" the instant it is opened, and
-    // opening it also FINALIZES the challenge (audit row + Feishu card + WS), so
+    // opening it also FINALIZES the challenge (audit row + WS), so
     // those side-effects no longer depend on the sweep ever running.
     const nowMs = Date.now();
     if (ch.status !== 'pending' || isPendingExpired(ch, nowMs)) {
-      // Fail closed: even if finalizing side-effects throw (storage/Feishu), the
+      // Fail closed: even if finalizing side-effects throw (storage), the
       // challenge is expired, so still return 410 rather than a 500.
       if (isPendingExpired(ch, nowMs)) {
         try { await this.expireChallenge(approveToken, nowMs); }
