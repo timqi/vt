@@ -167,24 +167,59 @@ pub struct ChallengeMeta {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub user: String,
     pub pwd: String,
+    /// The repository's common git dir when inside one, else the cwd. The
+    /// advisory half of the Worker's DEK-cache key: every worktree of one
+    /// repository shares the grant its host token earned (docs/dek-cache.md).
+    pub project: String,
     pub ppid_cmd: String,
     pub reason: String,
 }
 
 /// Build a `ChallengeMeta` by collecting local context from the running
-/// process: cwd and the parent process command line. The caller supplies the
-/// three fields it already knows (`op_kind`, `command`, `reason`).
+/// process: cwd, project root, and the parent process command line. The caller
+/// supplies the three fields it already knows (`op_kind`, `command`, `reason`).
 pub fn collect_meta(op_kind: &str, command: &str, reason: &str) -> ChallengeMeta {
     let client = collect_client_meta();
+    let project = sanitize(&project_dir(&client.pwd), 200);
     ChallengeMeta {
         op_kind: sanitize(op_kind, 32),
         command: sanitize_for_display_uncapped(command),
         host: String::new(),
         user: String::new(),
         pwd: client.pwd,
+        project,
         ppid_cmd: client.ppid_cmd,
         reason: sanitize(reason, 200),
     }
+}
+
+/// `git rev-parse --git-common-dir` resolved to an absolute path, or `cwd`
+/// when git is absent, `cwd` is not in a repository, or `cwd` is unknown.
+/// Silent on failure: no git is the normal case on many hosts.
+fn project_dir(cwd: &str) -> String {
+    if cwd.is_empty() {
+        return String::new();
+    }
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let rel = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return cwd.to_string(),
+    };
+    if rel.is_empty() {
+        return cwd.to_string();
+    }
+    // The main worktree answers `.git` relative to cwd; linked worktrees
+    // answer absolute. Canonicalize so both name the same directory.
+    let joined = std::path::Path::new(cwd).join(rel);
+    std::fs::canonicalize(&joined)
+        .unwrap_or(joined)
+        .display()
+        .to_string()
 }
 
 #[derive(Deserialize)]
@@ -238,8 +273,8 @@ struct DekCacheReq<'a> {
     timestamp_ms: u64,
     /// Full display meta (host/user/command/ppid/…), same shape as the challenge
     /// request — so a cache HIT is audited with the same context as a ceremony
-    /// decrypt. The cache binding ctx is keyed on worker-derived IP + pwd;
-    /// `meta.ppid` here is forensic-only and not part of the key.
+    /// decrypt. The cache key is the host token plus `meta.project`; the rest
+    /// is forensic only.
     meta: &'a ChallengeMeta,
 }
 
@@ -575,11 +610,9 @@ pub async fn get_deks(
 
 /// Fast path: try the opt-in server-side DEK cache before running a full phone
 /// approval. Returns `Some(deks)` on a full cache hit (all `salts` present,
-/// unexpired, and the request's IP + normalized pwd scope match what was
-/// recorded at approval — the worker strips each path segment's `.suffix`, so a
-/// git-worktree sibling shares the approval's scope; see docs/dek-cache.md),
-/// or `None` on any miss / disabled cache / recoverable transport error (the
-/// caller then falls back to `get_deks`).
+/// unexpired, armed by this host token for the same `meta.project` — see
+/// docs/dek-cache.md), or `None` on any miss / disabled cache / recoverable
+/// transport error (the caller then falls back to `get_deks`).
 ///
 /// SECURITY: the cache path has NO PWA and NO binding tag, so `verify_binding`
 /// does not apply (a cache hit is the worker delivering DEKs it already holds —
@@ -1071,7 +1104,68 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(fields, ["command", "op_kind", "ppid_cmd", "pwd", "reason"]);
+        assert_eq!(
+            fields,
+            ["command", "op_kind", "ppid_cmd", "project", "pwd", "reason"]
+        );
+    }
+
+    /// `project` is the repository's common git dir for every worktree of it,
+    /// and the cwd itself outside a repository. Skipped where git is absent:
+    /// that is exactly the case `project_dir` must degrade silently for.
+    #[test]
+    fn project_dir_names_common_git_dir_or_falls_back_to_cwd() {
+        let tmp = std::env::temp_dir().join(format!("vt-cf-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let plain = std::fs::canonicalize(&tmp).unwrap();
+        let plain_s = plain.display().to_string();
+        assert_eq!(project_dir(""), "");
+        let git = |args: &[&str], dir: &std::path::Path| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["--version"], &plain) {
+            return;
+        }
+        // Not a repository (GIT_CEILING is not set, so guard against the
+        // tempdir living under one).
+        let outside = project_dir(&plain_s);
+        assert!(outside == plain_s || outside.ends_with(".git"));
+        let repo = plain.join("repo");
+        let sub = repo.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(git(&["init", "-q"], &repo));
+        let common = repo.join(".git").display().to_string();
+        assert_eq!(project_dir(&repo.display().to_string()), common);
+        assert_eq!(project_dir(&sub.display().to_string()), common);
+        // A linked worktree reports the SAME common dir as its trunk.
+        if git(
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+            &repo,
+        ) {
+            let wt = plain.join("repo.wt");
+            assert!(git(&["worktree", "add", "-q", wt.to_str().unwrap()], &repo));
+            assert_eq!(project_dir(&wt.display().to_string()), common);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Agent audit rows still name the session host: non-empty host/user

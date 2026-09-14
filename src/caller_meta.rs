@@ -11,7 +11,7 @@ pub fn get_hostname() -> String {
 
 /// Numeric parent PID of the current process (libc::getppid). 0 where
 /// unavailable. Reported to the worker for audit/forensics only — the DEK cache
-/// is bound to worker-derived IP + client-reported pwd, not to the PID (ppid
+/// is bound to the host token + client-reported project, not to the PID (ppid
 /// was both spoofable and unstable across orchestrated shells, so it was
 /// dropped from the binding).
 #[cfg(unix)]
