@@ -99,16 +99,19 @@ export class AccountCache {
   // is found and never accumulated, so this is safe on a cache far larger than
   // an unbounded list() could hold (list() with no options loads the whole
   // prefix into the isolate's memory).
+  //
+  // `pick` sees the raw stored value: the shape check belongs to the predicate,
+  // so a clear-all selects every key under the prefix whatever its value.
   private async sweepCacheEntries(
-    pick: (entry: CacheEntry, key: string) => boolean,
+    pick: (value: unknown) => boolean,
   ): Promise<{ deleted: number; scanned: number }> {
     let deleted = 0;
     let scanned = 0;
     let batch: string[] = [];
-    for await (const page of listPrefixPages<CacheEntry>(this.storage, 'dek:')) {
-      for (const [key, entry] of page) {
+    for await (const page of listPrefixPages<unknown>(this.storage, 'dek:')) {
+      for (const [key, value] of page) {
         scanned++;
-        if (!entry || typeof entry !== 'object' || !pick(entry, key)) continue;
+        if (!pick(value)) continue;
         batch.push(key);
         if (batch.length >= STORAGE_BATCH) {
           deleted += await this.storage.delete(batch);
@@ -120,8 +123,13 @@ export class AccountCache {
     return { deleted, scanned };
   }
 
+  // Not provably live is expired: a value without a numeric `expires_ms` is
+  // never served (read) nor shown (listLive), so the alarm removes it too.
   sweepExpired(now: number): Promise<{ deleted: number; scanned: number }> {
-    return this.sweepCacheEntries(entry => entry.expires_ms <= now);
+    return this.sweepCacheEntries(v => {
+      const e = v as Partial<CacheEntry> | null;
+      return !e || typeof e !== 'object' || typeof e.expires_ms !== 'number' || e.expires_ms <= now;
+    });
   }
 
   clearAll(): Promise<{ deleted: number; scanned: number }> {

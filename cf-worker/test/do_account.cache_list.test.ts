@@ -254,6 +254,33 @@ describe('清除全部 — exhaustive by contract', () => {
     expect(res.json).toEqual({ cleared: SCAN_MAX + 5 });
     expect(await inDO(allDekKeys)).toEqual([]);
   }, 120_000);
+
+  it('removes a malformed value under the prefix: the key is the unit, not its shape', async () => {
+    await inDO(async h => {
+      await putAt(h, 'z', 2);
+      await h.state.storage.put({
+        'dek:zz:junk:string': 'not an entry',
+        'dek:zz:junk:null': null,
+        'dek:zz:junk:number': 7,
+        'dek:zz:junk:object': { unrelated: true },
+      });
+    });
+    expect(await inDO(allDekKeys)).toHaveLength(6);
+
+    const res = await doPost('clear-cache', {});
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ cleared: 6 });
+    expect(await inDO(allDekKeys)).toEqual([]);
+  });
+
+  it('the expiry sweep drops a value with no numeric expires_ms and keeps the live one', async () => {
+    await inDO(async h => {
+      await putAt(h, 'z', 1);
+      await h.state.storage.put({ 'dek:zz:junk:string': 'not an entry', 'dek:zz:junk:object': { unrelated: true } });
+      expect(await h.inst.cache.sweepExpired(Date.now())).toEqual({ deleted: 2, scanned: 3 });
+      expect(await allDekKeys(h)).toHaveLength(1);
+    });
+  });
 });
 
 // Removed surfaces (docs/refactor.md rule: a migration's test becomes a
