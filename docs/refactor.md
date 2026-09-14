@@ -17,13 +17,8 @@ with its approve/extend ladders and admin.
 
 | Leaves | Files | Operator step |
 | --- | --- | --- |
-| Legacy `vt://mac/` v0/v1 records and `vt rewrap` | `src/core/compat.rs`, `VtUrl::Legacy`, `legacy_decrypt`, `DecryptInput::Legacy`, legacy branches in `client/records.rs`, `ssh_agent/handlers.rs`, the engine's "legacy batch stays fresh" rule, `src/client/rewrap.rs`, `--no-legacy-decrypt`, README row | run `vt rewrap --no-dry-run` on the current release before upgrading; rewrap has no key of its own, so it cannot outlive the agent's legacy path |
-| Keychain wrap v1 | `derive_passphrase_secret` (v1), `upgrade_wrap_v2_if_needed`, `secret rebind --to-v1` | `vt secret rebind` stays one release for v1 stores, then goes with wrap v1 |
-| Worker bare-master auth | `auth.legacy_master` branch in `cf-worker/src/index.ts`, "absent = legacy master" fields in `types.ts`, IP-only cache derivation | every host runs `vt enroll` first |
-| `VT_AUTH_CF_PREV` two-generation master | `MasterGen`/`last_key_gen` in `types.ts`, `account_tokens.ts`, `index.ts` auth path, `crypto.ts` dual verify, admin column, `host-token.md` rotation section, `wrangler.toml.example` | rotating `VT_AUTH_CF` = `vt enroll` on every host, same day |
-| Cache ctx v3 mentions | comments in `account_cache.ts`, `dek-cache.md` history | none; v4 entries are re-keyed by step 3 anyway |
-| Legacy id-less inject sidecars | `client/inject.rs` mtime-ordering branch | none after one release (sidecars live minutes) |
-| `docs/dek-v5-design.md` | replaced by this document and step 3 | none |
+| Keychain wrap v1 | `derive_passphrase_secret` (v1), `upgrade_wrap_v2_if_needed`, `secret rebind --to-v1`, the now-unused AES `mac_cipher` returned by `load_mac_cipher` | `vt secret rebind` stays one release for v1 stores, then goes with wrap v1 |
+| Audit-ingest master key | hostname-salted HKDF in `src/audit.rs`, `--audit-key` master form in `src/main.rs`, `/api/audit-ingest` verifier in `index.ts`; the agent pushes with its host token instead | every agent host runs `vt enroll`; needs a Rust + Worker change landed together |
 
 Rule: a compatibility branch is removed, never widened, and its test moves to
 a "rejected input" test.
@@ -74,8 +69,8 @@ Depends on step 1 (bare-master gone) so `token_id` is always present.
   reuse the local path loses.
 - **Notification channels.** Feishu and Pushover stay until one is unused for
   a release; Slack App likewise.
-- **Record naming** (`dek-v5-design.md` §4). Not part of this plan; reopen as
-  its own document if still wanted after step 3.
+- **Record naming.** Not part of this plan; reopen as its own document if
+  still wanted after step 3.
 
 ## Order
 
