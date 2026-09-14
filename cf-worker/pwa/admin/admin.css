@@ -270,7 +270,7 @@ tbody tr.clickable { cursor: pointer; }
 .rec-name.unnamed { color: var(--muted); font-weight: 400; }
 .rec-name.more { background: transparent; border-style: dashed; color: var(--muted); }
 .rec-edit { min-width: 140px; width: 200px; padding: 4px 8px; font-size: var(--cap); min-height: 32px; }
-#cache td.col-rec { white-space: normal; min-width: 220px; max-width: 360px; }
+#cache td.col-rec { white-space: normal; min-width: 220px; }
 #detail-dl .record-list { margin-top: 2px; }
 #detail-dl .rec-name { min-height: 44px; }
 
@@ -288,26 +288,18 @@ tbody tr.clickable { cursor: pointer; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .expired .cell-main, .expired .row-main { color: var(--muted); }
-#cache .cell-main.trunc-host { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
-#cache .cell-sub.trunc-sub   { max-width: 200px; }
-#cache th.col-num, #cache td.col-num { text-align: right; width: 1%; white-space: nowrap; }
-#cache td.col-num .cell-main { font-variant-numeric: tabular-nums; }
-#cache td.col-act { white-space: nowrap; width: 1%; }
-#cache td.col-act button { margin: 0 0 0 6px; }
-#cache td.col-act button:first-child { margin-left: 0; }
+/* 主机 · 项目 header of the cache tab: a row of the same list, set apart by
+   weight and a tinted surface; its label toggles the scope's rows. */
+.group-head { background: var(--panel-2); cursor: pointer; }
+.group-head .group-label, .group-head .row-main { font-weight: 600; font-size: var(--sec); }
+.group-head td .cell-sub { display: inline; margin-left: 10px; }
+.row.group-head .row-body { min-width: 0; }
 /* Selection column: tight, so the data columns keep the width. */
 th.col-pick, td.col-pick { width: 1%; padding-right: 0; }
 th.col-pick input, td.col-pick input, .row-lead input { accent-color: var(--accent); margin: 0; cursor: pointer; width: 20px; height: 20px; }
 /* Signal that a cell holds more than it shows, without adding visual noise. */
 .has-hover { cursor: help; }
 .has-hover:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
-/* "Why this group can't be extended" — muted pill, always in view. */
-.reason-badge {
-  display: inline-block; padding: 1px 7px; border-radius: 999px;
-  background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
-  max-width: 100%;
-}
-
 /* Bulk-action bar: appears only once something is selected, so the
    authority-granting controls are not permanently on screen. */
 #bulkbar {
@@ -442,8 +434,8 @@ pre.cmd {
   overflow-x: auto; font-family: var(--mono); font-size: var(--sec);
 }
 
-.hint a, #detail-dl a { color: var(--accent); text-decoration: none; }
-.hint a:hover, #detail-dl a:hover { text-decoration: underline; }
+.hint a, #detail-dl a, .cache-link { color: var(--accent); text-decoration: none; white-space: nowrap; }
+.hint a:hover, #detail-dl a:hover, .cache-link:hover { text-decoration: underline; }
 
 /* ── Reduced motion: opacity only, no movement. ──────────────────────────── */
 @media (prefers-reduced-motion: reduce) {

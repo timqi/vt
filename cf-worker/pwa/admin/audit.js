@@ -101,16 +101,18 @@ vt.tabs.audit = function (panel) {
     var proj = vt.projectName(r.project);
     // 缓存: live → TTL label; armed-but-elapsed → grey 过期; never armed → —.
     var cache = (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) ? (live ? ttlLabel(r.cache_ttl_s) : '过期') : '—';
-    // 操作: a "清除缓存" button on EVERY approval that ever armed a cache — not
-    // just ones this view believes are still live. Liveness here is a projection
-    // (and, for a pre-migration row, an inference); if it is ever wrong, an extra
-    // clear click is harmless, whereas hiding the button would leave a live cache
-    // unrevokable from this page. Fail toward being able to revoke.
-    var btn = null;
+    // 操作: every approval that armed a cache links to the DEK 缓存 tab filtered
+    // to its 主机 · 项目 — the only view of the real entry set, and the only place
+    // a cache is revoked. Liveness here is a projection, so the link stays on an
+    // elapsed row too; the cache tab is the truth.
+    var link = null;
     if (armedCache(r)) {
-      btn = vt.el('button', 'danger small', '清除缓存');
-      btn.type = 'button';
-      btn.addEventListener('click', function (e) { e.stopPropagation(); clearOrigin(r.token_id, btn); });
+      var q = new URLSearchParams();
+      if (r.host) q.set('host', r.host);
+      if (r.project) q.set('project', r.project);
+      link = vt.el('a', 'cache-link', '查看缓存 →');
+      link.href = '#cache?' + q.toString();
+      link.addEventListener('click', function (e) { e.stopPropagation(); });
     }
     return list.item({
       cls: 'clickable',
@@ -122,7 +124,7 @@ vt.tabs.audit = function (panel) {
         // Command and IP live in the detail sheet.
         return [cell(fmtTime(r.created_ms)), cell(badge), cellClipped(r.host, 'col-host'),
           cellClipped(proj, 'col-proj'), cellClipped(recs, 'col-rec'),
-          cell(cache, cache === '过期' ? 'cache-expired' : null), cell(btn)];
+          cell(cache, cache === '过期' ? 'cache-expired' : null), cell(link)];
       },
       row: function () {
         // Sub line: the project, then the records; the full path is in the sheet.
@@ -132,7 +134,7 @@ vt.tabs.audit = function (panel) {
           main: r.host || '—',
           sub: [line,
             vt.el('div', null, fmtTime(r.created_ms) + (cache !== '—' ? ' · 缓存 ' + cache : ''))],
-          trail: badge, actions: btn ? [btn] : [],
+          trail: badge, actions: link ? [link] : [],
         };
       },
     });
@@ -163,10 +165,9 @@ vt.tabs.audit = function (panel) {
   // ── Real-time apply ───────────────────────────────────────────────────────
 
   // Does a row match the CURRENTLY-applied filter? Mirrors the server's
-  // opAuditQuery predicates (status incl. the 'cache' pseudo-filter; host exact).
+  // opAuditQuery predicates (status and host exact).
   function matchesFilter(r) {
     if (activeHost && r.host !== activeHost) return false;
-    if (activeStatus === 'cache') return r.cache_ttl_s != null;
     if (activeStatus && r.status !== activeStatus) return false;
     return true;
   }
@@ -256,23 +257,6 @@ vt.tabs.audit = function (panel) {
     if (typeof r.cache_expires_ms === 'number') return r.cache_expires_ms > Date.now();
     return typeof r.finalized_ms === 'number'
       && (r.finalized_ms + r.cache_ttl_s * 1000 > Date.now());
-  }
-
-  async function clearOrigin(tokenId, btn) {
-    if (btn) btn.disabled = true;
-    try {
-      var resp = await vt.apiFetch(vt.api('cache-clear-origin'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ token_id: tokenId }),
-      });
-      if (!resp.ok) { setStatus('清除缓存失败 HTTP ' + resp.status, 'error'); if (btn) btn.disabled = false; return; }
-      var json = await resp.json();
-      setStatus('✓ 已清除该请求的 ' + (json && json.cleared != null ? json.cleared : '?') + ' 条缓存', 'ok');
-    } catch (e) {
-      setStatus('网络错误：' + (e.message || e), 'error');
-      if (btn) btn.disabled = false;
-    }
   }
 
   // ── Detail dialog (shared, admin.js) ────────────────────────────────────
@@ -432,39 +416,7 @@ vt.tabs.audit = function (panel) {
   $('#apply').addEventListener('click', function () {
     oldestId = null; exhausted = false; load(false);
   });
-  // Quick filter: show only cache-related records (hits + armed approvals).
-  $('#filter-cache').addEventListener('click', function () {
-    $('#f-status').value = 'cache';
-    oldestId = null; exhausted = false; load(false);
-  });
   $('#more').addEventListener('click', function () { if (!exhausted) load(true); });
-
-  $('.clear-all-cache').addEventListener('click', async function () {
-    if (!confirm('删除全部已缓存 DEK？此后解密将重新需要手机审批。')) return;
-    setStatus('清空缓存中…');
-    try {
-      var resp = await vt.apiFetch(vt.api('clear-cache'), { method: 'POST', headers: { 'Accept': 'application/json' } });
-      if (!resp.ok) { setStatus('清空缓存失败 HTTP ' + resp.status, 'error'); return; }
-      var json = await resp.json();
-      setStatus('✓ 已清空 ' + (json && json.cleared != null ? json.cleared : '?') + ' 条 DEK 缓存', 'ok');
-    } catch (e) {
-      setStatus('网络错误：' + (e.message || e), 'error');
-    }
-  });
-
-  $('#clear-audit').addEventListener('click', async function () {
-    if (!confirm('清空全部审计日志？此操作不可恢复。')) return;
-    setStatus('清空审计中…');
-    try {
-      var resp = await vt.apiFetch(vt.api('clear-audit'), { method: 'POST', headers: { 'Accept': 'application/json' } });
-      if (!resp.ok) { setStatus('清空审计失败 HTTP ' + resp.status, 'error'); return; }
-      oldestId = null; exhausted = false;
-      load(false);
-      setStatus('✓ 已清空全部审计日志', 'ok');
-    } catch (e) {
-      setStatus('网络错误：' + (e.message || e), 'error');
-    }
-  });
 
   // ── Real-time WebSocket ───────────────────────────────────────────────────
 
@@ -496,13 +448,6 @@ vt.tabs.audit = function (panel) {
     ws.onmessage = function (ev) {
       var msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.kind === 'hello') { startCatchup(); return; }
-      if (msg.kind === 'clear') {
-        // Another tab wiped the audit log — reset and reload so we don't keep
-        // showing deleted rows. newestSeq is left intact (server seq stays
-        // monotonic across a clear), so live events still apply correctly.
-        oldestId = null; exhausted = false; load(false);
-        return;
-      }
       if (msg.kind === 'audit') {
         // Buffer live events during catch-up OR a fresh snapshot load so they
         // aren't lost or applied against a to-be-wiped list; drained (in arrival
@@ -565,8 +510,7 @@ vt.tabs.audit = function (panel) {
   // ── Cache-expiry ticker (client-side) ─────────────────────────────────────
   // The 缓存 column is a pure time calc, so nothing pushes a "cache expired"
   // event. Periodically re-render only rows whose live cache has just elapsed
-  // (data-cache-live flips 1→0), turning the column grey 过期 and dropping the
-  // 清除缓存 button without a round-trip.
+  // (data-cache-live flips 1→0), turning the column grey 过期 without a round-trip.
   setInterval(function () {
     Object.keys(trById).forEach(function (id) {
       var tr = trById[id];

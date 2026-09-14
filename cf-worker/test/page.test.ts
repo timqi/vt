@@ -47,24 +47,26 @@ describe('cache creation time rendering', () => {
   runInNewContext(pwa('admin/admin.js'), context);
   runInNewContext(source.slice(0, wiring) + 'globalThis.renderRow = renderRow; };', context);
   (context.vt as { tabs: { cache: (panel: Element) => void } }).tabs.cache(new Element());
-  const renderRow = context.renderRow as (group: Record<string, unknown>) => Element;
-
-  function creationLine(created: number | null, expires: number) {
-    const row = renderRow({
-      group_id: 'test-group', origin_token_id: 'test-origin',
-      live: 1, entries: 1, created_ms: created, max_expires_ms: expires,
-    });
-    return row.children[4].children.at(-1)!.textContent;
-  }
-
-  it('renders the six table cells at desktop width', () => {
-    const row = renderRow({ group_id: 'g', origin_token_id: 'o', live: 1, entries: 1, created_ms: 1, max_expires_ms: Date.now() + 60_000 });
-    expect(row.children).toHaveLength(6);
+  const renderRow = context.renderRow as (entry: Record<string, unknown>) => Element;
+  const entry = (over: Record<string, unknown>) => ({
+    token_id: 'testtoken0000000', project: '/srv/app/.git', salt_b64u: 'K0g8nyJ5aGVsbG8gd29ybA',
+    record: { salt_b64u: 'K0g8nyJ5aGVsbG8gd29ybA', name: null, claimed: '', source: null },
+    host: 'h', user: 'u', ip: '', created_ms: 1, expires_ms: Date.now() + 60_000, ttl_s: 1200, origin_token_id: 'o',
+    ...over,
   });
 
-  it('shows the original creation timestamp before and after extension or expiry', () => {
+  function creationLine(created: number | null, expires: number) {
+    const row = renderRow(entry({ created_ms: created, expires_ms: expires }));
+    return row.children[2].children.at(-1)!.textContent;
+  }
+
+  it('renders the three table cells at desktop width', () => {
+    expect(renderRow(entry({})).children).toHaveLength(3);
+  });
+
+  it('shows the original creation timestamp before and after extension', () => {
     const created = new Date(2026, 0, 2, 3, 4, 5).getTime();
-    for (const expires of [Date.now() + 60_000, Date.now() + 86_400_000, 1]) {
+    for (const expires of [Date.now() + 60_000, Date.now() + 86_400_000]) {
       expect(creationLine(created, expires)).toBe('创建于 2026-01-02 03:04:05');
     }
   });

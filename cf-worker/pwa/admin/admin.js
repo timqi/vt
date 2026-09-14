@@ -361,8 +361,9 @@
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hideHover(); });
 
   // ── Tab bar ───────────────────────────────────────────────────────────────
-  // Tab in the URL hash (/{seg}#audit), first tab default. A panel's script
-  // runs once, on first activation, so a hidden tab costs nothing until opened.
+  // Tab in the URL hash (/{seg}#audit), first tab default; a tab may carry a
+  // query (`#cache?host=…`) its script reads. A panel's script runs once, on
+  // first activation, so a hidden tab costs nothing until opened.
   // Marks are single Unicode glyphs (no icon set); the label sits under the
   // mark on a phone, beside it on desktop.
   var TABS = [
@@ -372,7 +373,7 @@
   var started = {};
 
   function activate(data) {
-    var key = location.hash.slice(1);
+    var key = location.hash.slice(1).split('?')[0];
     if (!TABS.some(function (t) { return t[0] === key; })) key = TABS[0][0];
     TABS.forEach(function (t) {
       var on = t[0] === key;
