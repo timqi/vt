@@ -1927,7 +1927,7 @@ mod tests {
             backup: backup.to_string_lossy().into_owned(),
             tmp: tmp.to_string_lossy().into_owned(),
             deadline_ms: now_ms() + 60_000,
-            backup_id: backup_id,
+            backup_id,
         };
         write_inject_sidecar(&sidecar, &sc).unwrap();
         let armed = ArmedExposure {
