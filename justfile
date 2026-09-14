@@ -110,10 +110,10 @@ size:
     }
     row() { printf '%-22s %6s %6s\n' "$1" "$2" "$3"; }
     row Area Lines Ceiling
-    row 'src/core/'          "$(count src/core/*.rs)"            1100
-    row 'src/client/'        "$(count src/client/*.rs)"          1400
+    row 'src/core/'          "$(count src/core.rs src/core/*.rs)"   1700
+    row 'src/client/'        "$(count src/client.rs src/client/*.rs)" 1800
     row 'src/server_macos/'  "$(count src/server_macos/*.rs src/server_macos/ssh_agent/*.rs)" 4500
-    row 'root src/*.rs'      "$(count src/*.rs)"                 2500
+    row 'root src/*.rs'      "$(count $(ls src/*.rs | grep -v -e /core.rs -e /client.rs))" 2000
     row 'cf-worker/src/'     "$(count cf-worker/src/*.ts)"       3500
     echo
     echo 'Modules over 750:'

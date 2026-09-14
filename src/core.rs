@@ -933,6 +933,14 @@ mod tests {
     }
 
     #[test]
+    fn wire_rejects_legacy_decrypt_items() {
+        // An old client's `{"Legacy":..}` item has no variant to land in; the
+        // agent fails the whole request as BadRequest before any prompt.
+        let legacy = r#"{"Legacy":{"url":"vt://mac/0AAAAAAAAAA"}}"#;
+        assert!(serde_json::from_str::<DecryptInput>(legacy).is_err());
+    }
+
+    #[test]
     fn parse_rejects_non_ascii_v2_type_byte() {
         // Reachable from any client-supplied URL; must not panic on
         // byte-slicing at a non-char boundary.
