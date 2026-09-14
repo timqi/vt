@@ -128,8 +128,9 @@ in [src/client/inject.rs](src/client/inject.rs). Keep these implementation bound
 ## SSH-agent authorization
 
 - All auth/run/sign/decrypt operations use the unified engine. `auth@vt` and
-  `run@vt` always require fresh approval; legacy-containing decrypt batches stay
-  fresh. Duration `0` means `Fresh`, never `StrictTtl(0)`. Reusable grants remain
+  `run@vt` always require fresh approval; a decrypt item that is not a v2
+  envelope is a `BadRequest`, never a fresh-prompt batch. Duration `0` means
+  `Fresh`, never `StrictTtl(0)`. Reusable grants remain
   operation/subject/resource-scoped. Commit the non-cloneable permit only after
   operation success AND extension response encryption; failure drops without a
   grant. A live permit blocks revocation: no unbounded-latency work while held.
