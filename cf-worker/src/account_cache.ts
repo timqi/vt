@@ -1,10 +1,10 @@
 // Account-local DEK storage. Uses the AccountDO storage and input gate; it
 // cannot authenticate a request, finalize a ceremony, or dispatch notifications.
 
-import { Challenge, ChallengeMeta, CacheEntry, CacheExtendIntent } from './types';
-import { b64uEnc, isB64uString, decodeB64uExact, sha256, randomBytes } from './crypto';
+import { Challenge, ChallengeMeta, CacheEntry, CacheEntryRef, CacheExtendIntent } from './types';
+import { b64uEnc, isB64uString, decodeB64uExact, sha256 } from './crypto';
 import { seal, openToCache } from './cache_crypto';
-import { planExtend, isAllowedApproveTtl, groupIdOf, isExtendableGroupId } from './cache_policy';
+import { planExtend, isAllowedApproveTtl } from './cache_policy';
 import { isTokenId } from './host_token';
 import { logErr } from './log';
 import { STORAGE_BATCH, deleteKeysBatched, listPrefixPages } from './storage_batch';
@@ -30,7 +30,7 @@ const CACHE_LIST_SCAN_MAX = 20000;
 // storage key with the old one; v4 (`dek:{ctx}:{salt}`) entries are unreachable
 // and lapse or are cleared from the admin tab. Derived HERE for reads and
 // writes alike, so no caller can key the two on different rules.
-async function cacheCtx(tokenId: string, project: string): Promise<string> {
+export async function cacheCtx(tokenId: string, project: string): Promise<string> {
   // Fail closed: a key with an empty token half would be one every host could
   // reach. opCreate/opDekCache already refuse such bodies; this is the seam's
   // own guard, so a throw here is a DO bug surfacing as a 500, never a hit.
@@ -49,37 +49,16 @@ function cacheKey(ctx: string, saltB64u: string): string {
   return `dek:${ctx}:${saltB64u}`;
 }
 
-// One aggregated DEK-cache group, as scanned from storage. `keys` holds the
-// `dek:{token_id}:{project_h}:{salt}` storage keys and is populated ONLY for the
-// extension commit — it must never reach a response body (the project hash would
-// let a reader brute-force the client-reported `project` path offline). `records`
-// carries each key's salt (the rename key, public in every vt:// URL) with the
-// client's name claim.
-interface CacheAgg {
-  group_id: string;
-  keys: string[];
-  records: Array<[string, string]>;
-  project: string | null;
-  origin_token_id: string;
-  entries: number;
-  live: number;
-  max_expires_ms: number;
-  created_ms: number | null;
-  ip: string;
-  ppid_cmd: string;
-  consistent: boolean;
-}
-
 type CacheWriteResult =
   | { ok: false; reason: string }
-  | { ok: true; expires_ms: number; group_id: string };
+  | { ok: true; expires_ms: number };
 
 interface CacheExtendResult {
-  groups: number;
   skipped: Record<string, number>;
   extended: number;
   latest: number;
-  effects: Array<{ origin_token_id: string; expires_ms: number }>;
+  /** Latest new expiry per origin approval, for its audit row. */
+  effects: Map<string, number>;
 }
 
 export class AccountCache {
@@ -109,10 +88,10 @@ export class AccountCache {
   // Delete every `dek:` entry `pick` selects, paging the prefix to its END.
   //
   // This is the REVOKE direction, so completeness is the contract. Unlike
-  // scanCacheGroups — which stops at CACHE_LIST_SCAN_MAX and makes its caller
-  // surface `truncated` — a clear that stopped early would leave DEKs
-  // decryptable while answering 200 with a count, i.e. a success the operator
-  // cannot tell from a real one. There is deliberately NO cap here; the only
+  // listLive — which stops at CACHE_LIST_SCAN_MAX and makes its caller surface
+  // `truncated` — a clear that stopped early would leave DEKs decryptable
+  // while answering 200 with a count, i.e. a success the operator cannot tell
+  // from a real one. There is deliberately NO cap here; the only
   // bound left is the request's own CPU/wall budget, and exhausting that fails
   // LOUDLY instead of under-delivering silently.
   //
@@ -145,24 +124,17 @@ export class AccountCache {
     return this.sweepCacheEntries(entry => entry.expires_ms <= now);
   }
 
-  clearByOrigin(tokenId: string): Promise<{ deleted: number; scanned: number }> {
-    return this.sweepCacheEntries(entry => entry.origin_token_id === tokenId);
-  }
-
   clearAll(): Promise<{ deleted: number; scanned: number }> {
     return this.sweepCacheEntries(() => true);
   }
 
-  async clearGroups(ids: string[]): Promise<{ deleted: number; scanned: number; groups: number }> {
-    const want = new Set(ids);
-    const hit = new Set<string>();
-    const result = await this.sweepCacheEntries(entry => {
-      const gid = groupIdOf(entry);
-      if (!want.has(gid)) return false;
-      hit.add(gid);
-      return true;
-    });
-    return { ...result, groups: hit.size };
+  // The console names entries by (token_id, project, salt); the key is derived
+  // here, so a clear can only ever address what a read would. Exact keys, no
+  // scan: the count is what storage removed.
+  async clearEntries(refs: CacheEntryRef[]): Promise<number> {
+    const keys: string[] = [];
+    for (const r of refs) keys.push(cacheKey(await cacheCtx(r.token_id, r.project), r.salt_b64u));
+    return deleteKeysBatched(this.storage, keys);
   }
 
   // Write one cache entry per salt, keyed by ctx(token_id, project)+salt. Caller
@@ -207,11 +179,8 @@ export class AccountCache {
     const ctx = await cacheCtx(ch.token_id, ch.meta.project ?? '');
     const createdMs = Date.now();
     const expires = createdMs + ttlS * 1000;
-    // One group handle per write: unique, random, and independent of the
-    // approve_token — an authority-GRANTING mutation (extend) must not hang off a
-    // selector that could ever be ambiguous. created_ms is forensic only (extension
-    // measures from the approval) and is never rewritten afterwards.
-    const groupId = 'g_' + b64uEnc(randomBytes(9));
+    // created_ms is forensic only (extension measures from the approval) and is
+    // never rewritten afterwards. host/user are the token record's (opCreate).
     const writes: Record<string, CacheEntry> = {};
     for (let i = 0; i < salts.length; i++) {
       writes[cacheKey(ctx, salts[i]!)] = {
@@ -222,7 +191,9 @@ export class AccountCache {
         ppid_cmd: ch.meta.ppid_cmd ?? '',
         project: ch.meta.project ?? '',
         name: ch.meta.names?.[i] ?? '',
-        cache_group_id: groupId,
+        host: ch.meta.host,
+        user: ch.meta.user,
+        ttl_s: ttlS,
         created_ms: createdMs,
       };
     }
@@ -233,7 +204,7 @@ export class AccountCache {
     for (let i = 0; i < entries.length; i += STORAGE_BATCH) {
       await this.storage.put(Object.fromEntries(entries.slice(i, i + STORAGE_BATCH)));
     }
-    return { ok: true, expires_ms: expires, group_id: groupId };
+    return { ok: true, expires_ms: expires };
   }
 
   async read(tokenId: string, meta: ChallengeMeta, salts: string[], daemonPk: Uint8Array): Promise<string | null> {
@@ -284,146 +255,90 @@ export class AccountCache {
     return sealedB64u;
   }
 
-  // One aggregated group as scanned from storage. `keys` is populated only when
-  // the caller needs to mutate/delete (kept out of the listing response, which
-  // must never expose a storage key: its project hash would turn the listing
-  // into an offline oracle for the client-reported `project` path).
-  private static aggInit(groupId: string, e: CacheEntry): CacheAgg {
-    return {
-      group_id: groupId,
-      keys: [],
-      records: [],
-      project: typeof e.project === 'string' ? e.project : null,
-      origin_token_id: e.origin_token_id ?? '',
-      entries: 0,
-      live: 0,
-      max_expires_ms: 0,
-      created_ms: typeof e.created_ms === 'number' ? e.created_ms : null,
-      ip: e.ip ?? '',
-      ppid_cmd: e.ppid_cmd ?? '',
-      consistent: true,
-    };
-  }
-
-  // Aggregate every `dek:` entry into groups. Paged internally (list() caps what
-  // one call should hold in memory) and hard-capped by CACHE_LIST_SCAN_MAX, which
-  // the caller must surface as `truncated` rather than pass off as a full view.
+  // Every live `dek:` entry with its storage key. Paged internally (list() caps
+  // what one call should hold in memory) and hard-capped by CACHE_LIST_SCAN_MAX,
+  // which the caller must surface as `truncated` rather than pass off as a full
+  // view. Expired entries are already a miss on the read path and the alarm's
+  // to sweep, so they are not the console's to see. Keys stay inside the DO.
   //
-  // That cap makes this the wrong tool for a REVOKE: a group past it is simply
-  // never seen, so a clear built on this scan reports success for entries it did
-  // not touch. Clearing therefore uses sweepCacheEntries (uncapped, streaming);
-  // what is left here is the listing and the extension commit, where stopping
-  // short only ever under-grants — and is tallied in the extension's audit row.
-  //
-  // `want` restricts aggregation to specific groups (still a full scan — the group
-  // id is inside the value, not the key — but bounds memory to what is needed).
-  // `collectKeys` additionally records each group's storage keys for a mutation.
-  async scanCacheGroups(
-    now: number,
-    opts: { want?: Set<string>; collectKeys?: boolean } = {},
-  ): Promise<{ groups: Map<string, CacheAgg>; scanned: number; truncated: boolean }> {
-    const groups = new Map<string, CacheAgg>();
+  // That cap makes this the wrong tool for a REVOKE: an entry past it is simply
+  // never seen. Clearing uses exact keys (clearEntries) or sweepCacheEntries.
+  async listLive(now: number): Promise<{ live: Array<[string, CacheEntry]>; scanned: number; truncated: boolean }> {
+    const live: Array<[string, CacheEntry]> = [];
     let scanned = 0;
     let truncated = false;
     for await (const page of listPrefixPages<CacheEntry>(this.storage, 'dek:')) {
       for (const [key, e] of page) {
         scanned++;
-        if (!e || typeof e !== 'object') continue;
-        const gid = groupIdOf(e);
-        if (opts.want && !opts.want.has(gid)) continue;
-        let agg = groups.get(gid);
-        if (!agg) { agg = AccountCache.aggInit(gid, e); groups.set(gid, agg); }
-        if (opts.collectKeys) agg.keys.push(key);
-        agg.records.push([key.slice(key.lastIndexOf(':') + 1), e.name ?? '']);
-        agg.entries++;
-        const exp = typeof e.expires_ms === 'number' ? e.expires_ms : 0;
-        if (exp > now) agg.live++;
-        if (exp > agg.max_expires_ms) agg.max_expires_ms = exp;
-        // Entries of one group are written by a single put batch, so they MUST
-        // agree on origin/creation/IP. If they don't, something wrote across a
-        // group boundary: report it and refuse to extend (clearing stays safe).
-        const created = typeof e.created_ms === 'number' ? e.created_ms : null;
-        if (agg.origin_token_id !== (e.origin_token_id ?? '')
-            || agg.created_ms !== created
-            || agg.ip !== (e.ip ?? '')) {
-          agg.consistent = false;
-        }
+        if (!e || typeof e !== 'object' || typeof e.expires_ms !== 'number' || e.expires_ms <= now) continue;
+        live.push([key, e]);
       }
       if (scanned >= CACHE_LIST_SCAN_MAX) { truncated = true; break; }
     }
-    return { groups, scanned, truncated };
+    return { live, scanned, truncated };
+  }
+
+  // The named entries of one scope as stored right now, by salt (absent = gone).
+  async getEntries(tokenId: string, project: string, salts: string[]): Promise<Map<string, CacheEntry>> {
+    const ctx = await cacheCtx(tokenId, project);
+    const map = await this.getKeysBatched(salts.map(s => cacheKey(ctx, s)));
+    const out = new Map<string, CacheEntry>();
+    for (const [k, v] of map) out.set(k.slice(k.lastIndexOf(':') + 1), v);
+    return out;
   }
 
   // Commit an APPROVED extension. AccountDO calls this only after the WebAuthn
-  // assertion verified, the challenge was consumed, and the cache switch and TTL
-  // were rechecked. Results describe acknowledged effects for the DO's audit.
+  // assertion verified, the challenge was consumed, and the TTL was rechecked.
+  // Results describe acknowledged effects for the DO's audit.
   //
-  // Per group, per storage batch: re-read the entries and apply planExtend to the
-  // FRESH copy with no await between the read and the write. The DO input gate
-  // reopens at every await, so a plan computed from the request-time scan could
+  // Per storage batch: re-read the entries and apply planExtend to the FRESH
+  // copy with no await between the read and the write. The DO input gate
+  // reopens at every await, so a plan computed from the request-time read could
   // otherwise be written over an entry that opDekCache's orphan sweep just
-  // deleted, or that the alarm just expired — i.e. resurrect it. Re-reading in the
-  // same atomic step makes that impossible: only keys still present and still live
-  // at write time are touched.
+  // deleted, or that the alarm just expired — i.e. resurrect it. Re-reading in
+  // the same atomic step makes that impossible: only keys still present and
+  // still live at write time are touched.
   async commitExtend(intent: CacheExtendIntent): Promise<CacheExtendResult> {
-    const want = new Set(intent.group_ids.filter(isExtendableGroupId));
-    const scan = await this.scanCacheGroups(Date.now(), { want, collectKeys: true });
-    // One merged skip tally for the whole commit — the audit line reports totals,
-    // and nothing consumed the per-group breakdown.
+    const ctx = await cacheCtx(intent.token_id, intent.project);
+    const keys = intent.salts_b64u.map(s => cacheKey(ctx, s));
     const skipped: Record<string, number> = {};
-    let totalExtended = 0;
+    const effects = new Map<string, number>();
+    let extended = 0;
     let latest = 0;
-    const effects: CacheExtendResult['effects'] = [];
-
-    for (const g of scan.groups.values()) {
-      let extended = 0;
-      let groupLatest = 0;
-      // A group that drifted between request and commit is refused outright — we
-      // will not guess which record the approver meant.
-      if (!g.consistent) {
-        skipped.inconsistent = (skipped.inconsistent ?? 0) + g.entries;
-        continue;
-      }
-      // Isolate each group: a storage failure on one must not abort the loop, or
-      // groups that already mutated would go unrecorded by the trailing audit row
-      // (the mutation is durable, so its trail must be too).
-      try {
-        for (let i = 0; i < g.keys.length; i += STORAGE_BATCH) {
-          const chunk = g.keys.slice(i, i + STORAGE_BATCH);
-          const fresh = await this.storage.get<CacheEntry>(chunk);
-          // ── atomic section: no await until the put ──
-          const now = Date.now();
-          const writes: Record<string, CacheEntry> = {};
-          let chunkLatest = 0;
-          for (const key of chunk) {
-            const entry = fresh.get(key);
-            if (!entry) { skipped.gone = (skipped.gone ?? 0) + 1; continue; }
-            const plan = planExtend(entry, intent.ttl_s, now);
-            if (!plan.ok) { skipped[plan.skip] = (skipped[plan.skip] ?? 0) + 1; continue; }
-            writes[key] = { ...entry, expires_ms: plan.expires_ms };
-            if (plan.expires_ms > chunkLatest) chunkLatest = plan.expires_ms;
-          }
-          const count = Object.keys(writes).length;
-          if (count > 0) {
-            await this.storage.put(writes);
-            // Account for effects only after storage acknowledges this batch.
-            // A failed later batch must retain the earlier successful tally.
-            extended += count;
-            if (chunkLatest > groupLatest) groupLatest = chunkLatest;
-          }
-          // ── end atomic section ──
+    // A storage failure stops the commit but is caught here, so batches that
+    // already mutated reach the trailing audit row (the mutation is durable,
+    // so its trail must be too).
+    try {
+      for (let i = 0; i < keys.length; i += STORAGE_BATCH) {
+        const chunk = keys.slice(i, i + STORAGE_BATCH);
+        const fresh = await this.storage.get<CacheEntry>(chunk);
+        // ── atomic section: no await until the put ──
+        const now = Date.now();
+        const writes: Record<string, CacheEntry> = {};
+        const origins = new Map<string, number>();
+        for (const key of chunk) {
+          const entry = fresh.get(key);
+          if (!entry) { skipped.gone = (skipped.gone ?? 0) + 1; continue; }
+          const plan = planExtend(entry, intent.ttl_s, now);
+          if (!plan.ok) { skipped[plan.skip] = (skipped[plan.skip] ?? 0) + 1; continue; }
+          writes[key] = { ...entry, expires_ms: plan.expires_ms };
+          if (entry.origin_token_id) origins.set(entry.origin_token_id, plan.expires_ms);
         }
-      } catch (e) {
-        logErr('cache.extend_group_failed', e, { group: g.group_id });
-        skipped.error = (skipped.error ?? 0) + 1;
+        const count = Object.keys(writes).length;
+        if (count === 0) continue;
+        // Account for effects only after storage acknowledges this batch.
+        await this.storage.put(writes);
+        // ── end atomic section ──
+        extended += count;
+        for (const [origin, exp] of origins) {
+          if (exp > (effects.get(origin) ?? 0)) effects.set(origin, exp);
+          if (exp > latest) latest = exp;
+        }
       }
-      totalExtended += extended;
-      if (groupLatest > latest) latest = groupLatest;
-      if (extended > 0 && g.origin_token_id) {
-        effects.push({ origin_token_id: g.origin_token_id, expires_ms: groupLatest });
-      }
+    } catch (e) {
+      logErr('cache.extend_failed', e);
+      skipped.error = 1;
     }
-
-    return { groups: scan.groups.size, skipped, extended: totalExtended, latest, effects };
+    return { skipped, extended, latest, effects };
   }
 }

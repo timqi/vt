@@ -98,7 +98,7 @@ describe('AccountAudit persistence and projection', () => {
     });
   });
 
-  it('retains sequence ordering across reinitialization and clear', async () => {
+  it('retains sequence ordering across reinitialization', async () => {
     await inDO(({ state }) => {
       const audit = new AccountAudit(state.storage.sql, () => []);
       audit.initialize();
@@ -114,15 +114,13 @@ describe('AccountAudit persistence and projection', () => {
       restarted.finalize(first.approve_token, 'rejected', 1);
       const terminal = restarted.query(new URLSearchParams()).snapshot_seq;
       expect(terminal).toBeGreaterThan(before);
-      restarted.clear();
-      expect(messages).toEqual([{ kind: 'clear' }]);
-      expect(restarted.query(new URLSearchParams()).rows).toEqual([]);
+      expect(messages).toEqual([]);
       restarted.create(makeChallenge());
       expect(restarted.query(new URLSearchParams()).snapshot_seq).toBeGreaterThan(terminal);
     });
   });
 
-  it('preserves filters, cursor order, retention, and origin joins', async () => {
+  it('preserves filters, cursor order and retention', async () => {
     await inDO(({ state }) => {
       const audit = new AccountAudit(state.storage.sql, () => []);
       audit.initialize();
@@ -132,21 +130,20 @@ describe('AccountAudit persistence and projection', () => {
       audit.create(armed);
       audit.setCacheTtl(armed.approve_token, 1200, Date.now() + 1200_000);
       audit.cacheEvent(makeMeta(), 2, 'approved');
-      const armedRows = audit.query(new URLSearchParams('status=cache')).rows;
-      expect(armedRows.map(row => row.token_id)).toEqual([armed.approve_token]);
+      // The former `status=cache` pseudo-filter is gone: it is an ordinary status.
+      expect(audit.query(new URLSearchParams('status=cache')).rows).toEqual([]);
       const page = audit.query(new URLSearchParams('limit=1'));
       expect(page.rows).toHaveLength(1);
       const older = audit.query(new URLSearchParams(`before_id=${page.rows[0]!.id}`));
       expect(older.rows.map(row => row.token_id)).toEqual([armed.approve_token, old.approve_token]);
       expect(audit.query(new URLSearchParams('host=missing')).rows).toEqual([]);
-      expect(audit.contextFor([armed.approve_token]).get(armed.approve_token)?.cache_ttl_s).toBe(1200);
       audit.sweep(Date.now());
-      expect(audit.contextFor([old.approve_token]).size).toBe(0);
+      expect(audit.query(new URLSearchParams()).rows.map(row => row.token_id)).not.toContain(old.approve_token);
       expect(audit.query(new URLSearchParams()).rows).toHaveLength(2);
     });
   });
 
-  it('keeps audit writes best-effort while clear and query errors propagate', async () => {
+  it('keeps audit writes best-effort while query errors propagate', async () => {
     await inDO(({ state }) => {
       const audit = new AccountAudit(state.storage.sql, () => []);
       audit.initialize();
@@ -159,7 +156,6 @@ describe('AccountAudit persistence and projection', () => {
         expect(() => audit.cacheEvent(makeMeta(), 1, 'approved')).not.toThrow();
         expect(() => audit.agent(agentOp())).not.toThrow();
         expect(() => audit.sweep(Date.now())).not.toThrow();
-        expect(() => audit.clear()).toThrow('synthetic SQL failure');
         expect(() => audit.query(new URLSearchParams())).toThrow('synthetic SQL failure');
       } finally {
         exec.mockRestore();

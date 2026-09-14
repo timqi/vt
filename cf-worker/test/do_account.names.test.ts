@@ -194,9 +194,9 @@ describe('names on the audit, cache and push surfaces', () => {
     expect(authRow.records).toBeNull();
     // The cache listing shows the same names plus the project the key was narrowed on.
     const list = (await doGet('cache-list')).json as CacheListResponse;
-    expect(list.groups).toHaveLength(1);
-    expect(list.groups[0]!.project).toBe(makeMeta().project);
-    expect(list.groups[0]!.records.map(r => [r.salt_b64u, r.name, r.claimed]).sort()).toEqual(
+    expect(list.entries).toHaveLength(2);
+    expect(list.entries.every(e => e.project === makeMeta().project)).toBe(true);
+    expect(list.entries.map(e => [e.record.salt_b64u, e.record.name, e.record.claimed]).sort()).toEqual(
       [[salts[0], 'GH_TOKEN', 'GH_TOKEN'], [salts[1], 'second', '']].sort());
   });
 

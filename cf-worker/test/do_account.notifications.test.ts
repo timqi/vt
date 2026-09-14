@@ -87,7 +87,7 @@ describe('AccountNotifications push contract', () => {
   it('marks enrollment pushes and keeps extension ceremonies console-only', async () => {
     await withPush(async ({ notifications, tasks, send }) => {
       notifications.approval(makeChallenge({ extend: {
-        group_ids: [], ttl_s: 1200, preview: [],
+        token_id: 'testtoken0000000', project: '', salts_b64u: [], ttl_s: 1200, host: '', records: [], expires_ms: 0,
       } }));
       expect(tasks).toEqual([]);
       notifications.approval(makeChallenge({ enroll: {

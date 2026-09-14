@@ -6,15 +6,13 @@ import { b64uEnc } from '../src/crypto';
 import { seal, cachePublicKey } from '../src/cache_crypto';
 import { deleteKeysBatched } from '../src/storage_batch';
 import {
-  inDO, configure, makeChallenge, makeMeta, signApproval, seedGroup,
+  inDO, configure, makeChallenge, makeMeta, signApproval, seedEntries,
   readEntries, auditRows, nextSalt, sealFakeDek, cacheSeckey, liveTokenId, daemonAuth,
-  bootstrap,
-  adminHeaders,
+  bootstrap, adminHeaders, refOf, TEST_TOKEN_ID, TEST_PROJECT,
 } from './do_helpers';
 import type { Challenge, CacheExtendIntent } from '../src/types';
 
 const TTL_MS = 5 * 60_000;
-const GROUP = 'g_testgroup00000';
 
 beforeEach(bootstrap);
 
@@ -198,7 +196,7 @@ describe('challenge alarm sweep', () => {
       await state.storage.put({
         [`ch:${ch.approve_token}`]: ch, [`pt:${ch.poll_token}`]: ch.approve_token,
       });
-      const keys = await seedGroup({ inst, state }, 1, { expires_ms: now - 1 });
+      const keys = await seedEntries({ inst, state }, 1, { expires_ms: now - 1 });
       const list = state.storage.list.bind(state.storage);
       const lists = vi.spyOn(state.storage, 'list').mockImplementation((options) => {
         if (options?.prefix === 'ch:' && options.startAfter) {
@@ -345,12 +343,15 @@ it('keeps cache write, read, extension, and clear within every 128-key storage l
       expect(read.source).toBe('cache');
       expect(sizes.get).toEqual([128, 22]);
       const listing = await post('cache-list', {});
+      expect(listing.entries).toHaveLength(150);
       const pending = await post('cache-extend-create', {
-        group_ids: [listing.groups[0].group_id], ttl_s: 86400,
+        entries: listing.entries.map((e: any) => ({ token_id: e.token_id, project: e.project, salt_b64u: e.salt_b64u })),
+        ttl_s: 86400,
       });
       const extension = (await state.storage.get<Challenge>(`ch:${pending.approve_token}`))!;
       await approve(extension);
-      expect(sizes.get).toEqual([128, 22, 128, 22]);
+      // The read, the request's preview read, and the commit's re-read.
+      expect(sizes.get).toEqual([128, 22, 128, 22, 128, 22]);
       expect(sizes.put).toEqual([2, 128, 22, 2, 128, 22]);
       expect(await post('clear-cache', {})).toEqual({ cleared: 150 });
       expect(sizes.delete).toEqual([128, 22]);
@@ -369,11 +370,12 @@ describe('extension storage failures', () => {
       const origin = makeChallenge();
       inst.audit.create(origin);
       inst.audit.setCacheTtl(origin.approve_token, 20 * 60, expiry);
-      const keys = await seedGroup({ inst, state }, 150, {
+      const keys = await seedEntries({ inst, state }, 150, {
         origin_token_id: origin.approve_token, expires_ms: expiry,
       });
       const intent: CacheExtendIntent = {
-        group_ids: [GROUP], ttl_s: 24 * 3600, preview: [],
+        token_id: TEST_TOKEN_ID, project: TEST_PROJECT, salts_b64u: keys.map(k => refOf(k).salt_b64u),
+        ttl_s: 24 * 3600, host: 'testbox', records: [], expires_ms: expiry,
       };
       const ch = makeChallenge({ status: 'approved', extend: intent });
       const put = state.storage.put.bind(state.storage);

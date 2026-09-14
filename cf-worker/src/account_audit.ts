@@ -279,8 +279,8 @@ export class AccountAudit {
   // Move an origin approval's recorded cache expiry forward after an approved
   // extension. MAX() in SQL so a concurrent/older commit can never pull a row's
   // recorded expiry backwards, and so the column tracks the LATEST expiry across
-  // the group (which is what "is this still live" needs). Broadcast is left to
-  // the caller (one push per commit, not one per group).
+  // the approval's entries (which is what "is this still live" needs).
+  // Broadcast is left to the caller (one push per origin, not per entry).
   bumpCacheExpiry(originTokenId: string, expiresMs: number): void {
     try {
       this.sql.exec(
@@ -354,43 +354,13 @@ export class AccountAudit {
     }
   }
 
-  // Join the origin approvals' display context (the same fields the audit tab
-  // already renders behind the same Access gate). Chunked so the IN list stays
-  // small; a missing row (retention-swept origin) simply yields no context.
-  contextFor(tokenIds: string[]): Map<string, AuditRow> {
-    const out = new Map<string, AuditRow>();
-    const ids = tokenIds.filter(t => typeof t === 'string' && t.length > 0);
-    for (let i = 0; i < ids.length; i += 100) {
-      const chunk = ids.slice(i, i + 100);
-      const placeholders = chunk.map(() => '?').join(',');
-      try {
-        const rows = this.sql
-          .exec(
-            `SELECT token_id, host, user, pwd, command, finalized_ms, cache_ttl_s
-               FROM audit WHERE token_id IN (${placeholders})`,
-            ...chunk,
-          )
-          .toArray() as unknown as AuditRow[];
-        for (const r of rows) out.set(r.token_id, r);
-      } catch (e) {
-        logErr('cache.list_join_failed', e);
-      }
-    }
-    return out;
-  }
-
+  // Retention is the only deletion: no admin op empties this table.
   sweep(now: number): void {
     try {
       this.sql.exec(`DELETE FROM audit WHERE created_ms < ?`, now - AUDIT_RETENTION_MS);
     } catch (e) {
       logErr('audit.sweep_failed', e);
     }
-  }
-
-  clear(): void {
-    this.sql.exec(`DELETE FROM audit`);
-    // Retain the instance's sequence high-water mark across a clear.
-    this.broadcastAdmin({ kind: 'clear' });
   }
 
   query(q: URLSearchParams): AuditQueryResponse {
@@ -409,12 +379,7 @@ export class AccountAudit {
     const useAfterSeq = afterSeqRaw != null && /^\d+$/.test(afterSeqRaw);
     if (useAfterSeq) { conds.push('seq > ?'); binds.push(parseInt(afterSeqRaw!, 10)); }
     const status = q.get('status');
-    // 'cache' is a pseudo-filter selecting records that ARMED a DEK cache (the
-    // approvals where a TTL was chosen → cache_ttl_s set). It deliberately
-    // EXCLUDES cache-event rows (hits/cleared/write_failed, op_kind='cache',
-    // cache_ttl_s NULL) — those are consumption logs, not "records with a cache".
-    if (status === 'cache') { conds.push(`cache_ttl_s IS NOT NULL`); }
-    else if (status) { conds.push('status = ?'); binds.push(status); }
+    if (status) { conds.push('status = ?'); binds.push(status); }
     const host = q.get('host');
     if (host) { conds.push('host = ?'); binds.push(host); }
     // Filter by row origin (ceremony / cache / agent). Independent of `status`.

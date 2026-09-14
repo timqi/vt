@@ -47,7 +47,7 @@ export class AccountNotifications {
 
   approval(challenge: Challenge): void {
     // A cache-extension ceremony is NOT pushed. Its entire flow is console-
-    // resident: the operator picks the groups on the admin DEK 缓存 tab and the
+    // resident: the operator picks the entries on the admin DEK 缓存 tab and the
     // Passkey ceremony mounts inline on that same page, so a push would notify
     // the person already watching the result. The audit tab still receives the
     // request row (op_kind='cache-extend') and the effect row (status='extended').

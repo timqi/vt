@@ -9,13 +9,12 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { Challenge } from '../src/types';
 import {
-  inDO, doPost, doGet, configure, makeChallenge, approve, reject, seedGroup, daemonAuth, accountStub, adminHeaders,
+  inDO, doPost, doGet, configure, makeChallenge, approve, reject, seedEntries, refOf, daemonAuth, accountStub, adminHeaders,
   FLAGS_UP_ONLY, FLAGS_UP_UV, liveTokenId,
   bootstrap,
 } from './do_helpers';
 
 const HOUR = 60 * 60_000;
-const GROUP = 'g_testgroup00000';
 
 beforeEach(bootstrap);
 
@@ -151,9 +150,9 @@ describe('the cache-extension ceremony keeps its biometric step', () => {
     await configure({
       uv_policy: { default: 'discouraged', by_op: { 'cache-extend': 'discouraged' } },
     });
-    await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
+    const keys = await inDO(h => seedEntries(h, 1, { expires_ms: Date.now() + HOUR }));
     const res = await doPost('cache-extend-create', {
-      group_ids: [GROUP], ttl_s: 24 * 3600,
+      entries: keys.map(k => refOf(k)), ttl_s: 24 * 3600,
     });
     expect(res.status).toBe(200);
     const ch = await inDO(h =>

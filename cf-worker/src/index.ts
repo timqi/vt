@@ -179,9 +179,8 @@ const ADMIN_GET: Record<string, string> = {
   credentials: 'admin-credentials', config: 'admin-config', 'push/vapid': 'push-vapid',
 };
 const ADMIN_POST: Record<string, string> = {
-  'cache-clear-origin': 'cache-clear-origin', 'cache-clear-groups': 'cache-clear-groups',
-  'cache-extend-request': 'cache-extend-create', 'tokens-revoke': 'tokens-revoke',
-  'clear-cache': 'clear-cache', 'clear-audit': 'clear-audit',
+  'cache-clear-entries': 'cache-clear-entries', 'cache-extend-request': 'cache-extend-create',
+  'tokens-revoke': 'tokens-revoke', 'clear-cache': 'clear-cache',
   'push/subscribe': 'push-subscribe', 'push/unsubscribe': 'push-unsubscribe', 'push/test': 'push-test',
   logout: 'admin-logout', 'sessions-revoke': 'admin-sessions-revoke',
   'credentials-add': 'admin-credentials-add', 'credentials-revoke': 'admin-credentials-revoke',

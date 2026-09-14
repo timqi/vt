@@ -124,10 +124,10 @@ describe('writeCache — approve-ladder only', () => {
   });
 });
 
-// ── cache_group_id / created_ms are minted once, per write ─────────────────
+// ── Per-entry metadata is stamped once, per write ──────────────────────────
 
-describe('writeCache — group handle and creation stamp', () => {
-  it('mints ONE fresh group id and one created_ms for the whole batch', async () => {
+describe('writeCache — creation stamp and metadata', () => {
+  it('stamps one created_ms, the chosen TTL and the token record\'s host/user on every entry', async () => {
     const { ch, sealed } = await createCeremony(3);
     const before = Date.now();
     expect((await approve(ch, { cache_ttl_s: TTL_2H, cache_sealed_deks_b64u: sealed })).status)
@@ -135,32 +135,17 @@ describe('writeCache — group handle and creation stamp', () => {
 
     const entries = await inDO(entriesOf);
     expect(entries).toHaveLength(3);
-    const gids = new Set(entries.map(e => e.cache_group_id));
-    expect(gids.size).toBe(1);
-    const gid = [...gids][0]!;
-    expect(gid.startsWith('g_')).toBe(true);
-    expect(gid.length).toBeLessThanOrEqual(40);
-
     for (const e of entries) {
       expect(e.created_ms).toBeGreaterThanOrEqual(before);
       expect(e.expires_ms).toBe(e.created_ms! + TTL_2H * 1000);
+      expect(e.ttl_s).toBe(TTL_2H);
       expect(e.origin_token_id).toBe(ch.approve_token);
+      expect(e.host).toBe(ch.meta.host);
+      expect(e.user).toBe(ch.meta.user);
+      expect(e).not.toHaveProperty('cache_group_id');
     }
     // One batch, one stamp.
     expect(new Set(entries.map(e => e.created_ms)).size).toBe(1);
-  });
-
-  it('gives a second approval a different group id — the handle is per write', async () => {
-    const a = await createCeremony(1);
-    expect((await approve(a.ch, { cache_ttl_s: TTL_20M, cache_sealed_deks_b64u: a.sealed })).status)
-      .toBe(200);
-    const b = await createCeremony(1);
-    expect((await approve(b.ch, { cache_ttl_s: TTL_20M, cache_sealed_deks_b64u: b.sealed })).status)
-      .toBe(200);
-
-    const gids = (await inDO(entriesOf)).map(e => e.cache_group_id);
-    expect(gids).toHaveLength(2);
-    expect(new Set(gids).size).toBe(2);
   });
 });
 

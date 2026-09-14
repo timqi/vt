@@ -21,8 +21,8 @@ import { seal, cachePublicKey } from '../src/cache_crypto';
 import { sessionCookieValue, SESSION_COOKIE } from '../src/admin_auth';
 import { AccountAdmin } from '../src/account_admin';
 import { AccountNotifications } from '../src/account_notifications';
-import { AccountCache } from '../src/account_cache';
-import type { CacheEntry, Challenge, ChallengeMeta, DaemonAuth } from '../src/types';
+import { AccountCache, cacheCtx } from '../src/account_cache';
+import type { CacheEntry, CacheEntryRef, Challenge, ChallengeMeta, DaemonAuth } from '../src/types';
 
 // ── DO access ──────────────────────────────────────────────────────────────
 
@@ -130,12 +130,23 @@ export function adminHeaders(): Record<string, string> {
 
 // ── Storage fixtures ───────────────────────────────────────────────────────
 
+/** A token id the key derivation accepts; no host_token row is needed for an
+ *  entry to be listed, cleared or extended (the entry carries its host). */
+export const TEST_TOKEN_ID = 'testtoken0000000';
+export const TEST_PROJECT = '/home/tester/repo/.git';
+/** The ctx half of every seeded key: `dek:{ctx}:{salt}` under the test token
+ *  and project, derived by the same seam production uses. */
+export const testCtx = (project = TEST_PROJECT): Promise<string> => cacheCtx(TEST_TOKEN_ID, project);
+/** A v4-shaped ctx (no token half): such keys stay listable and clearable
+ *  through 清除全部 but can never be addressed by the console. */
 export const FAKE_CTX = 'testctx0000000000000000000000000000000000';
 
 let saltCounter = 0;
+/** Unique per call (the counter is in the first bytes), so a 300-entry seed
+ *  is 300 keys. */
 export function nextSalt(): string {
   saltCounter++;
-  return b64uEnc(new Uint8Array(16).map((_, i) => (saltCounter * 31 + i) & 0xff));
+  return b64uEnc(new Uint8Array(16).map((_, i) => i < 4 ? (saltCounter >>> (8 * (3 - i))) & 0xff : (saltCounter * 31 + i) & 0xff));
 }
 
 /** A sealed blob writeCache/opDekCache will accept: crypto_box_seal of a 32-byte
@@ -153,32 +164,38 @@ export async function makeEntry(over: Partial<CacheEntry> = {}): Promise<CacheEn
     origin_token_id: 'origin0000000000',
     ip: '203.0.113.9',
     ppid_cmd: 'zsh -c fake',
-    cache_group_id: 'g_testgroup00000',
+    project: TEST_PROJECT,
+    host: 'testbox',
+    user: 'tester',
+    ttl_s: 20 * 60,
     created_ms: now - 60_000,
     ...over,
   };
 }
 
-/** Write one cache group straight into storage — the shortest path to "an entry
- *  in state X exists", without going through an approval.
- *
- *  The entry template is built ONCE and reused for every key: a real writeCache
- *  puts one batch, so a group's entries agree on origin/created_ms/ip. Rebuilding
- *  it per key would let the clock advance across the `put` awaits and hand every
- *  test a `consistent: false` group. */
-export async function seedGroup(
+/** Write `n` entries straight into storage under the test token + project —
+ *  the shortest path to "an entry in state X exists", without an approval.
+ *  One template for every key, as one writeCache batch would produce. */
+export async function seedEntries(
   h: DoHandle,
   n: number,
   over: Partial<CacheEntry> = {},
 ): Promise<string[]> {
   const entry = await makeEntry(over);
+  const ctx = await testCtx(entry.project);
   const keys: string[] = [];
   for (let i = 0; i < n; i++) {
-    const key = `dek:${FAKE_CTX}:${nextSalt()}`;
+    const key = `dek:${ctx}:${nextSalt()}`;
     keys.push(key);
     await h.state.storage.put(key, entry);
   }
   return keys;
+}
+
+/** The console's address of a seeded key: how cache-clear-entries and
+ *  cache-extend-create name it. */
+export function refOf(key: string, project = TEST_PROJECT): CacheEntryRef {
+  return { token_id: key.split(':')[1]!, project, salt_b64u: key.slice(key.lastIndexOf(':') + 1) };
 }
 
 export async function readEntries(h: DoHandle, keys: string[]): Promise<CacheEntry[]> {

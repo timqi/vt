@@ -118,7 +118,7 @@ describe('opDekCache — batched reads', () => {
     expect((await read(salts)).json).toMatchObject({ source: 'cache' });
   });
 
-  it('hits across egress IP and cwd within one project; pwd/ip stay literal in audit and listing', async () => {
+  it('hits across egress IP and cwd within one project; pwd/ip stay literal in audit, ip in the listing', async () => {
     const writtenPwd = '/home/tester/repo.feature';
     const readPwd = '/home/tester/repo.main';
     const salts = await armCache(2, makeMeta({ pwd: writtenPwd }));
@@ -128,9 +128,9 @@ describe('opDekCache — batched reads', () => {
         .toEqual([{ pwd: writtenPwd, ip: '203.0.113.9' }, { pwd: readPwd, ip: '198.51.100.4' }]);
     });
     const listing = await doPost('cache-list', {});
-    const g = (listing.json as { groups: Array<{ pwd: string; ip: string }> }).groups[0]!;
-    expect(g.pwd).toBe(writtenPwd);
-    expect(g.ip).toBe('203.0.113.9');
+    const e = (listing.json as { entries: Array<{ project: string; ip: string }> }).entries[0]!;
+    expect(e.project).toBe(makeMeta().project);
+    expect(e.ip).toBe('203.0.113.9');
   });
 
   // Rejected input: the v4 layout `dek:{ctx}:{salt}` (ctx = IP + normalized pwd)
@@ -141,7 +141,7 @@ describe('opDekCache — batched reads', () => {
     await inDO(async h => h.state.storage.put(`dek:${FAKE_CTX}:${salt}`, await makeEntry()));
     expect((await read([salt])).json).toEqual({ miss: true });
     const listing = await doPost('cache-list', {});
-    expect((listing.json as { groups: unknown[] }).groups).toHaveLength(1);
+    expect((listing.json as { entries: unknown[] }).entries).toHaveLength(1);
     expect((await doPost('clear-cache', {})).json).toEqual({ cleared: 1 });
   });
 });

@@ -17,17 +17,14 @@
 // input gate so a stale list snapshot cannot overwrite a committed decision.
 
 import { DurableObject } from 'cloudflare:workers';
-import { Env, Challenge, ChallengeMeta, ApprovePageData, DaemonAuth, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse, DoEnrollCreateOp, EnrollIntent, HostTokenListResponse } from './types';
+import { Env, Challenge, ChallengeMeta, ApprovePageData, DaemonAuth, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, DekCacheResponse, CacheEntryRef, CacheExtendIntent, CacheEntrySummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse, DoEnrollCreateOp, EnrollIntent, HostTokenListResponse } from './types';
 import { formatHostToken, isTokenId, mintPairCode, mintTokenId } from './host_token';
 import { AccountTokens } from './account_tokens';
 import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, randomBytes, challengeHash } from './crypto';
 import { lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
 import { cachePublicKey, discardedBoxPublicKey } from './cache_crypto';
-import {
-  isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
-  isExtendableGroupId,
-} from './cache_policy';
+import { isAllowedExtendTtl, approveTtlOptions, extendTtlOptions, planExtend } from './cache_policy';
 import { challengeUvLevel, effectiveUvLevel } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
@@ -42,10 +39,12 @@ const RETENTION_MS = 10 * 60 * 1000;
 // The TTL whitelist and the extension arithmetic live in cache_policy.ts (pure +
 // unit-tested); this module owns authorization and ceremony transitions.
 
-// Cap on groups one extension ceremony may target. Keeps the approval page's
-// summary readable (the approver must be able to see what they are signing for)
-// and bounds the commit's read-modify-write work.
-const CACHE_EXTEND_MAX_GROUPS = 32;
+// Cap on entries one extension ceremony may target: what one approval can
+// write (256 salts), so a whole project selects in one ceremony. The summary
+// names the first few records and counts the rest.
+const CACHE_EXTEND_MAX_ENTRIES = 256;
+// Cap on entries one clear request may name.
+const CACHE_CLEAR_MAX_ENTRIES = 512;
 
 // Cap concurrent admin audit-stream sockets (multiple browser tabs / stale
 // hibernated sockets). Bounds broadcast fan-out and DO memory; a new connect
@@ -82,19 +81,18 @@ function fmtTimeZh(ms: number): string {
 
 // The text an approver actually reads before touching their Passkey (it lands in
 // ChallengeMeta.command, which the ceremony UI renders verbatim). It must name
-// every dimension of the authority being granted: how many entries, on which
-// hosts/IPs, and for how long.
+// every dimension of the authority being granted: which host and project, which
+// records, and for how long.
 function extendSummary(intent: CacheExtendIntent): string {
-  const entries = intent.preview.reduce((n, t) => n + t.live, 0);
-  const lines = [
+  const shown = intent.records.slice(0, 8).join(', ');
+  const more = intent.records.length > 8 ? ` …等 ${intent.records.length} 条` : '';
+  return [
     'op: 延长 DEK 缓存有效期',
-    `scope: ${intent.preview.length} 组 / ${entries} 条缓存`,
+    `scope: ${intent.host || '?'} · ${intent.project || '?'} · ${intent.salts_b64u.length} 条缓存`,
+    `records: ${shown}${more}`,
     `ttl: ${ttlLabelZh(intent.ttl_s)}（自批准时刻起算，覆盖原有效期）`,
-  ];
-  for (const t of intent.preview) {
-    lines.push(`target: ${t.host || '?'} ${t.ip || '?'} · ${t.live} 条 · 现有效期至 ${fmtTimeZh(t.expires_ms)}`);
-  }
-  return lines.join('\n');
+    `until: 现有效期最晚至 ${fmtTimeZh(intent.expires_ms)}`,
+  ].join('\n');
 }
 
 // Outcome line for the audit row, so a partial commit is legible without digging
@@ -236,16 +234,14 @@ export class AccountDO extends DurableObject<Env> {
       case 'audit-ingest':        return this.opAuditIngest(request);
       case 'page':                return this.opPageData(url);
       case 'audit-query':         return this.opAuditQuery(url);
-      case 'cache-clear-origin':  return this.opCacheClearByOrigin(request);
       case 'cache-list':          return this.opCacheList();
-      case 'cache-clear-groups':  return this.opCacheClearGroups(request);
+      case 'cache-clear-entries': return this.opCacheClearEntries(request);
       case 'cache-extend-create': return this.opCacheExtendCreate(request);
       case 'enroll-create':       return this.opEnrollCreate(request);
       case 'tokens-list':         return this.opTokensList();
       case 'tokens-revoke':       return this.opTokensRevoke(request);
       case 'names-set':           return this.opNamesSet(request);
       case 'clear-cache':         return this.opClearCache();
-      case 'clear-audit':         return this.opClearAudit();
       default:                    return new Response('unknown op', { status: 400 });
     }
   }
@@ -629,7 +625,7 @@ export class AccountDO extends DurableObject<Env> {
       catch (e) { logErr('cache.write_failed', e, { at: tokenPrefix(ch.approve_token) }); }
     }
 
-    // Cache-extension ceremony: moving expires_ms forward on the named groups is
+    // Cache-extension ceremony: moving expires_ms forward on the named entries is
     // the ONLY effect of approving one (it carries no salts, so the block above
     // never runs for it). Reached only after the assertion verified AND the
     // challenge was flipped to 'approved' under the DO gate, so the intent is
@@ -773,7 +769,7 @@ export class AccountDO extends DurableObject<Env> {
     return Response.json({ ok: true });
   }
 
-  // `{token_id}` bodies (tokens-revoke, cache-clear-origin): a bounded string.
+  // `{token_id}` body (tokens-revoke): a bounded string.
   private static async tokenIdBody(request: Request): Promise<string | Response> {
     try {
       const body = await request.json() as { token_id?: unknown };
@@ -865,19 +861,6 @@ export class AccountDO extends DurableObject<Env> {
     return Response.json({ ok: true });
   }
 
-  // Admin: clear the cached DEKs written by ONE approval, identified by its
-  // audit token_id (cache entries store origin_token_id = the approval's
-  // token_id). Powers the per-row "清除缓存" button on the audit page.
-  private async opCacheClearByOrigin(request: Request): Promise<Response> {
-    const tokenId = await AccountDO.tokenIdBody(request);
-    if (tokenId instanceof Response) return tokenId;
-    const { deleted, scanned } = await this.cache.clearByOrigin(tokenId);
-    // Clears are benign admin actions (no secret exposure) — logged to CF logs,
-    // not the audit table, to keep it focused on DEK-delivery events.
-    log('cache.cleared_by_origin', { at: tokenPrefix(tokenId), n: deleted, scanned });
-    return Response.json({ cleared: deleted });
-  }
-
   // ── Admin cache inventory + extension ──────────────────────────────────
   //
   // Design note. Everything below needs an admin session (fetch dispatch), but
@@ -888,162 +871,128 @@ export class AccountDO extends DurableObject<Env> {
   // ceremony, and the expiry does not move until a Passkey approves it
   // (opApprove → commitExtend). See docs/dek-cache.md.
 
-  // Admin: inventory of what is actually cached right now, grouped by the approval
-  // that armed it. Read-only. Returns NO secret material (no sealed blob, no ctx,
-  // no salts) — see the note on scanCacheGroups.
+  // Admin: every entry that is live right now. Read-only. Returns NO secret
+  // material (no sealed blob, no storage key); the console addresses an entry
+  // by (token_id, project, salt) and the DO re-derives the key.
   private async opCacheList(): Promise<Response> {
     const now = Date.now();
     let scan;
     try {
-      scan = await this.cache.scanCacheGroups(now);
+      scan = await this.cache.listLive(now);
     } catch (e) {
       logErr('cache.list_failed', e);
       return new Response('cache list failed', { status: 500 });
     }
-    const ctxRows = this.audit.contextFor([...scan.groups.values()].map(g => g.origin_token_id));
-    const groups: CacheGroupSummary[] = [];
-    for (const g of scan.groups.values()) {
-      const row = ctxRows.get(g.origin_token_id);
-      // Extendability is decided here so the UI never has to re-derive the policy
-      // (and can explain a refusal); the commit path re-checks it anyway. With the
-      // lifetime budget gone, the only reasons left are structural: a lapsed grant
-      // cannot be revived, and a drifted group cannot be reasoned about.
-      let reason: string | null = null;
-      if (!isExtendableGroupId(g.group_id)) reason = 'not_extendable';
-      else if (!g.consistent) reason = 'inconsistent';
-      else if (g.live === 0) reason = 'expired';
-      groups.push({
-        group_id: g.group_id,
-        origin_token_id: g.origin_token_id,
-        entries: g.entries,
-        live: g.live,
-        max_expires_ms: g.max_expires_ms,
-        created_ms: g.created_ms,
-        ip: g.ip,
-        ppid_cmd: g.ppid_cmd,
-        project: g.project,
-        records: this.audit.names.resolve(g.records.map(r => r[0]), g.records.map(r => r[1])),
-        host: row?.host ?? null,
-        user: row?.user ?? null,
-        pwd: row?.pwd ?? null,
-        command: row?.command ?? null,
-        finalized_ms: row?.finalized_ms ?? null,
-        cache_ttl_s: row?.cache_ttl_s ?? null,
-        extendable: reason === null,
-        reason,
-      });
-    }
-    // Newest-first: the entries that matter most (longest still to run) on top.
-    groups.sort((a, b) => b.max_expires_ms - a.max_expires_ms);
-    if (scan.truncated) {
-      log('cache.list_truncated', { scanned: scan.scanned, groups: groups.length });
-    }
+    const salts = scan.live.map(([key]) => key.slice(key.lastIndexOf(':') + 1));
+    const records = this.audit.names.resolve(salts, scan.live.map(([, e]) => e.name ?? ''));
+    const entries: CacheEntrySummary[] = scan.live.map(([key, e], i) => ({
+      token_id: key.split(':')[1] ?? '',
+      project: e.project ?? '',
+      salt_b64u: salts[i]!,
+      record: records[i]!,
+      host: e.host ?? '',
+      user: e.user ?? '',
+      ip: e.ip ?? '',
+      created_ms: typeof e.created_ms === 'number' ? e.created_ms : null,
+      expires_ms: e.expires_ms,
+      ttl_s: typeof e.ttl_s === 'number' ? e.ttl_s : null,
+      origin_token_id: e.origin_token_id ?? '',
+    }));
+    // Latest expiry first: the entries that matter most (longest still to run) on top.
+    entries.sort((a, b) => b.expires_ms - a.expires_ms);
+    if (scan.truncated) log('cache.list_truncated', { scanned: scan.scanned, live: entries.length });
     const resp: CacheListResponse = {
-      groups,
-      now_ms: now,
-      scanned: scan.scanned,
-      truncated: scan.truncated,
-      ttl_options_s: extendTtlOptions(),
+      entries, now_ms: now, scanned: scan.scanned, truncated: scan.truncated, ttl_options_s: extendTtlOptions(),
     };
     return Response.json(resp);
   }
 
-  // Admin: clear whole groups in one round trip (bulk selection on the cache tab).
-  // Authority-REDUCING, so the session alone is sufficient — no ceremony. Accepts
-  // `legacy:` handles too, so pre-migration entries stay revocable.
-  private async opCacheClearGroups(request: Request): Promise<Response> {
-    let ids: string[];
-    try {
-      const body = await request.json() as { group_ids?: unknown };
-      if (!Array.isArray(body.group_ids) || body.group_ids.length === 0) {
-        throw new Error('group_ids');
-      }
-      ids = body.group_ids
-        .filter((g): g is string => typeof g === 'string' && g.length > 0 && g.length <= 80)
-        .slice(0, 512);
-      if (ids.length === 0) throw new Error('group_ids');
-    } catch (e) {
-      return badRequest(`bad request: ${(e as Error).message}`);
+  // `entries: [{token_id, project, salt_b64u}]` bodies: well-formed refs only,
+  // deduplicated, capped. A ref the key derivation would refuse is refused here.
+  private static entryRefs(raw: unknown, max: number): CacheEntryRef[] {
+    if (!Array.isArray(raw) || raw.length === 0 || raw.length > max) throw new Error('entries');
+    const seen = new Set<string>();
+    const out: CacheEntryRef[] = [];
+    for (const r of raw as Array<Record<string, unknown>>) {
+      if (!r || !isTokenId(r.token_id) || typeof r.project !== 'string' || r.project.length > 4096
+          || !isB64uString(r.salt_b64u) || r.salt_b64u.length !== 22) throw new Error('entries');
+      const id = `${r.token_id}:${r.project}:${r.salt_b64u}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({ token_id: r.token_id, project: r.project, salt_b64u: r.salt_b64u });
     }
-    // Deliberately NOT scanCacheGroups: that scan stops at CACHE_LIST_SCAN_MAX
-    // and only the LISTING surfaces the resulting `truncated`. Reusing it here
-    // meant a group sorting past the cap was never seen, never deleted, and the
-    // route still answered 200 {"cleared":0} — a silent partial revocation on
-    // the admin tab's only per-row revoke path. Clearing pages to the end.
-    const { deleted, scanned, groups } = await this.cache.clearGroups(ids);
-    log('cache.cleared_groups', { groups, n: deleted, scanned });
-    return Response.json({ cleared: deleted, groups });
+    return out;
+  }
+
+  // Admin: clear the named entries (the cache tab's 撤销). Authority-REDUCING,
+  // so the session alone is sufficient — no ceremony. Exact keys, no scan: the
+  // count is what storage removed.
+  private async opCacheClearEntries(request: Request): Promise<Response> {
+    let refs: CacheEntryRef[];
+    try { refs = AccountDO.entryRefs(((await request.json()) as { entries?: unknown }).entries, CACHE_CLEAR_MAX_ENTRIES); }
+    catch (e) { return badRequest(`bad request: ${(e as Error).message}`); }
+    const cleared = await this.cache.clearEntries(refs);
+    // Clears are benign admin actions (no secret exposure) — logged to CF logs,
+    // not the audit table, to keep it focused on DEK-delivery events.
+    log('cache.cleared_entries', { requested: refs.length, n: cleared });
+    return Response.json({ cleared });
   }
 
   // Admin: REQUEST an extension. This mints a pending Passkey ceremony and nothing
-  // else — no expiry moves here. The intent (groups + TTL + requester) is written
-  // onto the challenge and never mutated, so the approval finalizes exactly what
-  // was proposed, and the 5-minute challenge TTL bounds how long the request stays
-  // approvable.
+  // else — no expiry moves here. The intent (entries + TTL) is written onto the
+  // challenge and never mutated, so the approval finalizes exactly what was
+  // proposed, and the 5-minute challenge TTL bounds how long it stays approvable.
+  // One scope (token + project) per ceremony: the approver reads one host · project.
   private async opCacheExtendCreate(request: Request): Promise<Response> {
     let op: DoCacheExtendCreateOp;
-    try { op = await request.json() as DoCacheExtendCreateOp; }
-    catch { return badRequest('invalid json'); }
+    let refs: CacheEntryRef[];
+    try {
+      op = await request.json() as DoCacheExtendCreateOp;
+      refs = AccountDO.entryRefs(op.entries, CACHE_EXTEND_MAX_ENTRIES);
+    } catch (e) {
+      return badRequest(`bad request: ${(e as Error).message}`);
+    }
     if (!isAllowedExtendTtl(op.ttl_s)) return badRequest('ttl_s not whitelisted');
     const ttlS = op.ttl_s;
-    if (!Array.isArray(op.group_ids) || op.group_ids.length === 0) {
-      return badRequest('group_ids required');
+    const { token_id, project } = refs[0]!;
+    if (refs.some(r => r.token_id !== token_id || r.project !== project)) {
+      return badRequest('one project per ceremony');
     }
-    if (op.group_ids.length > CACHE_EXTEND_MAX_GROUPS) {
-      return badRequest(`at most ${CACHE_EXTEND_MAX_GROUPS} groups per request`);
-    }
-    const rejected: Array<{ group_id: string; reason: string }> = [];
-    const requested: string[] = [];
-    // Dedupe FIRST: a duplicated id would otherwise appear twice in
-    // intent.preview and inflate the "N 组 / M 条" scope the approver reads on the
-    // ceremony page. The commit dedupes anyway, so the effect was already correct
-    // — but what the human is asked to approve must match it exactly.
-    for (const g of new Set(op.group_ids)) {
-      if (isExtendableGroupId(g)) requested.push(g);
-      else rejected.push({ group_id: String(g).slice(0, 80), reason: 'not_extendable' });
-    }
-    if (requested.length === 0) return badRequest('no extendable group ids');
 
     const now = Date.now();
-    const scan = await this.cache.scanCacheGroups(now, { want: new Set(requested) });
-    const targets: CacheExtendPreview[] = [];
-    const ctxRows = this.audit.contextFor([...scan.groups.values()].map(g => g.origin_token_id));
-    for (const gid of requested) {
-      const agg = scan.groups.get(gid);
-      if (!agg) { rejected.push({ group_id: gid, reason: 'gone' }); continue; }
-      if (!agg.consistent) { rejected.push({ group_id: gid, reason: 'inconsistent' }); continue; }
-      if (agg.live === 0) { rejected.push({ group_id: gid, reason: 'expired' }); continue; }
-      // Refuse a request that provably cannot move expiry forward, rather than mint
-      // a ceremony that asks a human to approve a no-op.
-      if (now + ttlS * 1000 <= agg.max_expires_ms) {
-        rejected.push({ group_id: gid, reason: 'no_gain' }); continue;
-      }
-      targets.push({
-        group_id: gid,
-        live: agg.live,
-        expires_ms: agg.max_expires_ms,
-        host: ctxRows.get(agg.origin_token_id)?.host ?? '',
-        ip: agg.ip,
-      });
+    const stored = await this.cache.getEntries(token_id, project, refs.map(r => r.salt_b64u));
+    const rejected: CacheExtendCreateResponse['rejected'] = [];
+    const targets: string[] = [];
+    const claims: string[] = [];
+    let host = '';
+    let latest = 0;
+    for (const r of refs) {
+      const e = stored.get(r.salt_b64u);
+      if (!e) { rejected.push({ salt_b64u: r.salt_b64u, reason: 'gone' }); continue; }
+      // Refuse what provably cannot move expiry forward, rather than mint a
+      // ceremony that asks a human to approve a no-op.
+      const plan = planExtend(e, ttlS, now);
+      if (!plan.ok) { rejected.push({ salt_b64u: r.salt_b64u, reason: plan.skip }); continue; }
+      targets.push(r.salt_b64u);
+      claims.push(e.name ?? '');
+      host = host || e.host || '';
+      if (e.expires_ms > latest) latest = e.expires_ms;
     }
     if (targets.length === 0) {
       return Response.json({ error: 'no_extendable_targets', rejected }, { status: 409 });
     }
 
     const intent: CacheExtendIntent = {
-      group_ids: targets.map(t => t.group_id),
-      ttl_s: ttlS,
-      preview: targets,
+      token_id, project, salts_b64u: targets, ttl_s: ttlS, host,
+      records: this.audit.names.resolve(targets, claims).map(nameLabel),
+      expires_ms: latest,
     };
     const summary = extendSummary(intent);
     const ch = await this.mintAdminCeremony(now, {
-      op_kind: 'cache-extend', command: summary, host: 'admin', user: '', pwd: '', project: '', ppid_cmd: '',
+      op_kind: 'cache-extend', command: summary, host: 'admin', user: '', pwd: '', project, ppid_cmd: '',
       ip: request.headers.get('CF-Connecting-IP') ?? '', reason: '延长已授权的 DEK 缓存有效期',
     }, { extend: intent });
-    log('cache.extend_requested', {
-      at: tokenPrefix(ch.approve_token), ttl_s: ttlS,
-      groups: targets.length, entries: targets.reduce((n, t) => n + t.live, 0),
-    });
+    log('cache.extend_requested', { at: tokenPrefix(ch.approve_token), ttl_s: ttlS, entries: targets.length });
     const resp: CacheExtendCreateResponse = {
       approve_token: ch.approve_token,
       approve_url: `${this.admin.current.origin}/a/${ch.approve_token}`,
@@ -1064,9 +1013,7 @@ export class AccountDO extends DurableObject<Env> {
       return;
     }
     this.audit.setCacheTtl(ch.approve_token, ttlS, result.expires_ms);
-    log('cache.written', {
-      at: tokenPrefix(ch.approve_token), ttl_s: ttlS, n: ch.salts_b64u.length, group: result.group_id,
-    });
+    log('cache.written', { at: tokenPrefix(ch.approve_token), ttl_s: ttlS, n: ch.salts_b64u.length });
   }
 
   // ONLY opApprove calls this, after verification and single-use consumption.
@@ -1075,35 +1022,19 @@ export class AccountDO extends DurableObject<Env> {
       logErr('cache.extend_bad_ttl', new Error(`ttl ${intent.ttl_s}`));
       return;
     }
-    if (!intent.group_ids.some(isExtendableGroupId)) return;
     const result = await this.cache.commitExtend(intent);
-    for (const effect of result.effects) {
-      this.audit.bumpCacheExpiry(effect.origin_token_id, effect.expires_ms);
-      this.audit.broadcastRow(effect.origin_token_id, 'update');
+    for (const [origin, expiresMs] of result.effects) {
+      this.audit.bumpCacheExpiry(origin, expiresMs);
+      this.audit.broadcastRow(origin, 'update');
     }
-    // Include acknowledged batches even when a later group/batch failed, and
-    // record approved no-ops too. The ceremony row records the authorization.
+    // Include acknowledged batches even when a later batch failed, and record
+    // approved no-ops too. The ceremony row records the authorization.
     this.audit.cacheEvent({
       ...ch.meta,
       command: extendSummary(intent),
       reason: extendOutcomeSummary(result.skipped, result.extended, result.latest),
     }, result.extended, 'extended');
-    log('cache.extended', {
-      at: tokenPrefix(ch.approve_token), ttl_s: intent.ttl_s, groups: result.groups,
-      n: result.extended,
-    });
-  }
-
-  // Admin: wipe ALL audit rows (ceremony + cache events). Destructive; session-gated.
-  private async opClearAudit(): Promise<Response> {
-    try {
-      this.audit.clear();
-    } catch (e) {
-      logErr('audit.clear_failed', e);
-      return new Response('clear failed', { status: 500 });
-    }
-    log('audit.cleared', {});
-    return Response.json({ ok: true });
+    log('cache.extended', { at: tokenPrefix(ch.approve_token), ttl_s: intent.ttl_s, n: result.extended });
   }
 
   // Admin: drop ALL cached DEKs immediately (emergency revocation). After this,

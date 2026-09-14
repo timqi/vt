@@ -105,10 +105,7 @@ export interface AuditQueryResponse {
  *  the client never has to re-fetch on an event. */
 export type AdminWsMessage =
   | { kind: 'hello' }
-  | { kind: 'audit'; event: 'insert' | 'update'; row: AuditRow }
-  // The audit table was wiped (admin "清空审计") — connected tabs should reset
-  // their list and reload, rather than keep showing now-deleted rows.
-  | { kind: 'clear' };
+  | { kind: 'audit'; event: 'insert' | 'update'; row: AuditRow };
 
 /** One record as every surface shows it: `name` is operator-owned (adopted or
  *  typed on the console), `claimed` is the client's 自报 (display only). */
@@ -119,9 +116,9 @@ export interface RecordName {
   claimed: string;
 }
 
-// DEK-cache events (hit / miss / clear) are NOT a separate table — they are
-// rows in `audit` with op_kind='cache' and status ∈ {approved=hit, miss,
-// cleared}. One unified audit surface.
+// DEK-cache events are NOT a separate table — they are rows in `audit` with
+// op_kind='cache' and status ∈ {approved=hit, write_failed, extended}. One
+// unified audit surface; clears are CF-logs only.
 
 
 // ── Challenge stored in DO ─────────────────────────────────────────────────
@@ -166,7 +163,7 @@ export interface Challenge {
    *  opCacheExtendCreate and never mutated, so the thing the approver's assertion
    *  finalizes is the thing that was proposed. A challenge carrying this has NO
    *  salts and mints no DEKs — approving it only moves expires_ms forward on the
-   *  named groups. */
+   *  named entries. */
   extend?: CacheExtendIntent;
   /** Present ONLY on a host-token enrollment ceremony (op_kind='enroll'): what
    *  the unauthenticated requester claimed plus what the edge verified. Like
@@ -242,80 +239,64 @@ export interface HostTokenListResponse {
 
 // ── Cache extension (admin-requested, phone-approved) ──────────────────────
 
+/** One cache entry as the console addresses it: the two halves of the key the
+ *  DO re-derives (`cacheCtx`) plus the salt. The storage key itself never
+ *  leaves the DO — its project hash would be an offline oracle for the
+ *  client-reported `project` path. */
+export interface CacheEntryRef {
+  token_id: string;
+  project: string;
+  salt_b64u: string;
+}
+
 /** What one cache-extension ceremony proposes. Stored on the Challenge, so it
- *  cannot be swapped between the request and the approval. */
+ *  cannot be swapped between the request and the approval. One scope
+ *  (token + project) per ceremony, so the approver reads one host · project. */
 export interface CacheExtendIntent {
-  /** Target group handles (CacheEntry.cache_group_id). Only `g_…` handles are
-   *  accepted — see cache_policy.isExtendableGroupId. */
-  group_ids: string[];
+  token_id: string;
+  project: string;
+  salts_b64u: string[];
   /** Requested TTL in seconds; must be an EXTEND_TTL_WHITELIST member. Absolute
    *  from the moment of approval, not additive. */
   ttl_s: number;
-  /** Snapshot of each target group at request time, so the approval page and the
-   *  audit row show what the admin was actually looking at. */
-  preview: CacheExtendPreview[];
-}
-
-export interface CacheExtendPreview {
-  group_id: string;
-  /** Entries live at request time. */
-  live: number;
-  /** Latest expiry across the group at request time (epoch ms). */
-  expires_ms: number;
+  /** Snapshot at request time, so the approval page and the audit row show
+   *  what the admin was actually looking at. */
   host: string;
-  ip: string;
+  records: string[];
+  /** Latest expiry across the targets at request time (epoch ms). */
+  expires_ms: number;
 }
 
 // ── Admin cache listing ────────────────────────────────────────────────────
 
-/** One row of the admin cache tab: all entries written by ONE approval under one
- *  binding ctx. Deliberately carries NO secret material — no sealed blob, no
- *  binding ctx digest, and no salts (the ctx digest plus a known IP would turn
- *  the listing into an offline oracle for the client-reported `pwd`). */
-export interface CacheGroupSummary {
-  group_id: string;
-  /** Audit token_id of the approval that armed this cache. */
-  origin_token_id: string;
-  entries: number;
-  live: number;
-  /** Latest expiry across the group (epoch ms) — what liveness and eligibility
-   *  are judged on. */
-  max_expires_ms: number;
-  /** Entry creation time (epoch ms); null for pre-migration entries. Forensic
-   *  only — extension is measured from the approval, not from creation. */
-  created_ms: number | null;
+/** One live entry of the admin cache tab. Carries NO secret material: no
+ *  sealed blob and no storage key; the salt (public in every vt:// URL) is the
+ *  rename key and, with token_id + project, the entry's address. */
+export interface CacheEntrySummary extends CacheEntryRef {
+  record: RecordName;
+  host: string;
+  user: string;
   /** Worker-derived source IP at approval (audit metadata; not bound). */
   ip: string;
-  ppid_cmd: string;
-  /** CacheEntry.project; null on entries written before it was stored. */
-  project: string | null;
-  /** The group's records with their names; the salt is the rename key. */
-  records: RecordName[];
-  /** Joined from the origin audit row (same fields the audit tab already shows
-   *  on the same Access gate). */
-  host: string | null;
-  user: string | null;
-  pwd: string | null;
-  command: string | null;
-  finalized_ms: number | null;
-  cache_ttl_s: number | null;
-  /** True when this group may be targeted by an extension request. A group whose
-   *  entries disagree on origin/creation/IP is excluded here with
-   *  `reason='inconsistent'` — clearable, never extendable, since we refuse to
-   *  guess which record the human meant. */
-  extendable: boolean;
-  /** Why not, when extendable is false. */
-  reason: string | null;
+  /** Approval time (epoch ms); null on entries written before it was stored.
+   *  Forensic only — extension is measured from the approval, not creation. */
+  created_ms: number | null;
+  expires_ms: number;
+  /** The TTL the approver chose; null before it was stored. */
+  ttl_s: number | null;
+  /** Audit token_id of the approval that armed this entry. */
+  origin_token_id: string;
 }
 
 export interface CacheListResponse {
-  groups: CacheGroupSummary[];
+  /** Live entries only (expires_ms > now_ms), latest expiry first. */
+  entries: CacheEntrySummary[];
   /** Server clock, so the UI counts down against the same time base that
    *  enforces expiry (a skewed browser clock cannot invent liveness). */
   now_ms: number;
   /** Entries scanned to build this listing. */
   scanned: number;
-  /** True when the scan hit its cap — some groups are NOT shown. Never silently
+  /** True when the scan hit its cap — some entries are NOT shown. Never silently
    *  truncate: the UI must say so, and 清除全部 still covers everything. */
   truncated: boolean;
   /** TTL options (seconds) an extension may request. */
@@ -525,12 +506,11 @@ export interface CacheEntry {
    *  absent on entries written before they were stored. */
   project?: string;
   name?: string;
-  /** `g_…` handle minted once per writeCache call (one approval, one binding
-   *  ctx). This — not the truncated origin_token_id — is what an extension
-   *  selects on: a mutation that GRANTS authority needs an unambiguous key of its
-   *  own. ABSENT on pre-migration entries, which stay listable/clearable but are
-   *  never extendable (see cache_policy.groupIdOf). */
-  cache_group_id?: string;
+  /** The token record's host/user at approval and the TTL chosen; absent on
+   *  entries written before they were stored. */
+  host?: string;
+  user?: string;
+  ttl_s?: number;
   /** When the phone approval created this entry (epoch ms). Forensic only — an
    *  extension is measured from the approval and moves expires_ms alone, so
    *  nothing in the policy reads this. ABSENT on pre-migration entries, which are
@@ -670,7 +650,7 @@ export interface DoDekCacheOp {
  *  builds the ceremony (tokens, challenge hashes, immutable intent) itself, so
  *  a request and its approval cannot disagree about what is being extended. */
 export interface DoCacheExtendCreateOp {
-  group_ids: unknown;
+  entries: unknown;
   ttl_s: unknown;
 }
 
@@ -681,10 +661,10 @@ export interface CacheExtendCreateResponse {
   approve_url: string;
   /** Human-readable summary shown on the approval page and in the audit row. */
   summary: string;
-  /** Groups accepted into the ceremony. */
-  targets: CacheExtendPreview[];
-  /** Requested group ids that were dropped, with the reason. */
-  rejected: Array<{ group_id: string; reason: string }>;
+  /** Salts accepted into the ceremony. */
+  targets: string[];
+  /** Requested salts that were dropped, with the reason. */
+  rejected: Array<{ salt_b64u: string; reason: string }>;
 }
 
 export interface DoRejectOp {

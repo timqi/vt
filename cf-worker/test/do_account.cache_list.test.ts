@@ -1,27 +1,26 @@
 // AccountDO — the admin cache inventory (opCacheList) and the clear paths.
 //
 // "Cache listings must never expose sealed material or the binding ctx digest
-// (ctx + a known IP is an offline oracle for the client-reported `pwd`), and
-// must report `truncated` rather than silently showing a partial view."
-// (AGENTS.md) A record's salt — public in its vt:// URL — appears only as the
-// rename key of `records[]`. The listing is also where the UI learns whether a
-// row may be extended, so the reason projection is pinned here too.
+// (ctx + a known project is an offline oracle for the client-reported path),
+// and must report `truncated` rather than silently showing a partial view."
+// (AGENTS.md) A record's salt — public in its vt:// URL — is the entry's
+// address beside its literal token_id and project, never beside the hash.
+// Expired entries are not the console's to see: the listing filters them.
 //
 // The listing may be partial as long as it SAYS so. A clear may not: see the
 // second half of this file.
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { SELF } from 'cloudflare:test';
 import type { CacheEntry, CacheListResponse } from '../src/types';
 import { extendTtlOptions } from '../src/cache_policy';
 import {
-  inDO, seedGroup, configure, doGet, doPost, makeEntry, makeMeta, FAKE_CTX, nextSalt, bootstrap, adminHeaders,
-  allDekKeys, DoHandle,
+  inDO, seedEntries, doGet, doPost, makeEntry, makeMeta, FAKE_CTX, TEST_TOKEN_ID, TEST_PROJECT, TEST_ORIGIN,
+  testCtx, refOf, nextSalt, bootstrap, adminHeaders, allDekKeys, DoHandle,
 } from './do_helpers';
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
-
-const GROUP = 'g_testgroup00000';
 
 beforeEach(bootstrap);
 
@@ -32,103 +31,63 @@ async function list(): Promise<{ body: CacheListResponse; text: string }> {
 }
 
 describe('opCacheList — inventory without secrets', () => {
-  it('summarises a group and leaks no sealed blob, storage key, or binding ctx', async () => {
-    const keys = await inDO(h => seedGroup(h, 3, { expires_ms: Date.now() + HOUR }));
+  it('lists one row per entry and leaks no sealed blob, storage key, or binding ctx', async () => {
+    const keys = await inDO(h => seedEntries(h, 3, { expires_ms: Date.now() + HOUR }));
     const sealed = await inDO(async h =>
       (await h.state.storage.get<CacheEntry>(keys[0]!))!.sealed_to_cache_b64u);
 
     const { body, text } = await list();
-    expect(body.groups).toHaveLength(1);
-    const g = body.groups[0]!;
-    expect(g.group_id).toBe(GROUP);
-    expect(g.entries).toBe(3);
-    expect(g.live).toBe(3);
-    expect(g.ip).toBe('203.0.113.9');
+    expect(body.entries).toHaveLength(3);
+    const e = body.entries[0]!;
+    expect(e.token_id).toBe(TEST_TOKEN_ID);
+    expect(e.project).toBe(TEST_PROJECT);
+    expect(e.host).toBe('testbox');
+    expect(e.user).toBe('tester');
+    expect(e.ip).toBe('203.0.113.9');
+    expect(e.ttl_s).toBe(20 * 60);
+    expect(e.origin_token_id).toBe('origin0000000000');
 
     // Nothing that could rebuild a key or an offline oracle: the salt appears
-    // once per record as the rename key, never with its project hash.
+    // as the address and the rename key, never with its project hash.
+    const ctx = await testCtx();
     expect(text).not.toContain(sealed);
-    expect(text).not.toContain(FAKE_CTX);
+    expect(text).not.toContain(ctx.split(':')[1]);
     for (const k of keys) expect(text).not.toContain(k);
     expect(text).not.toContain('sealed');
-    expect(JSON.stringify(Object.keys(g))).not.toMatch(/salt|sealed|ctx/i);
-    expect(g.records.map(r => r.salt_b64u).sort()).toEqual(keys.map(k => k.split(':')[2]!).sort());
-    expect(g.records.every(r => r.name === null && r.claimed === '')).toBe(true);
+    expect(JSON.stringify(Object.keys(e))).not.toMatch(/sealed|ctx|key/i);
+    expect(body.entries.map(r => r.salt_b64u).sort()).toEqual(keys.map(k => k.split(':')[3]!).sort());
+    expect(body.entries.every(r => r.record.salt_b64u === r.salt_b64u && r.record.name === null)).toBe(true);
   });
 
-  it('joins the origin approval context the audit tab already shows', async () => {
-    const originToken = 'listorigin000001';
-    await inDO(h => {
-      h.inst.audit.create({
-        approve_token: originToken,
-        created_ms: Date.now(),
-        salts_b64u: ['s'],
-        meta: makeMeta({ host: 'listbox', user: 'lister', pwd: '/srv/app' }),
-      });
-      h.inst.audit.finalize(originToken, 'approved', 1234);
-      h.inst.audit.setCacheTtl(originToken, 20 * 60, Date.now() + 20 * MIN);
-    });
-    await inDO(h => seedGroup(h, 1, {
-      expires_ms: Date.now() + 20 * MIN, origin_token_id: originToken,
-    }));
-
-    const { body } = await list();
-    const g = body.groups[0]!;
-    expect(g.host).toBe('listbox');
-    expect(g.user).toBe('lister');
-    expect(g.pwd).toBe('/srv/app');
-    expect(g.cache_ttl_s).toBe(20 * 60);
+  it('shows the operator name, else the claim, on each entry', async () => {
+    const keys = await inDO(h => seedEntries(h, 1, { expires_ms: Date.now() + HOUR, name: 'GH_TOKEN' }));
+    const salt = refOf(keys[0]!).salt_b64u;
+    expect((await list()).body.entries[0]!.record).toMatchObject({ name: null, claimed: 'GH_TOKEN' });
+    expect((await doPost('names-set', { salt_b64u: salt, name: 'github' })).status).toBe(200);
+    expect((await list()).body.entries[0]!.record).toMatchObject({ name: 'github', claimed: 'GH_TOKEN' });
   });
 
   it('offers the extension ladder straight from policy', async () => {
-    await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
+    await inDO(h => seedEntries(h, 1, { expires_ms: Date.now() + HOUR }));
     const { body } = await list();
     expect(body.ttl_options_s).toEqual(extendTtlOptions());
-    expect(body.groups).toHaveLength(1);
   });
 
-  it('explains why a row is not extendable without hiding it', async () => {
-    // A lapsed group, a drifted group, and one with no usable handle at all.
-    await inDO(h => seedGroup(h, 1, {
-      expires_ms: Date.now() - MIN, cache_group_id: 'g_lapsedgroup000',
-    }));
-    await inDO(h => seedGroup(h, 1, {
-      expires_ms: Date.now() + HOUR, cache_group_id: 'g_driftgroup0000', ip: '203.0.113.9',
-    }));
-    await inDO(h => seedGroup(h, 1, {
-      expires_ms: Date.now() + HOUR, cache_group_id: 'g_driftgroup0000', ip: '198.51.100.4',
-    }));
-    await inDO(h => seedGroup(h, 1, {
-      expires_ms: Date.now() + HOUR, cache_group_id: undefined, origin_token_id: '',
-    }));
-    // …and one ordinary live group, so the contrast is in the same response.
-    await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
-
-    const { body } = await list();
-    const by = new Map(body.groups.map(g => [g.group_id, g]));
-    expect(by.size).toBe(4);
-    expect(by.get('g_lapsedgroup000')!.reason).toBe('expired');
-    expect(by.get('g_lapsedgroup000')!.extendable).toBe(false);
-    expect(by.get('g_driftgroup0000')!.reason).toBe('inconsistent');
-    expect(by.get('legacy:')!.reason).toBe('not_extendable');
-    expect(by.get(GROUP)!.extendable).toBe(true);
-    expect(by.get(GROUP)!.reason).toBeNull();
-    // Every row is still LISTED — the clear path must never be hidden.
-    for (const g of body.groups) expect(g.entries).toBeGreaterThan(0);
-  });
-
-  it('counts lapsed-but-unswept entries as entries, not as live', async () => {
+  it('never shows an expired entry, even before the sweep', async () => {
     const now = Date.now();
-    await inDO(async h => {
-      await h.state.storage.put(`dek:${FAKE_CTX}:${nextSalt()}`,
-        await makeEntry({ expires_ms: now - MIN, created_ms: now - HOUR }));
-      await h.state.storage.put(`dek:${FAKE_CTX}:${nextSalt()}`,
-        await makeEntry({ expires_ms: now + HOUR, created_ms: now - HOUR }));
-    });
-    const g = (await list()).body.groups[0]!;
-    expect(g.entries).toBe(2);
-    expect(g.live).toBe(1);
-    expect(g.max_expires_ms).toBeGreaterThan(now);
+    await inDO(h => seedEntries(h, 2, { expires_ms: now - MIN }));
+    const live = await inDO(h => seedEntries(h, 1, { expires_ms: now + HOUR }));
+    const { body } = await list();
+    expect(body.entries.map(e => e.salt_b64u)).toEqual([refOf(live[0]!).salt_b64u]);
+    expect(body.scanned).toBe(3);
+  });
+
+  it('lists a v4-shaped entry (no token half) by its literal fields only', async () => {
+    await inDO(async h => h.state.storage.put(`dek:${FAKE_CTX}:${nextSalt()}`,
+      await makeEntry({ expires_ms: Date.now() + HOUR, host: undefined, project: undefined })));
+    const e = (await list()).body.entries[0]!;
+    expect(e.host).toBe('');
+    expect(e.project).toBe('');
   });
 
   it('says `truncated` instead of passing a partial scan off as complete', async () => {
@@ -151,7 +110,7 @@ describe('opCacheList — inventory without secrets', () => {
   }, 120_000);
 
   it('reports truncated=false for a scan that really did see everything', async () => {
-    await inDO(h => seedGroup(h, 5, { expires_ms: Date.now() + HOUR }));
+    await inDO(h => seedEntries(h, 5, { expires_ms: Date.now() + HOUR }));
     const { body } = await list();
     expect(body.truncated).toBe(false);
     expect(body.scanned).toBe(5);
@@ -160,19 +119,13 @@ describe('opCacheList — inventory without secrets', () => {
 
 // ── The revoke paths ───────────────────────────────────────────────────────
 //
-// A clear is the authority-REDUCING half of the admin surface and, per CLAUDE.md,
-// "the only revoke path" a row exposes. The contract these pin is therefore
-// completeness, not a flag: a clear pages the `dek:` prefix to its end, and the
-// count it returns is what storage actually removed — never what it intended to.
-//
-// This is where the bug found by the first pass of these tests lived:
-// opCacheClearGroups reused scanCacheGroups, inheriting its CACHE_LIST_SCAN_MAX
-// cap without inheriting the `truncated` the listing surfaces, so a group sorting
-// past the cap was never seen, never deleted, and the route still answered
-// 200 {"cleared":0,"groups":0}.
+// A clear is the authority-REDUCING half of the admin surface. The contract:
+// the count a clear returns is what storage actually removed — never what the
+// request intended. cache-clear-entries addresses exact keys (no scan, so no
+// cap to fall past); 清除全部 pages the `dek:` prefix to its end.
 
 /** Write `n` entries at fully controlled keys, so a test can decide exactly
- *  where a group lands in the sorted `dek:` prefix. '0…' sorts before every
+ *  where they land in the sorted `dek:` prefix. '0…' sorts before every
  *  base64url salt; 'z…' sorts after all of them. */
 async function putAt(
   h: DoHandle, prefix: string, n: number, over: Partial<CacheEntry> = {},
@@ -202,35 +155,75 @@ async function present(h: DoHandle, keys: string[]): Promise<number> {
  *  refuses to stop at the cap. */
 const SCAN_MAX = 20000;
 function seedPastTheCap(h: DoHandle) {
-  return putAt(h, '0', SCAN_MAX, { cache_group_id: 'g_bulkfiller0000', origin_token_id: 'fillerorigin0001' });
+  return putAt(h, '0', SCAN_MAX, { origin_token_id: 'fillerorigin0001' });
 }
 
-describe('cache clear paths — exhaustive by contract', () => {
-  it.each(['cache-clear-groups', 'cache-clear-origin', 'clear-cache'])(
-    '%s continues across short nonempty pages', async (op) => {
-      await inDO(async h => {
-        const target = await putAt(h, 'z', 7, {
-          cache_group_id: 'g_targetgroup000', origin_token_id: 'shortpageorigin1',
-        });
-        const list = h.state.storage.list.bind(h.state.storage);
-        const pages = vi.spyOn(h.state.storage, 'list').mockImplementation((options: any) =>
-          list(options?.prefix === 'dek:' ? { ...options, limit: 2 } : options));
-        try {
-          const response = await h.inst.fetch(new Request(`https://account.do/op/${op}`, {
-            method: 'POST', headers: adminHeaders(), body: JSON.stringify({
-              group_ids: ['g_targetgroup000'], token_id: 'shortpageorigin1',
-            }),
-          }));
-          expect(response.status).toBe(200);
-          expect(await response.json()).toMatchObject({ cleared: 7 });
-          expect(pages).toHaveBeenCalledTimes(5);
-        } finally {
-          pages.mockRestore();
-        }
-        expect(await present(h, target)).toBe(0);
-      });
-    },
-  );
+describe('cache-clear-entries — exact keys', () => {
+  it('clears the named entries and only those, across delete batches', async () => {
+    // DO storage takes at most 128 keys per delete(); 300 needs three calls, and
+    // an unchunked array would throw and remove nothing.
+    const target = await inDO(h => seedEntries(h, 300, { expires_ms: Date.now() + HOUR }));
+    const keep = await inDO(h => seedEntries(h, 4, { expires_ms: Date.now() + HOUR }));
+    const sizes = await inDO(async h => {
+      const del = h.state.storage.delete.bind(h.state.storage);
+      const seen: number[] = [];
+      const spy = vi.spyOn(h.state.storage, 'delete').mockImplementation((keys: any) => { seen.push(keys.length); return del(keys); });
+      try {
+        const res = await h.inst.fetch(new Request('https://account.do/op/cache-clear-entries', {
+          method: 'POST', headers: adminHeaders(), body: JSON.stringify({ entries: target.map(k => refOf(k)) }),
+        }));
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ cleared: 300 });
+      } finally { spy.mockRestore(); }
+      return seen;
+    });
+    expect(sizes).toEqual([128, 128, 44]);
+    expect(await inDO(h => present(h, target))).toBe(0);
+    expect(await inDO(h => present(h, keep))).toBe(4);
+  });
+
+  it('reports only what it actually removed', async () => {
+    const keep = await inDO(h => seedEntries(h, 2, { expires_ms: Date.now() + HOUR }));
+    const res = await doPost('cache-clear-entries', { entries: [{ ...refOf(keep[0]!), salt_b64u: nextSalt() }] });
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ cleared: 0 });
+    expect(await inDO(h => present(h, keep))).toBe(2);
+  });
+
+  it('refuses a malformed, empty or oversize address list', async () => {
+    const ref = refOf((await inDO(h => seedEntries(h, 1)))[0]!);
+    for (const entries of [
+      undefined, [], 'x', [{ ...ref, token_id: 'not-a-token' }], [{ ...ref, salt_b64u: 'short' }],
+      [{ ...ref, project: 'p'.repeat(5000) }], Array.from({ length: 513 }, () => ref),
+    ]) {
+      expect((await doPost('cache-clear-entries', { entries })).status).toBe(400);
+    }
+    // A v4-shaped key has no token half, so the console cannot address it; it
+    // is cleared by 清除全部 or lapses.
+    expect((await doPost('cache-clear-entries', { entries: [{ ...ref, token_id: FAKE_CTX }] })).status).toBe(400);
+  });
+});
+
+describe('清除全部 — exhaustive by contract', () => {
+  it('continues across short nonempty pages', async () => {
+    await inDO(async h => {
+      const target = await putAt(h, 'z', 7);
+      const list = h.state.storage.list.bind(h.state.storage);
+      const pages = vi.spyOn(h.state.storage, 'list').mockImplementation((options: any) =>
+        list(options?.prefix === 'dek:' ? { ...options, limit: 2 } : options));
+      try {
+        const response = await h.inst.fetch(new Request('https://account.do/op/clear-cache', {
+          method: 'POST', headers: adminHeaders(),
+        }));
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ cleared: 7 });
+        expect(pages).toHaveBeenCalledTimes(5);
+      } finally {
+        pages.mockRestore();
+      }
+      expect(await present(h, target)).toBe(0);
+    });
+  });
 
   it('fails loudly after a partially completed clear', async () => {
     await inDO(async h => {
@@ -252,62 +245,36 @@ describe('cache clear paths — exhaustive by contract', () => {
     });
   });
 
-  it('clears a group that sorts past the listing scan cap', async () => {
-    const filler = await inDO(seedPastTheCap);
-    const target = await inDO(h => putAt(h, 'z', 3, { cache_group_id: 'g_targetgroup000' }));
-
-    const res = await doPost('cache-clear-groups', { group_ids: ['g_targetgroup000'] });
-    expect(res.status).toBe(200);
-    expect(res.json).toEqual({ cleared: 3, groups: 1 });
-    expect(await inDO(h => present(h, target))).toBe(0);
-    // …and only that group: a clear must not become a wildcard.
-    expect(await inDO(h => present(h, filler.slice(0, 50)))).toBe(50);
-  }, 120_000);
-
-  it('clears every entry of a group larger than one delete batch', async () => {
-    // DO storage takes at most 128 keys per delete(); 300 needs three calls, and
-    // an unchunked array would throw and remove nothing.
-    const target = await inDO(h => putAt(h, 'z', 300, { cache_group_id: 'g_bigsingle00000' }));
-    const res = await doPost('cache-clear-groups', { group_ids: ['g_bigsingle00000'] });
-    expect(res.json).toEqual({ cleared: 300, groups: 1 });
-    expect(await inDO(h => present(h, target))).toBe(0);
-    expect(await inDO(allDekKeys)).toEqual([]);
-  }, 120_000);
-
-  it('reports only what it actually removed', async () => {
-    const keep = await inDO(h => putAt(h, 'z', 4, { cache_group_id: 'g_untouched00000' }));
-    const res = await doPost('cache-clear-groups', { group_ids: ['g_nosuchgroup000'] });
-    expect(res.status).toBe(200);
-    expect(res.json).toEqual({ cleared: 0, groups: 0 });
-    expect(await inDO(h => present(h, keep))).toBe(4);
-  });
-
-  it('still clears by group when the handle is a legacy: one', async () => {
-    const target = await inDO(h => putAt(h, 'z', 2, {
-      cache_group_id: undefined, origin_token_id: 'legacyorigin0002',
-    }));
-    const res = await doPost('cache-clear-groups', { group_ids: ['legacy:legacyorigin0002'] });
-    expect(res.json).toEqual({ cleared: 2, groups: 1 });
-    expect(await inDO(h => present(h, target))).toBe(0);
-  });
-
-  it('clears by origin past the cap too (the audit tab per-row revoke)', async () => {
+  it('removes everything, including past the listing cap', async () => {
     await inDO(seedPastTheCap);
-    const target = await inDO(h => putAt(h, 'z', 3, { origin_token_id: 'rowremove0000001' }));
-
-    const res = await doPost('cache-clear-origin', { token_id: 'rowremove0000001' });
-    expect(res.status).toBe(200);
-    expect(res.json).toEqual({ cleared: 3 });
-    expect(await inDO(h => present(h, target))).toBe(0);
-  }, 120_000);
-
-  it('clear-all removes everything, including past the cap', async () => {
-    await inDO(seedPastTheCap);
-    await inDO(h => putAt(h, 'z', 5, { cache_group_id: 'g_tailgroup00000' }));
+    await inDO(h => putAt(h, 'z', 5));
 
     const res = await doPost('clear-cache', {});
     expect(res.status).toBe(200);
     expect(res.json).toEqual({ cleared: SCAN_MAX + 5 });
     expect(await inDO(allDekKeys)).toEqual([]);
   }, 120_000);
+});
+
+// Removed surfaces (docs/refactor.md rule: a migration's test becomes a
+// rejected-input test): the per-approval and per-group clears, and the audit
+// wipe. Retention is the only deletion the audit table knows.
+describe('removed clear ops are unknown', () => {
+  it.each(['cache-clear-origin', 'cache-clear-groups', 'clear-audit'])('DO op %s → 400', async (op) => {
+    await inDO(h => seedEntries(h, 1, { expires_ms: Date.now() + HOUR }));
+    const res = await doPost(op, { token_id: 'origin0000000000', group_ids: ['g_x'] });
+    expect(res.status).toBe(400);
+    expect(res.text).toBe('unknown op');
+    expect(await inDO(allDekKeys)).toHaveLength(1);
+  });
+
+  it.each(['cache-clear-origin', 'cache-clear-groups', 'clear-audit'])('edge route /api/admin/%s → 404', async (route) => {
+    await inDO(h => { h.inst.audit.create({ approve_token: 'keeprow000000001', created_ms: Date.now(), salts_b64u: [], meta: makeMeta() }); });
+    const resp = await SELF.fetch(`${TEST_ORIGIN}/api/admin/${route}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...adminHeaders() }, body: '{}',
+    });
+    await resp.text();
+    expect(resp.status).toBe(404);
+    expect((await doGet('audit-query')).json.rows).toHaveLength(1);
+  });
 });

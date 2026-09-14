@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  planExtend, isAllowedApproveTtl, isAllowedExtendTtl, groupIdOf, isExtendableGroupId,
+  planExtend, isAllowedApproveTtl, isAllowedExtendTtl,
   APPROVE_TTL_WHITELIST, EXTEND_TTL_WHITELIST, MAX_EXTEND_TTL_MS,
   approveTtlOptions, extendTtlOptions,
 } from '../src/cache_policy';
@@ -145,35 +145,5 @@ describe('planExtend', () => {
   it('treats a malformed expiry as expired', () => {
     expect(planExtend({ created_ms: NOW, expires_ms: undefined as unknown as number }, 20 * 60, NOW))
       .toEqual({ ok: false, skip: 'expired' });
-  });
-});
-
-describe('group handles', () => {
-  it('uses the minted id when present', () => {
-    expect(groupIdOf({ cache_group_id: 'g_abc', origin_token_id: 'tok' })).toBe('g_abc');
-  });
-
-  // Pre-migration entries fall back to an origin-derived handle, and that handle IS
-  // a valid extend target: origin_token_id is a full 96-bit approve token, and the
-  // group is refused anyway if its entries disagree about their origin. Without
-  // this, everything already cached would be stranded until it lapsed.
-  it('falls back to a legacy handle that is still extendable', () => {
-    const gid = groupIdOf({ origin_token_id: 'tok0123456789ab' });
-    expect(gid).toBe('legacy:tok0123456789ab');
-    expect(isExtendableGroupId(gid)).toBe(true);
-  });
-
-  it('rejects forged / oversized / empty handles', () => {
-    expect(isExtendableGroupId('g_' + 'x'.repeat(60))).toBe(false);  // over the cap
-    expect(isExtendableGroupId('legacy:' + 'x'.repeat(60))).toBe(false);
-    expect(isExtendableGroupId('g_')).toBe(false);                   // no body
-    expect(isExtendableGroupId('legacy:')).toBe(false);
-    expect(isExtendableGroupId('')).toBe(false);
-    expect(isExtendableGroupId(null)).toBe(false);
-    expect(isExtendableGroupId('dek:ctx:salt')).toBe(false);         // not a group handle
-    // A value that merely *starts* with g_ after junk must not pass, in either
-    // direction — neither as a selector nor as a minted id when grouping.
-    expect(isExtendableGroupId(' g_abc')).toBe(false);
-    expect(groupIdOf({ cache_group_id: ' g_abc', origin_token_id: 'tok' })).toBe('legacy:tok');
   });
 });

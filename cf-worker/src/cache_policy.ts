@@ -135,30 +135,3 @@ export function approveTtlOptions(): number[] {
 export function extendTtlOptions(): number[] {
   return [...EXTEND_TTL_WHITELIST].sort((a, b) => a - b);
 }
-
-/** Stable grouping handle for a cache entry.
- *
- *  New entries carry a random `cache_group_id` minted once per writeCache call
- *  (= per approval, per binding ctx). Pre-migration entries have none and are
- *  grouped under a `legacy:` handle derived from the origin audit token.
- *
- *  Both forms are valid selectors. The `legacy:` half rests on origin_token_id
- *  being a FULL 96-bit approve token (auditKey keeps all 16 b64u chars of a
- *  12-byte token — it is "truncated" only in name), so a collision is not a real
- *  ambiguity; and the group is refused anyway if its entries disagree about their
- *  origin. That is what makes already-cached entries extendable instead of
- *  stranded until they lapse. */
-export function groupIdOf(entry: Pick<CacheEntry, 'cache_group_id' | 'origin_token_id'>): string {
-  const gid = entry.cache_group_id;
-  if (typeof gid === 'string' && gid.startsWith('g_') && gid.length <= 40) return gid;
-  return `legacy:${entry.origin_token_id ?? ''}`;
-}
-
-/** Is this a well-formed group handle an extension may target? Shape-checked so a
- *  hostile body cannot smuggle in a wildcard or an over-long storage key. */
-export function isExtendableGroupId(groupId: unknown): groupId is string {
-  if (typeof groupId !== 'string' || groupId.length > 40) return false;
-  if (groupId.startsWith('g_')) return groupId.length > 2;
-  if (groupId.startsWith('legacy:')) return groupId.length > 'legacy:'.length;
-  return false;
-}
