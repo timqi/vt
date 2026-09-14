@@ -120,9 +120,6 @@ pub enum ErrKind {
     AgentLocked,
     /// Request JSON malformed, unknown `SecretType`, mismatched batch shape.
     BadRequest,
-    /// Reserved: was "legacy URL sent to an agent started with
-    /// `--no-legacy-decrypt`". Kept so exit code 21 stays unassigned.
-    LegacyDisabled,
     /// Client and agent disagree on [`WIRE_VERSION`].
     ProtocolVersion,
     /// Retryable failure (file-lock contention, transient keychain error).
@@ -146,7 +143,6 @@ impl ErrKind {
             ErrKind::NotInitialized => 13,
             ErrKind::AgentLocked => 14,
             ErrKind::BadRequest => 20,
-            ErrKind::LegacyDisabled => 21,
             ErrKind::ProtocolVersion => 22,
             ErrKind::Transient => 75,
             ErrKind::Unknown => 1,
@@ -165,7 +161,6 @@ impl ErrKind {
             ErrKind::NotInitialized => "vt: agent is not initialized — run `vt init`",
             ErrKind::AgentLocked => "vt: agent is locked — unlock with `ssh-add -X`",
             ErrKind::BadRequest => "vt: agent rejected the request as malformed",
-            ErrKind::LegacyDisabled => "vt: legacy vt:// URLs are not supported by this agent",
             ErrKind::ProtocolVersion => {
                 "vt: client and agent protocol versions do not match — reinstall both"
             }
@@ -239,7 +234,6 @@ mod tests {
             ErrKind::NotInitialized,
             ErrKind::AgentLocked,
             ErrKind::BadRequest,
-            ErrKind::LegacyDisabled,
             ErrKind::ProtocolVersion,
             ErrKind::Transient,
         ]
@@ -268,7 +262,7 @@ mod tests {
         assert_eq!(ErrKind::NotInitialized.exit_code(), 13);
         assert_eq!(ErrKind::AgentLocked.exit_code(), 14);
         assert_eq!(ErrKind::BadRequest.exit_code(), 20);
-        assert_eq!(ErrKind::LegacyDisabled.exit_code(), 21);
+        // 21 retired (`LegacyDisabled`) — never reuse.
         assert_eq!(ErrKind::ProtocolVersion.exit_code(), 22);
         assert_eq!(ErrKind::Transient.exit_code(), 75);
         assert_eq!(ErrKind::Unknown.exit_code(), 1);
@@ -276,19 +270,22 @@ mod tests {
 
     #[test]
     fn unknown_kind_deserializes_to_unknown_then_generic_exit() {
-        // Future agent sends a kind this client doesn't recognize.
-        let raw = json!({
-            "v": WIRE_VERSION,
-            "status": "err",
-            "kind": "future_kind_we_havent_added_yet",
-            "detail": "something happened",
-        });
-        let env: ExtResponse<Dummy> = serde_json::from_value(raw).unwrap();
-        assert_eq!(env.status, Status::Err);
-        assert_eq!(env.kind, Some(ErrKind::Unknown));
-        // Client maps Unknown → exit 1 (same as Generic).
-        assert_eq!(ErrKind::Unknown.exit_code(), 1);
-        assert_eq!(env.detail.as_deref(), Some("something happened"));
+        // Future agent sends a kind this client doesn't recognize; a retired
+        // kind (`legacy_disabled`, exit 21) is the same unknown input.
+        for kind in ["future_kind_we_havent_added_yet", "legacy_disabled"] {
+            let raw = json!({
+                "v": WIRE_VERSION,
+                "status": "err",
+                "kind": kind,
+                "detail": "something happened",
+            });
+            let env: ExtResponse<Dummy> = serde_json::from_value(raw).unwrap();
+            assert_eq!(env.status, Status::Err);
+            assert_eq!(env.kind, Some(ErrKind::Unknown));
+            // Client maps Unknown → exit 1 (same as Generic).
+            assert_eq!(ErrKind::Unknown.exit_code(), 1);
+            assert_eq!(env.detail.as_deref(), Some("something happened"));
+        }
     }
 
     #[test]

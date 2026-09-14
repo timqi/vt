@@ -82,7 +82,7 @@ original agent error's code.
 | `NotInitialized`     | handler cannot validate or load master-key material after the wrap cipher is derived | 13 |
 | `AgentLocked`        | reserved; `ssh-add -x` currently causes an unstructured failure | 14 |
 | `BadRequest`         | malformed request, unknown v2 decrypt type, size/empty-batch checks, or run allowlist refusal | 20 |
-| `LegacyDisabled`     | reserved; was "legacy URL under `--no-legacy-decrypt`", never emitted since legacy records were removed | 21 |
+| —                    | exit 21 retired (`LegacyDisabled`, never emitted) — never reuse   | 21        |
 | `ProtocolVersion`    | `v` mismatch between client and agent                        | 22        |
 | `Transient`          | authorization invalidated; also the defensive invalidated-commit mapping | 75 |
 
@@ -191,8 +191,7 @@ Wire rejection does **not** prohibit trying a different backend:
 
 - `agent_call_or_fallback` in `auto` mode treats typed transport failures and
   every agent kind except `AuthRejected` and `BadRequest` as fallback-eligible.
-  This includes `ProtocolVersion`, `Unknown`, `LegacyDisabled`, and
-  `Transient`. An untyped error is not fallback-eligible under
+  This includes `ProtocolVersion`, `Unknown`, and `Transient`. An untyped error is not fallback-eligible under
   `should_fallback_to_cf`.
 - Rejection is terminal to respect the user's refusal. `BadRequest` is
   terminal because a second backend cannot repair the request. Eligible

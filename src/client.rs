@@ -84,7 +84,7 @@ fn transport<E: Into<anyhow::Error>>(e: E) -> anyhow::Error {
 /// - Agent errors where the agent self-reports it cannot deliver key
 ///   material on this host (`SessionLocked`, `NoGuiSession`,
 ///   `NotInitialized`, `AgentLocked`, `Generic`, `Transient`, `Unknown`,
-///   `LegacyDisabled`, `ProtocolVersion`).
+///   `ProtocolVersion`).
 ///
 /// Does NOT fall back for:
 /// - `AuthRejected` — user explicitly declined on Touch ID / phone; silently
@@ -950,7 +950,6 @@ mod tests {
             ErrKind::Generic,
             ErrKind::Transient,
             ErrKind::Unknown,
-            ErrKind::LegacyDisabled,
             ErrKind::ProtocolVersion,
         ] {
             let e: anyhow::Error = VtClientError::Agent(kind, None).into();

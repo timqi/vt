@@ -895,7 +895,6 @@ fn auth_outcome_detail(kind: ErrKind) -> Option<&'static str> {
         | ErrKind::NotInitialized
         | ErrKind::AgentLocked
         | ErrKind::BadRequest
-        | ErrKind::LegacyDisabled
         | ErrKind::ProtocolVersion
         | ErrKind::Transient
         | ErrKind::Unknown => None,
