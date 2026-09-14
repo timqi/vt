@@ -984,8 +984,8 @@ mod relay_detection_tests {
     fn matches_with_global_option_before_subcommand() {
         assert!(is_vt_relay_invocation(&v(&[
             "vt",
-            "--auth",
-            "tok",
+            "--uv",
+            "required",
             "ssh",
             "connect",
             "--forward-real-agent",
