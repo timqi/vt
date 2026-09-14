@@ -196,31 +196,17 @@ pub fn wrap_ok_envelope(inner_body_json: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Pure mapping from a successful/failed [`AuthOutcome`] to an [`ErrKind`].
-/// Returns `None` on success. Lives here (not in `server_macos`) so the
-/// Linux client-surface check can also see it.
-pub fn outcome_to_err(outcome: AuthOutcome) -> Option<ErrKind> {
+/// Pure mapping from an [`AuthOutcome`] to an [`ErrKind`]. `Success` is the
+/// only `None` arm; the match is exhaustive with no wildcard, so a new
+/// outcome variant is a compile error here, never a silent `None` on an
+/// auth-gated path. Lives here (not in `server_macos`) so the Linux
+/// client-surface check can also see it.
+pub fn outcome_to_err_strict(outcome: AuthOutcome) -> Option<ErrKind> {
     match outcome {
         AuthOutcome::Success(_) => None,
         AuthOutcome::Rejected => Some(ErrKind::AuthRejected),
         AuthOutcome::Unavailable(UnavailableReason::NotInteractive) => Some(ErrKind::SessionLocked),
         AuthOutcome::Unavailable(UnavailableReason::NoGuiSession) => Some(ErrKind::NoGuiSession),
-    }
-}
-
-/// Like [`outcome_to_err`], but never returns `None` for a non-`Success`
-/// outcome — falls back to [`ErrKind::Generic`] for any future variant the
-/// classifier hasn't grown a case for. Auth-gated paths should use this so
-/// a forgotten match arm fails closed (deny) rather than open (allow).
-///
-/// Today Rust's exhaustive matching ensures `outcome_to_err` covers every
-/// variant, but `#[non_exhaustive]` on either enum (or a partial-update
-/// PR that maps a new variant to `None`) would silently turn a missed case
-/// into an authorization bypass without this shim.
-pub fn outcome_to_err_strict(outcome: AuthOutcome) -> Option<ErrKind> {
-    match outcome {
-        AuthOutcome::Success(_) => None,
-        other => Some(outcome_to_err(other).unwrap_or(ErrKind::Generic)),
     }
 }
 
@@ -324,45 +310,21 @@ mod tests {
 
     #[test]
     fn outcome_to_err_strict_never_returns_none_for_failure() {
-        // Success path: None (unchanged).
+        // Success is the only None.
         for m in [AuthMethod::Biometric, AuthMethod::Password] {
             assert_eq!(outcome_to_err_strict(AuthOutcome::Success(m)), None);
         }
-        // All non-Success outcomes resolve to Some(_) — the fail-closed
-        // contract. Today these match `outcome_to_err`'s output, but the
-        // shim guarantees they will continue to be `Some` even if a future
-        // variant slips past `outcome_to_err`.
-        assert!(outcome_to_err_strict(AuthOutcome::Rejected).is_some());
-        assert!(
-            outcome_to_err_strict(AuthOutcome::Unavailable(UnavailableReason::NotInteractive))
-                .is_some()
-        );
-        assert!(
-            outcome_to_err_strict(AuthOutcome::Unavailable(UnavailableReason::NoGuiSession))
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn outcome_to_err_table() {
+        // Every non-Success outcome maps to its kind — the fail-closed contract.
         assert_eq!(
-            outcome_to_err(AuthOutcome::Success(AuthMethod::Biometric)),
-            None
-        );
-        assert_eq!(
-            outcome_to_err(AuthOutcome::Success(AuthMethod::Password)),
-            None
-        );
-        assert_eq!(
-            outcome_to_err(AuthOutcome::Rejected),
+            outcome_to_err_strict(AuthOutcome::Rejected),
             Some(ErrKind::AuthRejected)
         );
         assert_eq!(
-            outcome_to_err(AuthOutcome::Unavailable(UnavailableReason::NotInteractive)),
+            outcome_to_err_strict(AuthOutcome::Unavailable(UnavailableReason::NotInteractive)),
             Some(ErrKind::SessionLocked)
         );
         assert_eq!(
-            outcome_to_err(AuthOutcome::Unavailable(UnavailableReason::NoGuiSession)),
+            outcome_to_err_strict(AuthOutcome::Unavailable(UnavailableReason::NoGuiSession)),
             Some(ErrKind::NoGuiSession)
         );
     }

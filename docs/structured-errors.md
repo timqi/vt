@@ -105,10 +105,10 @@ default to exit `1`.
 ## Server-side mapping
 
 `AuthOutcome` and `UnavailableReason` are defined in `src/core/session.rs`.
-`outcome_to_err` in `src/core/wire.rs` maps rejection to `AuthRejected`,
+`outcome_to_err_strict` in `src/core/wire.rs` maps rejection to `AuthRejected`,
 `NotInteractive` to `SessionLocked`, and `NoGuiSession` to `NoGuiSession`;
-success maps to `None`. `outcome_to_err_strict` keeps failure mapping
-fail-closed. The agent's `authorization_failure_wire` maps engine decisions
+success is the only `None`, and the match has no wildcard, so a new outcome
+variant fails to compile rather than mapping to `None`. The agent's `authorization_failure_wire` maps engine decisions
 using these kinds and static details. Locked/off-console and absent-GUI
 outcomes deliberately stay distinct: one can recover when the session becomes
 interactive, while the other needs a GUI session.
@@ -257,7 +257,7 @@ running native agent. Names below are functions in each file's `tests` module.
 | `roundtrip_all_kinds`, `exit_code_table` | Named error kinds round-trip; every exit code, including `Unknown`, matches the table. The round-trip set excludes `Unknown`. |
 | `unknown_kind_deserializes_to_unknown_then_generic_exit` | Future kind becomes `Unknown`, retains detail, exits `1`. |
 | `version_mismatch_is_detected_by_client_policy` | Schema preserves a mismatched `v`; this test only compares it with `WIRE_VERSION`, not client rejection. |
-| `outcome_to_err_table`, `outcome_to_err_strict_never_returns_none_for_failure` | Auth outcome mapping and fail-closed failure mapping. These tests live here, not in `session.rs`. |
+| `outcome_to_err_strict_never_returns_none_for_failure` | Auth outcome mapping: `Success` is the only `None`, every failure has its kind. These tests live here, not in `session.rs`. |
 | `ok_body_with_unknown_future_field`, `err_body_missing_kind_field_is_parse_error` | Schema accepts extra fields but rejects absent error kind. |
 | `detail_none_roundtrip_skips_field` | Absent detail is omitted, then round-trips as `None`. |
 | `wrap_ok_envelope_matches_ext_response_schema`, `ok_envelope_roundtrip` | Production success wrapper matches the declared schema; success data round-trips. |

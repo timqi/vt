@@ -878,7 +878,7 @@ const DETAIL_SIGN_FAILED: &str = "sign@vt signing operation failed";
 /// detail strings. Defined alongside the `DETAIL_*` constants so the
 /// allow-list discipline is enforced in one place.
 ///
-/// Callers must only pass kinds emitted by [`outcome_to_err`]
+/// Callers must only pass kinds emitted by [`outcome_to_err_strict`]
 /// (`AuthRejected` / `SessionLocked` / `NoGuiSession`). Other kinds
 /// explicitly map to `None`; the enumeration is exhaustive so a newly
 /// added [`ErrKind`] forces a compile error here rather than silently
@@ -888,7 +888,7 @@ fn auth_outcome_detail(kind: ErrKind) -> Option<&'static str> {
         ErrKind::AuthRejected => Some(DETAIL_AUTH_REJECTED),
         ErrKind::SessionLocked => Some(DETAIL_SCREEN_LOCKED),
         ErrKind::NoGuiSession => Some(DETAIL_NO_GUI),
-        // These kinds are never produced by `outcome_to_err`; passing one
+        // These kinds are never produced by `outcome_to_err_strict`; passing one
         // here is a programmer error. Each must be enumerated explicitly
         // so adding a new ErrKind triggers a compile failure (no `_` arm).
         ErrKind::Generic
