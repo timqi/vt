@@ -16,10 +16,10 @@
       <h1>VT 审批请求</h1>
       <p class="hint">请用 Passkey（iCloud / 1Password / YubiKey）确认下列操作。</p>
     </header>
-    <!-- The ceremony UI (meta / cache selector / approve+reject / status) is
+    <!-- The ceremony UI (decision / details / cache selector / action bar) is
          built by approve.js's vt.mountApprove(), the single source shared with
-         the admin audit page's inline approval modal. -->
-    <div id="vt-approve-root"></div>
+         the admin audit sheet's inline approval. One solid card. -->
+    <div id="vt-approve-root" class="card"></div>
   </main>
   <script src="/pwa/libsodium.js"></script>
   <script src="/pwa/common.js?v={{ASSET_VER}}"></script>

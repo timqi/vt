@@ -34,10 +34,12 @@
         var refs = {};
 
         if (showMeta) {
-            // The decision block (类型, 记录, 主机, 命令) stays above the fold;
-            // the rest of the request folds into 详情 (docs/approval-transparency.md).
+            // The decision line (operation, record count) and the decision
+            // fields (记录, 主机, 命令) stay above the fold; the rest of the
+            // request folds into 详情 (docs/approval-transparency.md §C6).
             var metaSec = el('section', 'vt-ap-meta-section');
-            metaSec.appendChild(el('h2', null, '请求信息'));
+            refs.decision = el('h2', 'vt-ap-decision');
+            metaSec.appendChild(refs.decision);
             refs.meta = el('dl', 'vt-ap-meta');
             metaSec.appendChild(refs.meta);
             refs.details = el('details', 'vt-ap-details');
@@ -70,26 +72,30 @@
         refs.cacheScope = el('p', 'hint cache-scope');
         refs.cacheScope.hidden = true;
         cacheSec.appendChild(refs.cacheScope);
-        refs.cacheOpts = el('div', 'vt-ap-cache-opts');
+        // Duration control: a glass segmented control, 不缓存 first and default.
+        refs.cacheOpts = el('div', 'seg glass');
         refs.cacheOpts.setAttribute('role', 'radiogroup');
         refs.cacheOpts.setAttribute('aria-label', '缓存时长');
         cacheSec.appendChild(refs.cacheOpts);
         refs.cacheSection = cacheSec;
         root.appendChild(cacheSec);
 
+        // Action bar: the status line over 同意 (2fr) / 拒绝 (1fr). Floats over
+        // the standalone card; sticks to the sheet's bottom inline (admin.css).
+        var bar = el('div', 'vt-ap-bar glass');
+        refs.status = el('p', 'vt-ap-status');
+        refs.status.setAttribute('role', 'status');
+        refs.status.setAttribute('aria-live', 'polite');
+        bar.appendChild(refs.status);
         var actions = el('div', 'vt-ap-actions');
-        refs.approve = el('button', 'vt-ap-approve', '✓ 同意');
+        refs.approve = el('button', 'vt-ap-approve', '同意');
         refs.approve.type = 'button';
         refs.reject = el('button', 'vt-ap-reject', '拒绝');
         refs.reject.type = 'button';
         actions.appendChild(refs.approve);
         actions.appendChild(refs.reject);
-        root.appendChild(actions);
-
-        refs.status = el('p', 'vt-ap-status');
-        refs.status.setAttribute('role', 'status');
-        refs.status.setAttribute('aria-live', 'polite');
-        root.appendChild(refs.status);
+        bar.appendChild(actions);
+        root.appendChild(bar);
 
         return refs;
     }
@@ -177,11 +183,12 @@
                 // the rest is client-reported.
                 var enrolling = !!data.enroll_pair_code;
                 var hostVerified = !enrolling && !!data.host_verified;
-                addRow(refs.meta, '类型', meta.op_kind);
                 var records = Array.isArray(data.records) ? data.records : [];
-                if (records.length > 0) {
-                    addRow(refs.meta, '记录 · ' + records.length + ' 条', renderRecords(records));
-                }
+                // 类型 + 记录 · N 条 (N worker-derived) form the decision line;
+                // the records themselves, named first, sit right under it.
+                refs.decision.textContent = (meta.op_kind || '')
+                    + (records.length > 0 ? ' · 记录 ' + records.length + ' 条' : '');
+                if (records.length > 0) refs.meta.parentNode.insertBefore(renderRecords(records), refs.meta);
                 var who = [meta.user, meta.host].filter(Boolean).join('@');
                 addRow(refs.meta, hostVerified ? '主机（已验证）' : '主机', who);
                 addRow(refs.meta, '命令', meta.command);
@@ -231,7 +238,7 @@
             }
             refs.cacheOpts.innerHTML = '';
             optsList.forEach(function (s, i) {
-                var label = el('label', 'cache-opt');
+                var label = el('label', null);
                 var input = document.createElement('input');
                 input.type = 'radio';
                 input.name = 'cache-ttl';
@@ -241,6 +248,7 @@
                 label.appendChild(el('span', null, ttlLabel(s)));
                 refs.cacheOpts.appendChild(label);
             });
+            vt.seg(refs.cacheOpts);
             refs.cacheSection.hidden = false;
         })();
 

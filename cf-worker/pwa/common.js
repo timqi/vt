@@ -36,6 +36,25 @@
         };
     };
 
+    // Segmented control (.seg): radios inside labels; the thumb slides by
+    // transform to the checked option. --n / --i go through CSSOM (allowed under
+    // `style-src 'self'`), so the CSS never measures anything.
+    vt.seg = function (seg) {
+        var thumb = vt.el('span', 'seg-thumb');
+        thumb.setAttribute('aria-hidden', 'true');
+        seg.insertBefore(thumb, seg.firstChild);
+        function sync() {
+            var inputs = seg.querySelectorAll('input');
+            var i = 0;
+            inputs.forEach(function (x, k) { if (x.checked) i = k; });
+            seg.style.setProperty('--n', String(inputs.length));
+            seg.style.setProperty('--i', String(i));
+        }
+        seg.addEventListener('change', sync);
+        sync();
+        return sync;
+    };
+
     // Parse the #vt-data block; null (and a console error) when absent/invalid.
     vt.bootData = function () {
         var raw = document.getElementById('vt-data');
