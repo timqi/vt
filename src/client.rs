@@ -851,7 +851,7 @@ mod tests {
         }
     }
 
-    /// Reproduces the agent's `ErrEnvelope` serialization shape.
+    /// Reproduces the agent's `ExtResponse::err` serialization shape.
     fn fake_err_envelope(kind: &str, detail: Option<&str>) -> Vec<u8> {
         let detail_part = detail
             .map(|d| format!(r#","detail":"{}""#, d))

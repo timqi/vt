@@ -28,7 +28,7 @@ use crate::core::authorization::{
 };
 use crate::core::crypto::AesGcmCrypto;
 use crate::core::session::AuthOutcome;
-use crate::core::wire::{outcome_to_err_strict, wrap_ok_envelope, ErrKind, WIRE_VERSION};
+use crate::core::wire::{outcome_to_err_strict, wrap_ok_envelope, ErrKind, ExtResponse};
 use zeroize::Zeroizing;
 
 mod handlers;
@@ -1047,16 +1047,10 @@ async fn commit_authorization(permit: AuthorizationPermit) -> Result<(), WireFai
 
 // ---- Envelope serialization helpers -----------------------------------------
 
-/// Concrete shape used to serialize an `err` envelope. Mirrors the JSON
-/// produced by `ExtResponse::err(kind, detail)`; `&'static str` detail
-/// restricts construction to the reviewed `DETAIL_*` allow-list.
-#[derive(Serialize)]
-struct ErrEnvelope {
-    v: u16,
-    status: &'static str,
-    kind: ErrKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<&'static str>,
+fn err_envelope((kind, detail): WireFailure) -> Result<Zeroizing<Vec<u8>>, AgentError> {
+    serde_json::to_vec(&ExtResponse::<()>::err(kind, detail))
+        .map(Zeroizing::new)
+        .map_err(|e| agent_err(e.into()))
 }
 
 #[async_trait]
@@ -1296,19 +1290,7 @@ impl Session for VtSshSession {
                 success.authorization,
                 success.cache_hit_note,
             ),
-            Err((kind, detail)) => (
-                Zeroizing::new(
-                    serde_json::to_vec(&ErrEnvelope {
-                        v: WIRE_VERSION,
-                        status: "err",
-                        kind,
-                        detail,
-                    })
-                    .map_err(|e| agent_err(e.into()))?,
-                ),
-                None,
-                None,
-            ),
+            Err(failure) => (err_envelope(failure)?, None, None),
         };
 
         // The envelope is complete before a pending grant is committed, so a
@@ -1327,17 +1309,9 @@ impl Session for VtSshSession {
             // guard is released — a blocking notify while the permit is live
             // would stall revocation (docs/app-bundle.md §3).
             let reuse_remaining = permit.reuse_remaining();
-            if let Err((kind, detail)) = commit_authorization(permit).await {
+            if let Err(failure) = commit_authorization(permit).await {
                 tracing::warn!("authorization commit invalidated after operation success");
-                response = Zeroizing::new(
-                    serde_json::to_vec(&ErrEnvelope {
-                        v: WIRE_VERSION,
-                        status: "err",
-                        kind,
-                        detail,
-                    })
-                    .map_err(|e| agent_err(e.into()))?,
-                );
+                response = err_envelope(failure)?;
             } else {
                 self.fire_cache_hit_note(cache_hit_note, reuse_remaining);
             }

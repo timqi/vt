@@ -63,8 +63,8 @@ pub struct ExtResponse<T> {
     pub detail: Option<String>,
 }
 
-#[cfg(test)]
 impl<T> ExtResponse<T> {
+    #[cfg(test)]
     pub fn ok(data: T) -> Self {
         ExtResponse {
             v: WIRE_VERSION,
@@ -75,13 +75,15 @@ impl<T> ExtResponse<T> {
         }
     }
 
-    pub fn err(kind: ErrKind, detail: Option<String>) -> Self {
+    /// `&'static str` detail restricts construction to the agent's reviewed
+    /// `DETAIL_*` allow-list: no runtime string can reach the wire here.
+    pub fn err(kind: ErrKind, detail: Option<&'static str>) -> Self {
         ExtResponse {
             v: WIRE_VERSION,
             status: Status::Err,
             data: None,
             kind: Some(kind),
-            detail,
+            detail: detail.map(str::to_owned),
         }
     }
 }
@@ -260,7 +262,7 @@ mod tests {
     #[test]
     fn roundtrip_all_kinds() {
         for &k in all_kinds() {
-            let env: ExtResponse<Dummy> = ExtResponse::err(k, Some("explanation".into()));
+            let env: ExtResponse<Dummy> = ExtResponse::err(k, Some("explanation"));
             let bytes = serde_json::to_vec(&env).unwrap();
             let parsed: ExtResponse<Dummy> = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(parsed.v, WIRE_VERSION);

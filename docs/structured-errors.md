@@ -50,7 +50,7 @@ borrowed `RawValue` the client needs. For example:
 
 Production success serialization uses `wrap_ok_envelope` around raw inner JSON,
 not an intermediate `serde_json::Value`: DEK-bearing response buffers remain
-under `Zeroizing`. Production errors use `ErrEnvelope` in the dispatcher.
+under `Zeroizing`. Production errors serialize `ExtResponse::err` in the dispatcher.
 
 ### Versioning policy
 
@@ -147,7 +147,7 @@ relays request and response details unparsed.
 Error `detail` must be **server-controlled static text, never PII or reflected
 request data**: no host, command, reason, key fingerprint, or filesystem path.
 The `DETAIL_*` constants in `src/server_macos/ssh_agent.rs` are the reviewed
-allow-list, and `WireFailure`/`ErrEnvelope` require `Option<&'static str>`.
+allow-list, and `WireFailure`/`ExtResponse::err` require `Option<&'static str>`.
 That type restricts construction; it is not a substitute for reviewing new
 constants. The client appends any received detail verbatim in parentheses,
 without a client-side allow-list check. This restriction concerns error
