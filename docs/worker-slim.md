@@ -22,11 +22,11 @@ each worthless.
 | host token secret | `R` | `token_id` | `vt-host-token-v1` | daemon HMAC, compared in the DO ([host-token.md](host-token.md) §1) |
 | `K_cfg` AES-256-GCM | `R` | empty | `vt-config-key-v1` | the config blob at rest (§4) |
 | `K_sess` HMAC | `R` | empty | `vt-admin-session-v1` | admin session cookie (§3.1) |
-| cache X25519 scalar | `R` | empty | `vt-cache-seckey-v1` | DEK sealed boxes; `cachePublicKey` derives the point |
+| cache X25519 scalar | `R` | empty | `vt-cache-seckey-v1` | DEK sealed boxes ([sealed-box-v1.md](sealed-box-v1.md)); `cachePublicKey` derives the point via a PKCS#8 import |
 
-HKDF-SHA256, `L = 32`. Not derived: the VAPID key pair (§5.2) — WebCrypto
-cannot turn a derived scalar into its public point, so it is generated once and
-stored under `K_cfg`.
+HKDF-SHA256, `L = 32`. Not derived: the VAPID key pair (§5.2), generated
+once and stored under `K_cfg` (it predates the PKCS#8 import route the cache
+scalar uses).
 
 - `SECRET` is 32 random bytes, base64url, set with `wrangler secret put`. It is
   never sent to a host, a browser, or a log. The DO unwraps `R` once per

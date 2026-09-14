@@ -135,9 +135,13 @@ later vt read/inject
              CLI verifies source=cache and decrypts locally
 ```
 
-The cache public key is derived at runtime from the root-key scalar. The
-Worker uses `tweetnacl` + `blakejs` for the sealed-box compatibility layer; the
-Rust client opens the result with the existing sealed-box implementation.
+The cache public key is derived at runtime from the root-key scalar. Every
+seal and open above is sealed box v1 ([sealed-box-v1.md](sealed-box-v1.md)):
+WebCrypto on the phone and in the Worker, `x25519-dalek` + `hkdf` + `aes-gcm`
+in the CLI, one byte layout. An entry that does not open (a previous root
+key, or the pre-v1 libsodium format) is a miss for that request and is
+deleted; the operator step for the format change is 清除全部 on the DEK 缓存
+tab.
 
 ## Client network bounds
 
@@ -297,7 +301,7 @@ factory reset also orphans every entry). The cache does not re-key existing
 | Cache key binding (`cacheCtx`), writes/reads, live listing, exact-key and exhaustive clears, extension storage batches | `cf-worker/src/account_cache.ts` (`AccountCache`, same DO storage/input gate) |
 | Cache request validation, Passkey authorization, ceremony transitions, audit/notification orchestration | `cf-worker/src/do_account.ts` (`AccountDO`) |
 | Audit persistence and notification lifecycle | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts` |
-| Sealed-box cache crypto | `cf-worker/src/cache_crypto.ts` |
+| Sealed-box cache crypto ([sealed-box-v1.md](sealed-box-v1.md)) | `cf-worker/src/cache_crypto.ts`, `cf-worker/pwa/common.js` (`vt.sealBox`), `src/cf.rs` (`open_sealed_deks`) |
 | PWA TTL selection and sealing | `cf-worker/pwa/approve.js` |
 | CLI cache request, `project` collection, and source check | `src/cf.rs`, `src/client.rs` |
 | Admin cache inventory / 撤销 / 延长 UI | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/cache.js` |
