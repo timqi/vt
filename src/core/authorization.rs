@@ -1428,6 +1428,106 @@ mod tests {
         assert!(!GrantScope::sign(None, "fp", "/repo").is_reusable());
     }
 
+    /// Pins the exact scope key of every reusable constructor. A digest is
+    /// the grant identity: a changed label, field order or length prefix
+    /// silently invalidates every stored grant or, worse, merges families.
+    /// A failure here is a wire-compatibility decision, never a value to
+    /// re-paste.
+    #[test]
+    fn scope_key_digests_are_pinned() {
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let subject = (7, 42);
+        let salt = [7u8; 16];
+        let cases: [(&str, GrantScope, Operation, ScopeFamily, SubjectId, &str); 9] = [
+            (
+                "sign",
+                GrantScope::sign(Some(subject), "SHA256:fp", "/repo"),
+                Operation::Sign,
+                ScopeFamily::Connection,
+                subject,
+                "8b892dddbb70fca39abb87835a6560d5a8f5d2e105cca7f95df4dc045d30f056",
+            ),
+            (
+                "sign_destination",
+                GrantScope::sign_destination(b"hostkey-wire", "SHA256:fp"),
+                Operation::Sign,
+                ScopeFamily::Destination,
+                DESTINATION_SUBJECT,
+                "055a298e1488e59fb98419efab0ff040f87a077eef9b533c8b7d8156e1852399",
+            ),
+            (
+                "sign_workspace",
+                GrantScope::sign_workspace(subject, "/repo", "SHA256:fp"),
+                Operation::Sign,
+                ScopeFamily::Workspace,
+                subject,
+                "e8031eb4e65a043aee1593dcbfce230365e220559fa029ddde4d58fdf91dfdf8",
+            ),
+            (
+                "sign_cwd",
+                GrantScope::sign_cwd(subject, "/repo", "SHA256:fp"),
+                Operation::Sign,
+                ScopeFamily::CwdFallback,
+                subject,
+                "747231724e8646721e8dfe431e599ad3f716af5c09a758c63f30e02ba153ec7e",
+            ),
+            (
+                "sign_app",
+                GrantScope::sign_app(subject, "/Applications/A.app/Contents/MacOS/A", "SHA256:fp"),
+                Operation::Sign,
+                ScopeFamily::ParentApp,
+                subject,
+                "3732e33f56ed554ec12b3c7d6923671fd8d8ce9e00fe1ef5490299783e4e3913",
+            ),
+            (
+                "decrypt_workspace",
+                GrantScope::decrypt_workspace(subject, "/repo", b'0', &salt),
+                Operation::Decrypt,
+                ScopeFamily::Workspace,
+                subject,
+                "5371f98b9b83974469416fa7c2168d3ee15f58722b0a3f2fd705f2221e991671",
+            ),
+            (
+                "decrypt_cwd",
+                GrantScope::decrypt_cwd(subject, "/repo", b'0', &salt),
+                Operation::Decrypt,
+                ScopeFamily::CwdFallback,
+                subject,
+                "3ee252717bc9e98b3239e121c81152fe7b77d43d7eac90b60ed143f3233b225b",
+            ),
+            (
+                "decrypt_app",
+                GrantScope::decrypt_app(
+                    subject,
+                    "/Applications/A.app/Contents/MacOS/A",
+                    b'0',
+                    &salt,
+                ),
+                Operation::Decrypt,
+                ScopeFamily::ParentApp,
+                subject,
+                "cb5fddec68f2816ed1b606e08ea976ff44caf08e75f32f8dfe8b52c30d8b3dcb",
+            ),
+            (
+                "decrypt_v2",
+                GrantScope::decrypt_v2(Some(subject), b'0', &salt, "host", "/repo"),
+                Operation::Decrypt,
+                ScopeFamily::Connection,
+                subject,
+                "0edb5650e5dc5c6d84b2096a99d0caf7fb43a5c8d95fa91170e8c2936b075e7d",
+            ),
+        ];
+        for (name, scope, operation, family, subject, digest) in cases {
+            let key = scope.key.expect(name);
+            assert_eq!(key.operation, operation, "{name}");
+            assert_eq!(key.family, family, "{name}");
+            assert_eq!(key.subject, subject, "{name}");
+            assert_eq!(hex(&key.digest), digest, "{name}");
+        }
+    }
+
     #[test]
     fn typed_operation_and_subject_partition_grants() {
         let sign = sign_scope((1, 2), "fp").key.unwrap();
