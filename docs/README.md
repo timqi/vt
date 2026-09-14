@@ -21,6 +21,7 @@ and update the relevant document in the same change.
 | Tune approval user verification (UV) | [`cf-worker-deploy.md`](cf-worker-deploy.md#approval-user-verification-approval_uv_json) | `cf-worker/src/uv_policy.ts` (policy), `cf-worker/src/webauthn.ts` (enforcement), `cf-worker/pwa/approve.js` |
 | Understand DEK caching | [`dek-cache.md`](dek-cache.md) | `cf-worker/src/do_account.ts` (ceremony and audit), `cf-worker/src/account_cache.ts` (cache storage), `cf-worker/src/storage_batch.ts` (shared batch deletion and prefix paging), `src/cf.rs` |
 | Follow the slim refactor (deletions, cache key v5) | [`refactor.md`](refactor.md) (plan) | `cf-worker/src/account_cache.ts` |
+| Slim the Worker (Web Push, passkey admin login, config in the DO, one secret) | [`worker-slim.md`](worker-slim.md) (plan) | `cf-worker/src/index.ts`, `cf-worker/src/do_account.ts`, `cf-worker/src/types.ts` (`Env`) |
 | Use SSH identities | [`README.md` — portable identity](../README.md#portable-ssh-identity-for-git-vt) | `src/ssh_sign.rs`, `src/client.rs` |
 | Understand agent signing, identity selection, and decrypt-then-sign fallback | [`sign-vt-design.md`](sign-vt-design.md) | `src/ssh_sign.rs` (`resolve_identities`, `decide_sign_route`), `src/client.rs` (`VTClient::sign_vt`), `src/server_macos/ssh_agent/handlers.rs` (`handle_sign_vt`) |
 | Understand extension errors | [`structured-errors.md`](structured-errors.md) | `src/core/wire.rs`, `src/client.rs` |
