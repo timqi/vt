@@ -3,6 +3,7 @@
 // (Node's WebCrypto has X25519); no workerd needed.
 
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { b64uDec, b64uEnc } from '../src/crypto';
 import { seal, openToCache, cachePublicKey, discardedBoxPublicKey } from '../src/cache_crypto';
 
@@ -68,5 +69,36 @@ describe('sealed box v1', () => {
     const sealed = await seal(M, pk);
     expect(b64uDec(sealed).length).toBe(80);
     expect(await openToCache(sealed, RSK)).toBeNull();
+  });
+});
+
+// The PWA's implementation (pwa/common.js vt.sealBox) is the third copy of
+// the construction; it is plain browser script, so evaluate it here with a
+// `window` shim and prove its boxes open with the Worker's openToCache. A
+// real browser's X25519 is still only verified on a real phone.
+describe('pwa/common.js vt.sealBox', () => {
+  const src = readFileSync(new URL('../pwa/common.js', import.meta.url), 'utf8');
+  const win: { vt?: Record<string, (...a: never[]) => unknown> } = {};
+  new Function('window', src)(win);
+  const pwa = win.vt as unknown as {
+    sealBox(m: Uint8Array, rpk: Uint8Array): Promise<Uint8Array>;
+    x25519Keypair(): Promise<{ privateKey: CryptoKey; pk: Uint8Array }>;
+    x25519(k: CryptoKey, pk: Uint8Array): Promise<Uint8Array>;
+  };
+
+  it('seals what openToCache opens, 80 bytes per DEK', async () => {
+    const box = await pwa.sealBox(M, b64uDec(RPK_B64U));
+    expect(box.length).toBe(80);
+    expect(Array.from((await openToCache(b64uEnc(box), RSK))!)).toEqual(Array.from(M));
+    const two = await pwa.sealBox(new Uint8Array(64).fill(0xcd), b64uDec(RPK_B64U));
+    expect(two.length).toBe(112);
+    expect((await openToCache(b64uEnc(two), RSK))!.every(b => b === 0xcd)).toBe(true);
+  });
+
+  it('refuses the all-zero shared secret in the binding exchange', async () => {
+    const kp = await pwa.x25519Keypair();
+    expect(kp.pk.length).toBe(32);
+    await expect(pwa.x25519(kp.privateKey, new Uint8Array(32))).rejects.toThrow();
+    await expect(pwa.sealBox(M, new Uint8Array(32))).rejects.toThrow();
   });
 });

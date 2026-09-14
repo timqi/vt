@@ -57,8 +57,9 @@ npm ci
 npm run typecheck
 ```
 
-`pwa/libsodium.js` is vendored/committed (ISC) — no build step fetches it. If it
-is ever missing, refresh it per `pwa/libsodium.README`.
+The PWA is plain same-origin script on `crypto.subtle` and WebAuthn; nothing
+is vendored or bundled (the approval page's X25519 floor is in
+[sealed-box-v1.md](sealed-box-v1.md)).
 
 ## 2. Configure `wrangler.toml`
 

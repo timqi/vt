@@ -46,7 +46,7 @@ const FAVICON_TAGS =
 // admin.css stays stale, which desyncs markup from styles. The .html page
 // shells need no token — the Worker reads them server-side per request.)
 // Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
-const ASSET_VER = '20260914-1d3a45a';
+const ASSET_VER = '20260914-4a9844a';
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
@@ -140,7 +140,7 @@ app.get('/healthz', c => c.text('ok'));
 // Static PWA assets, UNAUTHENTICATED — including pwa/admin/*: the shells and
 // scripts carry no data (a raw shell is `{{VT_DATA}}` plus markup); data reaches
 // a page only through the gated admin route or the gated API. Strip "/pwa" so
-// ASSETS resolves against the pwa/ root: /pwa/libsodium.js → pwa/libsodium.js.
+// ASSETS resolves against the pwa/ root: /pwa/common.js → pwa/common.js.
 app.get('/pwa/*', async (c) => {
   const url = new URL(c.req.url);
   url.pathname = url.pathname.slice('/pwa'.length) || '/';

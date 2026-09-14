@@ -127,6 +127,61 @@
         return new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
     };
 
+    // ── Sealed box v1 (docs/sealed-box-v1.md): X25519 → HKDF → AES-256-GCM ──
+    // Same bytes as cf-worker/src/cache_crypto.ts and src/cf.rs. No fallback:
+    // a browser without X25519 in crypto.subtle (Safari < 17, Chrome < 133,
+    // Firefox < 130) fails here, before any WebAuthn prompt.
+
+    var X25519 = { name: 'X25519' };
+    var SEALED_BOX_INFO = new TextEncoder().encode('vt-sealed-box-v1');
+
+    // { privateKey (non-extractable CryptoKey), pk (32 raw bytes) }.
+    vt.x25519Keypair = async function () {
+        var kp;
+        try {
+            kp = await crypto.subtle.generateKey(X25519, false, ['deriveBits']);
+        } catch (_) {
+            throw new Error('此浏览器不支持 X25519（需 Safari 17 / Chrome 133 / Firefox 130 及以上）');
+        }
+        return { privateKey: kp.privateKey, pk: new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey)) };
+    };
+
+    // X25519(privateKey, peerPk) → 32 bytes; the all-zero result (low-order
+    // peer point) is refused.
+    vt.x25519 = async function (privateKey, peerPk) {
+        var pub = await crypto.subtle.importKey('raw', peerPk, X25519, false, []);
+        var ss = new Uint8Array(await crypto.subtle.deriveBits({ name: 'X25519', public: pub }, privateKey, 256));
+        if (ss.every(function (b) { return b === 0; })) throw new Error('X25519 共享密钥为零');
+        return ss;
+    };
+
+    // seal(m, recipientPk) → epk(32) ‖ AES-256-GCM(HKDF(ss, salt=epk‖rpk,
+    // info), nonce 0^12, m, aad=epk‖rpk). One ephemeral key per message; the
+    // AES key is derived straight into a non-extractable CryptoKey.
+    vt.sealBox = async function (m, recipientPk) {
+        if (recipientPk.length !== 32) throw new Error('recipient key 长度异常');
+        var eph = await vt.x25519Keypair();
+        var header = new Uint8Array(64);
+        header.set(eph.pk, 0);
+        header.set(recipientPk, 32);
+        var ss = await vt.x25519(eph.privateKey, recipientPk);
+        var key;
+        try {
+            var ikm = await crypto.subtle.importKey('raw', ss, 'HKDF', false, ['deriveKey']);
+            key = await crypto.subtle.deriveKey(
+                { name: 'HKDF', hash: 'SHA-256', salt: header, info: SEALED_BOX_INFO },
+                ikm, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+        } finally {
+            ss.fill(0);
+        }
+        var ct = new Uint8Array(await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv: new Uint8Array(12), additionalData: header }, key, m));
+        var out = new Uint8Array(32 + ct.length);
+        out.set(eph.pk, 0);
+        out.set(ct, 32);
+        return out;
+    };
+
     vt.zeroize = function (arr) { if (!arr) return; try { arr.fill(0); } catch (_) {} };
 
     window.vt = vt;

@@ -108,8 +108,6 @@
         var onSettled = opts.onSettled || function () {};
 
         var b64uDec = vt.b64uDec, b64uEnc = vt.b64uEnc;
-        var sodiumReady = (typeof sodium !== 'undefined') ? sodium.ready
-            : Promise.reject(new Error('libsodium 未加载'));
 
         // User-verification level for BOTH ceremonies below. The worker decides
         // it per challenge (uv_policy.ts) and the worker enforces the same value
@@ -273,7 +271,7 @@
 
         async function runApprove() {
             var k = null, kWrap = null, masterKey = null, deks = null;
-            var pwaSk = null, shared = null, bindingKey = null;
+            var shared = null, bindingKey = null;
             try {
                 setStatus('请触摸 Passkey 完成验证…');
                 // Read before the ceremony: the inputs are what the approver saw
@@ -281,13 +279,12 @@
                 var adoptNames = typedNames();
 
                 var PRF_INPUT = await prfInputReady;
-                await sodiumReady;
 
-                // Ephemeral X25519 keypair, then commit pwa_pk into the WebAuthn
-                // challenge: effective_challenge = SHA-256(approve_challenge_hash || pwa_pk).
-                var kp = sodium.crypto_box_keypair();
-                var pwaPk = kp.publicKey;
-                pwaSk = kp.privateKey;
+                // Ephemeral X25519 keypair (non-extractable; docs/sealed-box-v1.md),
+                // then commit pwa_pk into the WebAuthn challenge:
+                // effective_challenge = SHA-256(approve_challenge_hash || pwa_pk).
+                var kp = await vt.x25519Keypair();
+                var pwaPk = kp.pk;
                 var approveChHash = b64uDec(data.approve_challenge_b64u);
                 var concat = new Uint8Array(approveChHash.length + pwaPk.length);
                 concat.set(approveChHash, 0);
@@ -359,7 +356,7 @@
 
                 var daemonPk = b64uDec(data.daemon_pubkey_b64u);
                 if (daemonPk.length !== 32) throw new Error('daemon_pubkey 长度异常');
-                var sealedDeks = sodium.crypto_box_seal(deks, daemonPk);
+                var sealedDeks = await vt.sealBox(deks, daemonPk);
 
                 // INVARIANT: cache sealing MUST happen here — after sealing to the
                 // daemon and BEFORE `deks.fill(0)` below. Only when the user picked
@@ -372,14 +369,14 @@
                     cacheSealed = [];
                     for (var ci = 0; ci < salts.length; ci++) {
                         var dekSlice = deks.subarray(ci * 32, (ci + 1) * 32);
-                        cacheSealed.push(b64uEnc(sodium.crypto_box_seal(dekSlice, cachePk)));
+                        cacheSealed.push(b64uEnc(await vt.sealBox(dekSlice, cachePk)));
                     }
                 }
 
                 deks.fill(0); deks = null;
 
                 // Bind sealed_deks via ECDH(pwa_sk, daemon_pk) → HKDF → HMAC.
-                shared = sodium.crypto_scalarmult(pwaSk, daemonPk);
+                shared = await vt.x25519(kp.privateKey, daemonPk);
                 bindingKey = await vt.hkdfSha256(shared, ENC.encode('vt-sealed-deks-bind-v1'), 32);
                 var domain = ENC.encode('vt-bind-v1');
                 var msg = new Uint8Array(domain.length + approveChHash.length + daemonPk.length + pwaPk.length + sealedDeks.length);
@@ -393,7 +390,6 @@
 
                 vt.zeroize(shared); shared = null;
                 vt.zeroize(bindingKey); bindingKey = null;
-                vt.zeroize(pwaSk); pwaSk = null;
 
                 setStatus('正在提交…');
                 var resp = await fetch('/api/approve', {
@@ -425,7 +421,7 @@
                 console.error(e);
             } finally {
                 vt.zeroize(k); vt.zeroize(kWrap); vt.zeroize(masterKey); vt.zeroize(deks);
-                vt.zeroize(pwaSk); vt.zeroize(shared); vt.zeroize(bindingKey);
+                vt.zeroize(shared); vt.zeroize(bindingKey);
             }
         }
 
