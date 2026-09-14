@@ -222,13 +222,13 @@ expiry guard.
 - Workers Logs (dashboard) show the structured audit events; retention is
   platform-managed (~3 days Free, ~7 days Paid). `config.unreadable` there
   means the root key does not unwrap under the current `SECRET` (see reset).
-- The admin **审计** tab (`/admin#audit`) shows the SQLite audit table, cache
-  TTL/expiry columns, and the **“清除 DEK 缓存”** (clear-cache) button.
-- The admin **DEK 缓存** tab (`/admin#cache`) is the inventory of entries that
-  actually exist right now, grouped by the approval that armed them, with
-  per-group and bulk clear. Extending a group's window is gated on both the
-  admin session and a fresh phone Passkey approval, and is offered only while
-  caching is enabled — see [`docs/dek-cache.md`](dek-cache.md).
+- The admin **审计** tab (`/admin#audit`) shows the SQLite audit table with the
+  cache TTL/expiry columns; a cache-armed row links to the DEK 缓存 tab.
+- The admin **DEK 缓存** tab (`/admin#cache`) is the inventory of live entries,
+  one per record under 主机 · 项目 headers, with 撤销 of the selection and
+  清除全部. Extending is gated on both the admin session and a fresh phone
+  Passkey approval, one project per ceremony — see
+  [`docs/dek-cache.md`](dek-cache.md).
 
 ## Updates, rotation, reset
 

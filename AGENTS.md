@@ -205,19 +205,27 @@ Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
 - There is no cache switch: option `0` = `不缓存`, the approval page's
   default, is the no-cache path; the scalar is `HKDF(R, vt-cache-seckey-v1)`.
   A hit is not a phone approval: always audit it. `cache_hit_notify` independently enables best-effort hit pushes
-  and is off by default. Group IDs and creation stamps are immutable.
+  and is off by default. The unit is one entry `dek:{token_id}:{project_h}:{salt}`
+  (no groups); its `created_ms` is immutable.
 - Session-gated list/clear need no Passkey; extension requires a verified Passkey
-  via `opApprove` -> `commitExtend`, never a session alone. Never resurrect expired entries, shorten expiry, or extend
-  drifted/no-gain groups; re-read entries with no await before the write, and audit
+  via `opApprove` -> `commitExtend`, never a session alone. Extension is per
+  entry, one `token_id` + `project` per ceremony (a mixed scope is a 400):
+  never resurrect an expired entry, never shorten expiry, a no-gain entry is
+  skipped; re-read entries with no await before the write, and audit
   authorization plus actual effects. Expiry is approval-time + TTL, not a lifetime
   budget. Keep distinct approve/extend TTL ladders and finite expiries, never
   null/Infinity; policy lives in [cf-worker/src/cache_policy.ts](cf-worker/src/cache_policy.ts).
 - Record names are operator-owned (`names` table keyed by salt, adopted on a
   verified approve or renamed with the session cookie); a client's `meta.names`
   is a suggestion, shown as 自报 and never stored on its own.
-- Listing exposes no sealed material or binding ctx digest — a record's salt
-  only as the rename key of `records[]` — and reports `truncated`. Clearing must exhaust the `dek:` prefix, report actual deletions,
-  and fail loudly if incomplete. Keep every cache-armed audit row's revoke button.
+- Listing shows live entries only (`expires_ms <= now` filtered in the DO) and
+  exposes no sealed material or storage key — an entry is addressed by
+  `{token_id, project, salt_b64u}` and the DO re-derives the key in `cacheCtx`
+  — and reports `truncated`. A clear of named entries deletes exact keys;
+  清除全部 must exhaust the `dek:` prefix; both report actual deletions and
+  fail loudly if incomplete. Revocation happens only on the DEK 缓存 tab: a
+  cache-armed audit row links there (`查看缓存 →`), never clears. The audit
+  table's only deletion is the retention sweep; there is no clear-audit op.
   `audit.cache_ttl_s` stays immutable; only `audit.cache_expires_ms` tracks extension.
   Every multi-key storage `get`/`put`/`delete` is chunked to <= 128 keys.
 - Admin is a passkey session: `/admin` and every `/api/admin/*` op are verified

@@ -15,10 +15,11 @@ TTL, a caller can decrypt the approved records without another phone tap.
   reviewed on the approval page before the tap. The multi-day rungs also make the
   feature useful at all: with the ceiling pinned to `8h`, an `8h` grant sat at its
   ceiling from birth and every extension of it was a no-op.
-- The cap is **per operation, not per lifetime**: one extension sets expiry to
-  `now + chosen TTL`, and an entry may be renewed indefinitely — one
-  Passkey-approved hop at a time. `MAX_EXTEND_TTL_MS` follows the ladder, so
-  trimming `EXTEND_TTL_WHITELIST` shortens the longest single hop.
+- The cap is **per operation, not per lifetime**: one extension sets each
+  selected entry's expiry to `now + chosen TTL`, and an entry may be renewed
+  indefinitely — one Passkey-approved hop at a time. `MAX_EXTEND_TTL_MS`
+  follows the ladder, so trimming `EXTEND_TTL_WHITELIST` shortens the longest
+  single hop.
 - What bounds renewal is **liveness, not a budget**: an extension can only continue
   a window that has not yet lapsed. Once a cache expires it is gone for good and
   only a fresh phone approval can arm a new one.
@@ -59,8 +60,8 @@ TTL, a caller can decrypt the approved records without another phone tap.
   (`PUT /api/admin/names {salt_b64u, name}`, session-gated, `""` deletes,
   `source='manual'`). Audit rows store `[salt, claimed]` pairs and resolve
   them on every read, so a rename retitles history; cache entries keep the
-  claim and the `project`; the cache listing, the hit audit row and the hit
-  push show the resolved name, else the claim tagged 自报, else the salt's
+  claim and the `project`; the cache listing, the extension summary, the hit
+  audit row and the hit push show the resolved name, else the claim tagged 自报, else the salt's
   first 8 characters (`K0g8nyJ5…`, the same handle on every surface, in
   `code` on the console). Audit rows also carry the challenge's `project`
   (NULL before the column existed): its directory name sits beside the host,
@@ -99,11 +100,16 @@ TTL, a caller can decrypt the approved records without another phone tap.
 - Cache hits, write failures, and approved extensions are recorded in the
   unified `audit` table. Routine misses are logged and then followed by the
   normal ceremony audit. Extension effect counts and projected expiry reflect
-  only storage batches whose writes succeeded. A failed later batch leaves
-  earlier successful extensions recorded, without claiming the failed batch.
-- Each write mints one `cache_group_id` (all entries from one approval under one
-  key prefix) and stamps an immutable `created_ms`. The group id is the handle
-  the admin surface lists, clears, and extends by.
+  only storage batches whose writes succeeded. A failed batch stops the commit;
+  the batches already acknowledged stay recorded, and the effect row says
+  `error=1`.
+- **The unit is one entry.** Each write stamps every entry with an immutable
+  `created_ms`, the chosen `ttl_s`, the token record's `host`/`user`, the
+  client's `project` and name claim, the Worker-derived `ip`, and the approval's
+  `origin_token_id`. There is no group: the console addresses an entry by
+  `{token_id, project, salt_b64u}` (`CacheEntryRef`) and the DO re-derives its
+  key in `cacheCtx`, so a clear or an extension can only ever reach what a read
+  would. Entries written before `host`/`ttl_s` existed list with those blank.
 - A hit sends a best-effort Web Push notice (`cache_hit_notify`, 设置 tab) to
   every phone subscribed there — tag `cache:<host>`, TTL 1 h, opening the audit
   tab. Notifications never block DEK delivery and contain no approval URL.
@@ -146,93 +152,102 @@ Rust client opens the result with the existing sealed-box implementation.
 ## Admin surface: the DEK 缓存 tab
 
 The admin shell's DEK 缓存 tab (`/admin#cache`) lists what is **actually
-cached right now**, one row per cache group: 主机 · 项目 / 记录 (names,
-renameable in place) / 条目 / 剩余 · 到期 / 操作, joined with the approval
-that armed it (user, directory, command and IP in the host cell's hover). Each row shows its original `created_ms` below the remaining time and
-expiry, in the browser's local time. Legacy entries without that timestamp show
-`创建于 未知`; extending a cache does not change its creation time.
-It is the only view of the real entry set — the audit tab can merely
-show which approvals *armed* a cache, which is an inference, not an inventory.
+cached and live right now**, one row per entry — 记录 (operator name, else the
+自报 claim, else the salt handle; renameable in place) · 剩余 · 到期 · 创建于 —
+grouped client-side under collapsible **主机 · 项目** headers (`vt.projectName`
+of the project; the full path, user and token in the header's hovercard and
+the row's sheet, with IP, TTL and origin approval). The DO filters
+`expires_ms <= now` before answering: an expired entry is already a miss on the
+read path and the 5-minute alarm sweep's to delete, so the console never shows
+one and has no 已过期 filter. Extending never changes `created_ms`.
+It is the only view of the real entry set — the audit tab can merely show which
+approvals *armed* a cache, which is an inference, not an inventory; a
+cache-armed audit row links here (`查看缓存 →`, `#cache?host=…&project=…`
+fills the filter bar).
 
 The listing deliberately carries no secret material: no sealed DEK and **no
 storage key**. The key holds `SHA-256(tag ‖ project)`, so publishing it would
-turn the page into an offline oracle for the client-reported `project` path. A
-record's salt (public in every `vt://` URL) appears once per record as the
-rename key of `records[]`, never beside its project hash. Entries scanned per request are capped; the response
-reports `truncated` and the UI says so rather than implying a complete view.
+turn the page into an offline oracle for the client-reported `project` path.
+An entry is addressed by its literal `token_id`, `project` and salt (public in
+every `vt://` URL); the DO re-derives the key. Entries scanned per request are
+capped; the response reports `truncated` and the UI says so rather than
+implying a complete view.
 
-Two classes of action, with deliberately different gates:
+Selection drives every mutation: a header's checkbox selects its whole
+project, the bulk bar appears once anything is selected. Two classes of
+action, with deliberately different gates:
 
 | Action | Gate | Why |
 |---|---|---|
 | List | Admin session (passkey login, [worker-slim.md](worker-slim.md) §3) | Read-only |
-| Clear (row / selected / all) | Admin session | Authority-**reducing**: worst case is "decrypts re-prompt" |
-| Extend | Session **+ a fresh phone Passkey approval** | Authority-**granting**: prolongs no-human-in-the-loop decrypts |
+| 撤销 (selected entries) / 清除全部 | Admin session | Authority-**reducing**: worst case is "decrypts re-prompt" |
+| 延长 (selected entries, one 主机 · 项目) | Session **+ a fresh phone Passkey approval** | Authority-**granting**: prolongs no-human-in-the-loop decrypts |
 
-The scan cap above applies to the LISTING only. **A clear is exhaustive**: all
-three clear paths (by group, by origin approval, and 清除全部) stream the `dek:`
-prefix to its end through `sweepCacheEntries` rather than reusing the capped
-`scanCacheGroups`, deleting matches as they are found so memory stays bounded
-without bounding the work. The `cleared` count they return is what storage
+The scan cap above applies to the LISTING only. 撤销 deletes the exact keys of
+the named entries (`cache-clear-entries`, ≤ 512 per request), so there is no
+scan to fall past; 清除全部 streams the `dek:` prefix to its end through
+`sweepCacheEntries`, deleting matches as they are found so memory stays bounded
+without bounding the work. The `cleared` count both return is what storage
 actually removed, not what the request intended to remove, and the UI reports
-that number. This is deliberately asymmetric with the listing: a partial view
-that says `truncated` costs the operator a second look, whereas a partial revoke
-that answers `200 {"cleared":0}` reads as a completed revocation while the DEKs
-stay decryptable with no phone tap. A clear that cannot finish must fail loudly
-(the request's own CPU/wall budget is the only remaining bound) — never quietly.
-Regression cover: `cf-worker/test/do_account.cache_list.test.ts`, "cache clear
-paths — exhaustive by contract".
+that number. A clear that cannot finish must fail loudly — never quietly.
+Regression cover: `cf-worker/test/do_account.cache_list.test.ts`. The audit
+tab revokes nothing and deletes nothing: its only deletion is the 90-day
+retention sweep (the former 清空审计 op is gone).
 
 ### Extension contract
 
-Extension is always offered (the former `CACHE_ADMIN_EXTEND` and
-`cache_enabled` switches are gone). An admin selects groups and a TTL and
-presses 延长; the Worker then only **mints a
-pending ceremony**. Nothing expires later until a Passkey approves it, and
-every one of these holds:
+An admin selects entries of one 主机 · 项目 and a TTL and presses 延长; the
+Worker then only **mints a pending ceremony**. Nothing expires later until a
+Passkey approves it, and every one of these holds:
 
-1. **Passkey required.** The intent (group ids, TTL, requester) is written onto
-   the challenge at request time and never mutated, so the approval finalizes
-   exactly what was proposed. The ceremony is single-use, expires in 5 minutes if
-   untouched, and rechecks that deadline after assertion verification, immediately
-   before approval commits. It is **not pushed to any notification channel** — the flow is
-   console-resident (select groups on the DEK 缓存 tab, approve in the modal that
-   opens on the same page), so a card would only notify the person already watching
-   the result. Observability stays where it belongs: the audit tab receives the
-   request row (`op_kind='cache-extend'`) and the effect row (`status='extended'`)
-   over its real-time stream, so the action is still visible to anyone with the
-   console open, and permanently in the 90-day audit table afterwards.
-2. **Laddered TTLs only** (`20m` / `2h` / `8h` / `1d` / `2d` / `1w` / 100 years). No arbitrary
+1. **Passkey required.** The intent (`token_id`, `project`, the salts, TTL,
+   plus the host and record names the admin saw) is written onto the challenge
+   at request time and never mutated, so the approval finalizes exactly what was
+   proposed. The ceremony is single-use, expires in 5 minutes if untouched, and
+   rechecks that deadline after assertion verification, immediately before
+   approval commits. It is **not pushed to any notification channel** — the flow
+   is console-resident (select on the DEK 缓存 tab, approve in the sheet that
+   opens on the same page), so a card would only notify the person already
+   watching the result. Observability stays where it belongs: the audit tab
+   receives the request row (`op_kind='cache-extend'`) and the effect row
+   (`status='extended'`) over its real-time stream, and permanently in the
+   90-day audit table afterwards.
+2. **One project per ceremony.** The request names entries of exactly one
+   `token_id` + `project`; a mixed selection is a 400 (`one project per
+   ceremony`), so the approver reads one host · project line. Up to 256 entries
+   — what one approval can write — per ceremony.
+3. **Laddered TTLs only** (`20m` / `2h` / `8h` / `1d` / `2d` / `1w` / 100 years). No arbitrary
    deltas. The multi-day rungs are extension-only: `writeCache` validates against
    the shorter approve ladder, so a tampered approve body cannot arm a multi-day
    cache without going through this ceremony.
-3. **Never resurrects.** An entry already past `expires_ms` is skipped. Only a
-   new phone approval can bring a lapsed capability back.
-4. **Never shortens.** A request that would not move expiry forward is a no-op.
-5. **Measured from the approval, every time.** New expiry is `now + TTL`, where
+4. **Never resurrects.** An entry already past `expires_ms` is refused at request
+   time (`expired`) and skipped at commit time if it lapsed in between — the
+   commit re-reads every entry under the DO gate with no await before the write.
+   Only a new phone approval can bring a lapsed capability back.
+5. **Never shortens.** An entry the TTL would not move forward is refused at
+   request time (`no_gain`) and skipped at commit; a request with no movable
+   entry is a 409. The UI disables 延长 and names the smallest rung that works.
+6. **Measured from the approval, every time.** New expiry is `now + TTL`, where
    `now` is the moment of the tap — not an offset from creation, and not additive
-   with whatever remains. `created_ms` is forensic metadata only, which is exactly
-   what lets pre-migration entries be renewed like any other. Total lifetime is
-   unbounded by design; the price is a Passkey approval per hop, so a human is in
-   the loop every single time instead of once at the start.
+   with whatever remains. `created_ms` is forensic metadata only. Total lifetime
+   is unbounded by design; the price is a Passkey approval per hop, so a human is
+   in the loop every single time instead of once at the start.
 
    This replaced an absolute `created_ms + 1w` ceiling, which failed twice over: it
    made the feature inert for the common case (operators cache for `8h`, so an
    entry sat at its ceiling from birth and every extension was a silent no-op), and
    it only ever constrained the legitimate operator — the ceiling binds nobody who
    can already complete a WebAuthn ceremony.
-6. **Drifted groups are never extendable.** A group whose entries disagree on
-   origin/creation/IP is refused outright rather than guessed at; it stays listable
-   and clearable. Pre-`created_ms` entries ARE extendable (their `legacy:` handle
-   rests on a full 96-bit origin token), so nothing already cached is stranded.
 7. **Audited twice.** The ceremony row records the authorization (host
    `admin`, the requesting browser's IP); a second `op_kind='cache'`,
    `status='extended'` row records the effect — how many entries moved, to when,
-   and what was skipped. Clears remain CF-logs-only: they reduce authority.
+   and what was skipped (`expired=`, `no_gain=`, `gone=`, `error=`). Each origin
+   approval whose entries moved gets its `cache_expires_ms` bumped. Clears
+   remain CF-logs-only: they reduce authority.
 8. `audit.cache_ttl_s` keeps its original meaning (the TTL the approver chose)
-   and is never rewritten. The new `audit.cache_expires_ms` column tracks the
-   live expiry, so the audit tab shows real liveness instead of an inference that
-   an extension would falsify.
+   and is never rewritten. `audit.cache_expires_ms` tracks the live expiry, so
+   the audit tab shows real liveness instead of an inference that an extension
+   would falsify.
 
 Residual gap, stated plainly: the approver reads the intent as rendered by the
 Worker, and the assertion covers the challenge rather than a hash of the
@@ -276,14 +291,14 @@ factory reset also orphans every entry). The cache does not re-key existing
 | Concern | Source |
 |---|---|
 | TTL ladders, per-hop cap, extension arithmetic | `cf-worker/src/cache_policy.ts` (+ `test/cache_policy.test.ts`) |
-| Cache key binding, writes/reads, paged aggregation, exhaustive clear, extension storage batches | `cf-worker/src/account_cache.ts` (`AccountCache`, same DO storage/input gate) |
+| Cache key binding (`cacheCtx`), writes/reads, live listing, exact-key and exhaustive clears, extension storage batches | `cf-worker/src/account_cache.ts` (`AccountCache`, same DO storage/input gate) |
 | Cache request validation, Passkey authorization, ceremony transitions, audit/notification orchestration | `cf-worker/src/do_account.ts` (`AccountDO`) |
 | Audit persistence and notification lifecycle | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts` |
 | Sealed-box cache crypto | `cf-worker/src/cache_crypto.ts` |
 | PWA TTL selection and sealing | `cf-worker/pwa/approve.js` |
 | CLI cache request, `project` collection, and source check | `src/cf.rs`, `src/client.rs` |
-| Admin cache inventory / clear / extend UI | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/cache.js` |
-| Admin audit cache column + per-row clear | `cf-worker/pwa/admin/audit.js` |
+| Admin cache inventory / 撤销 / 延长 UI | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/cache.js` |
+| Admin audit cache column + 查看缓存 link | `cf-worker/pwa/admin/audit.js` |
 | Hit-notify switch, root-key scalar | `cf-worker/src/account_admin.ts` (`Config`, `cacheSeckey`), 设置 tab in `cf-worker/pwa/admin/settings.js` |
 | Record names: table, adopt / rename gates, resolution on read | `cf-worker/src/account_names.ts`, `do_account.ts` (`opApprove`, `opNamesSet`), `account_audit.ts` (`records`), `pwa/admin/admin.js` (`vt.recordList`) |
 | Deployment, secret rotation, reset | [`cf-worker-deploy.md`](cf-worker-deploy.md) |
@@ -297,15 +312,19 @@ factory reset also orphans every entry). The cache does not re-key existing
    (any worktree, any egress IP); the second read should not open a phone
    ceremony.
 4. Check the admin audit page for the cache grant and hit.
-5. Open the admin `DEK 缓存` tab: the entry group appears with its remaining time.
-6. Select the group and press 延长. First pick a
-   duration SHORTER than the time remaining and confirm the button is disabled and
-   the note names a usable rung — extension is absolute, so a shorter rung is a
-   no-op by definition. Then pick a longer one, approve on a Passkey, and confirm
-   the remaining time jumps to `批准时刻 + 时长` and two audit rows appear
-   (`cache-extend` approved + `缓存已延长`). Let a cache lapse and confirm it can no
-   longer be extended at all — only a fresh phone approval arms a new one.
-7. Clear the cache, then confirm the next read returns to the phone ceremony.
+5. Open the admin `DEK 缓存` tab: the entry appears under its 主机 · 项目
+   header with its remaining time; the approval's audit row shows `查看缓存 →`
+   and lands on the tab filtered to that host and project.
+6. Tick the entry (or the header) and pick a duration SHORTER than the time
+   remaining: 延长 is disabled and the note names a usable rung — extension is
+   absolute, so a shorter rung is a no-op by definition. Pick a longer one,
+   press 延长, approve on a Passkey, and confirm the remaining time jumps to
+   `批准时刻 + 时长` and two audit rows appear (`cache-extend` approved +
+   `缓存已延长`). Tick entries of two projects: 延长 is disabled, 撤销 is not.
+   Let a cache lapse and confirm it leaves the tab and cannot be extended —
+   only a fresh phone approval arms a new one.
+7. Tick the entry and press 撤销 (or 清除全部), then confirm the next read
+   returns to the phone ceremony.
 
 For implementation changes, run the focused Rust/Worker tests and then the
 repository gates from [`docs/README.md`](README.md).

@@ -106,12 +106,14 @@ Used on a phone, one hand, under time pressure. Field set and order come from
   expired`), never color or a glyph alone.
 - Time is absolute (`YYYY-MM-DD HH:MM:SS`); relative (`fmtRemaining`) beside it
   when space allows, re-rendered on a ticker so it is never stale.
-- Nothing that happened disappears: a cleared table says so, a truncated
-  listing reports `truncated`, an extended row shows approved TTL and actual expiry.
+- Nothing that happened disappears: the audit table is never cleared (retention
+  only), a truncated listing reports `truncated`, an extended row shows approved
+  TTL and actual expiry.
 - The live indicator has three states, text plus color: `● 实时` `● 同步中`
   `● 已断开`; a live update never disturbs an open dialog's mounted ceremony.
-- A pending row opens its approval inline; every cache-armed row keeps its
-  revoke button.
+- A pending row opens its approval inline; every cache-armed row links to the
+  DEK 缓存 tab filtered to its 主机 · 项目 (`查看缓存 →`) — the audit tab
+  revokes nothing.
 
 ## Editing and forms `ported`
 
@@ -174,8 +176,10 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 - 审计: filter bar, list/table (时间 / 状态 / 主机 / 项目 / 记录 / 缓存 / 操作;
   项目 is the directory name, `vt.projectName`, the path in the sheet),
   `加载更多` with `已加载 N 条`, live indicator, detail sheet with inline
-  approval and record rename. DEK 缓存: filter bar, bulk bar, list/table
-  (主机 · 项目 / 记录 / 条目 / 剩余 · 到期 / 操作), extend sheet. A record name
+  approval and record rename. DEK 缓存: filter bar (主机 / 项目, filled by
+  `#cache?host=…&project=…`), list/table of live entries (记录 / 剩余 · 到期)
+  under collapsible `.group-head` rows (主机 · 项目, checkbox selects the
+  project), bulk bar (延长 · 撤销), entry sheet, extend sheet. A record name
   is a control (`vt.recordList`): click → input, Enter saves, Escape/blur
   cancels. 主机令牌: filter bar, list/table with per-row `吊销`. Passkey:
   current list/table (标签 / 凭据 ID / 注册日期), segmented `新增 / 吊销`,
@@ -194,7 +198,7 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 | `.badge`, `.badge-*`, `.reason-badge` | `admin.css` |
 | `.glass`, `.switch`, segmented control (`.seg`; its sliding thumb `vt.seg`) | `admin.css`, `common.js` |
 | `.select` (a `span` around every native `<select>`: CSS chevron, ring on the wrapper), `.chip` | `admin.css` |
-| Filter bar, `#bulkbar`, `.row` list + table + `.trunc`/`.cell-*` | `admin.css` |
+| Filter bar, `#bulkbar`, `.row` list + table + `.trunc`/`.cell-*`, `.group-head`, `.cache-link` | `admin.css` |
 | Row/table switch: `vt.phone`, `vt.onLayout`, `vt.list(wrap)` (`item({cells, row})`, `body`, `clear`, `empty`) | `admin.js` |
 | Detail sheet (`vt.dialog`), hovercard (`vt.hovercard`), `vt.commandSummary`, `vt.api` | `admin.js` |
 | Status line: `vt.statusLine(el)` returns the tab's `setStatus` | `common.js` |

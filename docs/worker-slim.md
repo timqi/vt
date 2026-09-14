@@ -104,7 +104,7 @@ Set-Cookie: …; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800
 | `PUT /api/admin/names` | cookie | record rename, `{salt_b64u, name}`, `""` deletes ([dek-cache.md](dek-cache.md)) |
 | `GET /api/admin/push/vapid`, `POST …/push/subscribe`, `…/push/unsubscribe`, `…/push/test` | cookie | §5 |
 | `POST /api/admin/rotate-secret` | cookie | §2 rotation; returns `{secret}` once |
-| existing `audit`, `audit-stream`, `cache-*`, `clear-cache`, `clear-audit`, `tokens`, `tokens-revoke` | cookie | unchanged bodies; the former `admin_email` fields are gone — the cookie carries no credential identity, so extend/revoke rows name no operator |
+| existing `audit`, `audit-stream`, `cache-list`, `cache-clear-entries`, `cache-extend-request`, `clear-cache`, `tokens`, `tokens-revoke` | cookie | the former `admin_email` fields are gone — the cookie carries no credential identity, so extend/revoke rows name no operator; `clear-audit` and the per-approval/per-group cache clears no longer exist ([dek-cache.md](dek-cache.md)) |
 
 - `LIMITER` is the existing 3/min/IP Workers Rate Limiting binding, keyed
   `enroll:<ip>` by `/api/enroll` and `login:<ip>` by bootstrap and
