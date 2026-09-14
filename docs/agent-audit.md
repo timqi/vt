@@ -76,8 +76,8 @@ just `--audit-url` + `--audit-key`. The cost is that the worker master
 - forge audit rows for **any** hostname;
 - make authenticated `/api/challenge` requests — still gated by a phone approval;
 - make authenticated `/api/dek-cache` requests — these return cached DEKs with
-  **no phone in the loop** for the same egress IP within the TTL window (the
-  same IP binding the CLI already relies on, see `docs/dek-cache.md`).
+  **no phone in the loop** for a host token whose project already holds a
+  live entry within the TTL window (see `docs/dek-cache.md`).
 
 It does **not** by itself decrypt secrets that aren't currently cached — the
 vault master never leaves the phone. With the Mac's own host token as

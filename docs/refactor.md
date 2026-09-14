@@ -29,26 +29,12 @@ The AI-agent hook and the FIDO2 fallback are gone. `cargo check --target
 aarch64-apple-darwin` on Linux still stops at `ring`'s C build (rustls via
 `reqwest`/`tokio-tungstenite`); macOS-only code is validated on macOS CI.
 
-## 3. Cache key v5
+## 3. Landed
 
-```
-dek:{token_id}:{project_h}:{salt_b64u}
-```
-
-- `token_id` is the hard boundary; it replaces the Worker-derived IP, which
-  becomes audit metadata only. A host on a new egress still hits.
-- `project_h = sha256(project)` truncated to 16 bytes. `project` is sent by
-  the CLI: `git rev-parse --git-common-dir` (absolute) when inside a
-  repository, else the cwd. Client-reported and advisory, as `pwd` was. The
-  worktree suffix heuristic `cacheScopePwd` is deleted.
-- `meta.pwd` keeps the literal cwd for display; the approval page shows
-  `project` where `cache_scope_pwd` was.
-- Requests without a `token_id` do not cache (there are none after step 1).
-- Tag `vt-dek-ctx-v5`; v4 entries lapse or are cleared from the admin tab.
-- Ladders, extension, listing, `truncated`, chunked deletes, audit fields:
-  unchanged.
-
-Depends on step 1 (bare-master gone) so `token_id` is always present.
+Cache key v5 (`dek:{token_id}:{project_h}:{salt}`) is in; `cacheScopePwd` is
+gone. Release note: a Worker ahead of the CLI keys every cache on
+`project=''` per token; a CLI ahead of the Worker sends an ignored field. No
+flag day.
 
 ## 4. Decide, then do or drop
 
@@ -65,7 +51,7 @@ Depends on step 1 (bare-master gone) so `token_id` is always present.
 
 ## Order
 
-1 → 2 → 3, each behind `cargo test`, `just check`, `just check-worker`, then
+1 → 2 → 3 landed, each behind `cargo test`, `just check`, `just check-worker`, then
 a macOS native check for the Keychain and agent changes. Step 4 items are
 separate documents when decided.
 
