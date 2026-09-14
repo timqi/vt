@@ -209,7 +209,6 @@ impl VTClient {
     ///   errors, version mismatch, or unstructured `AgentError::Failure`
     ///   (agent lock, non-vt agent — see docs/structured-errors.md for why
     ///   those stay unstructured).
-    #[cfg(unix)]
     fn try_agent_extension(
         config: &ResolvedConfig,
         name: &str,
@@ -253,7 +252,6 @@ impl VTClient {
     /// `~/.ssh/vt.sock`). `Ok(None)` when the socket is missing/refused (no agent
     /// running) so callers can degrade gracefully; other IO errors propagate.
     /// Shared by `try_agent_extension` and `list_agent_identities`.
-    #[cfg(unix)]
     fn connect_agent_socket(
         config: &ResolvedConfig,
     ) -> Result<Option<std::os::unix::net::UnixStream>> {
@@ -282,7 +280,6 @@ impl VTClient {
     /// NOTE: the discovered keys can only be *signed* via `sign@vt`, so callers
     /// must gate discovery on [`VTClient::uses_agent`] (as `resolve_identities`
     /// does) or the keys will fail at sign time under a passkey pin.
-    #[cfg(unix)]
     pub(crate) fn list_agent_identities(&self) -> Result<Vec<ssh_agent_lib::proto::Identity>> {
         let stream = match Self::connect_agent_socket(&self.config)? {
             Some(s) => s,
@@ -304,7 +301,6 @@ impl VTClient {
     ///   recoverable `Err(_)` (per [`should_fallback_to_cf`]) into a single
     ///   `Ok(None)` so callers route to the CF path; non-recoverable errors
     ///   propagate.
-    #[cfg(unix)]
     async fn agent_call_or_fallback(
         &self,
         name: &'static str,
@@ -345,45 +341,35 @@ impl VTClient {
     /// formats the resulting `vt://{type}{b64(salt||ct)}` URL. DEKs are
     /// zeroized after use.
     pub async fn encrypt(&self, items: &[EncryptItem]) -> Result<Vec<ItemResult>> {
-        #[cfg(unix)]
-        {
-            let req = EncryptReq {
-                types: items.iter().map(|i| i.t).collect(),
+        let req = EncryptReq {
+            types: items.iter().map(|i| i.t).collect(),
+        };
+        let payload = serde_json::to_vec(&req)?;
+        let result = self.agent_call_or_fallback("encrypt@vt", payload).await?;
+        let bytes = match result {
+            Some(b) => b,
+            None => return self.cf_encrypt(items).await,
+        };
+        let mut allocs: Vec<EncryptResItem> = serde_json::from_slice(&bytes)?;
+        ensure!(
+            allocs.len() == items.len(),
+            "agent returned {} (salt,DEK) pairs for {} items",
+            allocs.len(),
+            items.len()
+        );
+        let mut out = Vec::with_capacity(items.len());
+        for (item, alloc) in items.iter().zip(allocs.iter_mut()) {
+            let result = if alloc.err_message.is_empty() {
+                client_encrypt_v2(item.t, &alloc.salt, &alloc.dek, item.plaintext.as_bytes())
+                    .map_err(ItemError::from)
+            } else {
+                Err(ItemError(std::mem::take(&mut alloc.err_message)))
             };
-            let payload = serde_json::to_vec(&req)?;
-            let result = self.agent_call_or_fallback("encrypt@vt", payload).await?;
-            let bytes = match result {
-                Some(b) => b,
-                None => return self.cf_encrypt(items).await,
-            };
-            let mut allocs: Vec<EncryptResItem> = serde_json::from_slice(&bytes)?;
-            ensure!(
-                allocs.len() == items.len(),
-                "agent returned {} (salt,DEK) pairs for {} items",
-                allocs.len(),
-                items.len()
-            );
-            let mut out = Vec::with_capacity(items.len());
-            for (item, alloc) in items.iter().zip(allocs.iter_mut()) {
-                let result = if alloc.err_message.is_empty() {
-                    client_encrypt_v2(item.t, &alloc.salt, &alloc.dek, item.plaintext.as_bytes())
-                        .map_err(ItemError::from)
-                } else {
-                    Err(ItemError(std::mem::take(&mut alloc.err_message)))
-                };
-                alloc.dek.zeroize();
-                out.push(result);
-            }
-            // `bytes` is `Zeroizing<Vec<u8>>` — wiped on drop at end of scope.
-            Ok(out)
+            alloc.dek.zeroize();
+            out.push(result);
         }
-        #[cfg(not(unix))]
-        {
-            let _ = items;
-            Err(anyhow::anyhow!(
-                "vt encrypt requires Unix (SSH agent socket)"
-            ))
-        }
+        // `bytes` is `Zeroizing<Vec<u8>>` — wiped on drop at end of scope.
+        Ok(out)
     }
 
     /// v2 envelope decrypt. Each input `vt://...` URL is parsed locally; v2
@@ -404,36 +390,26 @@ impl VTClient {
         if urls.is_empty() {
             return Ok(Vec::new());
         }
-        #[cfg(unix)]
-        {
-            let batch = DecryptBatch::parse(urls, names);
-            let items = batch.agent_items();
-            // Nothing decryptable: no prompt, every record reports its own
-            // parse error.
-            if items.is_empty() {
-                return batch.finish_agent(Vec::new());
-            }
-            let wire = DecryptReq {
-                host: host.to_string(),
-                command: command.to_string(),
-                items,
-                meta: collect_client_meta(),
-            };
-            let payload = serde_json::to_vec(&wire)?;
-            let result = self.agent_call_or_fallback("decrypt@vt", payload).await?;
-            let bytes = match result {
-                Some(b) => b,
-                None => return self.cf_decrypt(command, batch).await,
-            };
-            batch.finish_agent(serde_json::from_slice(&bytes)?)
+        let batch = DecryptBatch::parse(urls, names);
+        let items = batch.agent_items();
+        // Nothing decryptable: no prompt, every record reports its own
+        // parse error.
+        if items.is_empty() {
+            return batch.finish_agent(Vec::new());
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (host, command, urls, names);
-            Err(anyhow::anyhow!(
-                "vt decrypt requires Unix (SSH agent socket)"
-            ))
-        }
+        let wire = DecryptReq {
+            host: host.to_string(),
+            command: command.to_string(),
+            items,
+            meta: collect_client_meta(),
+        };
+        let payload = serde_json::to_vec(&wire)?;
+        let result = self.agent_call_or_fallback("decrypt@vt", payload).await?;
+        let bytes = match result {
+            Some(b) => b,
+            None => return self.cf_decrypt(command, batch).await,
+        };
+        batch.finish_agent(serde_json::from_slice(&bytes)?)
     }
 
     /// `sign@vt`: ask the agent to sign `data` with the Keychain key identified
@@ -448,7 +424,6 @@ impl VTClient {
     ///   `Generic` = "this agent does not hold that key").
     /// - `Err(_)` — `AuthRejected` (user declined) or `BadRequest` (malformed):
     ///   do NOT fall back (guardrail G3).
-    #[cfg(unix)]
     pub async fn sign_vt(
         &self,
         host: &str,
@@ -552,67 +527,49 @@ impl VTClient {
     /// forwarded agent socket". A passkey pin is refused here instead of
     /// silently failing further down.
     pub async fn run(&self, argv: Vec<String>, reason: Option<&str>) -> Result<()> {
-        #[cfg(unix)]
-        {
-            if !self.route.uses_agent() {
-                anyhow::bail!(
-                    "vt run is agent-only, but VT_BACKEND=passkey disables the agent path"
-                );
-            }
-            if argv.is_empty() {
-                anyhow::bail!("vt run: argv is empty");
-            }
-            let req = RunReq {
-                host: get_hostname(),
-                argv,
-                reason: reason.map(str::to_string),
-                meta: collect_client_meta(),
-            };
-            let payload = serde_json::to_vec(&req)?;
-            let result = self.agent_call_or_fallback("run@vt", payload).await?;
-            match result {
-                Some(bytes) => {
-                    let res: RunRes =
-                        serde_json::from_slice(&bytes).context("Failed to parse run response")?;
-                    tracing::debug!("vt run: spawned pid={}", res.pid);
-                    Ok(())
-                }
-                None => Err(anyhow::anyhow!(
-                    "vt run: SSH agent path unavailable (no fallback exists for run@vt)"
-                )),
-            }
+        if !self.route.uses_agent() {
+            anyhow::bail!("vt run is agent-only, but VT_BACKEND=passkey disables the agent path");
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (argv, reason);
-            Err(anyhow::anyhow!("vt run requires Unix (SSH agent socket)"))
+        if argv.is_empty() {
+            anyhow::bail!("vt run: argv is empty");
+        }
+        let req = RunReq {
+            host: get_hostname(),
+            argv,
+            reason: reason.map(str::to_string),
+            meta: collect_client_meta(),
+        };
+        let payload = serde_json::to_vec(&req)?;
+        let result = self.agent_call_or_fallback("run@vt", payload).await?;
+        match result {
+            Some(bytes) => {
+                let res: RunRes =
+                    serde_json::from_slice(&bytes).context("Failed to parse run response")?;
+                tracing::debug!("vt run: spawned pid={}", res.pid);
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!(
+                "vt run: SSH agent path unavailable (no fallback exists for run@vt)"
+            )),
         }
     }
 
     pub async fn auth(&self, reason: &str) -> Result<()> {
-        #[cfg(unix)]
-        {
-            let req = AuthReq {
-                host: get_hostname(),
-                reason: reason.to_string(),
-                meta: collect_client_meta(),
-            };
-            let payload = serde_json::to_vec(&req)?;
-            let result = self.agent_call_or_fallback("auth@vt", payload).await?;
+        let req = AuthReq {
+            host: get_hostname(),
+            reason: reason.to_string(),
+            meta: collect_client_meta(),
+        };
+        let payload = serde_json::to_vec(&req)?;
+        let result = self.agent_call_or_fallback("auth@vt", payload).await?;
 
-            match result {
-                Some(bytes) => {
-                    let _res: AuthRes =
-                        serde_json::from_slice(&bytes).context("Failed to parse auth response")?;
-                    Ok(())
-                }
-                None => self.cf_auth(reason).await,
+        match result {
+            Some(bytes) => {
+                let _res: AuthRes =
+                    serde_json::from_slice(&bytes).context("Failed to parse auth response")?;
+                Ok(())
             }
-        }
-
-        #[cfg(not(unix))]
-        {
-            Err(anyhow::anyhow!("vt auth requires Unix (SSH agent socket)"))
+            None => self.cf_auth(reason).await,
         }
     }
 }

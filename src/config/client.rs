@@ -333,7 +333,6 @@ mod tests {
         assert_eq!(uv(None, Some("")), None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn non_unicode_values_preserve_lazy_environment_errors() {
         use std::os::unix::ffi::OsStringExt;

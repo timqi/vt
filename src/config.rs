@@ -44,16 +44,10 @@ fn is_allowed_key(key: &str) -> bool {
 /// The config file's permission bits when they are too loose (group/other
 /// accessible), else `None`. Single owner of the 0o077 policy — consumed by
 /// the load-time warning below and by `vt doctor`, so the two can't drift.
-#[cfg(unix)]
 pub fn insecure_config_mode(path: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(path).ok()?.permissions().mode();
     (mode & 0o077 != 0).then_some(mode & 0o7777)
-}
-
-#[cfg(not(unix))]
-pub fn insecure_config_mode(_path: &Path) -> Option<u32> {
-    None
 }
 
 /// Best-effort permission check: the file holds secrets (`VT_PASSKEY_TOKEN`),
@@ -178,11 +172,8 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.mode(0o600);
     let result = (|| -> anyhow::Result<()> {
         let mut f = opts
             .open(&tmp)
@@ -412,7 +403,6 @@ mod tests {
         assert!(upsert_toml_lines("", &[("PATH", "x")]).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn upsert_config_values_creates_private_file() {
         use std::os::unix::fs::PermissionsExt;

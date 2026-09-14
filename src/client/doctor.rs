@@ -16,7 +16,6 @@ use ssh_agent_lib::proto::{Extension, Unparsed};
 /// merely *ignores* the unknown extension name (an older vt agent) answers SSH
 /// success with an empty payload, which is a different signal from an explicit
 /// `SSH_AGENT_FAILURE` (non-vt agent or a locked agent).
-#[cfg(unix)]
 enum DiagOutcome {
     /// Socket missing/refused — no agent at all.
     NoSocket,
@@ -33,10 +32,8 @@ enum DiagOutcome {
 /// Read/write timeout for the diag round-trip. Every other agent call must
 /// wait indefinitely for a human Touch ID; diag@vt is interaction-free by
 /// design, so a hung or foreign agent must not hang the doctor.
-#[cfg(unix)]
 const DIAG_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[cfg(unix)]
 fn call_diag(config: &ResolvedConfig) -> Result<DiagOutcome> {
     let stream = match VTClient::connect_agent_socket(config)? {
         Some(s) => s,
@@ -190,90 +187,87 @@ pub async fn doctor(config: &ResolvedConfig) -> Result<()> {
     // ── 3. Agent (diag@vt) ────────────────────────────────────────────────
     println!("\nAgent:");
     println!("  socket: {}", config.socket_label());
-    #[cfg(unix)]
+    let probe_config = config.clone();
+    // Never hard-fail the report (doctor's contract): a panicked probe
+    // (outer Err) is itself a finding, printed like any other.
+    match tokio::task::spawn_blocking(move || call_diag(&probe_config))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
     {
-        let config = config.clone();
-        // Never hard-fail the report (doctor's contract): a panicked probe
-        // (outer Err) is itself a finding, printed like any other.
-        match tokio::task::spawn_blocking(move || call_diag(&config))
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|r| r)
-        {
-            Err(e) => println!("  ⚠ diag@vt transport error: {}", e),
-            Ok(DiagOutcome::NoSocket) => {
-                println!("  no agent listening (socket missing or connection refused)")
+        Err(e) => println!("  ⚠ diag@vt transport error: {}", e),
+        Ok(DiagOutcome::NoSocket) => {
+            println!("  no agent listening (socket missing or connection refused)")
+        }
+        Ok(DiagOutcome::TooOld) => println!(
+            "  agent reachable but ignored diag@vt — a vt agent older than \
+             this client (rebuild/restart it), or a non-vt agent"
+        ),
+        Ok(DiagOutcome::Refused(e)) => println!(
+            "  agent refused diag@vt ({}). Likely causes: a `vt ssh connect` \
+             relay running without --forward-real-agent (or built before \
+             diag@vt existed), a non-vt agent, an agent locked via \
+             ssh-add -x, or a dropped connection",
+            e
+        ),
+        Ok(DiagOutcome::Skew(e)) => println!(
+            "  agent answered but the reply didn't parse as a diag report \
+             ({}) — client/agent version skew; rebuild both from the same \
+             commit",
+            e
+        ),
+        Ok(DiagOutcome::Report(d)) => {
+            println!("  agent version: {}", d.agent_version);
+            // The agent is a long-lived daemon and does not restart on CLI
+            // upgrade — skew is common right after an update and changes
+            // scope/diag behavior silently.
+            if d.agent_version != env!("VT_VERSION") {
+                println!(
+                    "  ⚠ agent is {}, this client is {} — restart the agent \
+                     (`vt ssh agent`) so both run the same build",
+                    d.agent_version,
+                    env!("VT_VERSION")
+                );
             }
-            Ok(DiagOutcome::TooOld) => println!(
-                "  agent reachable but ignored diag@vt — a vt agent older than \
-                 this client (rebuild/restart it), or a non-vt agent"
-            ),
-            Ok(DiagOutcome::Refused(e)) => println!(
-                "  agent refused diag@vt ({}). Likely causes: a `vt ssh connect` \
-                 relay running without --forward-real-agent (or built before \
-                 diag@vt existed), a non-vt agent, an agent locked via \
-                 ssh-add -x, or a dropped connection",
-                e
-            ),
-            Ok(DiagOutcome::Skew(e)) => println!(
-                "  agent answered but the reply didn't parse as a diag report \
-                 ({}) — client/agent version skew; rebuild both from the same \
-                 commit",
-                e
-            ),
-            Ok(DiagOutcome::Report(d)) => {
-                println!("  agent version: {}", d.agent_version);
-                // The agent is a long-lived daemon and does not restart on CLI
-                // upgrade — skew is common right after an update and changes
-                // scope/diag behavior silently.
-                if d.agent_version != env!("VT_VERSION") {
-                    println!(
-                        "  ⚠ agent is {}, this client is {} — restart the agent \
-                         (`vt ssh agent`) so both run the same build",
-                        d.agent_version,
-                        env!("VT_VERSION")
-                    );
-                }
-                // Over --forward-real-agent the upstream agent's peer is the
-                // relay process on the agent's host — that IS the connection
-                // relayed requests ride, so label it honestly.
-                let peer_label = if d.peer.is_vt_relay {
-                    "peer (the relay process on the agent host)"
+            // Over --forward-real-agent the upstream agent's peer is the
+            // relay process on the agent's host — that IS the connection
+            // relayed requests ride, so label it honestly.
+            let peer_label = if d.peer.is_vt_relay {
+                "peer (the relay process on the agent host)"
+            } else {
+                "peer (this process)"
+            };
+            println!(
+                "  {}: pid {}, exe {}, tty {}, ssh-client {}, vt-relay {}",
+                peer_label,
+                d.peer.pid.map_or("?".to_string(), |p| p.to_string()),
+                d.peer.exe.as_deref().unwrap_or("?"),
+                if d.peer.has_tty { "yes" } else { "no" },
+                if d.peer.is_ssh_client { "yes" } else { "no" },
+                if d.peer.is_vt_relay { "yes" } else { "no" },
+            );
+            for (label, c) in [("sign", &d.sign_cache), ("decrypt", &d.decrypt_cache)] {
+                println!(
+                    "  {:8} ttl {}s, live grants (this caller): {}",
+                    format!("{}:", label),
+                    c.ttl_secs,
+                    c.live_entries
+                );
+                println!("           → {}", basis_human(&c.context_basis));
+            }
+            println!(
+                "  run@vt: {}; audit push: {}",
+                if d.run_allow_len == 0 {
+                    "disabled".to_string()
                 } else {
-                    "peer (this process)"
-                };
-                println!(
-                    "  {}: pid {}, exe {}, tty {}, ssh-client {}, vt-relay {}",
-                    peer_label,
-                    d.peer.pid.map_or("?".to_string(), |p| p.to_string()),
-                    d.peer.exe.as_deref().unwrap_or("?"),
-                    if d.peer.has_tty { "yes" } else { "no" },
-                    if d.peer.is_ssh_client { "yes" } else { "no" },
-                    if d.peer.is_vt_relay { "yes" } else { "no" },
-                );
-                for (label, c) in [("sign", &d.sign_cache), ("decrypt", &d.decrypt_cache)] {
-                    println!(
-                        "  {:8} ttl {}s, live grants (this caller): {}",
-                        format!("{}:", label),
-                        c.ttl_secs,
-                        c.live_entries
-                    );
-                    println!("           → {}", basis_human(&c.context_basis));
-                }
-                println!(
-                    "  run@vt: {}; audit push: {}",
-                    if d.run_allow_len == 0 {
-                        "disabled".to_string()
-                    } else {
-                        format!("{} allowlist entries", d.run_allow_len)
-                    },
-                    if d.audit_push { "on" } else { "off" }
-                );
-                println!(
-                    "  (classification applies to connections opened the way this \
-                     one was; a different launcher may classify differently)"
-                );
-            }
+                    format!("{} allowlist entries", d.run_allow_len)
+                },
+                if d.audit_push { "on" } else { "off" }
+            );
+            println!(
+                "  (classification applies to connections opened the way this \
+                 one was; a different launcher may classify differently)"
+            );
         }
     }
 

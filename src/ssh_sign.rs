@@ -24,24 +24,6 @@ pub async fn keygen(
     comment: Option<String>,
     key_file: Option<String>,
 ) -> Result<()> {
-    #[cfg(unix)]
-    {
-        keygen_unix(vt_client, label, comment, key_file).await
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (vt_client, label, comment, key_file);
-        bail!("vt ssh keygen requires Unix")
-    }
-}
-
-#[cfg(unix)]
-async fn keygen_unix(
-    vt_client: VTClient,
-    label: Option<String>,
-    comment: Option<String>,
-    key_file: Option<String>,
-) -> Result<()> {
     use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
@@ -106,7 +88,6 @@ async fn keygen_unix(
     Ok(())
 }
 
-#[cfg(unix)]
 fn default_key_path() -> Result<std::path::PathBuf> {
     let home = std::env::home_dir().context("cannot resolve home directory")?;
     Ok(home.join(DEFAULT_REL_PATH))
@@ -115,7 +96,6 @@ fn default_key_path() -> Result<std::path::PathBuf> {
 /// Resolve the *output* key-file path for `keygen`: explicit `--key-file` flag >
 /// default. The raw-content env vars (`VT_GIT_SSH_PRIVATE_KEY` /
 /// `VT_GIT_SSH_PUB`) are read sources for `connect`, never write destinations.
-#[cfg(unix)]
 fn resolve_key_path(flag: Option<String>) -> Result<std::path::PathBuf> {
     if let Some(p) = flag {
         return Ok(std::path::PathBuf::from(p));
@@ -132,7 +112,6 @@ fn resolve_key_path(flag: Option<String>) -> Result<std::path::PathBuf> {
 /// via `sign@vt`. Any OTHER IO error (e.g. permission denied) stays fatal.
 /// A present-but-non-`vt://` record is a configuration error and fails here, so
 /// the contract ("a record is a `vt://` URL") is enforced at load, not at use.
-#[cfg(unix)]
 async fn load_private_record_opt() -> Result<Option<String>> {
     let record = if let Ok(v) = std::env::var("VT_GIT_SSH_PRIVATE_KEY") {
         let v = v.trim();
@@ -154,7 +133,6 @@ async fn load_private_record_opt() -> Result<Option<String>> {
 
 /// Read the default ciphertext key file (`~/.config/vt/git-ssh`), `Ok(None)` if
 /// absent. Other IO errors stay fatal.
-#[cfg(unix)]
 async fn load_default_key_file() -> Result<Option<String>> {
     let key_path = default_key_path()?;
     match tokio::fs::read_to_string(&key_path).await {
@@ -165,14 +143,12 @@ async fn load_default_key_file() -> Result<Option<String>> {
 }
 
 /// `<key>` -> `<key>.pub`.
-#[cfg(unix)]
 fn pubkey_path(key: &std::path::Path) -> std::path::PathBuf {
     let mut s = key.as_os_str().to_os_string();
     s.push(".pub");
     std::path::PathBuf::from(s)
 }
 
-#[cfg(unix)]
 fn create_dir_0700(dir: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     if dir.exists() {
@@ -188,7 +164,6 @@ fn create_dir_0700(dir: &std::path::Path) -> Result<()> {
 
 /// Create-new write with `O_NOFOLLOW` + explicit mode (no umask reliance, no
 /// symlink redirection, no clobber). Mirrors the safe-write pattern in `inject`.
-#[cfg(unix)]
 fn write_new_file(path: &std::path::Path, contents: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -225,23 +200,6 @@ fn write_new_file(path: &std::path::Path, contents: &[u8], mode: u32) -> Result<
 /// the remote via standard agent forwarding — see `route_extension` and
 /// `docs/ssh-vt-design.md` (Forwarded relay).
 pub async fn connect(
-    vt_client: VTClient,
-    args: Vec<String>,
-    forward_real_agent: bool,
-) -> Result<()> {
-    #[cfg(unix)]
-    {
-        connect_unix(vt_client, args, forward_real_agent).await
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (vt_client, args, forward_real_agent);
-        bail!("vt ssh connect requires Unix")
-    }
-}
-
-#[cfg(unix)]
-async fn connect_unix(
     vt_client: VTClient,
     args: Vec<String>,
     forward_real_agent: bool,
@@ -366,7 +324,6 @@ async fn connect_unix(
 /// Returns `Ok(None)` when neither source exists (so `resolve_identities` can
 /// fall through to agent discovery). Any other IO error (e.g. permission
 /// denied) stays fatal. Mirrors `load_private_record_opt`.
-#[cfg(unix)]
 async fn load_pubkey_line_opt() -> Result<Option<String>> {
     if let Ok(p) = std::env::var("VT_GIT_SSH_PUB") {
         if !p.trim().is_empty() {
@@ -393,7 +350,6 @@ async fn load_pubkey_line_opt() -> Result<Option<String>> {
 ///    list ALL keys the upstream vt agent holds and advertise every one
 ///    (`vt_url: None`). Signing routes through `sign@vt` per key.
 /// 3. Otherwise an actionable error.
-#[cfg(unix)]
 async fn resolve_identities(client: &VTClient) -> Result<Vec<SignerIdentity>> {
     use ssh_key::public::PublicKey;
 
@@ -449,7 +405,6 @@ async fn resolve_identities(client: &VTClient) -> Result<Vec<SignerIdentity>> {
 /// Build a `SignerIdentity`, wire-encoding `pubkey` so the agent decodes +
 /// fingerprints it identically to its stored keys (no format drift). Shared by
 /// both `resolve_identities` branches (explicit pubkey + agent discovery).
-#[cfg(unix)]
 fn make_signer_identity(
     pubkey: ssh_key::public::KeyData,
     comment: String,
@@ -475,7 +430,6 @@ fn make_signer_identity(
 /// startup as a *path* (the parent env is read before the child spawns and is
 /// never mutated — D14), so per-request relaying cannot be redirected by any
 /// later env change.
-#[cfg(unix)]
 fn upstream_agent_sock() -> Result<std::path::PathBuf> {
     if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
         if !sock.is_empty() {
@@ -486,7 +440,6 @@ fn upstream_agent_sock() -> Result<std::path::PathBuf> {
     Ok(home.join(".ssh").join("vt.sock"))
 }
 
-#[cfg(unix)]
 fn make_temp_dir_0700() -> Result<std::path::PathBuf> {
     use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
     use rand::RngCore;
@@ -507,7 +460,6 @@ fn make_temp_dir_0700() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-#[cfg(unix)]
 fn chmod_0600(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -516,7 +468,6 @@ fn chmod_0600(path: &std::path::Path) -> Result<()> {
 
 /// Best-effort: pull the `[user@]host` token out of ssh's argv for the audit
 /// label. Not security-relevant; a miss just yields an empty host.
-#[cfg(unix)]
 fn parse_ssh_host(args: &[String]) -> Option<String> {
     // Short options that consume the following token as their value.
     const VAL_OPTS: &[&str] = &[
@@ -550,7 +501,6 @@ fn parse_ssh_host(args: &[String]) -> Option<String> {
 /// sign fallback) or ALL keys discovered from the upstream agent (each with
 /// `vt_url: None`, since discovery has no record — those sign via `sign@vt` or
 /// hard-fail per G3).
-#[cfg(unix)]
 struct SignerIdentity {
     pubkey: ssh_key::public::KeyData,
     /// SSH wire-encoded `pubkey`, sent in `sign@vt` to identify the agent key.
@@ -564,7 +514,6 @@ struct SignerIdentity {
     key: tokio::sync::OnceCell<zeroize::Zeroizing<[u8; 32]>>,
 }
 
-#[cfg(unix)]
 struct SignerInner {
     client: VTClient,
     /// Identities advertised to the system `ssh`. One when an explicit pubkey is
@@ -578,17 +527,14 @@ struct SignerInner {
     relay_upstream: Option<std::path::PathBuf>,
 }
 
-#[cfg(unix)]
 struct SignerFactory {
     inner: std::sync::Arc<SignerInner>,
 }
 
-#[cfg(unix)]
 struct SignerSession {
     inner: std::sync::Arc<SignerInner>,
 }
 
-#[cfg(unix)]
 impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for SignerFactory {
     fn new_session(
         &mut self,
@@ -600,14 +546,12 @@ impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for SignerFactory {
     }
 }
 
-#[cfg(unix)]
 fn sign_err(msg: impl Into<String>) -> ssh_agent_lib::error::AgentError {
     ssh_agent_lib::error::AgentError::other(std::io::Error::other(msg.into()))
 }
 
 /// Pure routing decision for `SignerSession::sign`, extracted so the fallback
 /// policy (guardrail G3) is unit-testable without a live agent socket.
-#[cfg(unix)]
 #[derive(Debug)]
 enum SignRoute {
     /// `sign@vt` succeeded — use this `(algorithm, signature)`.
@@ -622,7 +566,6 @@ enum SignRoute {
 /// record exists for the fallback path. G3: only `Ok(None)` (agent absent / key
 /// not held / recoverable) may fall back, and only if a record exists; an `Err`
 /// (AuthRejected / BadRequest) NEVER falls back, even when a record exists.
-#[cfg(unix)]
 fn decide_sign_route(outcome: Result<Option<(String, Vec<u8>)>>, has_vt_url: bool) -> SignRoute {
     match outcome {
         Ok(Some((alg, sig))) => SignRoute::Use(alg, sig),
@@ -641,7 +584,6 @@ fn decide_sign_route(outcome: Result<Option<(String, Vec<u8>)>>, has_vt_url: boo
 /// extensions may cross from the forwarded (remote) side to the UPSTREAM real
 /// vt agent. Decided on the `name` only — `details` is forwarded verbatim and
 /// never parsed, so the relay cannot filter by key or record.
-#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum ExtensionRoute {
     /// Forward the `Extension` verbatim to the upstream real agent and return
@@ -667,7 +609,6 @@ enum ExtensionRoute {
 /// local machine and must never be reachable over a forwarded socket; this is
 /// the deliberate narrowing vs a raw `ssh -A` of the real agent. Anything
 /// unknown (incl. session-bind@openssh.com) is refused too.
-#[cfg(unix)]
 fn route_extension(name: &str) -> ExtensionRoute {
     match name {
         "decrypt@vt" | "encrypt@vt" | "auth@vt" | "sign@vt" | "diag@vt" => ExtensionRoute::Relay,
@@ -675,7 +616,6 @@ fn route_extension(name: &str) -> ExtensionRoute {
     }
 }
 
-#[cfg(unix)]
 #[async_trait::async_trait]
 impl ssh_agent_lib::agent::Session for SignerSession {
     async fn request_identities(

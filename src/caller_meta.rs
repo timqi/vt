@@ -50,7 +50,6 @@ fn cwd() -> String {
         .unwrap_or_default()
 }
 
-#[cfg(unix)]
 fn tty_name() -> String {
     // ttyname(3) on stdin; returns NULL if stdin isn't a TTY (cron, pipes).
     unsafe {
@@ -61,17 +60,12 @@ fn tty_name() -> String {
         std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
     }
 }
-#[cfg(not(unix))]
-fn tty_name() -> String {
-    String::new()
-}
 
 /// Shorten a parent command line to `basename(argv[0]) + args`. A long
 /// absolute argv[0] (`/opt/homebrew/Cellar/…/bin/zsh -c …`) drowned the
 /// signal on every display surface (Touch ID `via:`, approval page 父进程,
 /// notifications); the field is client-claimed display data everywhere, so
 /// the shortening happens once at collection.
-#[cfg(unix)]
 fn basename_cmdline(first: &str, rest: &[String]) -> String {
     let base = first.rsplit('/').next().unwrap_or(first);
     std::iter::once(base)
@@ -80,7 +74,6 @@ fn basename_cmdline(first: &str, rest: &[String]) -> String {
         .join(" ")
 }
 
-#[cfg(unix)]
 fn parent_cmd() -> String {
     let ppid = unsafe { libc::getppid() };
     if ppid <= 0 {
@@ -113,10 +106,6 @@ fn parent_cmd() -> String {
             }
         }
     }
-    String::new()
-}
-#[cfg(not(unix))]
-fn parent_cmd() -> String {
     String::new()
 }
 
@@ -156,7 +145,6 @@ mod tests {
         assert!(blank.as_object().unwrap().values().all(|value| value == ""));
     }
 
-    #[cfg(unix)]
     #[test]
     fn parent_command_shortens_only_the_executable() {
         assert_eq!(
