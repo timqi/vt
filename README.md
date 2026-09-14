@@ -10,7 +10,7 @@ path.
 - Raw secrets, TOTP, and transient environment/file injection
 - Touch ID-gated SSH signing with optional scoped approval reuse
 - Portable Ed25519 identities for macOS, Linux, and CI
-- Remote sudo approval and on-demand secrets for AI-agent hooks
+- Remote sudo approval
 
 ## Documentation
 
@@ -19,10 +19,9 @@ common paths are:
 
 - [`docs/cf-worker-deploy.md`](docs/cf-worker-deploy.md): deploy phone approval;
 - [`docs/sudo.md`](docs/sudo.md): use VT as a Linux sudo/PAM factor;
-- [`docs/hook.md`](docs/hook.md): integrate with AI coding agents;
 - [`docs/sign-vt-design.md`](docs/sign-vt-design.md): SSH identity selection,
   signing, and fallback;
-- [`config.example.toml`](config.example.toml) and [`agent.example.toml`](agent.example.toml): configuration templates.
+- [`config.example.toml`](config.example.toml): configuration template.
 
 ## Installation
 
@@ -123,7 +122,6 @@ file private. Tokens can be revoked per host on the Worker's admin page.
 | `inject --recover` | Restore ciphertext for any file left decrypted by a crashed/rebooted supervisor (run at login/boot; no auth) |
 | `auth [--reason <text>]` | Trigger bio auth via SSH agent forwarding (for PAM/sudo) |
 | `run -- argv...` | (SSH-agent path) Ask a forwarded macOS agent to launch an allowlisted program locally after Touch ID |
-| `hook {claude,check,exec,install-shims}` | AI-agent command hook: decide/rewrite a proposed command per `~/.config/vt/agent.toml` so `vt://` env secrets decrypt on demand (see below) |
 | `fido2 {register,list,remove,remove-all}` | (macOS) Manage FIDO2/YubiKey credentials used as a Touch-ID fallback factor |
 | `secret export` | (macOS) Export the encrypted master secret |
 | `secret import` | (macOS) Import an encrypted master secret |
@@ -244,7 +242,7 @@ for how long:
 | `ssh` / `git fetch` / `git push` (OpenSSH ≥ 8.9) | The **destination server** (verified via `session-bind@openssh.com`): one approval covers repeated one-shot connections to the same host with the same key, from any local caller |
 | `ssh-keygen -Y sign` (git commit signing), local `vt ssh connect` | The caller's **git workspace** (kernel-derived `.git` root): one approval covers the project, including multi-host fan-outs and TTY-less AI agents / CI working in the same checkout |
 | Local caller outside any git repository | The caller's **exact working directory** (kernel-derived, a separate grant family from git workspaces) |
-| Local caller from a broad shared directory (`$HOME`, `/`, temp roots) | The **calling application** (kernel-derived parent process): repeated requests from the same app instance — e.g. a daemon probing `gh` through the hook — share one approval; grants die when the app exits |
+| Local caller from a broad shared directory (`$HOME`, `/`, temp roots) | The **calling application** (kernel-derived parent process): repeated requests from the same app instance — e.g. a daemon's `gh` helper — share one approval; grants die when the app exits |
 | Forwarded / relay traffic (`ssh -A`, `--forward-real-agent`) | vt extensions (`decrypt@vt`, `sign@vt`) are confined **per connection**: a remote host can reuse only its own approvals and never rides local grants. Raw SSH signs arriving through a forwarding-capable connection are never cached at all |
 | OpenSSH < 8.9, `auth@vt`, `run@vt` | Never cached — always prompts |
 
@@ -329,9 +327,7 @@ base64-encoded plaintext.
 | `VT_PASSKEY_UV` | Requested WebAuthn user-verification level for phone approval (`discouraged`/`preferred`/`required`); same as `--uv`, raise-only — the Worker's policy decides the floor | unset |
 | `VT_BACKEND` | `auto`, `agent`, or `passkey` transport selection | `auto` |
 | `VT_CONFIG` | Override the config-file path | `~/.config/vt/config.toml` |
-| `VT_AGENT_CONFIG` | Override the AI-agent hook config path | `~/.config/vt/agent.toml` |
 | `VT_GIT_SSH_PRIVATE_KEY` / `VT_GIT_SSH_PUB` | Optional portable SSH identity inputs | unset |
-| `VT_HOOK_BIN` | Override the binary used by hook rewrites | current `vt` binary |
 | `SSH_AUTH_SOCK` | SSH agent socket path (used by clients to reach `vt ssh agent`) | falls back to `~/.ssh/vt.sock` |
 | `RUST_LOG` | Log level | `info` (release) / `debug` (dev) |
 
@@ -374,7 +370,7 @@ Cloudflare Worker in `cf-worker/`. The CLI reaches it via `VT_PASSKEY_URL` +
 See [docs/cf-worker-deploy.md](docs/cf-worker-deploy.md) for the full deployment
 guide (Wrangler config, Cloudflare Access gate, secrets, first-Passkey
 bootstrap, and CLI wiring). See [docs/README.md](docs/README.md) for cache,
-hook, SSH, error-protocol, audit, and notification documentation.
+SSH, error-protocol, audit, and notification documentation.
 
 ## License
 

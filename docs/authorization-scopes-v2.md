@@ -246,8 +246,8 @@ workspace root, with two deliberate differences:
 ### Parent-app arm (broad cwd)
 
 A caller whose cwd is one of the excluded broad directories is typically an
-application-spawned helper (a daemon probing `gh` through the hook from
-cwd `/`, a GUI app's git integration from `$HOME`). Its activity identity is
+application-spawned helper (a daemon's `gh` helper from cwd `/`, a GUI
+app's git integration from `$HOME`). Its activity identity is
 the **kernel-derived parent process**:
 
 - `subject` = parent `(pid, start_tvsec)` — grants die when the app exits;

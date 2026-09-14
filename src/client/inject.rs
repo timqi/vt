@@ -128,9 +128,8 @@ pub async fn inject(
 
     // Scan env vars locally for vt:// patterns — only those values enter the
     // decrypt pipeline. Env var names and non-vt values never leave this process.
-    // When `--only-env` is given, restrict decryption to exactly those names:
-    // this is how `vt hook` keeps a matched command scoped to the secrets its
-    // rule authorizes, instead of every vt:// var in the environment.
+    // When `--only-env` is given, restrict decryption to exactly those names
+    // instead of every vt:// var in the environment.
     let env_vt_vars: Vec<(String, String)> = env::vars()
         .filter(|(k, v)| env_var_in_scope(k, v, only_env.as_deref()))
         .collect();

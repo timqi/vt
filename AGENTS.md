@@ -87,10 +87,8 @@ repo-wide number. Ceilings are the post-slim targets: steps 1–2 of
   recoverable errors; `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN` enable the Worker.
   `VT_BACKEND=agent` and `VT_BACKEND=passkey` pin the transport. Never silently
   broaden fallback. See [config.example.toml](config.example.toml).
-- Hook rules are separate: `~/.config/vt/agent.toml`, overridden by
-  `VT_AGENT_CONFIG`. Preserve default-accept and rewrite only when a configured
-  rule names a resolved `vt://` variable; `--only-env` prevents injecting unrelated
-  environment secrets. The hook is not a sandbox. See [docs/hook.md](docs/hook.md).
+- `inject --only-env` restricts env-var decryption to the named variables; a
+  wrapper uses it so a command never receives unrelated environment secrets.
 - Plaintext secrets and private seeds must never enter logs, examples, or test
   output. Do not introduce disk/argv exposure beyond explicit product flows such
   as transient injection.

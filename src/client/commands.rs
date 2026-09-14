@@ -213,8 +213,8 @@ impl SubstitutionPlan {
 
 /// Whether an environment variable enters the decrypt pipeline: its value must
 /// contain a `vt://` URL, and — when `--only-env` is given — its name must be in
-/// that allow-list. This is the scoping that keeps `vt hook` from handing a
-/// matched command every vt:// secret in the environment (confused-deputy guard).
+/// that allow-list, so a wrapper can hand a command exactly the secrets it
+/// needs instead of every vt:// secret in the environment (confused-deputy guard).
 pub(super) fn env_var_in_scope(key: &str, value: &str, only_env: Option<&[String]>) -> bool {
     has_vt_url(value) && only_env.is_none_or(|allow| allow.iter().any(|a| a == key))
 }

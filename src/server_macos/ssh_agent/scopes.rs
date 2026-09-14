@@ -103,8 +103,8 @@ impl Workspace {
 
 /// The caller's kernel-derived parent process, used as the activity identity
 /// when the caller's cwd is a broad shared directory: "this application
-/// instance keeps making the same request" (e.g. an app probing `gh` through
-/// the hook from cwd `/`). `subject` is the parent's `(pid, start_tvsec)`,
+/// instance keeps making the same request" (e.g. an app's `gh` helper from
+/// cwd `/`). `subject` is the parent's `(pid, start_tvsec)`,
 /// so grants die when the app exits; `exe` is the parent's kernel-verified
 /// executable path (`proc_pidpath`), bound into the digest — never the
 /// client-claimed `ppid_cmd` string.

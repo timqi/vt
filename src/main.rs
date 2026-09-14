@@ -60,7 +60,6 @@ mod cf;
 mod client;
 mod config;
 mod core;
-mod hook;
 #[cfg(target_os = "macos")]
 mod server_macos;
 mod ssh_sign;
@@ -161,7 +160,7 @@ enum Commands {
         #[arg(
             long = "only-env",
             value_delimiter = ',',
-            help = "Restrict env-var vt:// decryption to these names (comma-separated). When omitted, every env var whose value contains vt:// is decrypted. Used by `vt hook` to scope a command to exactly the secrets its rule names."
+            help = "Restrict env-var vt:// decryption to these names (comma-separated). When omitted, every env var whose value contains vt:// is decrypted."
         )]
         only_env: Option<Vec<String>>,
 
@@ -178,13 +177,6 @@ enum Commands {
         )]
         args: Vec<String>,
     },
-
-    /// AI-agent command hook. Reads an agent's proposed shell command and,
-    /// per the `[[rules]]` whitelist in ~/.config/vt/agent.toml, accepts it,
-    /// blocks it, or rewrites it to run under `vt inject` so vt:// secrets in
-    /// the environment are transparently decrypted. See `docs/hook.md`.
-    #[command(subcommand)]
-    Hook(HookCommands),
 
     /// Trigger bio auth via the vt SSH agent (for use with PAM, sudo, etc.)
     Auth {
@@ -225,46 +217,6 @@ enum Commands {
     #[cfg(target_os = "macos")]
     #[command(subcommand)]
     Fido2(Fido2Commands),
-}
-
-#[derive(Subcommand, PartialEq)]
-pub enum HookCommands {
-    /// Process a Claude Code PreToolUse event (JSON on stdin) and emit the
-    /// decision JSON on stdout. Wire it as a PreToolUse hook for the Bash tool.
-    Claude,
-    /// Dry-run: print what the hook would do (ACCEPT / BLOCK / REWRITE) for the
-    /// given command, without executing anything.
-    Check {
-        #[arg(
-            trailing_var_arg = true,
-            required = true,
-            help = "The command to evaluate, e.g. `vt hook check gh pr list`"
-        )]
-        command: Vec<String>,
-    },
-    /// Exec-gateway: evaluate <argv> against the rules and then exec it
-    /// unchanged, exec it under `vt inject`, or refuse it (non-zero exit).
-    /// Intended for shell shims/wrappers — see `vt hook install-shims`.
-    Exec {
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            required = true,
-            help = "Program and args to gate, e.g. `vt hook exec -- gh pr list`"
-        )]
-        argv: Vec<String>,
-    },
-    /// Generate PATH shims (symlinks to vt, one per command in
-    /// ~/.config/vt/agent.toml) that route through the exec-gateway, then print
-    /// the line to prepend to PATH. Works in interactive shells, scripts, and
-    /// non-interactive (agent) shells.
-    InstallShims {
-        #[arg(
-            long,
-            help = "Directory to write shims into (default: ~/.local/share/vt/shims)"
-        )]
-        dir: Option<String>,
-    },
 }
 
 #[cfg(target_os = "macos")]
@@ -611,7 +563,6 @@ async fn run(cli: Cli, config: config::ResolvedConfig) -> Result<()> {
             )
             .await
         }
-        Commands::Hook(cmd) => hook::run(cmd),
     }
 }
 
@@ -623,20 +574,6 @@ fn main() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if args.get(1).and_then(|s| s.to_str()) == Some(client::SUPERVISOR_SUBCOMMAND) {
         std::process::exit(client::supervisor_main(&args[2..]));
-    }
-
-    // Multi-call (busybox-style) dispatch: when invoked via a `vt hook
-    // install-shims` symlink whose name isn't `vt` (e.g. `gh`), act as the
-    // exec-gateway for that command. Runs before clap (argv[0] isn't `vt`).
-    if let Some(name) = args
-        .first()
-        .map(std::path::Path::new)
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-    {
-        if name != "vt" && !name.is_empty() {
-            std::process::exit(hook::shim_main(name, &args[1..]));
-        }
     }
 
     let log_level = std::env::var("RUST_LOG")
