@@ -17,26 +17,66 @@
         return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     };
 
-    vt.setStatus = function (text, kind) {
-        var el = document.getElementById('status');
-        if (!el) return;
-        el.textContent = text;
-        el.className = kind || '';
+    // ── DOM + formatting helpers shared by both shells (docs/design/ui-ux.md) ──
+
+    vt.el = function (tag, cls, text) {
+        var e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text != null) e.textContent = text;
+        return e;
     };
 
+    // One status line per surface: returns a setter that keeps the element's
+    // own classes and swaps only the kind ('' | 'ok' | 'error').
+    vt.statusLine = function (el) {
+        var base = el.className;
+        return function (text, kind) {
+            el.textContent = text || '';
+            el.className = kind ? base + ' ' + kind : base;
+        };
+    };
+
+    // Parse the #vt-data block; null (and a console error) when absent/invalid.
     vt.bootData = function () {
-        var bootStatus = document.getElementById('status');
         var raw = document.getElementById('vt-data');
-        if (!raw) {
-            if (bootStatus) { bootStatus.textContent = '页面初始化失败：缺少 vt-data 块'; bootStatus.className = 'error'; }
-            return null;
-        }
+        if (!raw) { console.error('页面初始化失败：缺少 vt-data 块'); return null; }
         try { return JSON.parse(raw.textContent); }
-        catch (e) {
-            console.error('页面数据解析失败', e);
-            if (bootStatus) { bootStatus.textContent = '页面数据解析失败：' + (e.message || e); bootStatus.className = 'error'; }
-            return null;
+        catch (e) { console.error('页面数据解析失败', e); return null; }
+    };
+
+    // Absolute local time, YYYY-MM-DD HH:MM:SS; '' for anything but a positive ms.
+    vt.fmtTime = function (ms) {
+        if (typeof ms !== 'number' || ms <= 0) return '';
+        var d = new Date(ms);
+        var p = function (n) { return (n < 10 ? '0' : '') + n; };
+        return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+            ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    };
+
+    // Coarse remaining-time label; callers re-render on a ticker, so minute
+    // granularity is honest (never a second-precision value that is stale).
+    vt.fmtRemaining = function (ms) {
+        if (ms <= 0) return '已过期';
+        var mins = Math.floor(ms / 60000);
+        if (mins < 1) return '< 1 分钟';
+        if (mins < 60) return mins + ' 分钟';
+        // Roll over to days past 24h: with a one-week ceiling, "167 小时 47 分" is
+        // a number an operator has to do arithmetic on before judging the risk.
+        if (mins >= 1440) {
+            var d = Math.floor(mins / 1440), dh = Math.floor((mins % 1440) / 60);
+            return d + ' 天' + (dh ? ' ' + dh + ' 小时' : '');
         }
+        var h = Math.floor(mins / 60), m = mins % 60;
+        return h + ' 小时' + (m ? ' ' + m + ' 分' : '');
+    };
+
+    vt.ttlLabel = function (s) {
+        if (s === 0) return '不缓存';
+        if (s % 604800 === 0) return (s / 604800) + ' 周';
+        if (s % 86400 === 0) return (s / 86400) + ' 天';
+        if (s % 3600 === 0) return (s / 3600) + ' 小时';
+        if (s % 60 === 0) return (s / 60) + ' 分钟';
+        return s + ' 秒';
     };
 
     var PRF_INFO_BYTES = new TextEncoder().encode('vt-master-wrap-v1');

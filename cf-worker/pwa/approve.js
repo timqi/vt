@@ -24,21 +24,7 @@
         'SHA-256', ENC.encode('vt-passkey-prf-v1')
     ).then(function (buf) { return new Uint8Array(buf); });
 
-    function el(tag, cls, text) {
-        var e = document.createElement(tag);
-        if (cls) e.className = cls;
-        if (text != null) e.textContent = text;
-        return e;
-    }
-
-    function ttlLabel(s) {
-        if (s === 0) return '不缓存';
-        if (s % 604800 === 0) return (s / 604800) + ' 周';
-        if (s % 86400 === 0) return (s / 86400) + ' 天';
-        if (s % 3600 === 0) return (s / 3600) + ' 小时';
-        if (s % 60 === 0) return (s / 60) + ' 分钟';
-        return s + ' 秒';
-    }
+    var el = vt.el, ttlLabel = vt.ttlLabel;
 
     // Build the ceremony UI into `root`; return element refs. Class-scoped so
     // duplicate ids can't collide with a host page (e.g. audit's own #status).
@@ -119,11 +105,7 @@
             .indexOf(data.user_verification) < 0 ? 'required' : data.user_verification;
 
         var refs = buildUi(root, showMeta);
-
-        function setStatus(text, kind) {
-            refs.status.textContent = text || '';
-            refs.status.className = 'vt-ap-status ' + (kind || '');
-        }
+        var setStatus = vt.statusLine(refs.status);
 
         // ── Request metadata ─────────────────────────────────────────────
         if (showMeta && refs.meta) {
@@ -431,11 +413,11 @@
     vt.mountApprove = mountApprove;
 
     // Standalone approval page (/a/:token): auto-mount from the embedded data,
-    // close the tab shortly after a decision.
-    if (document.getElementById('vt-data')) {
+    // close the tab shortly after a decision. The admin shell has no such root.
+    var root = document.getElementById('vt-approve-root');
+    if (root) {
         var data = vt.bootData();
-        var root = document.getElementById('vt-approve-root');
-        if (data && root) {
+        if (data) {
             mountApprove({
                 data: data,
                 root: root,
