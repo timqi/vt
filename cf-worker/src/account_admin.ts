@@ -41,7 +41,6 @@ export interface Config {
   /** When and from where the first credential was registered — what a 409 on
    *  a second bootstrap shows. */
   bootstrap: { ms: number; ip: string };
-  cache_enabled: boolean;
   cache_hit_notify: boolean;
   uv_policy: unknown;
   vapid: VapidKeys | null;
@@ -56,8 +55,7 @@ interface Loaded {
   root: Uint8Array;
   kcfg: CryptoKey;
   ksess: Uint8Array;
-  /** X25519 scalar the DEK cache seals to; derived once, used only while
-   *  `cfg.cache_enabled`. */
+  /** X25519 scalar the DEK cache seals to. */
   kcache: Uint8Array;
   cfg: Config;
 }
@@ -179,10 +177,11 @@ export class AccountAdmin {
     return ctEq(mac, await hmacSha256(await this.hostTokenSecret(tokenId), signed));
   }
 
-  /** The cache scalar, or null while caching is off (docs/dek-cache.md). */
-  cacheSeckey(): Uint8Array | null {
+  /** The cache scalar (docs/dek-cache.md); rooted on `R`, so nothing but a
+   *  factory reset changes it. */
+  cacheSeckey(): Uint8Array {
     if (!this.loaded) throw new Error('config not loaded');
-    return this.loaded.cfg.cache_enabled ? this.loaded.kcache : null;
+    return this.loaded.kcache;
   }
 
   /** The stored policy was validated on PUT, so an error here is a bug and
@@ -306,7 +305,7 @@ export class AccountAdmin {
       const root = randomBytes(32);
       const cfg: Config = {
         v: 1, origin, epoch: 1, credentials: [entry], bootstrap: { ms: Date.now(), ip },
-        cache_enabled: false, cache_hit_notify: false, uv_policy: null, vapid: null, push: [],
+        cache_hit_notify: false, uv_policy: null, vapid: null, push: [],
       };
       const cur = await this.keysFor(root, cfg);
       const rootRec: RootRecord = { wraps: [await sealWith(await this.kek(), ROOT_AAD, root)] };
@@ -423,29 +422,26 @@ export class AccountAdmin {
       case 'credentials':
         return json({ credentials: cfg.credentials, epoch: cfg.epoch });
       case 'config': {
-        const { origin, epoch, cache_enabled, cache_hit_notify, uv_policy } = cfg;
-        if (request.method !== 'PUT') return json({ origin, epoch, cache_enabled, cache_hit_notify, uv_policy });
+        const { origin, epoch, cache_hit_notify, uv_policy } = cfg;
+        if (request.method !== 'PUT') return json({ origin, epoch, cache_hit_notify, uv_policy });
         let body: Record<string, unknown>;
         try { body = (await request.json()) as Record<string, unknown>; }
         catch { return new Response('invalid json', { status: 400 }); }
         if (!body || typeof body !== 'object' || Array.isArray(body)) return new Response('not an object', { status: 400 });
         for (const k of Object.keys(body)) {
-          if (!['cache_enabled', 'cache_hit_notify', 'uv_policy'].includes(k)) return new Response(`unknown key ${k}`, { status: 400 });
+          if (!['cache_hit_notify', 'uv_policy'].includes(k)) return new Response(`unknown key ${k}`, { status: 400 });
         }
-        for (const k of ['cache_enabled', 'cache_hit_notify'] as const) {
-          if (k in body && typeof body[k] !== 'boolean') return new Response(`${k} must be a boolean`, { status: 400 });
-        }
+        if ('cache_hit_notify' in body && typeof body.cache_hit_notify !== 'boolean') return new Response('cache_hit_notify must be a boolean', { status: 400 });
         if ('uv_policy' in body && body.uv_policy !== null) {
           const { error } = parseUvPolicy(body.uv_policy);
           if (error) return new Response(`uv_policy: ${error}`, { status: 400 });
         }
         const next = await this.write(c => {
-          if ('cache_enabled' in body) c.cache_enabled = body.cache_enabled as boolean;
           if ('cache_hit_notify' in body) c.cache_hit_notify = body.cache_hit_notify as boolean;
           if ('uv_policy' in body) c.uv_policy = body.uv_policy;
         });
-        log('admin.config', { cache_enabled: next.cache_enabled, cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy !== null });
-        return json({ cache_enabled: next.cache_enabled, cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy });
+        log('admin.config', { cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy !== null });
+        return json({ cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy });
       }
       case 'rotate-secret':
         return this.rotateSecret();

@@ -25,9 +25,7 @@ const TTL_2D = 2 * 24 * 3600;
 const TTL_1W = 7 * 24 * 3600;
 const TTL_PERMANENT = 100 * 365 * 24 * 3600;
 
-// Extension is offered iff caching is (docs/worker-slim.md §4.1); the
-// off-switch cases flip `cache_enabled` after seeding.
-beforeEach(async () => { await bootstrap(); await configure({ cache_enabled: true }); });
+beforeEach(bootstrap);
 
 function requestExtend(groupIds: string[], ttlS: number): Promise<DoResult> {
   return doPost('cache-extend-create', { group_ids: groupIds, ttl_s: ttlS },
@@ -88,19 +86,6 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
     expect(ch.extend).toBeTruthy();
     expect(ch.extend!.ttl_s).toBe(TTL_1D);
     expect(ch.extend!.group_ids).toEqual([GROUP]);
-  });
-
-  it('is unreachable while caching is off — a switch, not an authorization', async () => {
-    const keys = await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
-    await configure({ cache_enabled: false });
-    const res = await requestExtend([GROUP], TTL_1D);
-    expect(res.status).toBe(404);
-    expect(res.text).toMatch(/disabled/);
-    // And no ceremony was minted, so nothing is even approvable.
-    const chs = await inDO(async h => [...(await h.state.storage.list({ prefix: 'ch:' })).keys()]);
-    expect(chs).toEqual([]);
-    const [e] = await inDO(h => readEntries(h, keys));
-    expect(e!.expires_ms).toBeLessThan(Date.now() + 2 * HOUR);
   });
 
   it('refuses a TTL that is not an extend-ladder rung', async () => {
@@ -280,14 +265,6 @@ describe('opApprove → commitExtend — the only path that moves expires_ms', (
     const dekKeysAfter = await inDO(async h =>
       [...(await h.state.storage.list({ prefix: 'dek:' })).keys()]);
     expect(dekKeysAfter).toEqual(dekKeysBefore);
-  });
-
-  it('re-checks the switch at commit: disabling caching mid-ceremony stops the hop', async () => {
-    const { keys, ch } = await armCeremony({ leftMs: HOUR, ttlS: TTL_1W });
-    await configure({ cache_enabled: false });
-    expect((await approve(ch)).status).toBe(200);
-    const after = await inDO(h => readEntries(h, keys));
-    for (const e of after) expect(e.expires_ms).toBeLessThan(Date.now() + 2 * HOUR);
   });
 
   it('re-checks the extend ladder at commit: a doctored stored intent moves nothing', async () => {

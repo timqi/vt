@@ -170,17 +170,21 @@ describe('session verification in the DO', () => {
     const put = (body: unknown, headers: Record<string, string> = adminHeaders()) => SELF.fetch(`${TEST_ORIGIN}/api/admin/config`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body),
     });
-    const denied = await put({ cache_enabled: true }, {});
+    const denied = await put({ cache_hit_notify: true }, {});
     expect(denied.status).toBe(401);
     await denied.text();
-    const ok = await put({ cache_enabled: true, uv_policy: { default: 'required' } });
+    const ok = await put({ cache_hit_notify: true, uv_policy: { default: 'required' } });
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toEqual({ cache_enabled: true, cache_hit_notify: false, uv_policy: { default: 'required' } });
-    const bad = await put({ cache_enabled: true, origin: 'https://evil.test.invalid' });
+    expect(await ok.json()).toEqual({ cache_hit_notify: true, uv_policy: { default: 'required' } });
+    // The deleted switch is a rejected input now, like any unknown key.
+    const gone = await put({ cache_enabled: true });
+    expect(gone.status).toBe(400);
+    await gone.text();
+    const bad = await put({ cache_hit_notify: true, origin: 'https://evil.test.invalid' });
     expect(bad.status).toBe(400);
     await bad.text();
     const got = await SELF.fetch(`${TEST_ORIGIN}/api/admin/config`, { headers: adminHeaders() });
-    expect(await got.json()).toMatchObject({ cache_enabled: true, origin: TEST_ORIGIN, epoch: 1 });
+    expect(await got.json()).toMatchObject({ cache_hit_notify: true, origin: TEST_ORIGIN, epoch: 1 });
     const rotate = await SELF.fetch(`${TEST_ORIGIN}/api/admin/rotate-secret`, { method: 'POST', headers: adminHeaders() });
     expect(rotate.status).toBe(200);
     const { secret } = await rotate.json() as { secret: string };

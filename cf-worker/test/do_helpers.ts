@@ -53,7 +53,7 @@ export function inDO<T>(fn: (h: DoHandle) => T | Promise<T>): Promise<T> {
   ) as Promise<T>;
 }
 
-/** Set config knobs (cache_enabled, cache_hit_notify, uv_policy) through the
+/** Set config knobs (cache_hit_notify, uv_policy) through the
  *  real PUT op with the session bootstrap() minted. */
 export async function configure(partial: Record<string, unknown>): Promise<void> {
   const res = await accountStub().fetch('https://account.do/op/admin-config', {
@@ -74,13 +74,9 @@ export function redeployWithSecret(secret: string): Promise<void> {
   });
 }
 
-/** The DEK-cache scalar of this test's root key (null while caching is off). */
+/** The DEK-cache scalar of this test's root key. */
 export function cacheSeckey(): Promise<Uint8Array> {
-  return inDO(({ inst }) => {
-    const sk = inst.admin.cacheSeckey() as Uint8Array | null;
-    if (!sk) throw new Error('cache disabled — configure({ cache_enabled: true }) first');
-    return sk;
-  });
+  return inDO(({ inst }) => inst.admin.cacheSeckey() as Uint8Array);
 }
 
 /** The secret a host holding `tokenId` would present, derived from this

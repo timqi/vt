@@ -67,11 +67,11 @@ describe('the policy is read from the config blob', () => {
     expect((await put({ uv_policy: { default: 'sometimes' } })).status).toBe(400);
     expect((await put({ uv_policy: 'required' })).status).toBe(400);
     expect((await put({ uv_policy: ['required'] })).status).toBe(400);
-    expect((await put({ cache_enabled: 'yes' })).status).toBe(400);
+    expect((await put({ cache_hit_notify: 'yes' })).status).toBe(400);
     expect((await put({ origin: 'https://evil.test.invalid' })).status).toBe(400);
     expect((await put({ epoch: 99 })).status).toBe(400);
     const cfg = await doGet('admin-config');
-    expect(cfg.json).toMatchObject({ uv_policy: null, cache_enabled: false, cache_hit_notify: false, epoch: 1, origin: 'https://vt.test.invalid' });
+    expect(cfg.json).toMatchObject({ uv_policy: null, cache_hit_notify: false, epoch: 1, origin: 'https://vt.test.invalid' });
   });
 });
 
@@ -149,7 +149,6 @@ describe('the assertion is checked against that same level', () => {
 describe('the cache-extension ceremony keeps its biometric step', () => {
   it('mints a required ceremony even under a fully discouraged policy', async () => {
     await configure({
-      cache_enabled: true,
       uv_policy: { default: 'discouraged', by_op: { 'cache-extend': 'discouraged' } },
     });
     await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));

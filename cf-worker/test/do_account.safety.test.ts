@@ -16,10 +16,7 @@ import type { Challenge, CacheExtendIntent } from '../src/types';
 const TTL_MS = 5 * 60_000;
 const GROUP = 'g_testgroup00000';
 
-beforeEach(async () => {
-  await bootstrap();
-  await configure({ cache_enabled: true });
-});
+beforeEach(bootstrap);
 
 it('expires a still-pending challenge when valid verification crosses its TTL', async () => {
   const ch = makeChallenge();

@@ -76,6 +76,9 @@ export interface AuditRow {
   grant_ttl_s: number | null;
   /** Peer is the vt relay: 0 | 1. */
   relayed: number | null;
+  /** Stored as `[salt, claimed]` pairs, resolved against the names table on
+   *  every read; NULL when the row carries no salts (auth, agent rows). */
+  records: RecordName[] | null;
   /** Monotonic change counter, bumped on EVERY write to the row (create +
    *  each in-place lifecycle update). Unlike `id` (assigned once at INSERT), a
    *  later approve/reject/expire/verify-fail UPDATE advances `seq`, so the
@@ -103,6 +106,15 @@ export type AdminWsMessage =
   // The audit table was wiped (admin "清空审计") — connected tabs should reset
   // their list and reload, rather than keep showing now-deleted rows.
   | { kind: 'clear' };
+
+/** One record as every surface shows it: `name` is operator-owned (adopted or
+ *  typed on the console), `claimed` is the client's 自报 (display only). */
+export interface RecordName {
+  salt_b64u: string;
+  name: string | null;
+  source: 'client' | 'manual' | null;
+  claimed: string;
+}
 
 // DEK-cache events (hit / miss / clear) are NOT a separate table — they are
 // rows in `audit` with op_kind='cache' and status ∈ {approved=hit, miss,
@@ -272,6 +284,10 @@ export interface CacheGroupSummary {
   /** Worker-derived source IP at approval (audit metadata; not bound). */
   ip: string;
   ppid_cmd: string;
+  /** CacheEntry.project; null on entries written before it was stored. */
+  project: string | null;
+  /** The group's records with their names; the salt is the rename key. */
+  records: RecordName[];
   /** Joined from the origin audit row (same fields the audit tab already shows
    *  on the same Access gate). */
   host: string | null;
@@ -299,8 +315,6 @@ export interface CacheListResponse {
   /** True when the scan hit its cap — some groups are NOT shown. Never silently
    *  truncate: the UI must say so, and 清除全部 still covers everything. */
   truncated: boolean;
-  /** Whether extension requests are offered (`config.cache_enabled`). */
-  extend_enabled: boolean;
   /** TTL options (seconds) an extension may request. */
   ttl_options_s: number[];
 }
@@ -356,6 +370,8 @@ export interface ChallengeMeta {
   /** Token path only: the IP of the token's PREVIOUS use when it differs from
    *  `ip` — an IP-change hint for the approver. '' / absent otherwise. */
   ip_prev?: string;
+  /** Client-suggested record names, one per salt, '' when unknown (自报). */
+  names?: string[];
 }
 
 // ── Inbound from daemon via POST /api/challenge ────────────────────────────
@@ -409,6 +425,8 @@ export interface ApproveRequest {
    * crypto_box_seal(DEK_i, CACHE_PUBKEY) produced by the PWA. Only sent when
    * cache_ttl_s > 0. */
   cache_sealed_deks_b64u?: string[];
+  /** Indices into salts_b64u whose suggestion the approver adopts (source='client'). */
+  adopt_names?: number[];
 }
 
 // ── Inbound from PWA via POST /api/reject ─────────────────────────────────
@@ -445,11 +463,13 @@ export interface ApprovePageData {
    *  `navigator.credentials.get`. Server-decided; the page never chooses it. */
   user_verification: UvLevel;
   metadata: ChallengeMeta;
+  /** One per salt: the owned name (truth line) and the client's claim. */
+  records: RecordName[];
   /** TTL options (seconds) the PWA renders as cache-duration radios. Always
-   *  includes 0 ("不缓存", the default). Empty (only [0]) when caching disabled. */
+   *  includes 0 ("不缓存", the default); only [0] when there is nothing to cache. */
   cache_options_s: number[];
   /** base64url 32-byte X25519 public key the PWA seals cached DEKs to. Empty
-   *  string while caching is disabled (PWA hides the UI). */
+   *  string when the ceremony has no DEKs (PWA hides the UI). */
   cache_pubkey_b64u: string;
   /** Enrollment ceremonies only: the pairing code the approver compares with
    *  the requesting terminal before approving. */
@@ -496,6 +516,10 @@ export interface CacheEntry {
   /** Legacy (pre-trim entries only); no longer written. */
   ppid?: number;
   ppid_cmd: string;
+  /** Client-reported project (for the listing) and name claim at approval;
+   *  absent on entries written before they were stored. */
+  project?: string;
+  name?: string;
   /** `g_…` handle minted once per writeCache call (one approval, one binding
    *  ctx). This — not the truncated origin_token_id — is what an extension
    *  selects on: a mutation that GRANTS authority needs an unambiguous key of its
@@ -623,6 +647,7 @@ export interface DoApproveOp {
   binding_tag_b64u: string;
   cache_ttl_s?: number;
   cache_sealed_deks_b64u?: string[];
+  adopt_names?: unknown;
 }
 
 /** Internal DO op for POST /api/dek-cache. The Worker builds `meta` (capping the

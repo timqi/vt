@@ -27,10 +27,7 @@ const TTL_1D = 24 * 3600;
 const TTL_1W = 7 * 24 * 3600;
 const TTL_PERMANENT = 100 * 365 * 24 * 3600;
 
-beforeEach(async () => {
-  await bootstrap();
-  await configure({ cache_enabled: true });
-});
+beforeEach(bootstrap);
 
 /** Create a normal decrypt ceremony carrying `n` salts, ready to approve. */
 async function createCeremony(n = 2) {
@@ -89,13 +86,11 @@ describe('writeCache — approve-ladder only', () => {
     expect(await inDO(allDekKeys)).toEqual([]);
   });
 
-  it('writes nothing while caching is disabled — caching is opt-in', async () => {
+  it('writes nothing for option 0 — the default is the no-cache path', async () => {
     const { ch, sealed } = await createCeremony(1);
-    await configure({ cache_enabled: false });
-    expect((await approve(ch, { cache_ttl_s: TTL_8H, cache_sealed_deks_b64u: sealed })).status)
-      .toBe(200);
+    expect((await approve(ch, { cache_ttl_s: 0, cache_sealed_deks_b64u: sealed })).status).toBe(200);
     expect(await inDO(allDekKeys)).toEqual([]);
-    expect((await inDO(auditRows)).some(r => r.status === 'write_failed')).toBe(true);
+    expect((await inDO(auditRows)).some(r => r.status === 'write_failed')).toBe(false);
   });
 
   it('refuses a sealed batch whose length disagrees with the salts', async () => {

@@ -32,7 +32,6 @@ let tokenId: string;
 
 beforeEach(async () => {
   await bootstrap();
-  await configure({ cache_enabled: true });
   tokenId = await liveTokenId();
 });
 
@@ -163,22 +162,20 @@ describe('opDekCache / writeCache — token_id is the hard half', () => {
     expect(forged.text).toBe('hmac mismatch');
   });
 
-  // docs/worker-slim.md §7 row 5: `cache_enabled=false` with live entries → miss,
-  // approve page offers [0], extend routes 404. Disabling does not delete.
-  it('misses, offers no TTL and 404s extension while caching is disabled, entries intact', async () => {
-    const salts = await armCache(2);
-    await configure({ cache_enabled: false });
-    expect((await read(salts)).json).toEqual({ miss: true });
-    expect(await inDO(allDekKeys)).toHaveLength(2);
+  // There is no cache switch: option 0 (the default) is the no-cache path, and
+  // an auth-only ceremony has nothing to offer.
+  it('offers the ladder for a salted ceremony, only [0] for an auth-only one', async () => {
     const ch = makeChallenge({ salts_b64u: [nextSalt()] });
     expect((await doPost('create', { challenge: ch, auth: await daemonAuth(tokenId) })).status).toBe(200);
     const page = await doGet(`page?approve_token=${ch.approve_token}`);
-    expect(page.json.cache_options_s).toEqual([0]);
-    expect(page.json.cache_pubkey_b64u).toBe('');
-    expect((await doPost('cache-extend-create', { group_ids: ['g_x'], ttl_s: 1200 })).status).toBe(404);
-    // Back on: the same entries serve again — the scalar is the root key's.
-    await configure({ cache_enabled: true });
-    expect((await read(salts)).json).toMatchObject({ source: 'cache' });
+    expect(page.json.cache_options_s[0]).toBe(0);
+    expect(page.json.cache_options_s.length).toBeGreaterThan(1);
+    expect(page.json.cache_pubkey_b64u).not.toBe('');
+    const auth = makeChallenge({ salts_b64u: [] });
+    expect((await doPost('create', { challenge: auth, auth: await daemonAuth(tokenId) })).status).toBe(200);
+    const authPage = await doGet(`page?approve_token=${auth.approve_token}`);
+    expect(authPage.json.cache_options_s).toEqual([0]);
+    expect(authPage.json.cache_pubkey_b64u).toBe('');
   });
 
   it('records write_failed instead of arming a key without a token half', async () => {

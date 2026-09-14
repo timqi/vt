@@ -15,17 +15,7 @@ export function metaLines(
   meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ip' | 'reason' | 'ip_prev'>,
   salts = 0,
 ): string[] {
-  const who = [meta.user, meta.host].filter(Boolean).join('@');
-  const lines: string[] = [];
-  const head = [who, salts > 0 ? `${salts} 条` : ''].filter(Boolean).join(' · ');
-  if (head) lines.push(head);
-  if (meta.pwd) lines.push(`pwd: ${meta.pwd}`);
-  if (meta.command) {
-    // The CLI sends `command` as a self-labelled multi-line body
-    // (`op: …\nfile: …\ncmd: …\nreason: …`); prefixing with another `cmd:`
-    // would duplicate the labels. Inline single-line legacy commands.
-    lines.push(meta.command.includes('\n') ? meta.command : `cmd: ${meta.command}`);
-  }
+  const lines = bodyLines(meta, salts);
   // The parent-process line mirrors the approval page's 父进程 row: users often
   // decide from the notification alone, and "which program asked" is the
   // highest-signal client-claimed field. ip is worker-verified; on the host-token
@@ -33,6 +23,21 @@ export function metaLines(
   if (meta.ppid_cmd) lines.push(`via: ${meta.ppid_cmd}`);
   if (meta.ip) lines.push(meta.ip_prev ? `ip: ${meta.ip}（上次 ${meta.ip_prev}）` : `ip: ${meta.ip}`);
   if (meta.reason) lines.push(`reason: ${meta.reason}`);
+  return lines;
+}
+
+// `user@host · N 条 · note`, then pwd and the command — the block both notices
+// open with. The CLI sends `command` as a self-labelled multi-line body
+// (`op: …\nfile: …\ncmd: …\nreason: …`); prefixing with another `cmd:` would
+// duplicate the labels, so only a single-line legacy command gets one.
+function bodyLines(
+  meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd'>, salts: number, ...extra: string[]
+): string[] {
+  const who = [meta.user, meta.host].filter(Boolean).join('@');
+  const head = [who, salts > 0 ? `${salts} 条` : '', ...extra].filter(Boolean).join(' · ');
+  const lines = head ? [head] : [];
+  if (meta.pwd) lines.push(`pwd: ${meta.pwd}`);
+  if (meta.command) lines.push(meta.command.includes('\n') ? meta.command : `cmd: ${meta.command}`);
   return lines;
 }
 
@@ -57,21 +62,17 @@ export function buildApprovalMessage(
 // `note` names the skipped factor: the default fits the Worker DEK cache
 // (no phone approval); the agent's Touch-ID-cache ingest path passes its own
 // (免 Touch ID). `salts` of 0 (e.g. an agent `sign` hit has no records) drops
-// the count segment rather than printing "0 条".
+// the count segment rather than printing "0 条". `names` are the served
+// records' labels (owned name, 自报 claim or 未命名 — account_names.nameLabel),
+// the first few of them: which secrets went out without a tap.
 export function buildCacheHitMessage(
   meta: Pick<ChallengeMeta, 'op_kind' | 'command' | 'host' | 'user' | 'pwd'>,
   salts: number,
   note = '缓存命中，无手机审批',
+  names: string[] = [],
 ): { title: string; body: string } {
   const title = meta.op_kind ? `VT 缓存命中(免审批): ${meta.op_kind}` : 'VT 缓存命中(免审批解密)';
-  const who = [meta.user, meta.host].filter(Boolean).join('@');
-  const head: string[] = [];
-  if (who) head.push(who);
-  if (salts > 0) head.push(`${salts} 条`);
-  head.push(note);
-  const lines: string[] = [head.join(' · ')];
-  if (meta.pwd) lines.push(`pwd: ${meta.pwd}`);
-  // Same self-labelled-multi-line handling as metaLines above.
-  if (meta.command) lines.push(meta.command.includes('\n') ? meta.command : `cmd: ${meta.command}`);
+  const lines = bodyLines(meta, salts, note);
+  if (names.length) lines.splice(1, 0, `records: ${names.slice(0, 6).join(', ')}${names.length > 6 ? ` …等 ${names.length} 条` : ''}`);
   return { title, body: lines.join('\n') };
 }

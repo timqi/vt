@@ -5,7 +5,8 @@
 // Storage keys:
 //   ch:{approve_token}        →  Challenge JSON
 //   pt:{poll_token}           →  approve_token (WS tag routing)
-//   dek:{token_id}:{project_h}:{salt_b64u}  →  CacheEntry (opt-in DEK cache)
+//   dek:{token_id}:{project_h}:{salt_b64u}  →  CacheEntry (approval-time DEK cache)
+//   SQL: audit, host_token, names (record display names, account_names.ts)
 //
 // WebSocket hibernation: WS clients connect via Worker GET /api/dek, which
 // forwards to the DO. The DO hibernates the WS tagged with the poll_token so
@@ -30,6 +31,7 @@ import {
 import { challengeUvLevel, effectiveUvLevel } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
+import { isName, nameLabel } from './account_names';
 import { AccountNotifications } from './account_notifications';
 import { AccountAdmin, notConfigured } from './account_admin';
 import { AccountCache } from './account_cache';
@@ -139,6 +141,23 @@ const PUBLIC_OPS = new Set(['create', 'approve', 'reject', 'dek-cache', 'audit-i
 // Reachable before a session exists: the shell state, bootstrap and login.
 const OPEN_ADMIN_OPS = new Set(['admin-state', 'admin-bootstrap', 'admin-login-challenge', 'admin-login']);
 
+// One log line per decision, then the audit row's terminal state. `latency`
+// is decision − creation (age for an expiry).
+function logFinal(audit: AccountAudit, ch: Challenge, status: 'approved' | 'rejected' | 'expired', at: number): void {
+  const latency_ms = at - ch.created_ms;
+  log(status, { at: tokenPrefix(ch.approve_token), op_kind: ch.meta.op_kind, host: ch.meta.host, user: ch.meta.user, latency_ms });
+  audit.finalize(ch.approve_token, status, latency_ms);
+}
+
+// Deliver a terminal status to the daemon sockets of one ceremony and close
+// them. Best-effort per socket: a dead one must not block the others.
+function settleSockets(wss: WebSocket[], msg: WsMessage): void {
+  const text = JSON.stringify(msg);
+  for (const ws of wss) {
+    try { ws.send(text); ws.close(1000, msg.status); } catch {}
+  }
+}
+
 // What an approve answers for a challenge that is no longer pending: the
 // sealed result again when it was approved (idempotent re-delivery), else 410.
 function sealedResult(ch: Challenge | undefined): Response {
@@ -224,6 +243,7 @@ export class AccountDO extends DurableObject<Env> {
       case 'enroll-create':       return this.opEnrollCreate(request);
       case 'tokens-list':         return this.opTokensList();
       case 'tokens-revoke':       return this.opTokensRevoke(request);
+      case 'names-set':           return this.opNamesSet(request);
       case 'clear-cache':         return this.opClearCache();
       case 'clear-audit':         return this.opClearAudit();
       default:                    return new Response('unknown op', { status: 400 });
@@ -250,17 +270,10 @@ export class AccountDO extends DurableObject<Env> {
     // If challenge already terminal (race: user approved before WS connected),
     // send the result now.
     const ch = await this.ctx.storage.get<Challenge>(`ch:${approveToken}`);
-    if (ch) {
-      if (ch.status === 'approved' && ch.sealed_deks_b64u && ch.pwa_pk_b64u && ch.binding_tag_b64u) {
-        server.send(JSON.stringify(await this.approvedWsMessage(ch)));
-        server.close(1000, 'approved');
-      } else if (ch.status === 'rejected') {
-        server.send(JSON.stringify({ status: 'rejected' } satisfies WsMessage));
-        server.close(1000, 'rejected');
-      } else if (ch.status === 'expired') {
-        server.send(JSON.stringify({ status: 'expired' } satisfies WsMessage));
-        server.close(1000, 'expired');
-      }
+    if (ch?.status === 'approved' && ch.sealed_deks_b64u && ch.pwa_pk_b64u && ch.binding_tag_b64u) {
+      settleSockets([server], await this.approvedWsMessage(ch));
+    } else if (ch?.status === 'rejected' || ch?.status === 'expired') {
+      settleSockets([server], { status: ch.status });
     }
 
     return new Response(null, { status: 101, webSocket: client });
@@ -408,23 +421,24 @@ export class AccountDO extends DurableObject<Env> {
     fresh.status = 'expired';
     fresh.finalized_ms = now;
     await this.ctx.storage.put(key, fresh);
-    const wss = this.ctx.getWebSockets(`pt:${fresh.poll_token}`);
-    for (const ws of wss) {
-      try { ws.send(JSON.stringify({ status: 'expired' } satisfies WsMessage)); ws.close(1000, 'expired'); } catch {}
-    }
-    log('expired', {
-      at: tokenPrefix(fresh.approve_token),
-      op_kind: fresh.meta.op_kind,
-      host: fresh.meta.host,
-      user: fresh.meta.user,
-      age_ms: now - fresh.created_ms,
-    });
-    this.audit.finalize(fresh.approve_token, 'expired', now - fresh.created_ms);
+    settleSockets(this.ctx.getWebSockets(`pt:${fresh.poll_token}`), { status: 'expired' });
+    logFinal(this.audit, fresh, 'expired', now);
     this.audit.broadcastRow(auditKey(fresh.approve_token), 'update');
     // Retain `ch:` for RETENTION_MS so an in-flight WS reconnect still sees the
     // terminal status; drop only the routing key now (a later RETENTION sweep
     // drops `ch:`).
     await this.ctx.storage.delete(`pt:${fresh.poll_token}`);
+  }
+
+  // Read-time expiry guard shared by approve / reject / page: a past-TTL pending
+  // challenge is finalized on the spot (audit row + WS, independent of the
+  // sweep) and answered 410 — fail closed even if finalizing throws, since the
+  // window has passed either way. Null while the challenge is still live.
+  private async expiredResponse(ch: Challenge, now: number, where: string): Promise<Response | null> {
+    if (!isPendingExpired(ch, now)) return null;
+    try { await this.expireChallenge(ch.approve_token, now); }
+    catch (e) { logErr(`expire.${where}_failed`, e); }
+    return new Response('challenge expired', { status: 410 });
   }
 
   // The daemon body check, done here because the token secret derives from the
@@ -496,23 +510,57 @@ export class AccountDO extends DurableObject<Env> {
     this.notifications.approval(challenge);
   }
 
+  // The fields approve and reject share. Length-cap the token before it
+  // becomes a DO storage key (2048-byte limit): an over-long key throws
+  // synchronously, surfacing as a 500 instead of a controlled 404. Ceremony
+  // tokens are 16 chars; 128 is generous.
+  private static checkDecisionBody(body: DoRejectOp): void {
+    if (typeof body.approve_token !== 'string' || !body.approve_token
+        || body.approve_token.length > 128) throw new Error('approve_token');
+    for (const f of ['credential_id_b64u', 'client_data_json_b64u', 'authenticator_data_b64u', 'signature_b64u'] as const) {
+      if (!isB64uString(body[f])) throw new Error(f);
+    }
+  }
+
+  // Shared by approve and reject: the assertion over `expected`, from a
+  // credential this account owns, at the level the STORED ceremony was created
+  // with (never the request's), so a caller cannot downgrade at verify time.
+  // Null on success, else the 401 to return (the failure is audited).
+  private async verifyDecision(ch: Challenge, body: DoRejectOp, expected: Uint8Array): Promise<Response | null> {
+    const entry = await lookupByCredentialId(this.admin.current.credentials, b64uDec(body.credential_id_b64u));
+    if (!entry) {
+      this.audit.verifyFailure(ch.approve_token);
+      return new Response('unknown credential', { status: 401 });
+    }
+    try {
+      await verifyAssertion({
+        cosePublicKey: b64uDec(entry.p),
+        clientDataJson: b64uDec(body.client_data_json_b64u),
+        authenticatorData: b64uDec(body.authenticator_data_b64u),
+        signature: b64uDec(body.signature_b64u),
+        expectedChallenge: expected,
+        rpId: new URL(this.admin.current.origin).hostname,
+        expectedOrigin: this.admin.current.origin,
+        userVerification: challengeUvLevel(ch.uv),
+      });
+    } catch (e) {
+      logErr('webauthn.verify_failed', e, { at: tokenPrefix(ch.approve_token) });
+      this.audit.verifyFailure(ch.approve_token);
+      return new Response('assertion verification failed', { status: 401 });
+    }
+    return null;
+  }
+
   private async opApprove(request: Request): Promise<Response> {
     let body: DoApproveOp;
     let pwaPkBytes: Uint8Array;
     try {
       body = await request.json() as DoApproveOp;
-      // Length-cap before the token becomes a DO storage key (2048-byte limit):
-      // an over-long key throws synchronously, surfacing as a 500 instead of a
-      // controlled 404. Ceremony tokens are 16 chars; 128 is generous.
-      if (typeof body.approve_token !== 'string' || !body.approve_token
-          || body.approve_token.length > 128) throw new Error('approve_token');
-      if (!isB64uString(body.credential_id_b64u)) throw new Error('credential_id_b64u');
+      AccountDO.checkDecisionBody(body);
       if (!isB64uString(body.sealed_deks_b64u)) throw new Error('sealed_deks_b64u');
-      if (!isB64uString(body.client_data_json_b64u)) throw new Error('client_data_json_b64u');
-      if (!isB64uString(body.authenticator_data_b64u)) throw new Error('authenticator_data_b64u');
-      if (!isB64uString(body.signature_b64u)) throw new Error('signature_b64u');
       if (!isB64uString(body.binding_tag_b64u)) throw new Error('binding_tag_b64u');
       pwaPkBytes = decodeB64uExact(body.pwa_pk_b64u, 32, 'pwa_pk_b64u');
+      if (body.adopt_names !== undefined && !Array.isArray(body.adopt_names)) throw new Error('adopt_names');
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
@@ -521,27 +569,9 @@ export class AccountDO extends DurableObject<Env> {
     if (!ch) return new Response('not found', { status: 404 });
     // Idempotent re-delivery: if already approved return the existing sealed result
     if (ch.status !== 'pending') return sealedResult(ch);
-    // Fail closed on a past-TTL pending challenge even if the alarm has not yet
-    // finalized it — a request may never be approved once its window has passed.
-    // Finalize it here too so a decision attempt on a stale request still flips
-    // the audit row, independent of the sweep.
-    {
-      const nowMs = Date.now();
-      if (isPendingExpired(ch, nowMs)) {
-        // Fail closed even if finalizing side-effects throw — the window passed.
-        try { await this.expireChallenge(ch.approve_token, nowMs); }
-        catch (e) { logErr('expire.approve_failed', e); }
-        return new Response('challenge expired', { status: 410 });
-      }
-    }
-
-    // Verify WebAuthn assertion
-    const credId = b64uDec(body.credential_id_b64u);
-    const entry = await lookupByCredentialId(this.admin.current.credentials, credId);
-    if (!entry) {
-      this.audit.verifyFailure(ch.approve_token);
-      return new Response('unknown credential', { status: 401 });
-    }
+    // A request may never be approved once its window has passed, alarm or not.
+    const stale = await this.expiredResponse(ch, Date.now(), 'approve');
+    if (stale) return stale;
 
     // Effective challenge = SHA-256(approve_challenge_hash || pwa_pk). Binding
     // pwa_pk into the authenticator signature means a wire-MITM cannot swap it
@@ -552,29 +582,8 @@ export class AccountDO extends DurableObject<Env> {
     const effective = new Uint8Array(approveChallengeHash.length + pwaPkBytes.length);
     effective.set(approveChallengeHash, 0);
     effective.set(pwaPkBytes, approveChallengeHash.length);
-    const expectedChallenge = new Uint8Array(
-      await crypto.subtle.digest('SHA-256', effective)
-    );
-
-    const coseKey = b64uDec(entry.p);
-    try {
-      await verifyAssertion({
-        cosePublicKey: coseKey,
-        clientDataJson: b64uDec(body.client_data_json_b64u),
-        authenticatorData: b64uDec(body.authenticator_data_b64u),
-        signature: b64uDec(body.signature_b64u),
-        expectedChallenge,
-        rpId: new URL(this.admin.current.origin).hostname,
-        expectedOrigin: this.admin.current.origin,
-        // From the STORED ceremony, never the request: the level this challenge
-        // was created with is the level its assertion is checked against.
-        userVerification: challengeUvLevel(ch.uv),
-      });
-    } catch (e) {
-      logErr('webauthn.verify_failed', e, { at: tokenPrefix(ch.approve_token) });
-      this.audit.verifyFailure(ch.approve_token);
-      return new Response('assertion verification failed', { status: 401 });
-    }
+    const refused = await this.verifyDecision(ch, body, new Uint8Array(await crypto.subtle.digest('SHA-256', effective)));
+    if (refused) return refused;
 
     // `ch` was read before the (non-storage) crypto/verify awaits, during which
     // the DO input gate is open — so a concurrent expiry (read-time
@@ -589,11 +598,8 @@ export class AccountDO extends DurableObject<Env> {
     // Verification can cross the TTL without an alarm or another request
     // finalizing this still-pending record. Check liveness at the write too.
     const finalizedMs = Date.now();
-    if (isPendingExpired(latest, finalizedMs)) {
-      try { await this.expireChallenge(ch.approve_token, finalizedMs); }
-      catch (e) { logErr('expire.approve_failed', e); }
-      return new Response('challenge expired', { status: 410 });
-    }
+    const lapsed = await this.expiredResponse(latest, finalizedMs, 'approve');
+    if (lapsed) return lapsed;
     ch.status = 'approved';
     ch.sealed_deks_b64u = body.sealed_deks_b64u;
     ch.pwa_pk_b64u = body.pwa_pk_b64u;
@@ -604,16 +610,16 @@ export class AccountDO extends DurableObject<Env> {
     // approved enrollment always has its token and a token always has its
     // approval. Single-use follows from the not-pending early-return above.
     if (ch.enroll) this.commitEnroll(ch, ch.enroll, finalizedMs);
+    // Adopted record names: only what the CLI suggested for THIS ceremony's
+    // salts, only after the assertion verified, never over an owned name.
+    for (const i of (body.adopt_names ?? []) as unknown[]) {
+      if (typeof i === 'number' && Number.isInteger(i) && ch.salts_b64u[i]) {
+        this.audit.names.adopt(ch.salts_b64u[i]!, ch.meta.names?.[i] ?? '', finalizedMs);
+      }
+    }
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 
-    log('approved', {
-      at: tokenPrefix(ch.approve_token),
-      op_kind: ch.meta.op_kind,
-      host: ch.meta.host,
-      user: ch.meta.user,
-      latency_ms: ch.finalized_ms - ch.created_ms,
-    });
-    this.audit.finalize(ch.approve_token, 'approved', ch.finalized_ms - ch.created_ms);
+    logFinal(this.audit, ch, 'approved', ch.finalized_ms);
 
     // Opt-in DEK cache write. Best-effort: a failure here must never break the
     // approval (the daemon already has its sealed DEKs via the WS path below).
@@ -641,11 +647,7 @@ export class AccountDO extends DurableObject<Env> {
     this.audit.broadcastRow(auditKey(ch.approve_token), 'update');
 
     // Wake waiting WS clients
-    const wss = this.ctx.getWebSockets(`pt:${ch.poll_token}`);
-    const wsMsg = JSON.stringify(await this.approvedWsMessage(ch));
-    for (const ws of wss) {
-      try { ws.send(wsMsg); ws.close(1000, 'approved'); } catch {}
-    }
+    settleSockets(this.ctx.getWebSockets(`pt:${ch.poll_token}`), await this.approvedWsMessage(ch));
 
     return sealedResult(ch);
   }
@@ -758,15 +760,33 @@ export class AccountDO extends DurableObject<Env> {
     return Response.json(resp);
   }
 
-  private async opTokensRevoke(request: Request): Promise<Response> {
-    let tokenId: string;
+  // Console rename (cookie-gated by dispatch): `{salt_b64u, name}`; an empty
+  // name deletes. The edge stripped control characters; the cap is re-checked.
+  private async opNamesSet(request: Request): Promise<Response> {
+    let body: { salt_b64u?: unknown; name?: unknown };
+    try { body = await request.json() as typeof body; }
+    catch { return badRequest('invalid json'); }
+    if (!isB64uString(body.salt_b64u) || body.salt_b64u.length !== 22 || !isName(body.name)) {
+      return badRequest('bad salt_b64u or name');
+    }
+    this.audit.names.set(body.salt_b64u, body.name, Date.now());
+    return Response.json({ ok: true });
+  }
+
+  // `{token_id}` bodies (tokens-revoke, cache-clear-origin): a bounded string.
+  private static async tokenIdBody(request: Request): Promise<string | Response> {
     try {
       const body = await request.json() as { token_id?: unknown };
       if (typeof body.token_id !== 'string' || !body.token_id || body.token_id.length > 32) throw new Error('token_id');
-      tokenId = body.token_id;
+      return body.token_id;
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
+  }
+
+  private async opTokensRevoke(request: Request): Promise<Response> {
+    const tokenId = await AccountDO.tokenIdBody(request);
+    if (tokenId instanceof Response) return tokenId;
     const revoked = this.tokens.revoke(tokenId, Date.now());
     log('token.revoked', { token: tokenId, revoked });
     return Response.json({ revoked });
@@ -810,13 +830,14 @@ export class AccountDO extends DurableObject<Env> {
 
     // Audit the hit with the requester's full meta (host/user/command/…), so the
     // detail dialog is as rich as a ceremony decrypt.
-    this.audit.cacheEvent(meta, salts.length, 'approved');
+    this.audit.cacheEvent(meta, salts.length, 'approved', salts);
     log('cache.hit', { n: salts.length, ip });
 
     // Real-time notice: a cache hit serves a decrypt with NO phone in the loop.
     // Fire-and-forget — delivery must never delay or fail the DEK response (the
     // audit row above is the durable record).
-    this.notifications.cacheHit(meta, salts.length);
+    const names = this.audit.names.resolve(salts, meta.names ?? []).map(nameLabel);
+    this.notifications.cacheHit(meta, salts.length, undefined, names);
     return Response.json({ source: 'cache', sealed_deks_b64u: sealedB64u } satisfies DekCacheResponse);
   }
 
@@ -848,14 +869,8 @@ export class AccountDO extends DurableObject<Env> {
   // audit token_id (cache entries store origin_token_id = the approval's
   // token_id). Powers the per-row "清除缓存" button on the audit page.
   private async opCacheClearByOrigin(request: Request): Promise<Response> {
-    let tokenId: string;
-    try {
-      const body = await request.json() as { token_id?: unknown };
-      if (typeof body.token_id !== 'string' || !body.token_id) throw new Error('token_id');
-      tokenId = body.token_id;
-    } catch (e) {
-      return badRequest(`bad request: ${(e as Error).message}`);
-    }
+    const tokenId = await AccountDO.tokenIdBody(request);
+    if (tokenId instanceof Response) return tokenId;
     const { deleted, scanned } = await this.cache.clearByOrigin(tokenId);
     // Clears are benign admin actions (no secret exposure) — logged to CF logs,
     // not the audit table, to keep it focused on DEK-delivery events.
@@ -906,6 +921,8 @@ export class AccountDO extends DurableObject<Env> {
         created_ms: g.created_ms,
         ip: g.ip,
         ppid_cmd: g.ppid_cmd,
+        project: g.project,
+        records: this.audit.names.resolve(g.records.map(r => r[0]), g.records.map(r => r[1])),
         host: row?.host ?? null,
         user: row?.user ?? null,
         pwd: row?.pwd ?? null,
@@ -926,7 +943,6 @@ export class AccountDO extends DurableObject<Env> {
       now_ms: now,
       scanned: scan.scanned,
       truncated: scan.truncated,
-      extend_enabled: this.admin.current.cache_enabled,
       ttl_options_s: extendTtlOptions(),
     };
     return Response.json(resp);
@@ -965,11 +981,6 @@ export class AccountDO extends DurableObject<Env> {
   // was proposed, and the 5-minute challenge TTL bounds how long the request stays
   // approvable.
   private async opCacheExtendCreate(request: Request): Promise<Response> {
-    // Extension is offered iff caching is; every extension still needs a
-    // passkey approval.
-    if (!this.admin.current.cache_enabled) {
-      return new Response('cache extension disabled', { status: 404 });
-    }
     let op: DoCacheExtendCreateOp;
     try { op = await request.json() as DoCacheExtendCreateOp; }
     catch { return badRequest('invalid json'); }
@@ -1049,7 +1060,7 @@ export class AccountDO extends DurableObject<Env> {
     const result = await this.cache.writeCache(ch, ttlS, sealedList, auditKey(ch.approve_token));
     if (!result.ok) {
       logErr('cache.write_rejected', new Error(result.reason));
-      this.audit.cacheEvent(ch.meta, ch.salts_b64u.length, 'write_failed');
+      this.audit.cacheEvent(ch.meta, ch.salts_b64u.length, 'write_failed', ch.salts_b64u);
       return;
     }
     this.audit.setCacheTtl(ch.approve_token, ttlS, result.expires_ms);
@@ -1059,12 +1070,7 @@ export class AccountDO extends DurableObject<Env> {
   }
 
   // ONLY opApprove calls this, after verification and single-use consumption.
-  // The switch can remove authority, never supply the Passkey authorization.
   private async commitExtend(ch: Challenge, intent: CacheExtendIntent): Promise<void> {
-    if (!this.admin.current.cache_enabled) {
-      logErr('cache.extend_disabled_at_commit', new Error('cache_enabled off'));
-      return;
-    }
     if (!isAllowedExtendTtl(intent.ttl_s)) {
       logErr('cache.extend_bad_ttl', new Error(`ttl ${intent.ttl_s}`));
       return;
@@ -1113,53 +1119,20 @@ export class AccountDO extends DurableObject<Env> {
     let body: DoRejectOp;
     try {
       body = await request.json() as DoRejectOp;
-      if (typeof body.approve_token !== 'string' || !body.approve_token
-          || body.approve_token.length > 128) throw new Error('approve_token');
-      if (!isB64uString(body.credential_id_b64u)) throw new Error('credential_id_b64u');
-      if (!isB64uString(body.client_data_json_b64u)) throw new Error('client_data_json_b64u');
-      if (!isB64uString(body.authenticator_data_b64u)) throw new Error('authenticator_data_b64u');
-      if (!isB64uString(body.signature_b64u)) throw new Error('signature_b64u');
+      AccountDO.checkDecisionBody(body);
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
 
     const ch = await this.ctx.storage.get<Challenge>(`ch:${body.approve_token}`);
     if (!ch) return new Response('not found', { status: 404 });
-    {
-      const nowMs = Date.now();
-      if (ch.status !== 'pending' || isPendingExpired(ch, nowMs)) {
-        if (isPendingExpired(ch, nowMs)) {
-          try { await this.expireChallenge(ch.approve_token, nowMs); }
-          catch (e) { logErr('expire.reject_failed', e); }
-        }
-        return new Response('challenge not pending', { status: 410 });
-      }
-    }
+    const stale = await this.expiredResponse(ch, Date.now(), 'reject');
+    if (stale) return stale;
+    if (ch.status !== 'pending') return new Response('challenge not pending', { status: 410 });
 
-    // Verify WebAuthn assertion (reject also requires physical presence)
-    const credId = b64uDec(body.credential_id_b64u);
-    const entry = await lookupByCredentialId(this.admin.current.credentials, credId);
-    if (!entry) {
-      this.audit.verifyFailure(ch.approve_token);
-      return new Response('unknown credential', { status: 401 });
-    }
-
-    try {
-      await verifyAssertion({
-        cosePublicKey: b64uDec(entry.p),
-        clientDataJson: b64uDec(body.client_data_json_b64u),
-        authenticatorData: b64uDec(body.authenticator_data_b64u),
-        signature: b64uDec(body.signature_b64u),
-        expectedChallenge: b64uDec(ch.reject_challenge_hash_b64u),
-        rpId: new URL(this.admin.current.origin).hostname,
-        expectedOrigin: this.admin.current.origin,
-        userVerification: challengeUvLevel(ch.uv),
-      });
-    } catch (e) {
-      logErr('webauthn.verify_failed', e, { at: tokenPrefix(ch.approve_token) });
-      this.audit.verifyFailure(ch.approve_token);
-      return new Response('assertion verification failed', { status: 401 });
-    }
+    // A rejection also requires physical presence.
+    const refused = await this.verifyDecision(ch, body, b64uDec(ch.reject_challenge_hash_b64u));
+    if (refused) return refused;
 
     ch.status = 'rejected';
     ch.finalized_ms = Date.now();
@@ -1172,19 +1145,9 @@ export class AccountDO extends DurableObject<Env> {
     }
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 
-    const wss = this.ctx.getWebSockets(`pt:${ch.poll_token}`);
-    for (const ws of wss) {
-      try { ws.send(JSON.stringify({ status: 'rejected' } satisfies WsMessage)); ws.close(1000, 'rejected'); } catch {}
-    }
+    settleSockets(this.ctx.getWebSockets(`pt:${ch.poll_token}`), { status: 'rejected' });
 
-    log('rejected', {
-      at: tokenPrefix(ch.approve_token),
-      op_kind: ch.meta.op_kind,
-      host: ch.meta.host,
-      user: ch.meta.user,
-      latency_ms: ch.finalized_ms - ch.created_ms,
-    });
-    this.audit.finalize(ch.approve_token, 'rejected', ch.finalized_ms - ch.created_ms);
+    logFinal(this.audit, ch, 'rejected', ch.finalized_ms);
     this.audit.broadcastRow(auditKey(ch.approve_token), 'update');
     return new Response('ok');
   }
@@ -1199,28 +1162,17 @@ export class AccountDO extends DurableObject<Env> {
 
     const ch = await this.ctx.storage.get<Challenge>(`ch:${approveToken}`);
     if (!ch) return new Response('not found', { status: 404 });
-    // Non-pending OR past-TTL → gone. The read-time TTL check is the fallback
-    // for a stalled alarm: the page shows "expired" the instant it is opened, and
-    // opening it also FINALIZES the challenge (audit row + WS), so
-    // those side-effects no longer depend on the sweep ever running.
-    const nowMs = Date.now();
-    if (ch.status !== 'pending' || isPendingExpired(ch, nowMs)) {
-      // Fail closed: even if finalizing side-effects throw (storage), the
-      // challenge is expired, so still return 410 rather than a 500.
-      if (isPendingExpired(ch, nowMs)) {
-        try { await this.expireChallenge(approveToken, nowMs); }
-        catch (e) { logErr('expire.page_failed', e); }
-      }
-      return new Response('challenge not pending', { status: 410 });
-    }
+    // Non-pending OR past-TTL → gone; opening a stale page finalizes it.
+    const stale = await this.expiredResponse(ch, Date.now(), 'page');
+    if (stale) return stale;
+    if (ch.status !== 'pending') return new Response('challenge not pending', { status: 410 });
 
-    // DEK-cache UI data. Only offer caching when `cache_enabled` AND the
-    // ceremony actually has DEKs to cache (auth-only ceremonies cannot).
+    // DEK-cache UI data: offered whenever the ceremony has DEKs to cache
+    // (auth-only ceremonies cannot); option 0, the default, writes nothing.
     let cacheOptionsS: number[] = [0];
     let cachePubkeyB64u = '';
-    const sk = this.admin.cacheSeckey();
-    if (sk && ch.salts_b64u.length > 0) {
-      cachePubkeyB64u = b64uEnc(cachePublicKey(sk));
+    if (ch.salts_b64u.length > 0) {
+      cachePubkeyB64u = b64uEnc(cachePublicKey(this.admin.cacheSeckey()));
       cacheOptionsS = [0, ...approveTtlOptions()];
     }
 
@@ -1237,6 +1189,7 @@ export class AccountDO extends DurableObject<Env> {
       // weaker one.
       user_verification: challengeUvLevel(ch.uv),
       metadata: ch.meta,
+      records: this.audit.names.resolve(ch.salts_b64u, ch.meta.names ?? []),
       cache_options_s: cacheOptionsS,
       cache_pubkey_b64u: cachePubkeyB64u,
       ...(ch.enroll ? { enroll_pair_code: ch.enroll.pair_code } : {}),

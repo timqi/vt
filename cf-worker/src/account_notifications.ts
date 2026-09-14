@@ -66,9 +66,9 @@ export class AccountNotifications {
   // by default: hits can fire many times a minute and bury the approvals that
   // need a tap): silence drops only the real-time FYI — the audit row is
   // written unconditionally.
-  cacheHit(meta: ChallengeMeta, salts: number, note?: string): void {
+  cacheHit(meta: ChallengeMeta, salts: number, note?: string, names: string[] = []): void {
     if (!this.admin.current.cache_hit_notify) return;
-    const { title, body } = buildCacheHitMessage(meta, salts, note);
+    const { title, body } = buildCacheHitMessage(meta, salts, note, names);
     this.push({
       v: 1, kind: 'cache_hit', title, body,
       url: `${this.admin.current.origin}${ADMIN_AUDIT_PATH}`, tag: `cache:${meta.host}`,

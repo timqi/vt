@@ -3,6 +3,7 @@
 
 import { Challenge, ChallengeMeta, DoAuditIngestOp, AdminWsMessage, AuditRow, AuditQueryResponse } from './types';
 import { b64uEnc } from './crypto';
+import { AccountNames } from './account_names';
 import { logErr } from './log';
 
 const AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
@@ -12,7 +13,24 @@ const AUDIT_SELECT_COLS =
   `id, token_id, created_ms, finalized_ms, status, op_kind, command, reason,
    host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms,
    verify_failures, cache_ttl_s, cache_expires_ms, ppid, source, seq,
-   peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed`;
+   peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed, records`;
+
+// Columns added after the per-challenge schema shipped, in the order they
+// landed. An older table gains each one it lacks by ALTER (rows preserved); a
+// fresh table already has them all from CREATE. `source` backfills existing
+// rows through its DEFAULT — SQLite allows that on ADD COLUMN.
+const ADDED_COLUMNS = [
+  'cache_ttl_s INTEGER', 'ppid INTEGER', "source TEXT NOT NULL DEFAULT 'ceremony'", 'seq INTEGER',
+  'peer_exe TEXT', 'key_fp TEXT', 'dest TEXT', 'scope_family TEXT', 'scope_label TEXT',
+  'grant_ttl_s INTEGER', 'relayed INTEGER', 'cache_expires_ms INTEGER', 'records TEXT',
+];
+
+// The stored form of AuditRow.records: `[salt_b64u, claimed]` pairs, or null.
+function recordPairs(salts: unknown, names: unknown): string | null {
+  if (!Array.isArray(salts) || salts.length === 0) return null;
+  const claimed = Array.isArray(names) ? names : [];
+  return JSON.stringify(salts.map((s, i) => [s, typeof claimed[i] === 'string' ? claimed[i] : '']));
+}
 
 // Audit row key. approve_token is a 12-byte (16-char) capability, so this is
 // effectively the whole token. Deliberately accepted: the token is only "live"
@@ -25,11 +43,15 @@ export function auditKey(approveToken: string): string {
 
 export class AccountAudit {
   private seqCounter = 0;
+  /** The record-name table; rows resolve their `records` against it on read. */
+  readonly names: AccountNames;
 
   constructor(
     private readonly sql: SqlStorage,
     private readonly adminSockets: () => WebSocket[],
-  ) {}
+  ) {
+    this.names = new AccountNames(sql);
+  }
 
   // Called by AccountDO inside blockConcurrencyWhile before any operation.
   initialize(): void {
@@ -37,136 +59,73 @@ export class AccountAudit {
     // of this branch used audit(ts_ms,event,token_prefix,...)). Audit data is
     // non-critical and per-event rows can't be faithfully converted to
     // per-challenge rows, so drop & rebuild rather than ALTER.
-    const cols = this.sql
-      .exec<{ name: string }>(`PRAGMA table_info(audit)`)
-      .toArray();
-    if (cols.length > 0 && !cols.some(c => c.name === 'token_id')) {
+    const columns = () => new Set(
+      this.sql.exec<{ name: string }>(`PRAGMA table_info(audit)`).toArray().map(c => c.name));
+    let have = columns();
+    if (have.size > 0 && !have.has('token_id')) {
       this.sql.exec(`DROP TABLE audit`);
-  }
-  // One row per challenge (keyed by token_id). The lifecycle events
-  // (created → approved/rejected/expired, plus verify_failures) are stages
-  // of the SAME challenge, so the params are stored ONCE on create and the
-  // terminal state is updated in place — no duplication, no second table.
-  this.sql.exec(
-    `CREATE TABLE IF NOT EXISTS audit (
-       id INTEGER PRIMARY KEY AUTOINCREMENT,
-       token_id TEXT UNIQUE NOT NULL,
-       created_ms INTEGER NOT NULL,
-       finalized_ms INTEGER,
-       status TEXT NOT NULL,
-       op_kind TEXT,
-       command TEXT,
-       reason TEXT,
-       host TEXT,
-       user TEXT,
-       pwd TEXT,
-       tty TEXT,
-       ppid_cmd TEXT,
-       ssh_client TEXT,
-       ip TEXT,
-       salts INTEGER,
-       latency_ms INTEGER,
-       verify_failures INTEGER NOT NULL DEFAULT 0,
-       cache_ttl_s INTEGER,
-       cache_expires_ms INTEGER,
-       ppid INTEGER,
-       source TEXT NOT NULL DEFAULT 'ceremony',
-       seq INTEGER,
-       peer_exe TEXT,
-       key_fp TEXT,
-       dest TEXT,
-       scope_family TEXT,
-       scope_label TEXT,
-       grant_ttl_s INTEGER,
-       relayed INTEGER
-     )`,
-  );
-  // Additive migrations for older audit tables (token_id present but newer
-  // columns missing): ALTER preserves existing rows, unlike the drop/rebuild
-  // above which only fires for the pre-token_id schema. DEK-cache events
-  // (hit/miss/clear) live in THIS same table — marked op_kind='cache' — so
-  // there is one unified audit surface, no second table.
-  const auditCols = this.sql
-    .exec<{ name: string }>(`PRAGMA table_info(audit)`)
-    .toArray();
-  const hasCol = (n: string) => auditCols.some(c => c.name === n);
-  if (auditCols.length > 0 && !hasCol('cache_ttl_s')) {
-    this.sql.exec(`ALTER TABLE audit ADD COLUMN cache_ttl_s INTEGER`);
-  }
-  if (auditCols.length > 0 && !hasCol('ppid')) {
-    this.sql.exec(`ALTER TABLE audit ADD COLUMN ppid INTEGER`);
-  }
-  // `source` distinguishes ceremony / cache / agent rows. SQLite DOES allow
-  // a NOT NULL DEFAULT <literal> on ALTER ADD COLUMN — the literal backfills
-  // existing rows (which are all ceremony rows), so no separate UPDATE is
-  // needed. (Surprises people; hence this note.) This reuses the `auditCols`/
-  // `hasCol` snapshot taken once above — fine because it is the LAST ALTER in
-  // this block. If a future migration is appended after it, re-run
-  // `PRAGMA table_info(audit)` rather than trusting this now-stale snapshot.
-  if (auditCols.length > 0 && !hasCol('source')) {
-    this.sql.exec(
-      `ALTER TABLE audit ADD COLUMN source TEXT NOT NULL DEFAULT 'ceremony'`);
-  }
-  // seq: monotonic per-row change counter for the real-time admin stream's
-  // reconnect catch-up. Re-snapshot table_info first — the `source` ALTER
-  // above invalidated the `auditCols` snapshot (per the note there). Backfill
-  // existing rows with seq = id (a valid monotonic ordering) so no row has a
-  // NULL seq and `after_seq` catch-up covers historical rows uniformly.
-  const colsAfterSource = this.sql
-    .exec<{ name: string }>(`PRAGMA table_info(audit)`)
-    .toArray();
-  if (colsAfterSource.length > 0 && !colsAfterSource.some(c => c.name === 'seq')) {
-    this.sql.exec(`ALTER TABLE audit ADD COLUMN seq INTEGER`);
-    this.sql.exec(`UPDATE audit SET seq = id WHERE seq IS NULL`);
-  }
-  // Agent-authoritative audit context (docs/approval-transparency.md §B).
-  // Re-snapshot table_info — the `source`/`seq` ALTERs above invalidated
-  // the earlier snapshots (per the note on the `source` migration). All
-  // seven are plain nullable adds: NULL on pre-migration rows means "the
-  // agent never sent the field", which is exactly the ingest convention.
-  const colsForAgentCtx = this.sql
-    .exec<{ name: string }>(`PRAGMA table_info(audit)`)
-    .toArray();
-  if (colsForAgentCtx.length > 0 && !colsForAgentCtx.some(c => c.name === 'peer_exe')) {
-    for (const col of ['peer_exe TEXT', 'key_fp TEXT', 'dest TEXT',
-                       'scope_family TEXT', 'scope_label TEXT',
-                       'grant_ttl_s INTEGER', 'relayed INTEGER']) {
-      this.sql.exec(`ALTER TABLE audit ADD COLUMN ${col}`);
+      have = new Set();
     }
-  }
-  // cache_expires_ms: absolute expiry of the row's cache entries, so the
-  // admin UI reads real liveness instead of inferring it from
-  // finalized_ms + cache_ttl_s (an inference an approved extension makes
-  // false). Re-snapshot table_info — the ALTERs above invalidated the
-  // earlier snapshots. Deliberately NOT backfilled: a pre-migration row's
-  // true expiry is unknown, and NULL means "fall back to the old
-  // inference", which is exactly right for entries written before this
-  // column existed (they can't have been extended either).
-  const colsForCacheExpiry = this.sql
-    .exec<{ name: string }>(`PRAGMA table_info(audit)`)
-    .toArray();
-  if (colsForCacheExpiry.length > 0
-      && !colsForCacheExpiry.some(c => c.name === 'cache_expires_ms')) {
-    this.sql.exec(`ALTER TABLE audit ADD COLUMN cache_expires_ms INTEGER`);
-  }
-  // Drop the short-lived standalone cache_audit table from an earlier build
-  // of this branch — its events now live in the unified audit table.
-  this.sql.exec(`DROP TABLE IF EXISTS cache_audit`);
-  // idx_audit_created serves the retention DELETE (created_ms range); the
-  // /<ADMIN_SEG>/api/audit cursor query uses the implicit primary-key (id) index.
-  this.sql.exec(
-    `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit(created_ms)`,
-  );
-  // idx_audit_seq serves the reconnect catch-up query (seq > ? ORDER BY seq).
-  this.sql.exec(
-    `CREATE INDEX IF NOT EXISTS idx_audit_seq ON audit(seq)`,
-  );
-  // Seed the in-memory counter from the durable high-water mark so a restart
-  // never re-issues a seq (which would let a reconnecting client skip a row).
-  const seqRow = this.sql
-    .exec<{ m: number }>(`SELECT COALESCE(MAX(seq), 0) AS m FROM audit`)
-    .toArray()[0];
-  this.seqCounter = seqRow?.m ?? 0;
+    // One row per challenge (keyed by token_id). The lifecycle events
+    // (created → approved/rejected/expired, plus verify_failures) are stages
+    // of the SAME challenge, so the params are stored ONCE on create and the
+    // terminal state is updated in place — no duplication, no second table.
+    // DEK-cache events (hit/write_failed/extended) live in THIS same table —
+    // marked op_kind='cache' — so there is one unified audit surface.
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS audit (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         token_id TEXT UNIQUE NOT NULL,
+         created_ms INTEGER NOT NULL,
+         finalized_ms INTEGER,
+         status TEXT NOT NULL,
+         op_kind TEXT,
+         command TEXT,
+         reason TEXT,
+         host TEXT,
+         user TEXT,
+         pwd TEXT,
+         tty TEXT,
+         ppid_cmd TEXT,
+         ssh_client TEXT,
+         ip TEXT,
+         salts INTEGER,
+         latency_ms INTEGER,
+         verify_failures INTEGER NOT NULL DEFAULT 0,
+         ${ADDED_COLUMNS.join(',\n       ')}
+       )`,
+    );
+    // Additive migrations for an older table: the `have` snapshot predates every
+    // ALTER, which is fine because each name is checked exactly once. seq is
+    // backfilled with id (a valid monotonic ordering) so `after_seq` catch-up
+    // covers historical rows; cache_expires_ms is deliberately not backfilled
+    // (a pre-migration row's true expiry is unknown; NULL = the old inference).
+    if (have.size > 0) {
+      for (const col of ADDED_COLUMNS) {
+        if (have.has(col.split(' ')[0]!)) continue;
+        this.sql.exec(`ALTER TABLE audit ADD COLUMN ${col}`);
+        if (col === 'seq INTEGER') this.sql.exec(`UPDATE audit SET seq = id WHERE seq IS NULL`);
+      }
+    }
+    this.names.initialize();
+    // Drop the short-lived standalone cache_audit table from an earlier build
+    // of this branch — its events now live in the unified audit table.
+    this.sql.exec(`DROP TABLE IF EXISTS cache_audit`);
+    // idx_audit_created serves the retention DELETE (created_ms range); the
+    // /<ADMIN_SEG>/api/audit cursor query uses the implicit primary-key (id) index.
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit(created_ms)`,
+    );
+    // idx_audit_seq serves the reconnect catch-up query (seq > ? ORDER BY seq).
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_audit_seq ON audit(seq)`,
+    );
+    // Seed the in-memory counter from the durable high-water mark so a restart
+    // never re-issues a seq (which would let a reconnecting client skip a row).
+    const seqRow = this.sql
+      .exec<{ m: number }>(`SELECT COALESCE(MAX(seq), 0) AS m FROM audit`)
+      .toArray()[0];
+    this.seqCounter = seqRow?.m ?? 0;
   }
 
   // Audit writes are best-effort: a failure must never break the ceremony, so
@@ -193,15 +152,34 @@ export class AccountAudit {
     }
   }
 
+  // Rows as the admin surfaces receive them: the stored `[salt, claimed]`
+  // pairs resolved against the names table in one lookup per page.
+  private project(rows: AuditRow[]): AuditRow[] {
+    const pairs = new Map<number, Array<[string, string]>>();
+    const salts: string[] = [];
+    rows.forEach((r, i) => {
+      let p: unknown;
+      try { p = typeof r.records === 'string' ? JSON.parse(r.records) : null; } catch { p = null; }
+      if (!Array.isArray(p) || p.length === 0) { r.records = null; return; }
+      pairs.set(i, p as Array<[string, string]>);
+      for (const [s] of p as Array<[string, string]>) salts.push(s);
+    });
+    const named = new Map(this.names.resolve(salts).map(n => [n.salt_b64u, n]));
+    for (const [i, p] of pairs) {
+      rows[i]!.records = p.map(([s, claimed]) => ({ ...named.get(s)!, claimed: claimed ?? '' }));
+    }
+    return rows;
+  }
+
   // Push one audit row to every admin stream. The re-SELECT uses the shared
   // projection, so the pushed row cannot expose any field the REST audit query
   // does not. Skips the SELECT entirely when no admin sockets are connected.
   broadcastRow(tokenId: string, event: 'insert' | 'update'): void {
     try {
       if (this.adminSockets().length === 0) return;
-      const rows = this.sql
+      const rows = this.project(this.sql
         .exec(`SELECT ${AUDIT_SELECT_COLS} FROM audit WHERE token_id = ?`, tokenId)
-        .toArray() as unknown as AuditRow[];
+        .toArray() as unknown as AuditRow[]);
       const row = rows[0];
       if (!row) return;
       this.broadcastAdmin({ kind: 'audit', event, row });
@@ -210,35 +188,37 @@ export class AccountAudit {
     }
   }
 
-  // INSERT the full challenge params once, at creation (status=pending). Returns
-  // true only if a row was actually written (false on an ON CONFLICT no-op), so
-  // the caller can skip a wasted broadcast on an idempotent re-create.
+  // The one INSERT every row kind goes through. Column names are this module's
+  // constants, never input. `source` is always set explicitly (not left to the
+  // column default) so a schema change can never silently mis-categorize rows.
+  // True only if a row was actually written: RETURNING names only a row this
+  // statement inserted, whereas rowsWritten counts AUTOINCREMENT bookkeeping
+  // on an ON CONFLICT no-op — so a caller can skip the broadcast on a retry.
+  private insert(row: Record<string, unknown>): boolean {
+    const cols = Object.keys(row);
+    const cursor = this.sql.exec(
+      `INSERT INTO audit (${cols.join(', ')}, seq) VALUES (${cols.map(() => '?').join(', ')}, ?)
+       ON CONFLICT(token_id) DO NOTHING RETURNING token_id`,
+      ...cols.map(c => row[c] ?? null), this.nextSeq(),
+    );
+    return cursor.toArray().length > 0;
+  }
+
+  // The display columns shared by every row kind, from a (partial) meta.
+  private static metaCols(m: Partial<ChallengeMeta>): Record<string, unknown> {
+    const { op_kind, command, reason, host, user, pwd, ppid_cmd, ip } = m;
+    return { op_kind, command, reason, host, user, pwd, ppid_cmd, ip };
+  }
+
+  // INSERT the full challenge params once, at creation (status=pending).
   create(ch: Challenge): boolean {
     const m = ch.meta ?? ({} as Challenge['meta']);
     try {
-      // source='ceremony' set explicitly (not relying on the column default) so
-      // a future schema change can never silently mis-categorize these rows.
-      const cursor = this.sql.exec(
-        `INSERT INTO audit
-           (token_id, created_ms, status, op_kind, command, reason, host, user, pwd, ppid_cmd, ip, salts, source, seq)
-         VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ceremony', ?)
-         ON CONFLICT(token_id) DO NOTHING RETURNING token_id`,
-        auditKey(ch.approve_token),
-        ch.created_ms ?? Date.now(),
-        m.op_kind ?? null,
-        m.command ?? null,
-        m.reason ?? null,
-        m.host ?? null,
-        m.user ?? null,
-        m.pwd ?? null,
-        m.ppid_cmd ?? null,
-        m.ip ?? null,
-        Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0,
-        this.nextSeq(),
-      );
-      // rowsWritten includes SQLite AUTOINCREMENT bookkeeping on a conflict.
-      // RETURNING names only a row this statement actually inserted.
-      return cursor.toArray().length > 0;
+      return this.insert({
+        token_id: auditKey(ch.approve_token), created_ms: ch.created_ms ?? Date.now(), status: 'pending',
+        ...AccountAudit.metaCols(m), salts: Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0,
+        source: 'ceremony', records: recordPairs(ch.salts_b64u, m.names),
+      });
     } catch (e) {
       logErr('audit.create_failed', e);
       return false;
@@ -333,24 +313,21 @@ export class AccountAudit {
   // the authorization; this one records what it did to the cache. Unlike a clear
   // (authority-reducing, CF-logs only), an extension prolongs plaintext-DEK
   // availability, so it must land in the durable audit table.
+  // `salts` are the records served (hit) or refused (write_failed); `count`
+  // is what the row's salts column shows (entries moved, for 'extended').
   cacheEvent(
-    meta: Partial<ChallengeMeta>, salts: number,
-    status: 'approved' | 'write_failed' | 'extended',
+    meta: Partial<ChallengeMeta>, count: number,
+    status: 'approved' | 'write_failed' | 'extended', salts: string[] = [],
   ): void {
     try {
       const now = Date.now();
       // Synthetic unique token_id (no approve_token exists for cache events).
       const tokenId = 'c_' + b64uEnc(crypto.getRandomValues(new Uint8Array(9)));
-      this.sql.exec(
-        `INSERT INTO audit
-           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, ppid_cmd, ip, salts, source, seq)
-         VALUES (?, ?, ?, ?, 'cache', ?, ?, ?, ?, ?, ?, ?, ?, 'cache', ?)
-         ON CONFLICT(token_id) DO NOTHING`,
-        tokenId, now, now, status,
-        meta.command ?? null, meta.reason ?? null, meta.host ?? null, meta.user ?? null,
-        meta.pwd ?? null, meta.ppid_cmd ?? null, meta.ip ?? null, salts,
-        this.nextSeq(),
-      );
+      this.insert({
+        token_id: tokenId, created_ms: now, finalized_ms: now, status,
+        ...AccountAudit.metaCols(meta), op_kind: 'cache', salts: count, source: 'cache',
+        records: recordPairs(salts, meta.names),
+      });
       this.broadcastRow(tokenId, 'insert');
     } catch (e) {
       logErr('audit.cacheevent_failed', e);
@@ -361,27 +338,17 @@ export class AccountAudit {
   // created_ms == finalized_ms == ts_ms. `ON CONFLICT(token_id) DO NOTHING`
   // makes the agent's 1-retry idempotent. Best-effort: swallow + log.
   agent(op: DoAuditIngestOp): void {
-    const m = op.meta;
     try {
-      const cursor = this.sql.exec(
-        `INSERT INTO audit
-           (token_id, created_ms, finalized_ms, status, op_kind, command, reason, host, user, pwd, ppid_cmd, ip, salts, latency_ms, source, seq,
-            peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(token_id) DO NOTHING RETURNING token_id`,
-        op.token_id, op.ts_ms, op.ts_ms, op.outcome,
-        m.op_kind ?? null, m.command ?? null, m.reason ?? null, m.host ?? null,
-        m.user ?? null, m.pwd ?? null, m.ppid_cmd ?? null,
-        m.ip ?? null, op.salts, op.latency_ms,
-        this.nextSeq(),
-        // Agent-authoritative context: the ingest already normalized these to
-        // string/number/null — `?? null` only guards a malformed internal op.
-        op.peer_exe ?? null, op.key_fp ?? null, op.dest ?? null,
-        op.scope_family ?? null, op.scope_label ?? null,
-        op.grant_ttl_s ?? null, op.relayed ?? null,
-      );
+      // Agent-authoritative context: the ingest already normalized these to
+      // string/number/null; insert() only guards a malformed internal op.
+      const { peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed } = op;
+      const written = this.insert({
+        token_id: op.token_id, created_ms: op.ts_ms, finalized_ms: op.ts_ms, status: op.outcome,
+        ...AccountAudit.metaCols(op.meta), salts: op.salts, latency_ms: op.latency_ms, source: 'agent',
+        peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed,
+      });
       // Skip the broadcast on an idempotent-retry no-op (agent's 1-retry).
-      if (cursor.toArray().length > 0) this.broadcastRow(op.token_id, 'insert');
+      if (written) this.broadcastRow(op.token_id, 'insert');
     } catch (e) {
       logErr('audit.agent_failed', e);
     }
@@ -461,7 +428,7 @@ export class AccountAudit {
        FROM audit ${where} ${order} LIMIT ?`;
     binds.push(limit);
 
-    const rows = this.sql.exec(sql, ...binds).toArray() as unknown as AuditRow[];
+    const rows = this.project(this.sql.exec(sql, ...binds).toArray() as unknown as AuditRow[]);
     // Current high-water mark, so the client can set its reconnect cursor even
     // when this page returns no rows (e.g. an empty initial load).
     const snapRow = this.sql

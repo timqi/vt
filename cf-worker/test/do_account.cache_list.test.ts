@@ -1,10 +1,11 @@
 // AccountDO — the admin cache inventory (opCacheList) and the clear paths.
 //
-// "Cache listings must never expose sealed material, salts, or the binding ctx
-// digest (ctx + a known IP is an offline oracle for the client-reported `pwd`),
-// and must report `truncated` rather than silently showing a partial view."
-// (CLAUDE.md) The listing is also where the UI learns whether a row may be
-// extended, so the reason projection is pinned here too.
+// "Cache listings must never expose sealed material or the binding ctx digest
+// (ctx + a known IP is an offline oracle for the client-reported `pwd`), and
+// must report `truncated` rather than silently showing a partial view."
+// (AGENTS.md) A record's salt — public in its vt:// URL — appears only as the
+// rename key of `records[]`. The listing is also where the UI learns whether a
+// row may be extended, so the reason projection is pinned here too.
 //
 // The listing may be partial as long as it SAYS so. A clear may not: see the
 // second half of this file.
@@ -22,9 +23,7 @@ const HOUR = 60 * MIN;
 
 const GROUP = 'g_testgroup00000';
 
-// Listing and clearing work while caching is on; the extend offer follows the
-// same switch, so the toggle test below flips it.
-beforeEach(async () => { await bootstrap(); await configure({ cache_enabled: true }); });
+beforeEach(bootstrap);
 
 async function list(): Promise<{ body: CacheListResponse; text: string }> {
   const res = await doGet('cache-list');
@@ -33,7 +32,7 @@ async function list(): Promise<{ body: CacheListResponse; text: string }> {
 }
 
 describe('opCacheList — inventory without secrets', () => {
-  it('summarises a group and leaks no sealed blob, salt, or binding ctx', async () => {
+  it('summarises a group and leaks no sealed blob, storage key, or binding ctx', async () => {
     const keys = await inDO(h => seedGroup(h, 3, { expires_ms: Date.now() + HOUR }));
     const sealed = await inDO(async h =>
       (await h.state.storage.get<CacheEntry>(keys[0]!))!.sealed_to_cache_b64u);
@@ -46,15 +45,15 @@ describe('opCacheList — inventory without secrets', () => {
     expect(g.live).toBe(3);
     expect(g.ip).toBe('203.0.113.9');
 
-    // Nothing that could rebuild a key or an offline oracle.
+    // Nothing that could rebuild a key or an offline oracle: the salt appears
+    // once per record as the rename key, never with its project hash.
     expect(text).not.toContain(sealed);
     expect(text).not.toContain(FAKE_CTX);
-    for (const k of keys) {
-      expect(text).not.toContain(k);
-      expect(text).not.toContain(k.split(':')[2]!);   // the salt
-    }
+    for (const k of keys) expect(text).not.toContain(k);
     expect(text).not.toContain('sealed');
     expect(JSON.stringify(Object.keys(g))).not.toMatch(/salt|sealed|ctx/i);
+    expect(g.records.map(r => r.salt_b64u).sort()).toEqual(keys.map(k => k.split(':')[2]!).sort());
+    expect(g.records.every(r => r.name === null && r.claimed === '')).toBe(true);
   });
 
   it('joins the origin approval context the audit tab already shows', async () => {
@@ -81,17 +80,11 @@ describe('opCacheList — inventory without secrets', () => {
     expect(g.cache_ttl_s).toBe(20 * 60);
   });
 
-  it('offers extension iff caching is enabled, with the ladder straight from policy', async () => {
+  it('offers the extension ladder straight from policy', async () => {
     await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
     const { body } = await list();
-    expect(body.extend_enabled).toBe(true);
     expect(body.ttl_options_s).toEqual(extendTtlOptions());
-    // Disabling caching keeps the inventory listable and clearable; only the
-    // extend offer goes.
-    await configure({ cache_enabled: false });
-    const off = (await list()).body;
-    expect(off.extend_enabled).toBe(false);
-    expect(off.groups).toHaveLength(1);
+    expect(body.groups).toHaveLength(1);
   });
 
   it('explains why a row is not extendable without hiding it', async () => {

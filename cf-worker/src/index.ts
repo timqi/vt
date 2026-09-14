@@ -19,6 +19,7 @@ import { isTokenId } from './host_token';
 import { log, logErr, tokenPrefix } from './log';
 import { escapeJsonForHtml, renderTemplate, pageVars, type PageChrome } from './page';
 import { tokenRefused } from './do_account';
+import { NAME_MAX } from './account_names';
 
 export { AccountDO } from './do_account';
 
@@ -89,6 +90,17 @@ function capChallengeMeta(raw: Partial<ChallengeMeta> | undefined, connectingIp:
     ip:         capMeta(connectingIp, 64),
     reason:     capMeta(raw?.reason, 200),
   };
+}
+
+// Client record-name suggestions: absent → none; else exactly one string per
+// salt, each within NAME_MAX before control characters are stripped. Anything
+// else is null (400): a name that silently moved or shrank would label the
+// wrong record. Returned '' entries mean "unknown".
+function checkNames(raw: unknown, count: number): string[] | null {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || raw.length !== count) return null;
+  if (!raw.every(n => typeof n === 'string' && n.length <= NAME_MAX)) return null;
+  return raw.map(n => capMeta(n, NAME_MAX));
 }
 
 // `request.cf` country + AS organisation — Cloudflare-derived, so an enrollment
@@ -219,8 +231,23 @@ app.get('/api/admin/*', async (c) => {
   return adminResponse(await accountStub(c).fetch(`https://account.do/op/${op}${url.search}`, { headers: adminHeaders(c) }));
 });
 
-// The one PUT: the three config knobs (§4.1); anything else in the body is 400.
+// Two PUTs: the config knobs (§4.1; anything else in the body is 400) and a
+// record rename — `{salt_b64u, name}`, name checked like a suggestion, ''
+// deletes. Both session-gated in the DO.
 app.put('/api/admin/config', (c) => adminPost(c, 'admin-config', ADMIN_OPEN_POST_MAX_BYTES));
+app.put('/api/admin/names', async (c) => {
+  const raw = await readCappedBody(c, ADMIN_OPEN_POST_MAX_BYTES);
+  if (!raw) return c.text('body too large', 413);
+  let body: { salt_b64u?: unknown; name?: unknown };
+  try { body = JSON.parse(new TextDecoder().decode(raw)); }
+  catch { return c.text('invalid json', 400); }
+  const name = checkNames([body.name], 1);
+  if (!name) return c.text('bad name', 400);
+  return adminResponse(await accountStub(c).fetch('https://account.do/op/names-set', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json', ...adminHeaders(c) },
+    body: JSON.stringify({ salt_b64u: body.salt_b64u, name: name[0] }),
+  }));
+});
 
 app.post('/api/admin/*', async (c) => {
   const tail = new URL(c.req.url).pathname.slice('/api/admin/'.length);
@@ -277,6 +304,9 @@ app.post('/api/challenge', async (c) => {
 
   // 5. Meta: capped here; host/user are overwritten by the DO from the token.
   const meta = capChallengeMeta(body.meta, c.req.header('CF-Connecting-IP'));
+  const names = checkNames(body.meta?.names, saltsB64u.length);
+  if (!names) return c.text('bad names', 400);
+  if (names.length) meta.names = names;
 
   // 6. Generate tokens. 12 bytes = 96-bit capability tokens (16 b64url chars):
   // unguessable within the 5-min single-use TTL, and approval still requires a
@@ -345,11 +375,8 @@ app.post('/api/challenge', async (c) => {
 // GET /api/dek — WebSocket; client waits for sealed DEKs
 app.get('/api/dek', async (c) => {
   // Forward to DO which handles WS hibernation
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
   const wsUrl = `https://account.do/ws?poll_token=${c.req.query('poll_token') ?? ''}`;
-  return stub.fetch(new Request(wsUrl, {
-    headers: c.req.raw.headers,
-  }));
+  return accountStub(c).fetch(new Request(wsUrl, { headers: c.req.raw.headers }));
 });
 
 // POST /api/dek-cache — daemon tries the opt-in DEK cache before a ceremony.
@@ -374,8 +401,10 @@ app.post('/api/dek-cache', async (c) => {
   // Cap the client meta and force `ip` from CF-Connecting-IP — identical to the
   // challenge path, so a cache hit records the same context.
   const meta = capChallengeMeta(body.meta, c.req.header('CF-Connecting-IP'));
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  return stub.fetch('https://account.do/op/dek-cache', {
+  const names = checkNames(body.meta?.names, Array.isArray(body.salts_b64u) ? body.salts_b64u.length : 0);
+  if (!names) return c.text('bad names', 400);
+  if (names.length) meta.names = names;
+  return accountStub(c).fetch('https://account.do/op/dek-cache', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -443,12 +472,8 @@ app.post('/api/audit-ingest', async (c) => {
   const clen = c.req.header('Content-Length');
   if (clen && Number(clen) > AUDIT_INGEST_MAX_BYTES) return c.text('body too large', 413);
 
-  const authHeader = c.req.header('Authorization') ?? '';
-  const prefix = 'VT-HMAC ';
-  if (!authHeader.startsWith(prefix)) return c.text('missing auth', 401);
-  let providedHmac: Uint8Array;
-  try { providedHmac = decodeB64uExact(authHeader.slice(prefix.length), 32, 'hmac'); }
-  catch { return c.text('hmac length', 401); }
+  const providedHmac = hmacHeader(c);
+  if (providedHmac instanceof Response) return providedHmac;
 
   const rawBody = await readCappedBody(c, AUDIT_INGEST_MAX_BYTES);
   if (!rawBody) return c.text('body too large', 413);
@@ -509,8 +534,7 @@ app.post('/api/audit-ingest', async (c) => {
     auth,
   };
 
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  return stub.fetch('https://account.do/op/audit-ingest', {
+  return accountStub(c).fetch('https://account.do/op/audit-ingest', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(op),
@@ -559,15 +583,21 @@ async function readCappedBody(c: Context, maxBytes = CEREMONY_POST_MAX_BYTES): P
 // DO refuses before it touches the token or stores anything. A request without
 // the header gets the same structured 401 as a dead token: the remedy is
 // `vt enroll` either way.
-async function readDaemonBody(
-  c: Context<{ Bindings: Env }>,
-): Promise<{ body: Uint8Array; auth: DaemonAuth } | Response> {
+// `Authorization: VT-HMAC <mac>` — shape only; the MAC itself is compared in
+// the DO.
+function hmacHeader(c: Context<{ Bindings: Env }>): Uint8Array | Response {
   const authHeader = c.req.header('Authorization') ?? '';
   const prefix = 'VT-HMAC ';
   if (!authHeader.startsWith(prefix)) return c.text('missing auth', 401);
-  let providedHmac: Uint8Array;
-  try { providedHmac = decodeB64uExact(authHeader.slice(prefix.length), 32, 'hmac'); }
+  try { return decodeB64uExact(authHeader.slice(prefix.length), 32, 'hmac'); }
   catch { return c.text('hmac length', 401); }
+}
+
+async function readDaemonBody(
+  c: Context<{ Bindings: Env }>,
+): Promise<{ body: Uint8Array; auth: DaemonAuth } | Response> {
+  const providedHmac = hmacHeader(c);
+  if (providedHmac instanceof Response) return providedHmac;
   const tokenHeader = c.req.header('VT-Token-Id');
   if (tokenHeader === undefined) return tokenRefused('token_missing');
   if (!isTokenId(tokenHeader)) return c.text('bad token id', 401);
@@ -577,35 +607,22 @@ async function readDaemonBody(
   return { body: rawBody, auth: { token_id: tokenHeader, mac_b64u: b64uEnc(providedHmac), signed_b64u: b64uEnc(rawBody) } };
 }
 
-// POST /api/approve — PWA submits sealed DEKs after WebAuthn
-app.post('/api/approve', async (c) => {
-  const raw = await readCappedBody(c);
-  if (!raw) return c.text('body too large', 413);
-  let body: ApproveRequest;
-  try { body = JSON.parse(new TextDecoder().decode(raw)); }
-  catch { return c.text('invalid json', 400); }
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  return stub.fetch('https://account.do/op/approve', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+// POST /api/approve — the PWA submits sealed DEKs after WebAuthn;
+// POST /api/reject — the PWA rejects. Same shape: cap, parse, hand to the DO.
+for (const op of ['approve', 'reject'] as const) {
+  app.post(`/api/${op}`, async (c) => {
+    const raw = await readCappedBody(c);
+    if (!raw) return c.text('body too large', 413);
+    let body: ApproveRequest | RejectRequest;
+    try { body = JSON.parse(new TextDecoder().decode(raw)); }
+    catch { return c.text('invalid json', 400); }
+    return accountStub(c).fetch(`https://account.do/op/${op}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
   });
-});
-
-// POST /api/reject — PWA rejects
-app.post('/api/reject', async (c) => {
-  const raw = await readCappedBody(c);
-  if (!raw) return c.text('body too large', 413);
-  let body: RejectRequest;
-  try { body = JSON.parse(new TextDecoder().decode(raw)); }
-  catch { return c.text('invalid json', 400); }
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  return stub.fetch('https://account.do/op/reject', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-});
+}
 
 // Fetch ApprovePageData for a token from the DO. Shared by the HTML page
 // (/a/:token) and the JSON sibling (/api/page/:token). Returns a discriminated
@@ -616,8 +633,7 @@ async function fetchApprovePageData(
   c: Context<{ Bindings: Env }>,
   approveToken: string,
 ): Promise<{ ok: true; data: ApprovePageData } | { ok: false; status: 404 | 410 | 503 }> {
-  const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
-  const dataResp = await stub.fetch(
+  const dataResp = await accountStub(c).fetch(
     `https://account.do/op/page?approve_token=${encodeURIComponent(approveToken)}`);
   if (dataResp.status === 503) return { ok: false, status: 503 };
   if (!dataResp.ok) return { ok: false, status: dataResp.status === 410 ? 410 : 404 };

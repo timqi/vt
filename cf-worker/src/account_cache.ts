@@ -52,10 +52,14 @@ function cacheKey(ctx: string, saltB64u: string): string {
 // One aggregated DEK-cache group, as scanned from storage. `keys` holds the
 // `dek:{token_id}:{project_h}:{salt}` storage keys and is populated ONLY for the
 // extension commit — it must never reach a response body (the project hash would
-// let a reader brute-force the client-reported `project` path offline).
+// let a reader brute-force the client-reported `project` path offline). `records`
+// carries each key's salt (the rename key, public in every vt:// URL) with the
+// client's name claim.
 interface CacheAgg {
   group_id: string;
   keys: string[];
+  records: Array<[string, string]>;
+  project: string | null;
   origin_token_id: string;
   entries: number;
   live: number;
@@ -79,11 +83,11 @@ interface CacheExtendResult {
 }
 
 export class AccountCache {
-  /** `seckey` is the X25519 scalar derived from the root key while
-   *  `cache_enabled`, null otherwise (AccountAdmin.cacheSeckey). */
+  /** `seckey` is the X25519 scalar derived from the root key
+   *  (AccountAdmin.cacheSeckey). */
   constructor(
     private readonly storage: DurableObjectStorage,
-    private readonly seckey: () => Uint8Array | null,
+    private readonly seckey: () => Uint8Array,
   ) {}
 
   // Read an arbitrary number of keys, in the batches the platform accepts.
@@ -175,7 +179,6 @@ export class AccountCache {
     // approve body cannot skip the deliberate extension ceremony.
     if (!isAllowedApproveTtl(ttlS)) return reject(`ttl ${ttlS} not approvable`);
     const sk = this.seckey();
-    if (!sk) return reject('caching disabled');
     const salts = ch.salts_b64u;
     // Auth-only ceremonies (no salts) have nothing to cache; a length mismatch
     // means the PWA and challenge disagree — refuse rather than store garbage.
@@ -217,6 +220,8 @@ export class AccountCache {
         origin_token_id: originTokenId,
         ip,
         ppid_cmd: ch.meta.ppid_cmd ?? '',
+        project: ch.meta.project ?? '',
+        name: ch.meta.names?.[i] ?? '',
         cache_group_id: groupId,
         created_ms: createdMs,
       };
@@ -234,7 +239,6 @@ export class AccountCache {
   async read(tokenId: string, meta: ChallengeMeta, salts: string[], daemonPk: Uint8Array): Promise<string | null> {
     if (salts.length === 0 || salts.length > 256) return null;
     const sk = this.seckey();
-    if (!sk) return null;
     for (const s of salts) { if (!isB64uString(s)) return null; }
 
     const ctx = await cacheCtx(tokenId, meta.project ?? '');
@@ -288,6 +292,8 @@ export class AccountCache {
     return {
       group_id: groupId,
       keys: [],
+      records: [],
+      project: typeof e.project === 'string' ? e.project : null,
       origin_token_id: e.origin_token_id ?? '',
       entries: 0,
       live: 0,
@@ -328,6 +334,7 @@ export class AccountCache {
         let agg = groups.get(gid);
         if (!agg) { agg = AccountCache.aggInit(gid, e); groups.set(gid, agg); }
         if (opts.collectKeys) agg.keys.push(key);
+        agg.records.push([key.slice(key.lastIndexOf(':') + 1), e.name ?? '']);
         agg.entries++;
         const exp = typeof e.expires_ms === 'number' ? e.expires_ms : 0;
         if (exp > now) agg.live++;
