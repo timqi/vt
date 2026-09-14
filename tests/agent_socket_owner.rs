@@ -11,6 +11,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+/// Held by every test that forks and by every test that expects a dropped
+/// listener to read as dead. Between fork and exec the child holds a copy of
+/// every open descriptor in this process — CLOEXEC closes them only at exec —
+/// so a concurrent probe of a just-dropped listener would still see it live.
+static FORK_GATE: Mutex<()> = Mutex::new(());
 
 struct TestDir(PathBuf);
 
@@ -59,6 +66,7 @@ fn second_owner_cannot_replace_socket_or_remove_it_on_failure() {
 
 #[test]
 fn stale_socket_is_replaced_and_persistent_lock_is_reused() {
+    let _gate = FORK_GATE.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TestDir::new();
     let path = dir.socket();
     drop(UnixListener::bind(&path).unwrap());
@@ -135,6 +143,7 @@ fn symlink_and_hardlinked_locks_are_refused() {
 
 #[test]
 fn spawned_child_does_not_retain_ownership_after_exec() {
+    let _gate = FORK_GATE.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TestDir::new();
     let path = dir.socket();
     let (owner, listener) = SocketOwner::bind(&path).unwrap();
