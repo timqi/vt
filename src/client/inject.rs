@@ -269,7 +269,7 @@ pub async fn inject(
             backup: absolutize(&backup_path).to_string_lossy().into_owned(),
             tmp: absolutize(&tmp_path).to_string_lossy().into_owned(),
             deadline_ms: now_ms().saturating_add((timeout as u64).saturating_mul(1000)),
-            backup_id: Some(backup_id),
+            backup_id,
         };
         if let Err(e) = write_inject_sidecar(&sidecar_path, &sidecar) {
             // Loud on stderr, not debug!: the user is about to expose
@@ -427,10 +427,9 @@ struct InjectSidecar {
     deadline_ms: u64,
     /// `(st_dev, st_ino)` of the backup at creation — the generation id that
     /// distinguishes THIS exposure's backup from a successor at the same
-    /// deterministic path. `None` on records written by builds without the
-    /// id; those rely on the backup's mtime ordering bound.
-    #[serde(default)]
-    backup_id: Option<(u64, u64)>,
+    /// deterministic path. Required: a record without it does not parse, so
+    /// recovery leaves both it and its backup alone (unknown state).
+    backup_id: (u64, u64),
 }
 
 /// Allow ordinary supervisor startup/scheduling delay before recovery cancels
@@ -550,7 +549,7 @@ fn write_inject_sidecar(path: &std::path::Path, sc: &InjectSidecar) -> Result<()
 // is held; every new sidecar MUST carry its backup's (dev, ino) generation
 // id, verified before recovery consumes anything; recovery refuses any
 // backup modified past the record's deadline — the ordering bound that
-// covers id-less legacy records and a successor reusing the old inode;
+// covers a successor reusing the old inode;
 // and every restorer re-checks the (dev, ino) it armed for before renaming
 // (see `restore_exposure` — a suspend can delay the supervisor's monotonic
 // sleep, or stop the parent short of its failure path, past the wall-clock
@@ -663,11 +662,8 @@ enum BackupProbe {
 /// stranding plaintext with no backup at worst. The `(dev, ino)` id
 /// disambiguates, backed by an mtime ordering bound: a legitimate backup is
 /// written BEFORE its sidecar's deadline is even computed (deadline = arm
-/// time + timeout), so a backup modified after the deadline is a successor.
-/// The bound is the only generation signal an id-less legacy record has —
-/// it cannot catch a successor created before the deadline; arm-time
-/// retirement covers those — and the guard against a successor reusing the
-/// old inode.
+/// time + timeout), so a backup modified after the deadline is a successor
+/// even when it reuses the old inode.
 fn probe_sidecar_backup(sc: &InjectSidecar) -> BackupProbe {
     use std::os::unix::fs::MetadataExt;
     let md = match std::fs::symlink_metadata(&sc.backup) {
@@ -682,11 +678,9 @@ fn probe_sidecar_backup(sc: &InjectSidecar) -> BackupProbe {
         }
         Err(_) => return BackupProbe::Unknown,
     };
-    // Generation id (always present on new records) must match.
-    if let Some((dev, ino)) = sc.backup_id {
-        if md.dev() != dev || md.ino() != ino {
-            return BackupProbe::Gone;
-        }
+    let (dev, ino) = sc.backup_id;
+    if md.dev() != dev || md.ino() != ino {
+        return BackupProbe::Gone;
     }
     match md
         .modified()
@@ -696,7 +690,7 @@ fn probe_sidecar_backup(sc: &InjectSidecar) -> BackupProbe {
         Some(mtime) if (mtime.as_millis() as u64) > sc.deadline_ms => BackupProbe::Gone,
         // At/before the deadline — or no mtime available, where we skip the
         // ordering bound rather than strand a genuine record (the id check
-        // above still applies to new records).
+        // above still applies).
         _ => BackupProbe::Ours,
     }
 }
@@ -1214,19 +1208,19 @@ mod tests {
             backup: "/abs/.secret.env.vt-backup".into(),
             tmp: "/abs/.secret.env.vt-tmp-ab".into(),
             deadline_ms: 1_723_000_000_000,
-            backup_id: Some((16_777_232, 42)),
+            backup_id: (16_777_232, 42),
         };
         let bytes = serde_json::to_vec(&sc).unwrap();
         let back: InjectSidecar = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(sc, back);
 
-        // Records written by builds that predate the generation id must still
-        // parse; they fall back to existence-only backup matching.
-        let legacy: InjectSidecar = serde_json::from_slice(
+        // A record without a generation id is rejected: nothing binds it to
+        // the backup at its deterministic path, so no restore path may act
+        // on it.
+        assert!(serde_json::from_slice::<InjectSidecar>(
             br#"{"target":"/t/f","backup":"/t/.f.vt-backup","tmp":"/t/.f.vt-tmp-ab","deadline_ms":7}"#,
         )
-        .unwrap();
-        assert_eq!(legacy.backup_id, None);
+        .is_err());
     }
 
     #[test]
@@ -1289,7 +1283,7 @@ mod tests {
             backup: "/t/.f.vt-backup".into(),
             tmp: "/t/.f.vt-tmp-ab".into(),
             deadline_ms: 100_000,
-            backup_id: None,
+            backup_id: (1, 2),
         };
         // Before the deadline: live, remaining seconds round up.
         assert_eq!(
@@ -1339,7 +1333,7 @@ mod tests {
             // In-window deadline: the ordering bound must not filter a record
             // whose exposure is simply still open.
             deadline_ms: now_ms() + 60_000,
-            backup_id: Some(current_backup_id(&backup)),
+            backup_id: current_backup_id(&backup),
         };
         std::fs::write(dir.join("aa.json"), serde_json::to_vec(&sc).unwrap()).unwrap();
         std::fs::write(dir.join("bb.json"), b"not json").unwrap(); // skipped
@@ -1355,7 +1349,7 @@ mod tests {
         // match: it describes an earlier, already-consumed backup that
         // happened to live at the same deterministic path.
         let stale = InjectSidecar {
-            backup_id: Some(mismatched_backup_id(&backup)),
+            backup_id: mismatched_backup_id(&backup),
             ..sc
         };
         std::fs::write(dir.join("aa.json"), serde_json::to_vec(&stale).unwrap()).unwrap();
@@ -1377,31 +1371,22 @@ mod tests {
             backup_id,
         };
         let future = now_ms() + 60_000;
-        // Legacy in-window record: existence is enough.
-        assert_eq!(probe_sidecar_backup(&sc(None, future)), BackupProbe::Ours);
+        let ours = current_backup_id(&backup);
         // Matching generation survives; a different inode means the recorded
         // backup was consumed and the path re-created by a later exposure.
+        assert_eq!(probe_sidecar_backup(&sc(ours, future)), BackupProbe::Ours);
         assert_eq!(
-            probe_sidecar_backup(&sc(Some(current_backup_id(&backup)), future)),
-            BackupProbe::Ours
-        );
-        assert_eq!(
-            probe_sidecar_backup(&sc(Some(mismatched_backup_id(&backup)), future)),
+            probe_sidecar_backup(&sc(mismatched_backup_id(&backup), future)),
             BackupProbe::Gone
         );
         // Ordering bound: a backup modified after the record's deadline is a
-        // successor, whatever the record's id says — a legitimate backup
-        // always predates its own deadline. This is what protects id-less
-        // legacy records (and inode reuse) from the stale-sidecar race; the
-        // fresh file here postdates the long-expired deadline.
-        assert_eq!(probe_sidecar_backup(&sc(None, 0)), BackupProbe::Gone);
-        assert_eq!(
-            probe_sidecar_backup(&sc(Some(current_backup_id(&backup)), 0)),
-            BackupProbe::Gone
-        );
-        // A genuinely old backup (mtime at or before the deadline) still
-        // reads as ours for an id-less record: legacy crash recovery keeps
-        // working, including the exact-deadline boundary a zero-timeout arm
+        // successor even with a matching id — a legitimate backup always
+        // predates its own deadline. This is what protects against inode
+        // reuse in the stale-sidecar race; the fresh file here postdates the
+        // long-expired deadline.
+        assert_eq!(probe_sidecar_backup(&sc(ours, 0)), BackupProbe::Gone);
+        // A genuinely old backup (mtime at or before the deadline) reads as
+        // ours, including the exact-deadline boundary a zero-timeout arm
         // produces. One millisecond past the deadline is already a successor
         // — a supervisor restoring at the deadline and a new inject arming
         // right after must not pair with this record.
@@ -1409,12 +1394,12 @@ mod tests {
         f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_000))
             .unwrap();
         drop(f);
-        assert_eq!(probe_sidecar_backup(&sc(None, 2_000)), BackupProbe::Ours);
-        assert_eq!(probe_sidecar_backup(&sc(None, 1_000)), BackupProbe::Ours);
-        assert_eq!(probe_sidecar_backup(&sc(None, 999)), BackupProbe::Gone);
+        assert_eq!(probe_sidecar_backup(&sc(ours, 2_000)), BackupProbe::Ours);
+        assert_eq!(probe_sidecar_backup(&sc(ours, 1_000)), BackupProbe::Ours);
+        assert_eq!(probe_sidecar_backup(&sc(ours, 999)), BackupProbe::Gone);
         // Backup gone: consumed; settled regardless of id.
         std::fs::remove_file(&backup).unwrap();
-        assert_eq!(probe_sidecar_backup(&sc(None, future)), BackupProbe::Gone);
+        assert_eq!(probe_sidecar_backup(&sc(ours, future)), BackupProbe::Gone);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1436,7 +1421,7 @@ mod tests {
             backup: backup.to_string_lossy().into_owned(),
             tmp: "unused".into(),
             deadline_ms: 0,
-            backup_id: None,
+            backup_id: current_backup_id(&backup),
         };
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
         let probe = probe_sidecar_backup(&sc);
@@ -1487,7 +1472,7 @@ mod tests {
             backup: "/t/.f.vt-backup".into(),
             tmp: "unused".into(),
             deadline_ms: 0,
-            backup_id: Some((1, 2)),
+            backup_id: (1, 2),
         };
         let err = write_inject_sidecar(&path, &sc).unwrap_err();
         assert!(err.to_string().contains("cap"), "got: {err}");
@@ -1507,7 +1492,7 @@ mod tests {
             backup: backup.to_string_lossy().into_owned(),
             tmp: "unused".into(),
             deadline_ms: 0,
-            backup_id: None,
+            backup_id: (1, 2),
         };
         std::fs::write(
             state.join("stale.json"),
@@ -1639,11 +1624,23 @@ mod tests {
             backup: "/t/.f.vt-backup".into(),
             tmp: "unused".into(),
             deadline_ms: 0,
-            backup_id: None,
+            backup_id: (1, 2),
         };
         let real = dir.join("real.json");
         std::fs::write(&real, serde_json::to_vec(&sc).unwrap()).unwrap();
         assert_eq!(read_sidecar_bounded(&real), Some(sc));
+
+        // Id-less record (a build before the generation id): unreadable, so
+        // every scan skips it and the file itself is left in place — unknown
+        // state, never restored, never retired.
+        let idless = dir.join("idless.json");
+        std::fs::write(
+            &idless,
+            br#"{"target":"/t/f","backup":"/t/.f.vt-backup","tmp":"unused","deadline_ms":0}"#,
+        )
+        .unwrap();
+        assert_eq!(read_sidecar_bounded(&idless), None);
+        assert!(idless.exists());
 
         // Symlink final component: refused even when it points at a valid
         // sidecar — the fallback scan may run in an attacker-writable dir.
@@ -1694,7 +1691,7 @@ mod tests {
             backup: backup.to_string_lossy().into_owned(),
             tmp: "unused".into(),
             deadline_ms: 2_000,
-            backup_id: None,
+            backup_id: current_backup_id(&backup),
         };
         std::fs::write(state.join("aa.json"), serde_json::to_vec(&sc).unwrap()).unwrap();
         let err = exposure_conflict_refusal(target_str, &backup, Some(&state));
@@ -1720,7 +1717,7 @@ mod tests {
         std::fs::write(
             state.join("aa.json"),
             serde_json::to_vec(&InjectSidecar {
-                backup_id: Some(mismatched_backup_id(&backup)),
+                backup_id: mismatched_backup_id(&backup),
                 ..sc.clone()
             })
             .unwrap(),
@@ -1931,7 +1928,7 @@ mod tests {
             backup: backup.to_string_lossy().into_owned(),
             tmp: tmp.to_string_lossy().into_owned(),
             deadline_ms: now_ms() + 60_000,
-            backup_id: Some(backup_id),
+            backup_id: backup_id,
         };
         write_inject_sidecar(&sidecar, &sc).unwrap();
         let armed = ArmedExposure {

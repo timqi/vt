@@ -113,10 +113,11 @@ in [src/client/inject.rs](src/client/inject.rs). Keep these implementation bound
   fails. Never remove another exposure's lock; never randomize the backup name.
   Refuse `-r` files with no `vt://` records.
 - Every restore consumes the backup by atomic `rename`, never copy+delete.
-  New sidecars must record `(dev, ino)`; arming retires stale sidecars for that
+  Every sidecar records `(dev, ino)`; an id-less record is unknown state (never
+  parsed, never restored, never retired). Arming retires stale sidecars for that
   backup path. Recovery checks generation and mtime versus the recorded deadline
-  (mtime is the legacy id-less record's ordering bound), including a re-probe
-  after publication cancellation. Never restore a known successor's backup.
+  (mtime catches a successor reusing the inode), including a re-probe after
+  publication cancellation. Never restore a known successor's backup.
 - Supervisor and parent failure paths also check their armed `(dev, ino)` before
   restoring. Preserve recovery records on cancellation/restore failure or unknown
   backup state; stat errors must not be mistaken for absence. Only successful
