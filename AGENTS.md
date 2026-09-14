@@ -59,7 +59,7 @@ the rules fail on the thing, not on the number.
 | `src/client/` | 1.8k | `client.rs` + `client/`: transport routing, CLI verbs, `inject` with its recovery supervisor, `doctor`, record parsing |
 | `src/server_macos/` | 4.5k | SSH agent, scopes, Keychain, socket owner check, audit push, UI status; step 4 of refactor.md decides the scopes share |
 | root `src/*.rs` | 2.0k | entry, config, `cf.rs` Worker client, `ssh_sign.rs` relay routing, caller metadata, audit push (its master-key form is an open step 1 row) |
-| `cf-worker/src/` | 4.0k | one DO owning state, routes, host tokens, DEK cache policy, WebAuthn, notifications, admin page; raised from 3.5k when steps 4–5 of worker-slim.md landed: the root key, config blob, passkey admin session and login ceremony (`account_admin.ts` ≈ 450, `admin_auth.ts`) are the right things, and nothing else in the area is a copy |
+| `cf-worker/src/` | 4.1k | one DO owning state, routes, host tokens, DEK cache policy, WebAuthn, notifications, admin page; raised from 3.5k when steps 4–5 of worker-slim.md landed: the root key, config blob, passkey admin session and login ceremony (`account_admin.ts` ≈ 450, `admin_auth.ts`) are the right things, and nothing else in the area is a copy; 4.1k adds the operator-owned record `names` table and its adopt/rename validator |
 | one module | 750 | rule 2 before splitting; `core/authorization.rs`, `server_macos/ssh_agent.rs`, `client/inject.rs` are the open tripwires |
 
 Non-blank, non-comment lines, `#[cfg(test)]` and `*.test.ts` excluded. No

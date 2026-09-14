@@ -69,15 +69,6 @@ vt.tabs.cache = function (panel) {
     gone: '已被清除',
   };
 
-  // Shorten a long path for the sub-line: keep the last two segments, which is
-  // what identifies the working tree (…/code/dev/avibe), not the mount prefix.
-  function shortPath(p) {
-    if (!p) return '';
-    var parts = String(p).split('/').filter(Boolean);
-    if (parts.length <= 2) return p;
-    return '…/' + parts.slice(-2).join('/');
-  }
-
   // ── Filtering (client-side; the listing is one bounded snapshot) ───────────
 
   function visibleGroups() {
@@ -125,7 +116,7 @@ vt.tabs.cache = function (panel) {
 
     // 主机 · 项目: the two halves of the key (verified token, advisory project).
     // Command, IP, user and directory are the hover detail.
-    var who = (g.user || '?') + ' · ' + (g.project ? shortPath(g.project) : '项目未知');
+    var who = (g.user || '?') + ' · ' + (g.project ? vt.projectName(g.project) : '项目未知');
     var hostHover = '主机: ' + (g.host || '—') + '\n用户: ' + (g.user || '—')
       + '\n命令: ' + (g.command || '—') + (g.ppid_cmd ? '\n父进程: ' + g.ppid_cmd : '')
       + '\n批准时来源 IP: ' + (g.ip || '—') + '（仅作审计，不参与绑定）'

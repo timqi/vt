@@ -46,7 +46,7 @@ const FAVICON_TAGS =
 // admin.css stays stale, which desyncs markup from styles. The .html page
 // shells need no token — the Worker reads them server-side per request.)
 // Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
-const ASSET_VER = '20260914-36e8b4a';
+const ASSET_VER = '20260914-7cc1301';
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
