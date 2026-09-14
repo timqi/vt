@@ -101,6 +101,7 @@ Set-Cookie: …; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800
 | `POST /api/admin/logout`, `/sessions-revoke` | cookie | §3.1 |
 | `GET /api/admin/credentials`, `POST …/credentials-add`, `POST …/credentials-revoke` | cookie | §3.4 |
 | `GET/PUT /api/admin/config` | cookie | §4 |
+| `PUT /api/admin/names` | cookie | record rename, `{salt_b64u, name}`, `""` deletes ([dek-cache.md](dek-cache.md)) |
 | `GET /api/admin/push/vapid`, `POST …/push/subscribe`, `…/push/unsubscribe`, `…/push/test` | cookie | §5 |
 | `POST /api/admin/rotate-secret` | cookie | §2 rotation; returns `{secret}` once |
 | existing `audit`, `audit-stream`, `cache-*`, `clear-cache`, `clear-audit`, `tokens`, `tokens-revoke` | cookie | unchanged bodies; the former `admin_email` fields are gone — the cookie carries no credential identity, so extend/revoke rows name no operator |
@@ -137,7 +138,7 @@ public and bootstrap right after `just deploy-worker`.
    receives the 409.
 5. The 409 view shows that time and IP and one line: not you ⇒ factory reset
    (§2) and redo. Nothing else exists yet.
-6. The console opens on the 设置 tab: enable caching, subscribe this phone.
+6. The console opens on the 设置 tab: subscribe this phone.
 
 `origin` is the request origin of the bootstrap call; it is the WebAuthn
 origin, the RP id source and the approve-URL base from then on, immutable
@@ -168,7 +169,6 @@ plaintext (JSON) = {
   epoch: 1,                           // §3.1
   credentials: [ {h, i, k, p, l, t} ],// credentials.ts entry, unchanged bytes
   bootstrap: { ms, ip },              // first registration, shown on a 409 (§3.3)
-  cache_enabled: false,               // was: CACHE_SECKEY present
   cache_hit_notify: false,            // was: CACHE_HIT_NOTIFY
   uv_policy: null,                    // was: APPROVAL_UV_JSON; same object, validated by parseUvPolicy on PUT
   vapid: null | { pub_b64u, jwk },    // §5.2; jwk is the exported P-256 private key
@@ -181,17 +181,20 @@ plaintext (JSON) = {
   writer, so random nonces are safe at this write rate.
 - The DO keeps the decrypted blob in memory after first load and replaces it in
   the same synchronous step as the `put`; ceremony ops read `credentials`,
-  `origin`, `uv_policy`, `cache_enabled` from that copy on every request, push
-  fan-out reads `vapid`/`push`. The edge reads nothing from config.
+  `origin`, `uv_policy` from that copy on every request, push fan-out reads
+  `vapid`/`push`. The edge reads nothing from config.
 - `uv_policy` is applied in `opCreate` only, against the verified host; the
   raise-only rule and the `cache-extend` pin are unchanged. A malformed object
   is refused at PUT (400); a malformed stored one (a bug) reads as `required`.
-- `PUT /api/admin/config` accepts only `cache_enabled`, `cache_hit_notify`,
-  `uv_policy`; anything else in the body is `400`. Disabling caching does not
-  delete entries; 清除全部 does.
-- Deleted as knobs: `CACHE_ADMIN_EXTEND` (extension is offered iff
-  `cache_enabled`; every extension still needs a passkey approval),
-  `WORKER_ORIGIN`, `RP_ID`.
+- `PUT /api/admin/config` accepts only `cache_hit_notify`, `uv_policy`;
+  anything else in the body is `400` (`cache_enabled` included: the switch is
+  gone, option `0` on the approval page is the no-cache path).
+- Deleted as knobs: `CACHE_ADMIN_EXTEND` and `cache_enabled` (every extension
+  still needs a passkey approval), `WORKER_ORIGIN`, `RP_ID`.
+- Beside the blob, plaintext SQLite tables the DO owns: `audit`, `host_token`
+  and `names(salt_b64u PRIMARY KEY, name, source, ms)` — record display names
+  ([dek-cache.md](dek-cache.md)); `PUT /api/admin/names` is the one write
+  route, session-gated like the rest.
 
 ### 4.2 Migration
 

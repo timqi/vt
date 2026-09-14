@@ -140,11 +140,10 @@ ends every admin session (yours included); the last passkey cannot be revoked.
 
 Saved into the encrypted config blob; effective immediately.
 
-- **启用 DEK 缓存** — off by default. On, the approval page offers a cache TTL
-  and the DEK 缓存 tab offers extension (each extension still needs a passkey
-  approval). Off does not delete entries; 清除全部 does. The cache key is
-  derived from `R`, so nothing rotates it but a factory reset.
-  See [dek-cache.md](dek-cache.md).
+- There is no cache switch: the approval page always offers a cache TTL with
+  `不缓存` as the default, and the DEK 缓存 tab offers extension (each still
+  needs a passkey approval). The cache key is derived from `R`, so nothing
+  rotates it but a factory reset. See [dek-cache.md](dek-cache.md).
 - **缓存命中时推送通知** — off by default; every no-tap decrypt pushes a notice.
 - **UV 策略** — WebAuthn user-verification level for **approval** ceremonies
   (registration and admin login always require verification):

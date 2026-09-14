@@ -33,15 +33,30 @@ TTL, a caller can decrypt the approved records without another phone tap.
   somewhere. The UI
   renders it with the ordinary duration formatter (`36500 天`) rather than a special
   "permanent" label, so no reader has to trust a word over a number.
-- Caching is enabled only by the 设置 tab's 启用 DEK 缓存 switch
-  (`config.cache_enabled`, off by default; [worker-slim.md](worker-slim.md)
-  §4). The X25519 scalar entries are sealed to is
+- There is no cache switch. Every approval page with DEKs to cache offers the
+  ladder; the first option, `0` = `不缓存`, is the default and IS the no-cache
+  path (the phone seals nothing to the cache key, so the Worker has nothing to
+  store). The X25519 scalar entries are sealed to is
   `HKDF(R, "vt-cache-seckey-v1")` of the Durable Object's root key
-  (`AccountAdmin.cacheSeckey`), so it exists whether caching is on or off and
-  nothing rotates it but a factory reset. Turning caching off makes every
-  probe a miss and every approval page offer `不缓存` only; it deletes nothing
-  (清除全部 does). There is no `VT_DEK_CACHE` environment variable and no
-  separate client-side no-cache flag.
+  (`AccountAdmin.cacheSeckey`); nothing rotates it but a factory reset. There is
+  no `VT_DEK_CACHE` environment variable and no separate client-side no-cache
+  flag; 清除全部 on the DEK 缓存 tab is the emergency off.
+- **Record names** are operator-owned display labels keyed by a record's
+  16-byte salt — the only identity of a record the Worker ever sees. The DO
+  table `names(salt_b64u PRIMARY KEY, name, source, ms)`
+  (`cf-worker/src/account_names.ts`) has no expiry; a name is ≤ 40 characters
+  and not unique. The CLI MAY send `meta.names` (one per salt, `""` when
+  unknown — `inject` sends the env var name or the file's basename, `vt read`
+  of a bare URL sends `""`) on challenge and dek-cache requests; the edge
+  refuses a miscounted or oversize array (400). A suggestion is shown as
+  自报 and stored only when the approver ticks 采用 on the approval page
+  (`adopt_names`, written with `source='client'` after the assertion
+  verifies, never over an owned name) or the console renames the record
+  (`PUT /api/admin/names {salt_b64u, name}`, session-gated, `""` deletes,
+  `source='manual'`). Audit rows store `[salt, claimed]` pairs and resolve
+  them on every read, so a rename retitles history; cache entries keep the
+  claim and the `project`; the cache listing, the hit audit row and the hit
+  push show the resolved name, else the claim tagged 自报, else 未命名.
 - A cache key is `dek:{token_id}:{project_h}:{salt_b64u}`. `token_id` is the
   host token the edge verified on the request ([host-token.md](host-token.md))
   and the **hard boundary**: a grant serves only the host that earned it, from
@@ -123,17 +138,19 @@ Rust client opens the result with the existing sealed-box implementation.
 ## Admin surface: the DEK 缓存 tab
 
 The admin shell's DEK 缓存 tab (`/admin#cache`) lists what is **actually
-cached right now**, one row per cache group, joined with the approval that
-armed it (host, user, directory, command). Each row shows its original `created_ms` below the remaining time and
+cached right now**, one row per cache group: 主机 · 项目 / 记录 (names,
+renameable in place) / 条目 / 剩余 · 到期 / 操作, joined with the approval
+that armed it (user, directory, command and IP in the host cell's hover). Each row shows its original `created_ms` below the remaining time and
 expiry, in the browser's local time. Legacy entries without that timestamp show
 `创建于 未知`; extending a cache does not change its creation time.
 It is the only view of the real entry set — the audit tab can merely
 show which approvals *armed* a cache, which is an inference, not an inventory.
 
-The listing deliberately carries no secret material: no sealed DEK, no salts, and
-**no storage key**. The key holds `SHA-256(tag ‖ project)`, so publishing it
-would turn the page into an offline oracle for the client-reported `project`
-path. Entries scanned per request are capped; the response
+The listing deliberately carries no secret material: no sealed DEK and **no
+storage key**. The key holds `SHA-256(tag ‖ project)`, so publishing it would
+turn the page into an offline oracle for the client-reported `project` path. A
+record's salt (public in every `vt://` URL) appears once per record as the
+rename key of `records[]`, never beside its project hash. Entries scanned per request are capped; the response
 reports `truncated` and the UI says so rather than implying a complete view.
 
 Two classes of action, with deliberately different gates:
@@ -160,9 +177,9 @@ paths — exhaustive by contract".
 
 ### Extension contract
 
-Extension is offered iff caching is enabled (`cache_enabled` — a switch, not
-an authorization; the former `CACHE_ADMIN_EXTEND` knob is gone). An admin
-selects groups and a TTL and presses 延长; the Worker then only **mints a
+Extension is always offered (the former `CACHE_ADMIN_EXTEND` and
+`cache_enabled` switches are gone). An admin selects groups and a TTL and
+presses 延长; the Worker then only **mints a
 pending ceremony**. Nothing expires later until a Passkey approves it, and
 every one of these holds:
 
@@ -259,13 +276,15 @@ factory reset also orphans every entry). The cache does not re-key existing
 | CLI cache request, `project` collection, and source check | `src/cf.rs`, `src/client.rs` |
 | Admin cache inventory / clear / extend UI | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/cache.js` |
 | Admin audit cache column + per-row clear | `cf-worker/pwa/admin/audit.js` |
-| Cache switch, hit-notify switch, root-key scalar | `cf-worker/src/account_admin.ts` (`Config`, `cacheSeckey`), 设置 tab in `cf-worker/pwa/admin/settings.js` |
+| Hit-notify switch, root-key scalar | `cf-worker/src/account_admin.ts` (`Config`, `cacheSeckey`), 设置 tab in `cf-worker/pwa/admin/settings.js` |
+| Record names: table, adopt / rename gates, resolution on read | `cf-worker/src/account_names.ts`, `do_account.ts` (`opApprove`, `opNamesSet`), `account_audit.ts` (`records`), `pwa/admin/admin.js` (`vt.recordList`) |
 | Deployment, secret rotation, reset | [`cf-worker-deploy.md`](cf-worker-deploy.md) |
 
 ## Verification
 
-1. Deploy and bootstrap a Worker; turn on 启用 DEK 缓存 on the 设置 tab.
-2. Read a `vt://` record and select `20m` on the approval page.
+1. Deploy and bootstrap a Worker.
+2. Read a `vt://` record and select `20m` on the approval page; tick 采用 on
+   its 自报 name (or rename it later from the audit dialog).
 3. Read the same record again from the same host inside the same repository
    (any worktree, any egress IP); the second read should not open a phone
    ceremony.
@@ -278,8 +297,7 @@ factory reset also orphans every entry). The cache does not re-key existing
    the remaining time jumps to `批准时刻 + 时长` and two audit rows appear
    (`cache-extend` approved + `缓存已延长`). Let a cache lapse and confirm it can no
    longer be extended at all — only a fresh phone approval arms a new one.
-7. Clear the cache (or turn caching off), then confirm the next read returns
-   to the phone ceremony.
+7. Clear the cache, then confirm the next read returns to the phone ceremony.
 
 For implementation changes, run the focused Rust/Worker tests and then the
 repository gates from [`docs/README.md`](README.md).

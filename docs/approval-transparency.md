@@ -157,8 +157,27 @@ Worker side (`cf-worker`):
 
 - **C1 — trust labeling on the approve page** (`pwa/approve.js`): the
   `ip` row is labeled `IP（已验证）`; a footnote under the field list
-  states `除 IP 外均为客户端自报信息，仅供参考`. New row `记录数: N`
-  (from `salts_b64u.length`, worker-derived) when N > 0.
+  states `除 IP 外均为客户端自报信息，仅供参考`. The `记录 · N 条` row
+  (N from `salts_b64u.length`, worker-derived) lists the records by name —
+  see C5.
+- **C5 — record names** ([dek-cache.md](dek-cache.md)): a name the operator
+  owns (adopted or typed on the console, keyed by the record's salt) is a
+  **truth line** — the Worker resolved it from its own table, the client
+  cannot influence it — and precedes every unnamed record. A record with no
+  owned name shows the client's suggestion labeled for what it is,
+  `未命名 · 客户端称 GH_TOKEN`, with an unchecked `采用` box: the label is
+  client-claimed until the approver adopts it, and the adoption itself
+  rides on the verified assertion (`adopt_names`), so a hostile client can
+  propose a misleading name but never make the page state it as fact. The
+  same rule holds on the audit table, the DEK 缓存 tab and the cache-hit
+  push: owned name, else `X（自报）`, else `未命名`. The footnote says
+  `记录名由服务端保存`.
+- **C6 — fold** (operator feedback, one-handed phone use): above the fold
+  are the decision lines only — 类型, 记录, 主机（已验证）@用户, 命令 — then
+  the cache scope + duration radios and 同意/拒绝; 目录, 项目, 父进程,
+  IP（已验证）（+上次） and 原因 sit in a collapsed `详情`. Enrollment keeps the
+  pairing code as the largest element. Truth-before-claim ordering is kept
+  inside each block.
 - **C2 — cache consent copy**: 「同一主机令牌（已验证）且同一项目（客户端
   自报）」 so the stated boundary matches the implemented one (key = verified
   host `token_id` + advisory `project`, see [`dek-cache.md`](dek-cache.md)).

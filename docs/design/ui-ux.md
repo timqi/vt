@@ -71,7 +71,9 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 [approval-transparency.md](../approval-transparency.md) §C; this adds presentation.
 
 - One solid card, 420px column at every width. The decision line is first and
-  largest (22px): the operation and the record names; then `主机（已验证）@用户`
+  largest (22px): the operation and the record names (server-owned first; an
+  unnamed record shows the client's claim as `未命名 · 客户端称 X` with an
+  unchecked `采用` box); then `主机（已验证）@用户`
   and 命令. Everything else sits in a closed `<details>` 详情 (目录, 项目,
   父进程, IP with 上次, 原因).
 - Agent-derived truth lines precede every client-reported line; trust is in
@@ -162,11 +164,14 @@ Used on a phone, one hand, under time pressure. Field set and order come from
   **login** — one primary button `使用 Passkey 登录` and the status line;
   **console** — the tab strip 审计 · DEK 缓存 · 主机令牌 · Passkey · 设置, tab
   in the URL hash (`/admin#audit`), first tab default.
-- 审计: filter bar, list/table, `加载更多`, live indicator, detail sheet with
-  inline approval. DEK 缓存: filter bar, bulk bar, list/table, extend sheet.
-  主机令牌: filter bar, list/table with per-row `吊销`. Passkey: current list,
+- 审计: filter bar, list/table (时间 / 状态 / 主机 / 记录 / 缓存 / 操作),
+  `加载更多` with `已加载 N 条`, live indicator, detail sheet with inline
+  approval and record rename. DEK 缓存: filter bar, bulk bar, list/table
+  (主机 · 项目 / 记录 / 条目 / 剩余 · 到期 / 操作), extend sheet. A record name
+  is a control (`vt.recordList`): click → input, Enter saves, Escape/blur
+  cancels. 主机令牌: filter bar, list/table with per-row `吊销`. Passkey: current list,
   segmented `新增 / 吊销`, `自检`. 设置: session (`退出登录`, `退出所有会话`),
-  caching and hit-notify switches, UV policy JSON, push subscriptions
+  hit-notify switch, UV policy JSON, push subscriptions
   (`开启推送`, per-row test/remove).
 - A `401` on any admin request returns the shell to the login state with the
   reason on the status line; the console never renders on stale data.
@@ -185,6 +190,7 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 | Status line: `vt.statusLine(el)` returns the tab's `setStatus` | `common.js` |
 | `fmtTime`, `fmtRemaining`, `ttlLabel`, `el` | `common.js` (`vt.*`) |
 | Passkey ceremony | `approve.js` (`vt.mountApprove`) |
+| Record names: `vt.recordLabel`, `vt.recordsSummary`, renameable `vt.recordList` | `admin.js` |
 
 A second copy of any row is a bug (AGENTS.md Budgets rule 3).
 

@@ -184,7 +184,7 @@ Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
   new value once; the first load under the new `SECRET` drops the old wrap;
   never a third. A root that does not unwrap is unconfigured (fail closed,
   `config.unreadable` once), and bootstrap over it is the factory reset.
-  No `[vars]`: `cache_enabled`, `cache_hit_notify`, `uv_policy` live in
+  No `[vars]`: `cache_hit_notify`, `uv_policy` live in
   `cfg:v1` and `PUT /api/admin/config` accepts nothing else; `origin` is
   captured at bootstrap and immutable. See [docs/worker-slim.md](docs/worker-slim.md).
 - Hosts authenticate with per-host tokens (`vt1.<id>.<secret>`, secret =
@@ -202,20 +202,21 @@ Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
   key only inside `cacheCtx` for both reads and writes; it refuses a missing
   `token_id`. Retain literal `meta.pwd` and show `metadata.project` beside
   approval duration controls.
-- Caching is opt-in (`cache_enabled`, off by default); the scalar is
-  `HKDF(R, vt-cache-seckey-v1)` and exists either way, so disabling deletes
-  nothing and makes every probe a miss. A hit is not a phone approval: always
-  audit it. `cache_hit_notify` independently enables best-effort hit pushes
+- There is no cache switch: option `0` = `不缓存`, the approval page's
+  default, is the no-cache path; the scalar is `HKDF(R, vt-cache-seckey-v1)`.
+  A hit is not a phone approval: always audit it. `cache_hit_notify` independently enables best-effort hit pushes
   and is off by default. Group IDs and creation stamps are immutable.
 - Session-gated list/clear need no Passkey; extension requires a verified Passkey
-  via `opApprove` -> `commitExtend`, never a session alone, and is offered iff
-  `cache_enabled`. Never resurrect expired entries, shorten expiry, or extend
+  via `opApprove` -> `commitExtend`, never a session alone. Never resurrect expired entries, shorten expiry, or extend
   drifted/no-gain groups; re-read entries with no await before the write, and audit
   authorization plus actual effects. Expiry is approval-time + TTL, not a lifetime
   budget. Keep distinct approve/extend TTL ladders and finite expiries, never
   null/Infinity; policy lives in [cf-worker/src/cache_policy.ts](cf-worker/src/cache_policy.ts).
-- Listing exposes no sealed material, salts, or binding ctx digest, and reports
-  `truncated`. Clearing must exhaust the `dek:` prefix, report actual deletions,
+- Record names are operator-owned (`names` table keyed by salt, adopted on a
+  verified approve or renamed with the session cookie); a client's `meta.names`
+  is a suggestion, shown as 自报 and never stored on its own.
+- Listing exposes no sealed material or binding ctx digest — a record's salt
+  only as the rename key of `records[]` — and reports `truncated`. Clearing must exhaust the `dek:` prefix, report actual deletions,
   and fail loudly if incomplete. Keep every cache-armed audit row's revoke button.
   `audit.cache_ttl_s` stays immutable; only `audit.cache_expires_ms` tracks extension.
   Every multi-key storage `get`/`put`/`delete` is chunked to <= 128 keys.
