@@ -31,7 +31,7 @@ import {
 import { challengeUvLevel, effectiveUvLevel } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
-import { isName, nameLabel } from './account_names';
+import { checkAdopt, isName, nameLabel } from './account_names';
 import { AccountNotifications } from './account_notifications';
 import { AccountAdmin, notConfigured } from './account_admin';
 import { AccountCache } from './account_cache';
@@ -560,13 +560,14 @@ export class AccountDO extends DurableObject<Env> {
       if (!isB64uString(body.sealed_deks_b64u)) throw new Error('sealed_deks_b64u');
       if (!isB64uString(body.binding_tag_b64u)) throw new Error('binding_tag_b64u');
       pwaPkBytes = decodeB64uExact(body.pwa_pk_b64u, 32, 'pwa_pk_b64u');
-      if (body.adopt_names !== undefined && !Array.isArray(body.adopt_names)) throw new Error('adopt_names');
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
 
     const ch = await this.ctx.storage.get<Challenge>(`ch:${body.approve_token}`);
     if (!ch) return new Response('not found', { status: 404 });
+    const adopt = checkAdopt(body.adopt_names, ch.salts_b64u.length);
+    if (!adopt) return badRequest('bad request: adopt_names');
     // Idempotent re-delivery: if already approved return the existing sealed result
     if (ch.status !== 'pending') return sealedResult(ch);
     // A request may never be approved once its window has passed, alarm or not.
@@ -610,12 +611,11 @@ export class AccountDO extends DurableObject<Env> {
     // approved enrollment always has its token and a token always has its
     // approval. Single-use follows from the not-pending early-return above.
     if (ch.enroll) this.commitEnroll(ch, ch.enroll, finalizedMs);
-    // Adopted record names: only what the CLI suggested for THIS ceremony's
-    // salts, only after the assertion verified, never over an owned name.
-    for (const i of (body.adopt_names ?? []) as unknown[]) {
-      if (typeof i === 'number' && Number.isInteger(i) && ch.salts_b64u[i]) {
-        this.audit.names.adopt(ch.salts_b64u[i]!, ch.meta.names?.[i] ?? '', finalizedMs);
-      }
+    // Typed record names: only after the assertion verified, never over an
+    // owned name; one equal to the client's claim is recorded as adopted.
+    for (const a of adopt) {
+      const src = a.name === ch.meta.names?.[a.index] ? 'client' : 'manual';
+      this.audit.names.adopt(ch.salts_b64u[a.index]!, a.name, src, finalizedMs);
     }
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 

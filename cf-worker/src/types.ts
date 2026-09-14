@@ -425,8 +425,10 @@ export interface ApproveRequest {
    * crypto_box_seal(DEK_i, CACHE_PUBKEY) produced by the PWA. Only sent when
    * cache_ttl_s > 0. */
   cache_sealed_deks_b64u?: string[];
-  /** Indices into salts_b64u whose suggestion the approver adopts (source='client'). */
-  adopt_names?: number[];
+  /** Names the approver typed on the page, one per unnamed salt at most: stored
+   *  after the assertion verifies, source='client' when equal to the client's
+   *  claim, else 'manual'. */
+  adopt_names?: { index: number; name: string }[];
 }
 
 // ── Inbound from PWA via POST /api/reject ─────────────────────────────────

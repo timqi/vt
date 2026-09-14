@@ -1,8 +1,8 @@
 // Operator-owned display names for records, keyed by the 16-byte salt the
 // Worker sees on every ceremony (docs/dek-cache.md). The client may suggest a
-// name (`meta.names`, 自报); nothing lands here without the approver adopting
-// it on the approval page or the console renaming it. Synchronous SQL like
-// account_audit.ts, so a lookup never opens a ceremony's input gate.
+// name (`meta.names`, 自报); nothing lands here without the approver typing or
+// adopting it on the approval page or the console renaming it. Synchronous SQL
+// like account_audit.ts, so a lookup never opens a ceremony's input gate.
 
 import type { RecordName } from './types';
 
@@ -13,6 +13,23 @@ export const NAME_MAX = 40;
 // would silently label a different record).
 export function isName(v: unknown): v is string {
   return typeof v === 'string' && v.length <= NAME_MAX;
+}
+
+// Names typed on the approval page: `{index, name}`, each salt at most once and
+// in range; the edge stripped control characters, the cap is re-checked. One
+// bad entry refuses the whole body — nothing is stored.
+export function checkAdopt(raw: unknown, count: number): { index: number; name: string }[] | null {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.length > count) return null;
+  const seen = new Set<number>();
+  const out: { index: number; name: string }[] = [];
+  for (const e of raw as { index?: unknown; name?: unknown }[]) {
+    const i = e?.index;
+    if (typeof i !== 'number' || !Number.isInteger(i) || i < 0 || i >= count || seen.has(i) || !isName(e.name)) return null;
+    seen.add(i);
+    out.push({ index: i, name: e.name });
+  }
+  return out;
 }
 
 // What a surface prints for one record when it has to be a single string:
@@ -65,14 +82,14 @@ export class AccountNames {
     );
   }
 
-  // Approval-page adoption of a client suggestion: never overwrites a name the
-  // operator already owns.
-  adopt(salt: string, name: string, now: number): void {
+  // Approval-page name (`source` 'client' when it is the client's claim, else
+  // 'manual'): never overwrites a name the operator already owns.
+  adopt(salt: string, name: string, source: RecordName['source'], now: number): void {
     if (name === '') return;
     this.sql.exec(
-      `INSERT INTO names (salt_b64u, name, source, ms) VALUES (?, ?, 'client', ?)
+      `INSERT INTO names (salt_b64u, name, source, ms) VALUES (?, ?, ?, ?)
        ON CONFLICT(salt_b64u) DO NOTHING`,
-      salt, name, now,
+      salt, name, source, now,
     );
   }
 }

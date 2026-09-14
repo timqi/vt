@@ -1,7 +1,7 @@
 // Record display names (account_names.ts): the salt is the key, the operator
 // owns the name, the client only suggests one. Pins:
 //   • a suggestion reaches the page as `claimed`, never as `name`;
-//   • adoption happens only through a VERIFIED approval, never over an owned name;
+//   • a name typed on the page lands only through a VERIFIED approval, never over an owned name;
 //   • rename is a session-gated PUT; an empty name deletes;
 //   • oversize / miscounted suggestions are refused at the edge (400);
 //   • names flow to audit rows (ceremony + hit), the cache listing and the hit push.
@@ -14,7 +14,7 @@ import * as webpush from '../src/webpush';
 import { AccountNotifications } from '../src/account_notifications';
 import {
   bootstrap, liveTokenId, hostSecret, makeMeta, makeChallenge, nextSalt, daemonAuth, configure,
-  approve, doPost, doGet, inDO, adminHeaders, sealFakeDek, TEST_ORIGIN,
+  approve, signApproval, doPost, doGet, inDO, adminHeaders, sealFakeDek, TEST_ORIGIN,
 } from './do_helpers';
 import type { RecordName, AuditRow, CacheListResponse } from '../src/types';
 
@@ -73,25 +73,54 @@ describe('suggestions on the approval page', () => {
   });
 });
 
-describe('adoption', () => {
-  it('writes the adopted suggestions only after the assertion verifies', async () => {
+describe('names typed on the approval page', () => {
+  it('writes them only after the assertion verifies, source by whether the claim was kept', async () => {
     const salts = [nextSalt(), nextSalt(), nextSalt()];
     const ch = await createWithNames(salts, ['A', 'B', '']);
-    // A failed assertion adopts nothing.
-    const bad = await approve(ch, { adopt_names: [0, 1], signature_b64u: b64uEnc(new Uint8Array(70).fill(3)) });
+    // A failed assertion stores nothing.
+    const bad = await approve(ch, { adopt_names: [{ index: 0, name: 'A' }], signature_b64u: b64uEnc(new Uint8Array(70).fill(3)) });
     expect(bad.status).toBe(401);
     expect(await namesTable()).toEqual([]);
-    // Verified: index 0 adopted; index 2 has no claim; 7 is out of range; junk ignored.
-    expect((await approve(ch, { adopt_names: [0, 2, 7, 'x', -1] })).status).toBe(200);
-    expect(await namesTable()).toEqual([{ salt_b64u: salts[0], name: 'A', source: 'client' }]);
+    // Verified, through the edge: the kept claim is 'client', a typed name is
+    // 'manual' (with or without a claim), control characters are stripped as
+    // for a rename.
+    const res = await app.fetch(new Request(`${TEST_ORIGIN}/api/approve`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        approve_token: ch.approve_token, sealed_deks_b64u: b64uEnc(new Uint8Array(48).fill(5)),
+        binding_tag_b64u: b64uEnc(new Uint8Array(32).fill(6)), ...(await signApproval(ch.approve_challenge_hash_b64u)),
+        adopt_names: [{ index: 0, name: 'A' }, { index: 1, name: 'ty\u0007ped' }, { index: 2, name: 'third' }],
+      }),
+    }), env);
+    expect(res.status).toBe(200);
+    await res.text(); // consume: an open body holds the DO's isolated storage frame
+    expect((await namesTable()).sort((a, b) => salts.indexOf(a.salt_b64u as string) - salts.indexOf(b.salt_b64u as string))).toEqual([
+      { salt_b64u: salts[0], name: 'A', source: 'client' },
+      { salt_b64u: salts[1], name: 'typed', source: 'manual' },
+      { salt_b64u: salts[2], name: 'third', source: 'manual' },
+    ]);
   });
 
-  it('never overwrites an owned name and refuses a non-array adopt_names', async () => {
+  it('refuses the old index-array form and any extra, duplicate or oversize entry, storing nothing', async () => {
+    const salts = [nextSalt(), nextSalt()];
+    const ch = await createWithNames(salts, ['A', '']);
+    for (const adopt_names of [
+      [0], 'all', [{ index: 7, name: 'x' }], [{ index: -1, name: 'x' }], [{ index: 0.5, name: 'x' }],
+      [{ index: 0, name: 'a' }, { index: 0, name: 'b' }], [{ index: 0, name: 'x'.repeat(41) }],
+      [{ index: 0, name: 5 }], [{ index: 0, name: 'a' }, { index: 1, name: 'b' }, { index: 1, name: 'c' }], [null],
+    ]) {
+      expect((await approve(ch, { adopt_names })).status, JSON.stringify(adopt_names)).toBe(400);
+    }
+    expect(await namesTable()).toEqual([]);
+    expect((await approve(ch, { adopt_names: [] })).status).toBe(200);
+    expect(await namesTable()).toEqual([]);
+  });
+
+  it('never overwrites an owned name', async () => {
     const salt = nextSalt();
     expect((await rename({ salt_b64u: salt, name: 'owned' })).status).toBe(200);
     const ch = await createWithNames([salt], ['claim']);
-    expect((await approve(ch, { adopt_names: 'all' })).status).toBe(400);
-    expect((await approve(ch, { adopt_names: [0] })).status).toBe(200);
+    expect((await approve(ch, { adopt_names: [{ index: 0, name: 'claim' }] })).status).toBe(200);
     expect(await namesTable()).toEqual([{ salt_b64u: salt, name: 'owned', source: 'manual' }]);
   });
 });
@@ -142,7 +171,7 @@ describe('names on the audit, cache and push surfaces', () => {
     const salts = [nextSalt(), nextSalt()];
     const ch = await createWithNames(salts, ['GH_TOKEN', '']);
     const sealed = await Promise.all(salts.map((_, i) => sealFakeDek(i + 1)));
-    expect((await approve(ch, { cache_ttl_s: 1200, cache_sealed_deks_b64u: sealed, adopt_names: [0] })).status).toBe(200);
+    expect((await approve(ch, { cache_ttl_s: 1200, cache_sealed_deks_b64u: sealed, adopt_names: [{ index: 0, name: 'GH_TOKEN' }] })).status).toBe(200);
     const hit = await daemonPost('/api/dek-cache', {
       daemon_pubkey_b64u: DAEMON_PK, timestamp_ms: Date.now(), salts_b64u: salts,
       meta: { ...makeMeta(), names: ['GH_TOKEN', 'late-claim'] },
@@ -187,7 +216,7 @@ describe('names on the audit, cache and push surfaces', () => {
     const salts = [nextSalt(), nextSalt(), nextSalt()];
     const ch = await createWithNames(salts, ['A', 'B', '']);
     const sealed = await Promise.all(salts.map((_, i) => sealFakeDek(i + 1)));
-    expect((await approve(ch, { cache_ttl_s: 1200, cache_sealed_deks_b64u: sealed, adopt_names: [0] })).status).toBe(200);
+    expect((await approve(ch, { cache_ttl_s: 1200, cache_sealed_deks_b64u: sealed, adopt_names: [{ index: 0, name: 'A' }] })).status).toBe(200);
     const hit = await daemonPost('/api/dek-cache', {
       daemon_pubkey_b64u: DAEMON_PK, timestamp_ms: Date.now(), salts_b64u: salts, meta: { ...makeMeta(), names: ['A', 'B', ''] },
     });

@@ -616,6 +616,14 @@ for (const op of ['approve', 'reject'] as const) {
     let body: ApproveRequest | RejectRequest;
     try { body = JSON.parse(new TextDecoder().decode(raw)); }
     catch { return c.text('invalid json', 400); }
+    // Typed record names are cleaned like a rename (checkNames); the DO checks
+    // each index against the ceremony's salts.
+    const adopt = (body as ApproveRequest).adopt_names;
+    if (op === 'approve' && adopt !== undefined) {
+      const names = Array.isArray(adopt) ? checkNames(adopt.map(e => e?.name), adopt.length) : null;
+      if (!names) return c.text('bad adopt_names', 400);
+      (body as ApproveRequest).adopt_names = adopt.map((e, i) => ({ index: e.index, name: names[i]! }));
+    }
     return accountStub(c).fetch(`https://account.do/op/${op}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
