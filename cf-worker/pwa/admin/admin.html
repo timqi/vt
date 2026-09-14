@@ -66,14 +66,14 @@
     <section class="tab-panel" id="tab-audit" hidden>
       <p class="hint">每个挑战一行（pending / approved / rejected / expired）。「记录」列显示本次涉及记录的名称（服务端保存；客户端自报的名称标为「自报」，可在详情里点击重命名）。「缓存」列显示该次审批授予的 DEK 缓存时长；带有效缓存的行可在「操作」列单独清除。点击行查看命令、IP 等完整详情。保留 90 天。</p>
       <section class="filters">
-        <label>状态 <select id="f-status">
+        <label>状态 <span class="select"><select id="f-status">
           <option value="">全部</option>
           <option value="pending">pending</option>
           <option value="approved">approved</option>
           <option value="rejected">rejected</option>
           <option value="expired">expired</option>
           <option value="cache">带缓存的记录</option>
-        </select></label>
+        </select></span></label>
         <label>主机 <input class="f-host" type="text" placeholder="host"></label>
         <button id="apply" type="button">查询</button>
         <button id="filter-cache" type="button" class="ghost">带缓存</button>
@@ -95,10 +95,10 @@
     <section class="tab-panel" id="tab-cache" hidden>
       <p class="hint">当前<strong>真实存在</strong>的 DEK 缓存（按授予它的那次审批分组）。在有效期内，持有同一 <code>VT_PASSKEY_TOKEN</code> 且项目（git 公共目录，否则为工作目录）一致的调用者可<strong>免手机审批</strong>解密这些记录，所以此处的每一行都是一份仍然生效的授权。清除立即生效；<strong>延长必须经手机 Passkey 重新批准</strong>，每次延长把有效期重设为「批准时刻 + 所选时长」，可反复续期，但<strong>已过期的缓存无法续期</strong>——只能重新审批。</p>
       <section class="filters">
-        <label>状态 <select class="f-live">
+        <label>状态 <span class="select"><select class="f-live">
           <option value="live">仅有效</option>
           <option value="">全部（含已过期未清理）</option>
-        </select></label>
+        </select></span></label>
         <label>主机 <input class="f-host" type="text" placeholder="host"></label>
         <button class="refresh" type="button">刷新</button>
         <span class="filter-spacer"></span>
@@ -109,7 +109,7 @@
       </section>
       <section id="bulkbar" hidden>
         <span id="bulk-count" class="badge"></span>
-        <label id="extend-ttl-label">延长时长 <select id="extend-ttl"></select></label>
+        <label id="extend-ttl-label">延长时长 <span class="select"><select id="extend-ttl"></select></span></label>
         <button id="extend-selected" type="button">申请延长（需 Passkey）</button>
         <span id="extend-note" class="hint"></span>
       </section>
@@ -129,10 +129,10 @@
     <section class="tab-panel" id="tab-tokens" hidden>
       <p class="hint">每台主机经 <code>vt enroll</code> + 手机 Passkey 审批后获得<strong>自己的</strong> <code>VT_PASSKEY_TOKEN</code>。令牌有效期 7 天，<strong>每次使用自动重设为「此刻 + 7 天」</strong>；到期或被吊销后该主机的解密请求会被拒绝，需重新 enroll。吊销立即生效，不需要 Passkey。此处不显示令牌密文（Worker 从不存储它）。令牌派生自 Worker 的根密钥：轮换 <code>SECRET</code> 不影响令牌，恢复出厂（重新引导）会让所有令牌失效，每台主机需重新 enroll。</p>
       <section class="filters">
-        <label>状态 <select class="f-live">
+        <label>状态 <span class="select"><select class="f-live">
           <option value="live">仅有效</option>
           <option value="">全部（含已过期 / 已吊销）</option>
-        </select></label>
+        </select></span></label>
         <label>主机 <input class="f-host" type="text" placeholder="host"></label>
         <button class="refresh" type="button">刷新</button>
       </section>
@@ -170,7 +170,7 @@
       <section id="revoke-section" class="card" hidden>
         <div class="field">
           <label for="revoke-pick">吊销条目</label>
-          <select id="revoke-pick"></select>
+          <span class="select"><select id="revoke-pick"></select></span>
         </div>
         <p class="warn">⚠️ 吊销 ≠ 密钥轮换：仅从允许列表移除，master_key 不变。若该 Passkey 的密文与 PRF 曾泄露，仍可离线解出同一 master_key。</p>
       </section>

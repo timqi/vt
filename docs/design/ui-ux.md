@@ -118,7 +118,9 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 - Primary actions belong with the page head or the filter bar's right edge,
   destructive ones (`.danger`) grouped so they wrap together.
 - Visible labels above controls, one grid (`.field`); filter controls share
-  one height. Active filters are always discoverable.
+  one height. A `<select>` is always wrapped in `.select` (the markup emits
+  the span; no script wraps it) so it carries the control skin and a drawn
+  chevron while the popup stays native. Active filters are always discoverable.
 - Background refreshes preserve input, focus, scroll and in-progress
   interactions. Long labels or paths never set the page's width (`overflow-wrap: anywhere`).
 - Destructive actions confirm with native `confirm()` naming the effect
@@ -190,6 +192,7 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 | Buttons: primary, `.ghost`, `.danger`, `.small` | `admin.css` |
 | `.badge`, `.badge-*`, `.reason-badge` | `admin.css` |
 | `.glass`, `.switch`, segmented control (`.seg`; its sliding thumb `vt.seg`) | `admin.css`, `common.js` |
+| `.select` (a `span` around every native `<select>`: CSS chevron, ring on the wrapper), `.chip` | `admin.css` |
 | Filter bar, `#bulkbar`, `.row` list + table + `.trunc`/`.cell-*` | `admin.css` |
 | Row/table switch: `vt.phone`, `vt.onLayout`, `vt.list(wrap)` (`item({cells, row})`, `body`, `clear`, `empty`) | `admin.js` |
 | Detail sheet (`vt.dialog`), hovercard (`vt.hovercard`), `vt.commandSummary`, `vt.api` | `admin.js` |

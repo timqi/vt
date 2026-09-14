@@ -123,7 +123,7 @@ label { display: flex; flex-direction: column; gap: 4px; font-size: var(--cap); 
 /* Filter bar: controls + buttons bottom-aligned on one row, one height. */
 .filters { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
 .filters button { margin: 0; }
-.filters select, .filters input[type="text"], .filters button { height: 44px; padding-top: 0; padding-bottom: 0; }
+.filters input[type="text"], .filters button { height: 44px; padding-top: 0; padding-bottom: 0; }
 .filters .filter-spacer { flex: 1 1 auto; }
 /* The destructive buttons wrap together as one unit, right-aligned. */
 .filters .filter-danger { display: flex; gap: 8px; margin-left: auto; }
@@ -143,7 +143,7 @@ label { display: flex; flex-direction: column; gap: 4px; font-size: var(--cap); 
 
 /* Fields: label above control */
 .field { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
-.field textarea, .field input[type="text"], .field input[type="password"], .field select { width: 100%; min-width: 0; }
+.field textarea, .field input[type="text"], .field input[type="password"], .field .select { width: 100%; min-width: 0; }
 /* A labelled checkbox row: native control, 44px target, text never alone. */
 .switch { display: flex; flex-direction: row; align-items: center; gap: 10px; min-height: 44px; cursor: pointer; color: var(--fg); font-size: var(--body); }
 .switch input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
@@ -174,6 +174,23 @@ input[type="text"], input[type="password"], select, textarea {
   border-radius: var(--r-ctl); padding: 8px 12px; font: inherit; min-width: 180px; min-height: 44px;
 }
 textarea { width: 100%; min-width: 0; font-family: var(--mono); font-size: var(--cap); }
+/* Native <select> in the control skin: the wrapper draws the chevron (CSP has
+   no image source) and carries the focus ring, so the popup stays native. */
+.select { position: relative; display: inline-flex; min-width: 180px; border-radius: var(--r-ctl); }
+.select select {
+  appearance: none; -webkit-appearance: none; width: 100%; min-width: 0; height: 44px; margin: 0;
+  padding: 0 36px 0 12px; border: 1px solid var(--hairline); box-shadow: 0 1px 2px rgba(0, 0, 0, .06);
+  font-weight: 500; cursor: pointer; text-overflow: ellipsis;
+}
+.select::after {
+  content: ""; position: absolute; right: 15px; top: 50%; width: 7px; height: 7px; pointer-events: none;
+  border: solid var(--muted); border-width: 0 2px 2px 0; transform: translateY(-70%) rotate(45deg);
+}
+.select:has(select:focus) select { border-color: var(--accent); }
+.select:has(select:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.select select:focus-visible { outline: none; }
+.select:has(select:disabled) { opacity: .5; }
+.select select:disabled { cursor: default; }
 button {
   background: var(--accent); color: #fff; border: 0; border-radius: var(--r-ctl);
   padding: 9px 16px; min-height: 44px; font: inherit; font-weight: 600; cursor: pointer; margin-right: 8px;
@@ -298,7 +315,7 @@ th.col-pick input, td.col-pick input, .row-lead input { accent-color: var(--acce
 }
 #bulkbar[hidden] { display: none; }
 #bulkbar label[hidden], #bulkbar button[hidden] { display: none; }
-#bulkbar select, #bulkbar button { height: 44px; margin: 0; }
+#bulkbar button { height: 44px; margin: 0; }
 #bulkbar #bulk-count { align-self: center; }
 #bulkbar #extend-note { margin: 0; align-self: center; }
 
