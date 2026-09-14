@@ -16,8 +16,8 @@
 // input gate so a stale list snapshot cannot overwrite a committed decision.
 
 import { DurableObject } from 'cloudflare:workers';
-import { Env, Challenge, ChallengeMeta, ApprovePageData, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse, DoEnrollCreateOp, EnrollIntent, HostTokenListResponse } from './types';
-import { formatHostToken, mintPairCode, mintTokenId } from './host_token';
+import { Env, Challenge, ChallengeMeta, ApprovePageData, DaemonAuth, DoCreateOp, DoApproveOp, DoRejectOp, DoDekCacheOp, DoAuditIngestOp, WsMessage, AdminWsMessage, DekCacheResponse, CacheExtendIntent, CacheExtendPreview, CacheGroupSummary, CacheListResponse, DoCacheExtendCreateOp, CacheExtendCreateResponse, DoEnrollCreateOp, EnrollIntent, HostTokenListResponse } from './types';
+import { formatHostToken, isTokenId, mintPairCode, mintTokenId } from './host_token';
 import { AccountTokens } from './account_tokens';
 import { b64uDec, b64uEnc, isB64uString, decodeB64uExact, randomBytes, challengeHash } from './crypto';
 import { lookupByCredentialId } from './credentials';
@@ -27,7 +27,7 @@ import {
   isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
   isExtendableGroupId,
 } from './cache_policy';
-import { challengeUvLevel, effectiveUvLevel, parseUvPolicy } from './uv_policy';
+import { challengeUvLevel, effectiveUvLevel } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
 import { AccountNotifications } from './account_notifications';
@@ -39,14 +39,6 @@ const TTL_MS = 5 * 60 * 1000;
 const RETENTION_MS = 10 * 60 * 1000;
 // The TTL whitelist and the extension arithmetic live in cache_policy.ts (pure +
 // unit-tested); this module owns authorization and ceremony transitions.
-
-// Admin-requested cache extension is a KILL SWITCH, not an authorization: even
-// when enabled, an extension requires a fresh phone Passkey ceremony. Off by
-// default so a deployment that never wants the capability does not have it.
-function cacheAdminExtendEnabled(env: Env): boolean {
-  const v = (env.CACHE_ADMIN_EXTEND ?? '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'on' || v === 'yes';
-}
 
 // Cap on groups one extension ceremony may target. Keeps the approval page's
 // summary readable (the approver must be able to see what they are signing for)
@@ -147,6 +139,19 @@ const PUBLIC_OPS = new Set(['create', 'approve', 'reject', 'dek-cache', 'audit-i
 // Reachable before a session exists: the shell state, bootstrap and login.
 const OPEN_ADMIN_OPS = new Set(['admin-state', 'admin-bootstrap', 'admin-login-challenge', 'admin-login']);
 
+// What an approve answers for a challenge that is no longer pending: the
+// sealed result again when it was approved (idempotent re-delivery), else 410.
+function sealedResult(ch: Challenge | undefined): Response {
+  if (ch?.status === 'approved' && ch.sealed_deks_b64u && ch.pwa_pk_b64u && ch.binding_tag_b64u) {
+    return Response.json({
+      sealed_deks_b64u: ch.sealed_deks_b64u,
+      pwa_pk_b64u: ch.pwa_pk_b64u,
+      binding_tag_b64u: ch.binding_tag_b64u,
+    });
+  }
+  return new Response('challenge not pending', { status: 410 });
+}
+
 // Structured 401 for a missing or dead host token. The body is what the CLI
 // shows the user, so it names the remedy (`vt enroll`) instead of just the
 // status; the edge uses it for a request without VT-Token-Id.
@@ -155,7 +160,6 @@ export function tokenRefused(reason: string): Response {
 }
 
 export class AccountDO extends DurableObject<Env> {
-  private readonly expectedOrigin: string;
   private readonly audit: AccountAudit;
   private readonly notifications: AccountNotifications;
   private readonly admin: AccountAdmin;
@@ -164,11 +168,10 @@ export class AccountDO extends DurableObject<Env> {
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    this.expectedOrigin = new URL(env.WORKER_ORIGIN).origin;
     this.audit = new AccountAudit(this.ctx.storage.sql, () => this.ctx.getWebSockets('admin'));
-    this.admin = new AccountAdmin(this.ctx.storage, this.env.VT_AUTH_CF);
-    this.notifications = new AccountNotifications(this.ctx, this.env, this.admin);
-    this.cache = new AccountCache(this.ctx.storage, this.env);
+    this.admin = new AccountAdmin(this.ctx.storage, this.env.SECRET);
+    this.notifications = new AccountNotifications(this.ctx, this.admin);
+    this.cache = new AccountCache(this.ctx.storage, () => this.admin.cacheSeckey());
     this.tokens = new AccountTokens(this.ctx.storage.sql);
     this.ctx.blockConcurrencyWhile(async () => {
       this.audit.initialize();
@@ -424,6 +427,27 @@ export class AccountDO extends DurableObject<Env> {
     await this.ctx.storage.delete(`pt:${fresh.poll_token}`);
   }
 
+  // The daemon body check, done here because the token secret derives from the
+  // root key only this object holds: a well-formed token id, the MAC over the
+  // exact bytes the edge read, then liveness (which also slides expiry and
+  // names the verified host/user). Nothing is stored or pushed before it
+  // passes. A body without `auth` is a Worker bug and fails closed.
+  private async authenticateDaemon(auth: DaemonAuth | undefined, ip: string, touch: boolean):
+    Promise<{ token_id: string; host: string; user: string; prev_ip?: string } | Response> {
+    if (!auth || !isTokenId(auth.token_id)) return badRequest('missing token_id');
+    if (!(await this.admin.verifyHostMac(auth.token_id, auth.mac_b64u, auth.signed_b64u))) {
+      return new Response('hmac mismatch', { status: 401 });
+    }
+    const now = Date.now();
+    if (!touch) {
+      return this.tokens.isLive(auth.token_id, now)
+        ? { token_id: auth.token_id, host: '', user: '' } : tokenRefused('token_unknown');
+    }
+    const t = this.tokens.touch(auth.token_id, ip, now);
+    if (!t.ok) return tokenRefused(t.reason);
+    return { token_id: auth.token_id, host: t.host, user: t.user, prev_ip: t.prev_ip };
+  }
+
   private async opCreate(request: Request): Promise<Response> {
     let parsed: DoCreateOp;
     try { parsed = await request.json() as DoCreateOp; }
@@ -432,22 +456,17 @@ export class AccountDO extends DurableObject<Env> {
     if (!challenge || typeof challenge.approve_token !== 'string' || typeof challenge.poll_token !== 'string') {
       return badRequest('invalid challenge');
     }
-    // The edge only forwards token-authenticated requests; a body without one
-    // is a Worker bug, and the DO fails closed rather than trusting the claim.
-    if (typeof parsed.token_id !== 'string') return badRequest('missing token_id');
-    // Refuse a dead token BEFORE anything is stored or pushed, and let the
-    // record — not the body — say which host/user this is.
-    const t = this.tokens.touch(parsed.token_id, challenge.meta?.ip ?? '', Date.now());
-    if (!t.ok) return tokenRefused(t.reason);
+    const t = await this.authenticateDaemon(parsed.auth, challenge.meta?.ip ?? '', true);
+    if (t instanceof Response) return t;
+    // The record — not the body — says which host/user this is.
     challenge.meta = { ...challenge.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
-    challenge.token_id = parsed.token_id;
-    // The Worker decided `uv` against the CLAIMED host; re-apply the policy
-    // with the verified one. Raise-only by construction (max of the stored
-    // level and the by_host rule), so a spoofed claim can never lower it.
-    const { policy } = parseUvPolicy(this.env.APPROVAL_UV_JSON);
-    challenge.uv = effectiveUvLevel(policy, challenge.meta, challenge.uv);
+    challenge.token_id = t.token_id;
+    // Decided HERE, once, from the stored policy plus the client's raise-only
+    // request, against the VERIFIED host: the approval page and the assertion
+    // check both read it back, so neither the phone nor the CLI can lower it.
+    challenge.uv = effectiveUvLevel(this.admin.uvPolicy(), challenge.meta, parsed.uv_request);
     await this.storeAndAnnounce(challenge);
-    return Response.json({ meta: challenge.meta });
+    return Response.json({ meta: challenge.meta, approve_url: `${this.admin.current.origin}/a/${challenge.approve_token}` });
   }
 
   // Persist a pending challenge and its routing key, re-arm the alarm, then
@@ -500,17 +519,8 @@ export class AccountDO extends DurableObject<Env> {
 
     const ch = await this.ctx.storage.get<Challenge>(`ch:${body.approve_token}`);
     if (!ch) return new Response('not found', { status: 404 });
-    if (ch.status !== 'pending') {
-      // Idempotent re-delivery: if already approved return the existing sealed result
-      if (ch.status === 'approved' && ch.sealed_deks_b64u && ch.pwa_pk_b64u && ch.binding_tag_b64u) {
-        return Response.json({
-          sealed_deks_b64u: ch.sealed_deks_b64u,
-          pwa_pk_b64u: ch.pwa_pk_b64u,
-          binding_tag_b64u: ch.binding_tag_b64u,
-        });
-      }
-      return new Response('challenge not pending', { status: 410 });
-    }
+    // Idempotent re-delivery: if already approved return the existing sealed result
+    if (ch.status !== 'pending') return sealedResult(ch);
     // Fail closed on a past-TTL pending challenge even if the alarm has not yet
     // finalized it — a request may never be approved once its window has passed.
     // Finalize it here too so a decision attempt on a stale request still flips
@@ -554,8 +564,8 @@ export class AccountDO extends DurableObject<Env> {
         authenticatorData: b64uDec(body.authenticator_data_b64u),
         signature: b64uDec(body.signature_b64u),
         expectedChallenge,
-        rpId: this.env.RP_ID,
-        expectedOrigin: this.expectedOrigin,
+        rpId: new URL(this.admin.current.origin).hostname,
+        expectedOrigin: this.admin.current.origin,
         // From the STORED ceremony, never the request: the level this challenge
         // was created with is the level its assertion is checked against.
         userVerification: challengeUvLevel(ch.uv),
@@ -574,17 +584,8 @@ export class AccountDO extends DurableObject<Env> {
     // the audit row). The get→put pair has no intervening await, so nothing can
     // slip between the check and the put.
     const latest = await this.ctx.storage.get<Challenge>(`ch:${ch.approve_token}`);
-    if (!latest || latest.status !== 'pending') {
-      // If a duplicate approve already sealed this, re-deliver idempotently.
-      if (latest && latest.status === 'approved' && latest.sealed_deks_b64u && latest.pwa_pk_b64u && latest.binding_tag_b64u) {
-        return Response.json({
-          sealed_deks_b64u: latest.sealed_deks_b64u,
-          pwa_pk_b64u: latest.pwa_pk_b64u,
-          binding_tag_b64u: latest.binding_tag_b64u,
-        });
-      }
-      return new Response('challenge not pending', { status: 410 });
-    }
+    // If a duplicate approve already sealed this, re-deliver idempotently.
+    if (!latest || latest.status !== 'pending') return sealedResult(latest);
     // Verification can cross the TTL without an alarm or another request
     // finalizing this still-pending record. Check liveness at the write too.
     const finalizedMs = Date.now();
@@ -646,15 +647,11 @@ export class AccountDO extends DurableObject<Env> {
       try { ws.send(wsMsg); ws.close(1000, 'approved'); } catch {}
     }
 
-    return Response.json({
-      sealed_deks_b64u: body.sealed_deks_b64u,
-      pwa_pk_b64u: body.pwa_pk_b64u,
-      binding_tag_b64u: body.binding_tag_b64u,
-    });
+    return sealedResult(ch);
   }
 
   // The 'approved' poll-socket payload. For an enrollment it also carries the
-  // minted host token, re-derived from the master + stored token_id so a
+  // minted host token, re-derived from the root key + stored token_id so a
   // reconnecting CLI (handleWsUpgrade) gets the identical string and nothing
   // secret ever sits in storage.
   private async approvedWsMessage(ch: Challenge): Promise<WsMessage> {
@@ -664,7 +661,9 @@ export class AccountDO extends DurableObject<Env> {
       pwa_pk_b64u: ch.pwa_pk_b64u ?? '',
       binding_tag_b64u: ch.binding_tag_b64u ?? '',
     };
-    if (ch.enroll_token_id) msg.host_token = await formatHostToken(this.env.VT_AUTH_CF, ch.enroll_token_id);
+    if (ch.enroll_token_id) {
+      msg.host_token = formatHostToken(ch.enroll_token_id, await this.admin.hostTokenSecret(ch.enroll_token_id));
+    }
     return msg;
   }
 
@@ -711,47 +710,46 @@ export class AccountDO extends DurableObject<Env> {
       origin: typeof op.origin === 'string' ? op.origin : '',
       pair_code: mintPairCode(),
     };
-    // Same ceremony shape as a cache extension: no salts, a daemon pubkey whose
-    // secret was discarded at birth, biometric UV regardless of policy — this
-    // approval hands out a credential.
-    const approveToken = b64uEnc(randomBytes(12));
-    const pollToken = b64uEnc(randomBytes(12));
+    // This approval hands out a credential: biometric UV regardless of policy.
+    const ch = await this.mintAdminCeremony(now, {
+      op_kind: 'enroll', command: enrollSummary(intent), host: intent.host, user: intent.user,
+      pwd: '', project: '', ppid_cmd: '', ip: intent.ip, reason: '',
+    }, { enroll: intent });
+    return Response.json({
+      approve_token: ch.approve_token,
+      poll_token: ch.poll_token,
+      pair_code: intent.pair_code,
+      approve_url: `${this.admin.current.origin}/a/${ch.approve_token}`,
+    });
+  }
+
+  // A ceremony that delivers no key material (enrollment, cache extension) in
+  // the normal challenge shape, so the standard PWA, the alarm sweep, the audit
+  // lifecycle and the push fan-out all work unchanged: salts=[], and the daemon
+  // pubkey is a key whose secret was destroyed at birth, so the PWA's
+  // placeholder seal is undecryptable by anyone rather than merely ignored.
+  // Always `required`: each of these GRANTS authority, so it keeps the
+  // biometric step whatever `uv_policy` does to the hot decrypt path.
+  private async mintAdminCeremony(now: number, meta: ChallengeMeta, intent: Pick<Challenge, 'enroll' | 'extend'>): Promise<Challenge> {
     const workerNonce = randomBytes(16);
     const daemonPk = discardedBoxPublicKey();
-    const meta: ChallengeMeta = {
-      op_kind: 'enroll',
-      command: enrollSummary(intent),
-      host: intent.host,
-      user: intent.user,
-      pwd: '',
-      project: '',
-      ppid_cmd: '',
-      ip: intent.ip,
-      reason: '',
-    };
     const ch: Challenge = {
-      approve_token: approveToken,
-      poll_token: pollToken,
+      approve_token: b64uEnc(randomBytes(12)),
+      poll_token: b64uEnc(randomBytes(12)),
       daemon_pubkey_b64u: b64uEnc(daemonPk),
       worker_nonce_b64u: b64uEnc(workerNonce),
       timestamp_ms: now,
-      approve_challenge_hash_b64u: b64uEnc(
-        await challengeHash(daemonPk, workerNonce, now, [], 'approve')),
-      reject_challenge_hash_b64u: b64uEnc(
-        await challengeHash(daemonPk, workerNonce, now, [], 'reject')),
+      approve_challenge_hash_b64u: b64uEnc(await challengeHash(daemonPk, workerNonce, now, [], 'approve')),
+      reject_challenge_hash_b64u: b64uEnc(await challengeHash(daemonPk, workerNonce, now, [], 'reject')),
       salts_b64u: [],
       meta,
       uv: 'required',
       status: 'pending',
       created_ms: now,
-      enroll: intent,
+      ...intent,
     };
     await this.storeAndAnnounce(ch);
-    return Response.json({
-      approve_token: approveToken,
-      poll_token: pollToken,
-      pair_code: intent.pair_code,
-    });
+    return ch;
   }
 
   private opTokensList(): Response {
@@ -793,13 +791,11 @@ export class AccountDO extends DurableObject<Env> {
     }
     // ip is worker-derived (forced by capChallengeMeta); audit metadata only.
     const ip = body.meta.ip ?? '';
-    // A probe is an authenticated use: same liveness check + sliding refresh as
-    // a ceremony, and the hit audit row names the token's host/user. Same
-    // fail-closed rule as opCreate for a body without a token — which is also
-    // the cache key's hard half.
-    if (typeof body.token_id !== 'string') return badRequest('missing token_id');
-    const t = this.tokens.touch(body.token_id, ip, Date.now());
-    if (!t.ok) return tokenRefused(t.reason);
+    // A probe is an authenticated use: same MAC + liveness check and sliding
+    // refresh as a ceremony, and the hit audit row names the token's host/user.
+    // The token is also the cache key's hard half.
+    const t = await this.authenticateDaemon(body.auth, ip, true);
+    if (t instanceof Response) return t;
     const meta = { ...body.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
     const salts = body.salts_b64u;
     const miss = (): Response => {
@@ -809,7 +805,7 @@ export class AccountDO extends DurableObject<Env> {
       return Response.json({ miss: true } satisfies DekCacheResponse);
     };
 
-    const sealedB64u = await this.cache.read(body.token_id, meta, salts, daemonPk);
+    const sealedB64u = await this.cache.read(t.token_id, meta, salts, daemonPk);
     if (sealedB64u === null) return miss();
 
     // Audit the hit with the requester's full meta (host/user/command/…), so the
@@ -824,8 +820,8 @@ export class AccountDO extends DurableObject<Env> {
     return Response.json({ source: 'cache', sealed_deks_b64u: sealedB64u } satisfies DekCacheResponse);
   }
 
-  // Ingest one SSH-agent audit record. The Worker has already verified the
-  // per-agent HMAC, capped `meta`, and bounded the scalars; we just insert.
+  // Ingest one SSH-agent audit record. The Worker capped `meta` and bounded
+  // the scalars; the host-token MAC is checked here, then we insert.
   // Return 200 on success so the agent's 1-retry stops (a non-2xx would make it
   // retry a row that already landed). Best-effort: audit.agent swallows DB errors.
   private async opAuditIngest(request: Request): Promise<Response> {
@@ -838,9 +834,8 @@ export class AccountDO extends DurableObject<Env> {
     }
     // A revoked/lapsed host token must not keep writing audit rows either. No
     // sliding here: a background push is not a use the operator would count.
-    if (op.token_id_host !== undefined && !this.tokens.isLive(op.token_id_host, Date.now())) {
-      return tokenRefused('token_unknown');
-    }
+    const t = await this.authenticateDaemon(op.auth, '', false);
+    if (t instanceof Response) return t;
     this.audit.agent(op);
     // An agent cache hit (sign / decrypt@vt served from the Touch ID auth
     // cache) had no human in the loop, so surface it like the Worker DEK-cache
@@ -931,7 +926,7 @@ export class AccountDO extends DurableObject<Env> {
       now_ms: now,
       scanned: scan.scanned,
       truncated: scan.truncated,
-      extend_enabled: cacheAdminExtendEnabled(this.env),
+      extend_enabled: this.admin.current.cache_enabled,
       ttl_options_s: extendTtlOptions(),
     };
     return Response.json(resp);
@@ -970,7 +965,9 @@ export class AccountDO extends DurableObject<Env> {
   // was proposed, and the 5-minute challenge TTL bounds how long the request stays
   // approvable.
   private async opCacheExtendCreate(request: Request): Promise<Response> {
-    if (!cacheAdminExtendEnabled(this.env)) {
+    // Extension is offered iff caching is; every extension still needs a
+    // passkey approval.
+    if (!this.admin.current.cache_enabled) {
       return new Response('cache extension disabled', { status: 404 });
     }
     let op: DoCacheExtendCreateOp;
@@ -1028,55 +1025,17 @@ export class AccountDO extends DurableObject<Env> {
       preview: targets,
     };
     const summary = extendSummary(intent);
-
-    // Build the ceremony. Reuses the normal challenge shape so the standard PWA,
-    // the alarm sweep, the audit lifecycle, and the push fan-out all work
-    // unchanged. salts=[] (an extension mints no DEKs), and the daemon pubkey is a
-    // key whose secret was destroyed at birth, so the PWA's placeholder seal is
-    // undecryptable by anyone rather than merely ignored.
-    const approveToken = b64uEnc(randomBytes(12));
-    const pollToken = b64uEnc(randomBytes(12));
-    const workerNonce = randomBytes(16);
-    const daemonPk = discardedBoxPublicKey();
-    const meta: ChallengeMeta = {
-      op_kind: 'cache-extend',
-      command: summary,
-      host: 'admin',
-      user: '',
-      pwd: '',
-      project: '',
-      ppid_cmd: '',
-      ip: request.headers.get('CF-Connecting-IP') ?? '',
-      reason: '延长已授权的 DEK 缓存有效期',
-    };
-    const ch: Challenge = {
-      approve_token: approveToken,
-      poll_token: pollToken,
-      daemon_pubkey_b64u: b64uEnc(daemonPk),
-      worker_nonce_b64u: b64uEnc(workerNonce),
-      timestamp_ms: now,
-      approve_challenge_hash_b64u: b64uEnc(
-        await challengeHash(daemonPk, workerNonce, now, [], 'approve')),
-      reject_challenge_hash_b64u: b64uEnc(
-        await challengeHash(daemonPk, workerNonce, now, [], 'reject')),
-      salts_b64u: [],
-      meta,
-      // An extension GRANTS cache lifetime (docs/dek-cache.md §extend), and it
-      // is a rare desk-bound admin ceremony, so it keeps the biometric step
-      // whatever APPROVAL_UV_JSON does to the hot decrypt path.
-      uv: 'required',
-      status: 'pending',
-      created_ms: now,
-      extend: intent,
-    };
-    await this.storeAndAnnounce(ch);
+    const ch = await this.mintAdminCeremony(now, {
+      op_kind: 'cache-extend', command: summary, host: 'admin', user: '', pwd: '', project: '', ppid_cmd: '',
+      ip: request.headers.get('CF-Connecting-IP') ?? '', reason: '延长已授权的 DEK 缓存有效期',
+    }, { extend: intent });
     log('cache.extend_requested', {
-      at: tokenPrefix(approveToken), ttl_s: ttlS,
+      at: tokenPrefix(ch.approve_token), ttl_s: ttlS,
       groups: targets.length, entries: targets.reduce((n, t) => n + t.live, 0),
     });
     const resp: CacheExtendCreateResponse = {
-      approve_token: approveToken,
-      approve_url: `${this.env.WORKER_ORIGIN}/a/${approveToken}`,
+      approve_token: ch.approve_token,
+      approve_url: `${this.admin.current.origin}/a/${ch.approve_token}`,
       summary,
       targets,
       rejected,
@@ -1102,8 +1061,8 @@ export class AccountDO extends DurableObject<Env> {
   // ONLY opApprove calls this, after verification and single-use consumption.
   // The switch can remove authority, never supply the Passkey authorization.
   private async commitExtend(ch: Challenge, intent: CacheExtendIntent): Promise<void> {
-    if (!cacheAdminExtendEnabled(this.env)) {
-      logErr('cache.extend_disabled_at_commit', new Error('CACHE_ADMIN_EXTEND off'));
+    if (!this.admin.current.cache_enabled) {
+      logErr('cache.extend_disabled_at_commit', new Error('cache_enabled off'));
       return;
     }
     if (!isAllowedExtendTtl(intent.ttl_s)) {
@@ -1192,8 +1151,8 @@ export class AccountDO extends DurableObject<Env> {
         authenticatorData: b64uDec(body.authenticator_data_b64u),
         signature: b64uDec(body.signature_b64u),
         expectedChallenge: b64uDec(ch.reject_challenge_hash_b64u),
-        rpId: this.env.RP_ID,
-        expectedOrigin: this.expectedOrigin,
+        rpId: new URL(this.admin.current.origin).hostname,
+        expectedOrigin: this.admin.current.origin,
         userVerification: challengeUvLevel(ch.uv),
       });
     } catch (e) {
@@ -1255,22 +1214,14 @@ export class AccountDO extends DurableObject<Env> {
       return new Response('challenge not pending', { status: 410 });
     }
 
-    // DEK-cache UI data. Only offer caching when CACHE_SECKEY is configured AND
-    // the ceremony actually has DEKs to cache (auth-only ceremonies cannot). On
-    // any derivation failure, degrade to "caching off" rather than erroring the
-    // approval page.
+    // DEK-cache UI data. Only offer caching when `cache_enabled` AND the
+    // ceremony actually has DEKs to cache (auth-only ceremonies cannot).
     let cacheOptionsS: number[] = [0];
     let cachePubkeyB64u = '';
-    const cachingConfigured = !!(this.env.CACHE_SECKEY && this.env.CACHE_SECKEY.trim());
-    if (cachingConfigured && ch.salts_b64u.length > 0) {
-      try {
-        cachePubkeyB64u = b64uEnc(cachePublicKey(this.env.CACHE_SECKEY));
-        cacheOptionsS = [0, ...approveTtlOptions()];
-      } catch (e) {
-        logErr('cache.pubkey_failed', e);
-        cacheOptionsS = [0];
-        cachePubkeyB64u = '';
-      }
+    const sk = this.admin.cacheSeckey();
+    if (sk && ch.salts_b64u.length > 0) {
+      cachePubkeyB64u = b64uEnc(cachePublicKey(sk));
+      cacheOptionsS = [0, ...approveTtlOptions()];
     }
 
     const pageData: ApprovePageData = {
@@ -1279,7 +1230,7 @@ export class AccountDO extends DurableObject<Env> {
       reject_challenge_b64u: ch.reject_challenge_hash_b64u,
       daemon_pubkey_b64u: ch.daemon_pubkey_b64u,
       salts_b64u: ch.salts_b64u,
-      rp_id: this.env.RP_ID,
+      rp_id: new URL(this.admin.current.origin).hostname,
       allow_credentials: this.admin.current.credentials.map(e => ({ id_b64u: e.i, h_b64u: e.h, k_b64u: e.k })),
       // What the page asks the authenticator for. Server state, so a tampered
       // page can only make the ceremony fail its own verification, never pass a

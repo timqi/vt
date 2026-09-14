@@ -253,11 +253,11 @@ vt.tabs.cache = function (panel) {
     countEl.textContent = '已选 ' + ids.length + ' 组 / ' + entries + ' 条';
     var ttlLabelEl = $('#extend-ttl-label');
     if (!meta.extend_enabled) {
-      // Kill switch off ⇒ the capability does not exist. Hide the controls
+      // Caching off ⇒ extension is not offered. Hide the controls
       // entirely rather than offer a button that can only 404.
       extendBtn.hidden = true;
       ttlLabelEl.hidden = true;
-      note.textContent = '延长功能未启用（设置 CACHE_ADMIN_EXTEND=1 后可用）';
+      note.textContent = '延长不可用：请先在「设置」启用 DEK 缓存';
       return;
     }
     ttlLabelEl.hidden = false;
@@ -419,7 +419,7 @@ vt.tabs.cache = function (panel) {
         body: JSON.stringify({ group_ids: targets, ttl_s: ttl }),
       });
       if (resp.status === 404) {
-        setStatus('延长功能未启用（CACHE_ADMIN_EXTEND）', 'error');
+        setStatus('延长不可用：DEK 缓存未启用', 'error');
         return;
       }
       if (resp.status === 401) return; // the shell shows the login view

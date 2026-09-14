@@ -1,28 +1,30 @@
 // Host tokens end to end: an unauthenticated enroll request becomes a Passkey
 // ceremony, approving it mints a token, and that token then authenticates
-// /api/challenge and /api/dek-cache through the real router (HMAC keyed on the
-// derived secret) with the DO checking liveness and sliding expiry. Revocation
-// and the rate-limit / pending-cap guards on the public enroll route are
-// covered here too — they are what makes the unauthenticated route safe.
+// /api/challenge and /api/dek-cache through the real router — the edge checks
+// shape and caps, the DO compares the HMAC against the secret it derives from
+// the root key and checks liveness / slides expiry. Revocation and the
+// rate-limit / pending-cap guards on the public enroll route are covered here
+// too — they are what makes the unauthenticated route safe.
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import app from '../src/index';
-import { b64uEnc, hkdfSha256, hmacSha256 } from '../src/crypto';
-import { deriveHostTokenSecret, HOST_TOKEN_TTL_MS } from '../src/host_token';
+import { b64uEnc, hmacSha256 } from '../src/crypto';
+import { HOST_TOKEN_TTL_MS } from '../src/host_token';
 import type { Challenge, HostTokenRow } from '../src/types';
-import { inDO, setDoVar, doPost, doGet, approve, reject, makeMeta, auditRow, bootstrap } from './do_helpers';
+import { AccountAdmin } from '../src/account_admin';
+import {
+  inDO, configure, doPost, doGet, approve, reject, makeMeta, auditRow, bootstrap, hostSecret,
+  redeployWithSecret, TEST_ORIGIN, TEST_CREDENTIAL_ENTRY,
+} from './do_helpers';
 
-const MASTER = 'throwaway-host-token-test-master';
 const ORIGIN = 'https://vt.test.invalid';
 const IP = '203.0.113.9';
 
-type Env = Record<string, unknown> & { ENROLL_LIMITER?: unknown };
-const routerEnv = (): Env => ({ ...(env as unknown as Env), VT_AUTH_CF: MASTER });
+type Env = Record<string, unknown> & { LIMITER?: unknown };
+const routerEnv = (): Env => ({ ...(env as unknown as Env) });
 
-// The DO derives token secrets from ITS env's master, which is a different
-// object from the one the router is invoked with.
-beforeEach(async () => { await bootstrap(); await setDoVar('VT_AUTH_CF', MASTER); });
+beforeEach(bootstrap);
 
 async function post(path: string, body: unknown, headers: Record<string, string> = {}, e: Env = routerEnv()) {
   const resp = await app.fetch(new Request(`${ORIGIN}${path}`, {
@@ -36,17 +38,18 @@ async function post(path: string, body: unknown, headers: Record<string, string>
   return { status: resp.status, text, json };
 }
 
-/** Sign a daemon body the way src/cf.rs does for a `vt1.` token. */
-async function tokenHeaders(tokenId: string, body: unknown, master = MASTER) {
+/** Sign a daemon body the way src/cf.rs does for a `vt1.` token; `secret`
+ *  defaults to the one this test's root key derives. */
+async function tokenHeaders(tokenId: string, body: unknown, secret?: Uint8Array) {
   const raw = new TextEncoder().encode(JSON.stringify(body));
-  const mac = await hmacSha256(await deriveHostTokenSecret(master, tokenId), raw);
+  const mac = await hmacSha256(secret ?? await hostSecret(tokenId), raw);
   return { Authorization: `VT-HMAC ${b64uEnc(mac)}`, 'VT-Token-Id': tokenId };
 }
 
-/** The pre-enroll shape: HMAC keyed on the master itself, no VT-Token-Id. */
+/** The pre-enroll shape: HMAC keyed on some shared value, no VT-Token-Id. */
 async function legacyHeaders(body: unknown) {
   const raw = new TextEncoder().encode(JSON.stringify(body));
-  const mac = await hmacSha256(new TextEncoder().encode(MASTER), raw);
+  const mac = await hmacSha256(new TextEncoder().encode('any-shared-value'), raw);
   return { Authorization: `VT-HMAC ${b64uEnc(mac)}` };
 }
 
@@ -75,7 +78,7 @@ async function enrollApproved(host = 'devbox', user = 'qiqi'): Promise<{ tokenId
   const tokenId = after!.enroll_token_id!;
   expect(tokenId).toMatch(/^[A-Za-z0-9_-]{16}$/);
   const ws = await inDO(h => h.inst.approvedWsMessage(after));
-  expect(ws.host_token).toBe(`vt1.${tokenId}.${b64uEnc(await deriveHostTokenSecret(MASTER, tokenId))}`);
+  expect(ws.host_token).toBe(`vt1.${tokenId}.${b64uEnc(await hostSecret(tokenId))}`);
   return { tokenId, hostToken: ws.host_token, approveToken };
 }
 
@@ -128,7 +131,7 @@ describe('enrollment', () => {
 
   it('fails closed without the rate limiter and caps pending enrollments', async () => {
     const e = routerEnv();
-    delete e.ENROLL_LIMITER;
+    delete e.LIMITER;
     expect((await post('/api/enroll', { host: 'h', user: 'u', timestamp_ms: Date.now() }, {}, e)).status).toBe(503);
     for (let i = 0; i < 5; i++) {
       expect((await post('/api/enroll', { host: `h${i}`, user: 'u', timestamp_ms: Date.now() })).status).toBe(200);
@@ -164,27 +167,27 @@ describe('authenticating with a host token', () => {
     expect(audit?.status).toBe('pending');
   });
 
-  it('re-applies the by_host UV rule against the verified host', async () => {
+  it('applies the by_host UV rule against the verified host', async () => {
     const { tokenId } = await enrollApproved('prod-db', 'qiqi');
-    await setDoVar('APPROVAL_UV_JSON', '{"default":"discouraged","by_host":{"prod-db":"required"}}');
-    try {
-      const body = challengeBody();
-      const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body));
-      expect(res.status).toBe(200);
-      const ch = await inDO(h => h.state.storage.get<Challenge>(`ch:${res.json.approve_token}`));
-      // The Worker saw host='spoofed' (discouraged); the record says prod-db.
-      expect(ch!.uv).toBe('required');
-    } finally {
-      await setDoVar('APPROVAL_UV_JSON', '');
-    }
+    await configure({ uv_policy: { default: 'discouraged', by_host: { 'prod-db': 'required' } } });
+    const body = challengeBody();
+    const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body));
+    expect(res.status).toBe(200);
+    const ch = await inDO(h => h.state.storage.get<Challenge>(`ch:${res.json.approve_token}`));
+    // The body claimed host='spoofed' (discouraged); the record says prod-db.
+    expect(ch!.uv).toBe('required');
+    expect(res.json.approve_url).toBe(`${ORIGIN}/a/${res.json.approve_token}`);
   });
 
-  it('refuses a wrong secret, an unknown id, and a malformed id at the edge', async () => {
+  it('refuses a wrong secret, an unknown id, and a malformed id', async () => {
     const { tokenId } = await enrollApproved();
     const body = challengeBody();
-    const wrong = await post('/api/challenge', body, await tokenHeaders(tokenId, body, 'other-master'));
+    const wrong = await post('/api/challenge', body, await tokenHeaders(tokenId, body, new Uint8Array(32).fill(1)));
     expect(wrong.status).toBe(401);
     expect(wrong.text).toBe('hmac mismatch');
+    // An unknown id derives SOME secret; signing with it still fails the MAC
+    // only if the caller does not know R — here the test does, so liveness is
+    // what refuses it.
     const unknown = await post('/api/challenge', body, await tokenHeaders('zzzzzzzzzzzzzzzz', body));
     expect(unknown.status).toBe(401);
     expect(unknown.json.error).toBe('token_unknown');
@@ -224,10 +227,10 @@ describe('authenticating with a host token', () => {
     expect((await tokenRow(tokenId))!.expires_ms).toBeGreaterThan(issued.expires_ms - 60_000);
   });
 
-  it('refuses the bare master on both daemon routes, storing and auditing nothing', async () => {
-    // A host that never ran `vt enroll` signs with VT_AUTH_CF itself and sends
-    // no VT-Token-Id. That was the migration branch; it now gets the same
-    // structured 401 as a dead token, so the CLI prints the enroll hint.
+  it('refuses a token-less signature on both daemon routes, storing and auditing nothing', async () => {
+    // A host that never ran `vt enroll` has nothing but a guess to sign with
+    // and sends no VT-Token-Id. It gets the same structured 401 as a dead
+    // token, so the CLI prints the enroll hint.
     const body = challengeBody();
     const before = await inDO(h => h.state.storage.list({ prefix: 'ch:' }).then(m => m.size));
     for (const path of ['/api/challenge', '/api/dek-cache']) {
@@ -238,8 +241,8 @@ describe('authenticating with a host token', () => {
     expect(await inDO(h => h.state.storage.list({ prefix: 'ch:' }).then(m => m.size))).toBe(before);
   });
 
-  it('fails closed inside the DO when a body arrives without a token_id', async () => {
-    // Only the edge can reach these ops; a missing token_id there is a Worker
+  it('fails closed inside the DO when a body arrives without auth', async () => {
+    // Only the edge can reach these ops; a missing auth block there is a Worker
     // bug, and the DO must not fall back to the client-claimed host/user.
     const ch = { ...challengeBody(), approve_token: 'a'.repeat(16), poll_token: 'p'.repeat(16), status: 'pending', created_ms: Date.now() };
     expect((await doPost('create', { challenge: ch })).status).toBe(400);
@@ -256,48 +259,94 @@ describe('authenticating with a host token', () => {
   });
 });
 
-// Rotating VT_AUTH_CF is a flag day: every token was derived from the old
-// master and none of them verifies afterwards. There is no second accepted
-// generation — a stray VT_AUTH_CF_PREV binding changes nothing.
-describe('master rotation', () => {
-  const NEW_MASTER = 'throwaway-rotated-master';
-  const rotatedEnv = (extra: Record<string, unknown> = {}): Env =>
-    ({ ...routerEnv(), VT_AUTH_CF: NEW_MASTER, ...extra });
+// SECRET is a KEK over the root key (docs/worker-slim.md §2): rotating it
+// through the console keeps R, so every host token keeps verifying; the old
+// value dies on the first load under the new one. A FRESH secret without that
+// rotation is the factory reset — root:v1 is unreadable, bootstrap replaces it
+// with a new R, and every token derived from the old one fails at once. There
+// is no second accepted generation and no PREV binding.
+describe('SECRET rotation and reset', () => {
+  /** A fresh AccountAdmin seeing `secret` as its SECRET, over the same storage. */
+  const withSecret = (secret: string) => inDO(async ({ state }) => {
+    const admin = new AccountAdmin(state.storage, secret);
+    return { loaded: await admin.load(), admin };
+  });
 
-  it('refuses every token derived from the previous master, PREV binding or not', async () => {
-    const { tokenId } = await enrollApproved('oldhost', 'qiqi');
+  it('keeps every host token across a console rotation and retires the old wrap on first use', async () => {
+    const { tokenId } = await enrollApproved('devbox', 'qiqi');
+    const rotated = await doPost('admin-rotate-secret', {});
+    expect(rotated.status).toBe(200);
+    const fresh = rotated.json.secret as string;
+    expect(fresh).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const wraps = () => inDO(h => h.state.storage.get<{ wraps: unknown[] }>('root:v1').then(r => r!.wraps.length));
+    expect(await wraps()).toBe(2);
+    // Both values open R while the window is open …
+    expect((await withSecret('test-kek-not-a-secret')).loaded).not.toBeNull();
+    expect(await wraps()).toBe(2);
+    // … and the first load under the new one collapses to a single wrap.
+    const under = await withSecret(fresh);
+    expect(under.loaded).not.toBeNull();
+    expect(await wraps()).toBe(1);
+    expect((await withSecret('test-kek-not-a-secret')).loaded).toBeNull();
+    // The token secret is R's, not SECRET's: the enrolled host is untouched.
+    expect(await under.admin.hostTokenSecret(tokenId)).toEqual(await hostSecret(tokenId));
     const body = challengeBody();
-    for (const e of [rotatedEnv(), rotatedEnv({ VT_AUTH_CF_PREV: MASTER })]) {
-      const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body, MASTER), e);
+    expect((await post('/api/challenge', body, await tokenHeaders(tokenId, body))).status).toBe(200);
+    // A second rotation before deploying replaces the pending wrap: never three.
+    await doPost('admin-rotate-secret', {});
+    await doPost('admin-rotate-secret', {});
+    expect(await wraps()).toBe(2);
+  });
+
+  it('refuses every token from the previous root after a reset, PREV binding or not', async () => {
+    const { tokenId } = await enrollApproved('oldhost', 'qiqi');
+    const oldSecret = await hostSecret(tokenId);
+    // Factory reset: a fresh SECRET, root:v1 unreadable, bootstrap again.
+    await redeployWithSecret('a-fresh-secret');
+    const state = await doGet('admin-state', {});
+    expect(state.json).toEqual({ state: 'setup', rp_id: null, reset: true });
+    const body = challengeBody();
+    const probe = { ...challengeBody(), salts_b64u: [b64uEnc(new Uint8Array(16).fill(5))] };
+    for (const path of ['/api/challenge', '/api/dek-cache'] as const) {
+      const res = await post(path, path === '/api/challenge' ? body : probe,
+        await tokenHeaders(tokenId, path === '/api/challenge' ? body : probe, oldSecret));
+      expect(res.status).toBe(503);
+      expect(res.json).toEqual({ error: 'not_configured' });
+    }
+    const boot = await app.fetch(new Request(`${ORIGIN}/api/admin/bootstrap`, {
+      method: 'POST', body: JSON.stringify({ entry: TEST_CREDENTIAL_ENTRY }),
+      headers: { 'Content-Type': 'application/json', Origin: TEST_ORIGIN, 'CF-Connecting-IP': IP },
+    }), routerEnv());
+    await boot.text();
+    expect(boot.status).toBe(204);
+    for (const e of [routerEnv(), { ...routerEnv(), SECRET_PREV: 'test-kek-not-a-secret' }]) {
+      const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body, oldSecret), e);
       expect(res.status).toBe(401);
       expect(res.text).toBe('hmac mismatch');
-      const probe = { ...challengeBody(), salts_b64u: [b64uEnc(new Uint8Array(16).fill(5))] };
-      const miss = await post('/api/dek-cache', probe, await tokenHeaders(tokenId, probe, MASTER), e);
+      const miss = await post('/api/dek-cache', probe, await tokenHeaders(tokenId, probe, oldSecret), e);
       expect(miss.status).toBe(401);
       expect(miss.text).toBe('hmac mismatch');
     }
     // The refusals were not uses: the row is exactly as enrollment left it.
     const row = (await tokenRow(tokenId))!;
     expect(row.last_used_ms).toBe(row.created_ms);
-    expect(row).not.toHaveProperty('last_key_gen');
-    // The same row verifies under the new master once the host re-enrolls
-    // (here: the secret re-derived from it).
-    const ok = await post('/api/challenge', body, await tokenHeaders(tokenId, body, NEW_MASTER), rotatedEnv());
-    expect(ok.status).toBe(200);
+    // Only a fresh `vt enroll` (a new token under the new R) gets back in.
+    const { tokenId: again } = await enrollApproved('oldhost', 'qiqi');
+    expect((await post('/api/challenge', body, await tokenHeaders(again, body))).status).toBe(200);
   });
 
-  it('refuses the bare master under either generation', async () => {
+  it('refuses a token-less signature under either generation', async () => {
     const body = challengeBody();
-    for (const master of [MASTER, NEW_MASTER]) {
+    for (const key of ['test-kek-not-a-secret', 'a-fresh-secret']) {
       const raw = new TextEncoder().encode(JSON.stringify(body));
-      const mac = await hmacSha256(new TextEncoder().encode(master), raw);
-      const res = await post('/api/challenge', body, { Authorization: `VT-HMAC ${b64uEnc(mac)}` }, rotatedEnv());
+      const mac = await hmacSha256(new TextEncoder().encode(key), raw);
+      const res = await post('/api/challenge', body, { Authorization: `VT-HMAC ${b64uEnc(mac)}` });
       expect(res.status).toBe(401);
       expect(res.json).toMatchObject({ error: 'token_missing' });
     }
   });
 
-  it('refuses an audit push signed under the previous master on either agent key', async () => {
+  it('refuses an audit push signed with a previous root, and the hostname-keyed master form', async () => {
     const { tokenId } = await enrollApproved('mac', 'qiqi');
     const body = {
       timestamp_ms: Date.now(), agent_id: `t:${tokenId}`, hostname: 'mac',
@@ -306,23 +355,17 @@ describe('master rotation', () => {
     };
     const raw = new TextEncoder().encode(JSON.stringify(body));
     const sign = async (key: Uint8Array) => ({ Authorization: `VT-HMAC ${b64uEnc(await hmacSha256(key, raw))}` });
-    const oldKey = await deriveHostTokenSecret(MASTER, tokenId);
-    for (const e of [rotatedEnv(), rotatedEnv({ VT_AUTH_CF_PREV: MASTER })]) {
-      expect((await post('/api/audit-ingest', body, await sign(oldKey), e)).status).toBe(401);
-    }
-    expect((await post('/api/audit-ingest', body, await sign(await deriveHostTokenSecret(NEW_MASTER, tokenId)), rotatedEnv())).status).toBe(200);
+    expect((await post('/api/audit-ingest', body, await sign(new Uint8Array(32).fill(9)))).status).toBe(401);
+    expect((await post('/api/audit-ingest', body, await sign(await hostSecret(tokenId)))).status).toBe(200);
 
-    // Legacy hostname-salted agent key: same flag day.
+    // The hostname-salted master key (refactor.md §1) is a rejected input now:
+    // no token id, no row, whatever it was signed with.
     const legacyBody = { ...body, agent_id: 'mac' };
     const legacyRaw = new TextEncoder().encode(JSON.stringify(legacyBody));
-    const legacyKey = await hkdfSha256(
-      new TextEncoder().encode(MASTER), new TextEncoder().encode('mac'),
-      new TextEncoder().encode('vt-agent-audit-v1'), 32);
-    const legacyMac = await hmacSha256(legacyKey, legacyRaw);
-    const refused = await post('/api/audit-ingest', legacyBody,
-      { Authorization: `VT-HMAC ${b64uEnc(legacyMac)}` }, rotatedEnv({ VT_AUTH_CF_PREV: MASTER }));
+    const legacyMac = await hmacSha256(new TextEncoder().encode('test-kek-not-a-secret'), legacyRaw);
+    const refused = await post('/api/audit-ingest', legacyBody, { Authorization: `VT-HMAC ${b64uEnc(legacyMac)}` });
     expect(refused.status).toBe(401);
-    expect(refused.text).toBe('hmac mismatch');
+    expect(refused.text).toBe('bad agent token id');
   });
 });
 
@@ -340,7 +383,7 @@ describe('audit ingest keyed on a host token', () => {
 
   it('accepts a live token and refuses a revoked one', async () => {
     const { tokenId } = await enrollApproved('mac', 'qiqi');
-    const key = await deriveHostTokenSecret(MASTER, tokenId);
+    const key = await hostSecret(tokenId);
     expect((await ingest(`t:${tokenId}`, key)).status).toBe(200);
     const before = (await tokenRow(tokenId))!;
     // A background push is not a use: expiry did not slide.
@@ -358,7 +401,7 @@ describe('admin token inventory', () => {
     expect(list.status).toBe(200);
     const row = list.json.tokens.find((t: HostTokenRow) => t.token_id === tokenId);
     expect(row.host).toBe('devbox');
-    expect(JSON.stringify(list.json)).not.toContain(b64uEnc(await deriveHostTokenSecret(MASTER, tokenId)));
+    expect(JSON.stringify(list.json)).not.toContain(b64uEnc(await hostSecret(tokenId)));
     expect((await doPost('tokens-revoke', { token_id: tokenId })).json).toEqual({ revoked: true });
     expect((await doPost('tokens-revoke', { token_id: tokenId })).json).toEqual({ revoked: false });
     expect((await doPost('tokens-revoke', { token_id: '' })).status).toBe(400);

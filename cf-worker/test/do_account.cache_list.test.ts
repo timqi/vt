@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { CacheEntry, CacheListResponse } from '../src/types';
 import { extendTtlOptions } from '../src/cache_policy';
 import {
-  inDO, seedGroup, setDoVar, doGet, doPost, makeEntry, makeMeta, FAKE_CTX, nextSalt, bootstrap, adminHeaders,
+  inDO, seedGroup, configure, doGet, doPost, makeEntry, makeMeta, FAKE_CTX, nextSalt, bootstrap, adminHeaders,
   allDekKeys, DoHandle,
 } from './do_helpers';
 
@@ -22,7 +22,9 @@ const HOUR = 60 * MIN;
 
 const GROUP = 'g_testgroup00000';
 
-beforeEach(async () => { await bootstrap(); await setDoVar('CACHE_ADMIN_EXTEND', '0'); });
+// Listing and clearing work while caching is on; the extend offer follows the
+// same switch, so the toggle test below flips it.
+beforeEach(async () => { await bootstrap(); await configure({ cache_enabled: true }); });
 
 async function list(): Promise<{ body: CacheListResponse; text: string }> {
   const res = await doGet('cache-list');
@@ -79,13 +81,17 @@ describe('opCacheList — inventory without secrets', () => {
     expect(g.cache_ttl_s).toBe(20 * 60);
   });
 
-  it('reports the kill switch and the extend ladder, both straight from policy', async () => {
+  it('offers extension iff caching is enabled, with the ladder straight from policy', async () => {
     await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
-    expect((await list()).body.extend_enabled).toBe(false);
-    await setDoVar('CACHE_ADMIN_EXTEND', '1');
     const { body } = await list();
     expect(body.extend_enabled).toBe(true);
     expect(body.ttl_options_s).toEqual(extendTtlOptions());
+    // Disabling caching keeps the inventory listable and clearable; only the
+    // extend offer goes.
+    await configure({ cache_enabled: false });
+    const off = (await list()).body;
+    expect(off.extend_enabled).toBe(false);
+    expect(off.groups).toHaveLength(1);
   });
 
   it('explains why a row is not extendable without hiding it', async () => {
@@ -122,9 +128,9 @@ describe('opCacheList — inventory without secrets', () => {
     const now = Date.now();
     await inDO(async h => {
       await h.state.storage.put(`dek:${FAKE_CTX}:${nextSalt()}`,
-        makeEntry({ expires_ms: now - MIN, created_ms: now - HOUR }));
+        await makeEntry({ expires_ms: now - MIN, created_ms: now - HOUR }));
       await h.state.storage.put(`dek:${FAKE_CTX}:${nextSalt()}`,
-        makeEntry({ expires_ms: now + HOUR, created_ms: now - HOUR }));
+        await makeEntry({ expires_ms: now + HOUR, created_ms: now - HOUR }));
     });
     const g = (await list()).body.groups[0]!;
     expect(g.entries).toBe(2);
@@ -136,7 +142,7 @@ describe('opCacheList — inventory without secrets', () => {
     // CACHE_LIST_SCAN_MAX is 20000 entries per listing.
     const SCAN_MAX = 20000;
     await inDO(async h => {
-      const entry = makeEntry({ expires_ms: Date.now() + HOUR });
+      const entry = await makeEntry({ expires_ms: Date.now() + HOUR });
       for (let i = 0; i < SCAN_MAX; i += 128) {
         const batch: Record<string, CacheEntry> = {};
         for (let j = 0; j < 128 && i + j < SCAN_MAX; j++) {
@@ -178,7 +184,7 @@ describe('opCacheList — inventory without secrets', () => {
 async function putAt(
   h: DoHandle, prefix: string, n: number, over: Partial<CacheEntry> = {},
 ): Promise<string[]> {
-  const entry = makeEntry({ expires_ms: Date.now() + HOUR, ...over });
+  const entry = await makeEntry({ expires_ms: Date.now() + HOUR, ...over });
   const keys: string[] = [];
   for (let i = 0; i < n; i += 128) {
     const batch: Record<string, CacheEntry> = {};

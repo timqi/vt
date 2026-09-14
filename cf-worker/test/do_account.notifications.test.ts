@@ -8,10 +8,9 @@ import app from '../src/index';
 import { AccountNotifications } from '../src/account_notifications';
 import { AccountAdmin } from '../src/account_admin';
 import { b64uEnc, hmacSha256 } from '../src/crypto';
-import { deriveHostTokenSecret } from '../src/host_token';
 import * as webpush from '../src/webpush';
-import type { Env, DoAuditIngestOp } from '../src/types';
-import { accountStub, inDO, makeChallenge, makeMeta, liveTokenId, bootstrap, doGet, doPost } from './do_helpers';
+import type { DoAuditIngestOp } from '../src/types';
+import { accountStub, inDO, makeChallenge, makeMeta, liveTokenId, bootstrap, doGet, doPost, hostSecret } from './do_helpers';
 
 beforeEach(bootstrap);
 
@@ -32,22 +31,26 @@ async function withPush(
   test: (h: {
     notifications: AccountNotifications;
     admin: AccountAdmin;
-    vars: Env;
+    /** Flip `cache_hit_notify` on the instance the notifications read. */
+    hitNotify: (on: boolean) => Promise<void>;
     tasks: Promise<unknown>[];
     send: ReturnType<typeof vi.spyOn<typeof webpush, 'sendPush'>>;
   }) => Promise<void>,
 ): Promise<void> {
   await inDO(async ({ inst, state }) => {
-    const vars: Env = { ...inst.env, CACHE_HIT_NOTIFY: '' };
-    const admin = new AccountAdmin(state.storage, vars.VT_AUTH_CF);
+    const admin = new AccountAdmin(state.storage, inst.env.SECRET);
     for (const n of [1, 2]) expect((await admin.pushOp('subscribe', post(await browserSub(n)))).status).toBe(200);
     await admin.pushOp('vapid', new Request('https://account.do/op/x'));
+    const hitNotify = async (on: boolean) => {
+      const r = await admin.adminOp('config', new Request('https://account.do/op/x', { method: 'PUT', body: JSON.stringify({ cache_hit_notify: on }) }));
+      expect(r.status).toBe(200);
+    };
     const tasks: Promise<unknown>[] = [];
     const notifications = new AccountNotifications(
-      { waitUntil(task: Promise<unknown>) { tasks.push(task); } }, vars, admin);
+      { waitUntil(task: Promise<unknown>) { tasks.push(task); } }, admin);
     const send = vi.spyOn(webpush, 'sendPush').mockResolvedValue({ status: 201 });
     try {
-      await test({ notifications, admin, vars, tasks, send });
+      await test({ notifications, admin, hitNotify, tasks, send });
       await Promise.all(tasks);
     } finally {
       vi.restoreAllMocks();
@@ -111,10 +114,10 @@ describe('AccountNotifications push contract', () => {
   });
 
   it('keeps cache-hit pushes opt-in, and throttles agent hits by operation and host', async () => {
-    await withPush(async ({ notifications, vars, tasks, send }) => {
+    await withPush(async ({ notifications, hitNotify, tasks, send }) => {
       notifications.cacheHit(makeMeta(), 2);
       expect(tasks).toEqual([]);
-      vars.CACHE_HIT_NOTIFY = 'yes';
+      await hitNotify(true);
       const clock = vi.spyOn(Date, 'now').mockReturnValue(120_000);
       const op: DoAuditIngestOp = {
         token_id: 'synthetic-agent-event', ts_ms: Date.now(), outcome: 'cache_hit',
@@ -147,13 +150,12 @@ describe('ceremony routes and push', () => {
   afterEach(() => vi.restoreAllMocks());
 
   it('/api/challenge returns before any push settles and carries no push_warning', async () => {
-    const key = 'synthetic-notification-route-key';
     const tokenId = await liveTokenId();
     const body = new TextEncoder().encode(JSON.stringify({
       daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
       timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta(),
     }));
-    const tag = await hmacSha256(await deriveHostTokenSecret(key, tokenId), body);
+    const tag = await hmacSha256(await hostSecret(tokenId), body);
     // Drain the internal create response so workerd's isolated storage stack
     // does not retain an open DO response stream after the public route returns.
     const account = {
@@ -165,7 +167,7 @@ describe('ceremony routes and push', () => {
     };
     const response = await app.fetch(new Request('https://vt.test.invalid/api/challenge', {
       method: 'POST', body, headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}`, 'VT-Token-Id': tokenId },
-    }), { ...env, VT_AUTH_CF: key, ACCOUNT: account });
+    }), { ...env, ACCOUNT: account });
     expect(response.status).toBe(200);
     const result = await response.json() as Record<string, unknown>;
     expect(result).not.toHaveProperty('push_warning');

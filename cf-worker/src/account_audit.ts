@@ -16,8 +16,8 @@ const AUDIT_SELECT_COLS =
 
 // Audit row key. approve_token is a 12-byte (16-char) capability, so this is
 // effectively the whole token. Deliberately accepted: the token is only "live"
-// during the ~5-min pending TTL, the audit surface is behind Cloudflare Access
-// (admin = the owner), and approval still requires a server-verified WebAuthn
+// during the ~5-min pending TTL, the audit surface is behind the admin passkey
+// session (admin = the owner), and approval still requires a server-verified WebAuthn
 // assertion — so a stored token grants nothing on its own.
 export function auditKey(approveToken: string): string {
   return approveToken.slice(0, 16);

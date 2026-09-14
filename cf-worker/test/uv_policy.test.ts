@@ -38,16 +38,16 @@ describe('policy defaults', () => {
     expect(DEFAULT_APPROVAL_UV).toBe('discouraged');
     expect(effectiveUvLevel(defaultUvPolicy(), DECRYPT)).toBe('discouraged');
     expect(parseUvPolicy(undefined)).toEqual({ policy: defaultUvPolicy(), error: null });
-    expect(parseUvPolicy('   ').policy).toEqual(defaultUvPolicy());
+    expect(parseUvPolicy(null).policy).toEqual(defaultUvPolicy());
   });
 });
 
 describe('configured policy', () => {
-  const policy = parseUvPolicy(JSON.stringify({
+  const policy = parseUvPolicy({
     default: 'discouraged',
     by_op: { decrypt: 'preferred', auth: 'required' },
     by_host: { 'prod-db': 'required', laptop: 'discouraged' },
-  })).policy;
+  }).policy;
 
   it('raises per op and per host', () => {
     expect(effectiveUvLevel(policy, { op_kind: 'encrypt', host: 'laptop' })).toBe('discouraged');
@@ -64,16 +64,16 @@ describe('configured policy', () => {
   });
 
   it('ignores unparseable entries instead of dropping the whole policy', () => {
-    const { policy: p, error } = parseUvPolicy(JSON.stringify({
+    const { policy: p, error } = parseUvPolicy({
       default: 'preferred', by_op: { decrypt: 'nonsense', auth: 'required' }, by_host: 'oops',
-    }));
+    });
     expect(error).toBeNull();
     expect(effectiveUvLevel(p, { op_kind: 'decrypt' })).toBe('preferred');
     expect(effectiveUvLevel(p, { op_kind: 'auth' })).toBe('required');
   });
 
   it('falls back to required — never to the permissive default — when malformed', () => {
-    for (const bad of ['{', '[]', 'null', '"required"', JSON.stringify({ default: 'off' })]) {
+    for (const bad of ['{', [], 'required', 7, { default: 'off' }]) {
       const { policy: p, error } = parseUvPolicy(bad);
       expect(error).toBeTruthy();
       expect(effectiveUvLevel(p, DECRYPT)).toBe('required');
@@ -83,7 +83,7 @@ describe('configured policy', () => {
 
 describe('client request folds in as a raise only', () => {
   const loose = defaultUvPolicy();
-  const strict = parseUvPolicy(JSON.stringify({ default: 'required' })).policy;
+  const strict = parseUvPolicy({ default: 'required' }).policy;
 
   it('lets a client raise the level', () => {
     expect(effectiveUvLevel(loose, DECRYPT, 'required')).toBe('required');

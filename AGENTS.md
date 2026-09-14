@@ -59,13 +59,13 @@ the rules fail on the thing, not on the number.
 | `src/client/` | 1.8k | `client.rs` + `client/`: transport routing, CLI verbs, `inject` with its recovery supervisor, `doctor`, record parsing |
 | `src/server_macos/` | 4.5k | SSH agent, scopes, Keychain, socket owner check, audit push, UI status; step 4 of refactor.md decides the scopes share |
 | root `src/*.rs` | 2.0k | entry, config, `cf.rs` Worker client, `ssh_sign.rs` relay routing, caller metadata, audit push (its master-key form is an open step 1 row) |
-| `cf-worker/src/` | 3.5k | one DO owning state, routes, host tokens, DEK cache policy, WebAuthn, notifications, admin page |
+| `cf-worker/src/` | 4.0k | one DO owning state, routes, host tokens, DEK cache policy, WebAuthn, notifications, admin page; raised from 3.5k when steps 4–5 of worker-slim.md landed: the root key, config blob, passkey admin session and login ceremony (`account_admin.ts` ≈ 450, `admin_auth.ts`) are the right things, and nothing else in the area is a copy |
 | one module | 750 | rule 2 before splitting; `core/authorization.rs`, `server_macos/ssh_agent.rs`, `client/inject.rs` are the open tripwires |
 
 Non-blank, non-comment lines, `#[cfg(test)]` and `*.test.ts` excluded. No
 repo-wide number. Ceilings are the post-slim targets: steps 1–2 of
-[docs/refactor.md](docs/refactor.md) close the current `core`, root and
-`cf-worker` overages.
+[docs/refactor.md](docs/refactor.md) close the current `core` and root
+overages.
 
 ## Start here
 
@@ -173,25 +173,40 @@ in [src/client/inject.rs](src/client/inject.rs). Keep these implementation bound
 
 Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
 
+- `SECRET` is the only Wrangler secret and only a KEK: the root key `R` is
+  generated at bootstrap, stored as `root:v1` wrapped under
+  HKDF(`SECRET`, `vt-kek-v1`), unwrapped into DO memory only, never logged.
+  Every other key derives from `R` (`account_admin.ts`): host tokens, `K_cfg`,
+  `K_sess`, the cache scalar. Rotation appends a second wrap and returns the
+  new value once; the first load under the new `SECRET` drops the old wrap;
+  never a third. A root that does not unwrap is unconfigured (fail closed,
+  `config.unreadable` once), and bootstrap over it is the factory reset.
+  No `[vars]`: `cache_enabled`, `cache_hit_notify`, `uv_policy` live in
+  `cfg:v1` and `PUT /api/admin/config` accepts nothing else; `origin` is
+  captured at bootstrap and immutable. See [docs/worker-slim.md](docs/worker-slim.md).
 - Hosts authenticate with per-host tokens (`vt1.<id>.<secret>`, secret =
-  HKDF(`VT_AUTH_CF`, id)); the edge verifies statelessly, the DO checks
-  liveness and slides expiry to now + 7 d on every use, never reviving a
-  revoked/expired token. `/api/enroll` is unauthenticated: keep the per-IP rate
-  limiter (absent → 503), the pending cap, and the pairing code. Issue a token
-  only inside `opApprove` → `commitEnroll`; never store the secret. On the token
-  path `meta.host`/`user` come from the record, never the body. Every request
-  carries a host token; never add a token-less branch. See [docs/host-token.md](docs/host-token.md).
+  HKDF(`R`, id)); the edge checks header shape and body caps, the DO compares
+  the MAC (`verifyHostMac`, constant time) before it touches the token, then
+  checks liveness and slides expiry to now + 7 d on every use, never reviving
+  a revoked/expired token. `/api/enroll` is unauthenticated: keep the per-IP
+  rate limiter (`LIMITER`, absent → 503), the pending cap, and the pairing
+  code. Issue a token only inside `opApprove` → `commitEnroll`; never store
+  the secret. On the token path `meta.host`/`user` come from the record, never
+  the body. Every daemon request, audit push included, carries a host token;
+  never add a token-less or master-keyed branch. See [docs/host-token.md](docs/host-token.md).
 - The host `token_id` is the hard cache boundary; client `project` (common git
   dir, else cwd) is advisory and Worker-derived IP is audit metadata. Derive the
   key only inside `cacheCtx` for both reads and writes; it refuses a missing
   `token_id`. Retain literal `meta.pwd` and show `metadata.project` beside
   approval duration controls.
-- Caching is opt-in and requires `CACHE_SECKEY`. A hit is not a phone approval:
-  always audit it. `CACHE_HIT_NOTIFY` independently enables best-effort hit pushes
+- Caching is opt-in (`cache_enabled`, off by default); the scalar is
+  `HKDF(R, vt-cache-seckey-v1)` and exists either way, so disabling deletes
+  nothing and makes every probe a miss. A hit is not a phone approval: always
+  audit it. `cache_hit_notify` independently enables best-effort hit pushes
   and is off by default. Group IDs and creation stamps are immutable.
 - Session-gated list/clear need no Passkey; extension requires a verified Passkey
-  via `opApprove` -> `commitExtend`, never a session alone. `CACHE_ADMIN_EXTEND` is
-  only a kill switch. Never resurrect expired entries, shorten expiry, or extend
+  via `opApprove` -> `commitExtend`, never a session alone, and is offered iff
+  `cache_enabled`. Never resurrect expired entries, shorten expiry, or extend
   drifted/no-gain groups; re-read entries with no await before the write, and audit
   authorization plus actual effects. Expiry is approval-time + TTL, not a lifetime
   budget. Keep distinct approve/extend TTL ladders and finite expiries, never
@@ -210,6 +225,8 @@ Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
   passkey or 退出所有会话 bumps the epoch; the last credential is never revoked.
   Unconfigured (no readable `root:v1`) fails closed everywhere but `/admin`,
   bootstrap and public assets. A `Cf-Access-Jwt-Assertion` header means nothing.
+  `opCreate` decides the UV level from `config.uv_policy` against the verified
+  host; the edge decides nothing.
   `pwa/*` (admin included) is public and carries no data: a shell on disk is
   markup plus `{{VT_DATA}}`; data reaches a page only through the shell route
   (state for this cookie) or the gated API. Preserve `STRICT_CSP`, HTML UTF-8 content type, and

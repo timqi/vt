@@ -16,8 +16,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { b64uEnc } from '../src/crypto';
 import {
-  inDO, setDoVar, doPost, approve, makeChallenge, makeMeta, makeEntry, FAKE_CTX,
-  sealFakeDek, nextSalt, allDekKeys, auditRows, testEnv, liveTokenId,
+  inDO, configure, doPost, doGet, approve, makeChallenge, makeMeta, makeEntry, FAKE_CTX,
+  sealFakeDek, nextSalt, allDekKeys, auditRows, liveTokenId, daemonAuth,
   bootstrap,
 } from './do_helpers';
 
@@ -32,7 +32,7 @@ let tokenId: string;
 
 beforeEach(async () => {
   await bootstrap();
-  await setDoVar('CACHE_SECKEY', testEnv.CACHE_SECKEY);
+  await configure({ cache_enabled: true });
   tokenId = await liveTokenId();
 });
 
@@ -40,10 +40,10 @@ beforeEach(async () => {
 async function armCache(n: number, meta = makeMeta()): Promise<string[]> {
   const salts = Array.from({ length: n }, () => nextSalt());
   const ch = makeChallenge({ salts_b64u: salts, meta });
-  expect((await doPost('create', { challenge: ch, token_id: tokenId })).status).toBe(200);
+  expect((await doPost('create', { challenge: ch, auth: await daemonAuth(tokenId) })).status).toBe(200);
   const res = await approve(ch, {
     cache_ttl_s: TTL_8H,
-    cache_sealed_deks_b64u: salts.map((_, i) => sealFakeDek((i % 251) + 1)),
+    cache_sealed_deks_b64u: await Promise.all(salts.map((_, i) => sealFakeDek((i % 251) + 1))),
   });
   expect(res.status).toBe(200);
   expect(await inDO(allDekKeys)).toHaveLength(n);
@@ -57,7 +57,7 @@ async function read(salts: string[], over = {}, token = tokenId) {
     daemon_pubkey_b64u: DAEMON_PK_B64U,
     salts_b64u: salts,
     meta: makeMeta(over),
-    token_id: token,
+    auth: await daemonAuth(token),
   });
 }
 
@@ -139,7 +139,7 @@ describe('opDekCache — batched reads', () => {
   // stay listable and clearable until they lapse.
   it('never serves a v4-shaped entry, which stays listable and clearable', async () => {
     const salt = nextSalt();
-    await inDO(h => h.state.storage.put(`dek:${FAKE_CTX}:${salt}`, makeEntry()));
+    await inDO(async h => h.state.storage.put(`dek:${FAKE_CTX}:${salt}`, await makeEntry()));
     expect((await read([salt])).json).toEqual({ miss: true });
     const listing = await doPost('cache-list', {});
     expect((listing.json as { groups: unknown[] }).groups).toHaveLength(1);
@@ -148,18 +148,43 @@ describe('opDekCache — batched reads', () => {
 });
 
 describe('opDekCache / writeCache — token_id is the hard half', () => {
-  it('refuses a probe without a token before touching the cache', async () => {
+  it('refuses a probe without a token or with a bad MAC before touching the cache', async () => {
     const salts = await armCache(2);
     const res = await doPost('dek-cache', {
       daemon_pubkey_b64u: DAEMON_PK_B64U, salts_b64u: salts, meta: makeMeta(),
     });
     expect(res.status).toBe(400);
+    const auth = await daemonAuth(tokenId);
+    const forged = await doPost('dek-cache', {
+      daemon_pubkey_b64u: DAEMON_PK_B64U, salts_b64u: salts, meta: makeMeta(),
+      auth: { ...auth, signed_b64u: b64uEnc(new TextEncoder().encode('{"x":1}')) },
+    });
+    expect(forged.status).toBe(401);
+    expect(forged.text).toBe('hmac mismatch');
+  });
+
+  // docs/worker-slim.md §7 row 5: `cache_enabled=false` with live entries → miss,
+  // approve page offers [0], extend routes 404. Disabling does not delete.
+  it('misses, offers no TTL and 404s extension while caching is disabled, entries intact', async () => {
+    const salts = await armCache(2);
+    await configure({ cache_enabled: false });
+    expect((await read(salts)).json).toEqual({ miss: true });
+    expect(await inDO(allDekKeys)).toHaveLength(2);
+    const ch = makeChallenge({ salts_b64u: [nextSalt()] });
+    expect((await doPost('create', { challenge: ch, auth: await daemonAuth(tokenId) })).status).toBe(200);
+    const page = await doGet(`page?approve_token=${ch.approve_token}`);
+    expect(page.json.cache_options_s).toEqual([0]);
+    expect(page.json.cache_pubkey_b64u).toBe('');
+    expect((await doPost('cache-extend-create', { group_ids: ['g_x'], ttl_s: 1200 })).status).toBe(404);
+    // Back on: the same entries serve again — the scalar is the root key's.
+    await configure({ cache_enabled: true });
+    expect((await read(salts)).json).toMatchObject({ source: 'cache' });
   });
 
   it('records write_failed instead of arming a key without a token half', async () => {
     const salts = [nextSalt(), nextSalt()];
     await inDO(async ({ inst }) => {
-      await inst.writeCache(makeChallenge({ salts_b64u: salts }), TTL_8H, salts.map(() => sealFakeDek()));
+      await inst.writeCache(makeChallenge({ salts_b64u: salts }), TTL_8H, await Promise.all(salts.map(() => sealFakeDek())));
     });
     expect(await inDO(allDekKeys)).toEqual([]);
     expect((await inDO(auditRows)).map(r => r.status)).toEqual(['write_failed']);

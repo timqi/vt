@@ -1,23 +1,22 @@
 // vt-passkey v2 Worker — Hono router.
 //
 // Endpoints sit at the root (no secret path prefix). Security rests on:
-//   • /api/challenge, /api/dek-cache — HMAC over the request body keyed on the
-//     caller's host token (HKDF(VT_AUTH_CF, token_id), see host_token.ts), whose
-//     liveness the DO then checks
+//   • /api/challenge, /api/dek-cache, /api/audit-ingest — HMAC over the request
+//     body keyed on the caller's host token (HKDF(R, token_id), host_token.ts).
+//     The edge checks header shape and caps the body; the DO, which alone holds
+//     R, compares the MAC and checks the token's liveness
 //   • /api/enroll           — unauthenticated, per-IP rate limited; mints a
 //     Passkey ceremony that issues a host token
-//   • /api/audit-ingest     — HMAC(HKDF(VT_AUTH_CF, agent_id)) over the request body
 //   • /a/:token, approve    — 12-byte (96-bit) unguessable approve/poll tokens + WebAuthn
 //   • /admin, /api/admin/* — passkey admin session verified in the DO; the
 //     one admin shell (tabs in the URL hash) plus its data API
 
 import { Hono, type Context } from 'hono';
 import { Env } from './types';
-import { b64uEnc, decodeB64uExact, ctEq, challengeHash, randomBytes, hmacSha256, hkdfSha256, inReplayWindow } from './crypto';
-import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, EnrollRequest, EnrollResponse, DoEnrollCreateOp } from './types';
-import { deriveHostTokenSecret, isTokenId } from './host_token';
+import { b64uEnc, decodeB64uExact, challengeHash, randomBytes, inReplayWindow } from './crypto';
+import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DaemonAuth, DoAuditIngestOp, DoCreateOp, DoDekCacheOp, EnrollRequest, EnrollResponse, DoEnrollCreateOp } from './types';
+import { isTokenId } from './host_token';
 import { log, logErr, tokenPrefix } from './log';
-import { effectiveUvLevel, parseUvPolicy } from './uv_policy';
 import { escapeJsonForHtml, renderTemplate, pageVars, type PageChrome } from './page';
 import { tokenRefused } from './do_account';
 
@@ -165,7 +164,7 @@ const ADMIN_POST_MAX_BYTES = 64 * 1024;
 // URL tail → DO op. Anything not listed is 404; the DO decides on the session.
 const ADMIN_GET: Record<string, string> = {
   audit: 'audit-query', 'cache-list': 'cache-list', tokens: 'tokens-list',
-  credentials: 'admin-credentials', 'push/vapid': 'push-vapid',
+  credentials: 'admin-credentials', config: 'admin-config', 'push/vapid': 'push-vapid',
 };
 const ADMIN_POST: Record<string, string> = {
   'cache-clear-origin': 'cache-clear-origin', 'cache-clear-groups': 'cache-clear-groups',
@@ -174,6 +173,7 @@ const ADMIN_POST: Record<string, string> = {
   'push/subscribe': 'push-subscribe', 'push/unsubscribe': 'push-unsubscribe', 'push/test': 'push-test',
   logout: 'admin-logout', 'sessions-revoke': 'admin-sessions-revoke',
   'credentials-add': 'admin-credentials-add', 'credentials-revoke': 'admin-credentials-revoke',
+  'rotate-secret': 'admin-rotate-secret',
 };
 // Open, so rate limited per IP (bootstrap and login-challenge) or gated by the
 // challenge it consumes (login).
@@ -194,7 +194,7 @@ async function adminPost(c: Context<{ Bindings: Env }>, op: string, maxBytes: nu
   const raw = await readCappedBody(c, maxBytes);
   if (!raw) return c.text('body too large', 413);
   return adminResponse(await accountStub(c).fetch(`https://account.do/op/${op}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', ...adminHeaders(c) }, body: raw,
+    method: c.req.method, headers: { 'Content-Type': 'application/json', ...adminHeaders(c) }, body: raw,
   }));
 }
 
@@ -219,6 +219,9 @@ app.get('/api/admin/*', async (c) => {
   return adminResponse(await accountStub(c).fetch(`https://account.do/op/${op}${url.search}`, { headers: adminHeaders(c) }));
 });
 
+// The one PUT: the three config knobs (§4.1); anything else in the body is 400.
+app.put('/api/admin/config', (c) => adminPost(c, 'admin-config', ADMIN_OPEN_POST_MAX_BYTES));
+
 app.post('/api/admin/*', async (c) => {
   const tail = new URL(c.req.url).pathname.slice('/api/admin/'.length);
   const open = ADMIN_OPEN_POST[tail];
@@ -237,7 +240,7 @@ app.post('/api/admin/*', async (c) => {
 // The one 3/min/IP binding, keyed by route family. Absent → refuse: neither a
 // phone page nor a session mint may run unthrottled.
 async function rateLimit(c: Context<{ Bindings: Env }>, key: string): Promise<Response | null> {
-  const limiter = c.env.ENROLL_LIMITER;
+  const limiter = c.env.LIMITER;
   if (!limiter) return c.text('rate limiter not configured', 503);
   const { success } = await limiter.limit({ key });
   return success ? null : c.text('rate limited', 429);
@@ -246,10 +249,11 @@ async function rateLimit(c: Context<{ Bindings: Env }>, key: string): Promise<Re
 
 // POST /api/challenge — daemon creates a challenge
 app.post('/api/challenge', async (c) => {
-  // 1. HMAC auth
-  const authed = await readAuthenticatedDaemonBody(c);
+  // 1. Auth header shape, token id shape, body cap. The MAC itself is compared
+  //    in the DO (step 8); nothing here is trusted until then.
+  const authed = await readDaemonBody(c);
   if (authed instanceof Response) return authed;
-  const { body: rawBody, tokenId } = authed;
+  const { body: rawBody, auth } = authed;
 
   // 2. Parse body
   let body: ChallengeRequest;
@@ -271,10 +275,8 @@ app.post('/api/challenge', async (c) => {
     return c.text((e as Error).message, 400);
   }
 
-  // 5. Approval UV level: server policy, raised (never lowered) by body.uv.
+  // 5. Meta: capped here; host/user are overwritten by the DO from the token.
   const meta = capChallengeMeta(body.meta, c.req.header('CF-Connecting-IP'));
-  const { policy: uvPolicy, error: uvPolicyError } = parseUvPolicy(c.env.APPROVAL_UV_JSON);
-  if (uvPolicyError) logErr('uv_policy.invalid', uvPolicyError);
 
   // 6. Generate tokens. 12 bytes = 96-bit capability tokens (16 b64url chars):
   // unguessable within the 5-min single-use TTL, and approval still requires a
@@ -297,31 +299,29 @@ app.post('/api/challenge', async (c) => {
     reject_challenge_hash_b64u: b64uEnc(rejectHash),
     salts_b64u: saltsB64u,
     meta,
-    // Decided HERE, once, from server-side policy plus the client's raise-only
-    // request, and stored on the challenge: the approval page and the assertion
-    // check both read it back from the DO, so neither the phone nor the CLI can
-    // lower what this ceremony is verified at.
-    uv: effectiveUvLevel(uvPolicy, meta, body.uv),
+    // The DO decides the level (stored policy + the raise-only request below)
+    // against the verified host and stores it on the challenge.
     status: 'pending',
     created_ms: Date.now(),
   };
 
-  // 8. Store in DO. On the token path the DO validates the token FIRST (401
-  //    with a structured reason the CLI turns into "run `vt enroll`") and fills
-  //    meta.host / user from the record; the stored challenge is what it returns.
+  // 8. Store in DO. The DO verifies the MAC and the token FIRST (401 with a
+  //    structured reason the CLI turns into "run `vt enroll`"), fills
+  //    meta.host / user from the record and returns the stored meta plus the
+  //    approve URL on the configured origin.
   const doResp = await accountStub(c).fetch('https://account.do/op/create', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ challenge: ch, token_id: tokenId }),
+    body: JSON.stringify({ challenge: ch, uv_request: body.uv, auth } satisfies DoCreateOp),
   });
-  // Structured refusals (dead token, unconfigured Worker) reach the CLI as-is.
+  // Refusals (bad MAC, dead token, unconfigured Worker) reach the CLI as-is.
   if (doResp.status === 401 || doResp.status === 503) return new Response(doResp.body, doResp);
   if (!doResp.ok) return c.text(`do create: ${await doResp.text()}`, 500);
-  const stored = await doResp.json() as { meta?: ChallengeMeta };
-  if (stored.meta) ch.meta = stored.meta;
+  const stored = await doResp.json() as { meta: ChallengeMeta; approve_url: string };
+  ch.meta = stored.meta;
 
   // 9. The DO already pushed the phone (storeAndAnnounce); nothing to await.
-  const approveUrl = `${c.env.WORKER_ORIGIN}/a/${approveToken}`;
+  const approveUrl = stored.approve_url;
 
   log('challenge.created', {
     at: tokenPrefix(approveToken),
@@ -353,17 +353,17 @@ app.get('/api/dek', async (c) => {
 });
 
 // POST /api/dek-cache — daemon tries the opt-in DEK cache before a ceremony.
-// Same HMAC(VT_AUTH_CF) gate + replay window as /api/challenge. On a full hit
-// the DO returns DEKs re-sealed to the daemon's ephemeral pubkey; otherwise
+// Same host-token gate + replay window as /api/challenge. On a full hit the DO
+// returns DEKs re-sealed to the daemon's ephemeral pubkey; otherwise
 // {miss:true} and the daemon falls through to the normal phone approval.
 //
-// The IP is taken from CF-Connecting-IP (trustworthy) — NOT from the body — and
-// forms half of the cache binding context; the ppid (client-reported) is the
-// advisory half. See docs/dek-cache.md §2.5.
+// The IP is taken from CF-Connecting-IP (trustworthy) — NOT from the body — as
+// audit metadata; the token the DO verifies is the cache key's hard half.
+// See docs/dek-cache.md.
 app.post('/api/dek-cache', async (c) => {
-  const authed = await readAuthenticatedDaemonBody(c);
+  const authed = await readDaemonBody(c);
   if (authed instanceof Response) return authed;
-  const { body: rawBody, tokenId } = authed;
+  const { body: rawBody, auth } = authed;
 
   let body: DekCacheRequest;
   try { body = JSON.parse(new TextDecoder().decode(rawBody)); }
@@ -382,8 +382,8 @@ app.post('/api/dek-cache', async (c) => {
       daemon_pubkey_b64u: body.daemon_pubkey_b64u,
       salts_b64u: body.salts_b64u,
       meta,
-      token_id: tokenId,
-    }),
+      auth,
+    } satisfies DoDekCacheOp),
   });
 });
 
@@ -422,23 +422,20 @@ app.post('/api/enroll', async (c) => {
     body: JSON.stringify(op),
   });
   if (!doResp.ok) return new Response(doResp.body, doResp);
-  const created = await doResp.json() as { approve_token: string; poll_token: string; pair_code: string };
-  const approveUrl = `${c.env.WORKER_ORIGIN}/a/${created.approve_token}`;
+  const created = await doResp.json() as { approve_token: string; poll_token: string; pair_code: string; approve_url: string };
   log('enroll.requested', { at: tokenPrefix(created.approve_token), host: op.host, user: op.user, ip: op.ip });
   return c.json({
-    approve_url: approveUrl,
+    approve_url: created.approve_url,
     poll_token: created.poll_token,
     pair_code: created.pair_code,
   } satisfies EnrollResponse);
 });
 
-// POST /api/audit-ingest — the SSH agent pushes one audit record per decision.
-// Unlike /api/challenge (HMAC keyed on VT_AUTH_CF directly), this is keyed on a
-// PER-AGENT HKDF subkey: the agent never holds the master. The Worker reads the
-// (still-unverified) `agent_id` from the body, derives the same subkey, then
-// verifies the VT-HMAC over the raw body. A forged agent_id only yields a key
-// that won't verify — parsing it before verification is safe. One HKDF per
-// request is negligible; the 64 KB cap + 401-on-bad-HMAC bound abuse.
+// POST /api/audit-ingest — the SSH agent pushes one audit record per decision,
+// signed with the Mac's own host token (`vt ssh agent --audit-key vt1.…`,
+// `agent_id = t:<token_id>`). Same gate as the daemon routes: shape and cap
+// here, MAC and liveness in the DO — a revoked token stops writing rows. The
+// hostname-keyed master form is gone (refactor.md §1).
 const AUDIT_INGEST_MAX_BYTES = 64 * 1024;
 app.post('/api/audit-ingest', async (c) => {
   // 0. Reject a declared oversized body before parsing the auth header;
@@ -446,11 +443,11 @@ app.post('/api/audit-ingest', async (c) => {
   const clen = c.req.header('Content-Length');
   if (clen && Number(clen) > AUDIT_INGEST_MAX_BYTES) return c.text('body too large', 413);
 
-  const auth = c.req.header('Authorization') ?? '';
+  const authHeader = c.req.header('Authorization') ?? '';
   const prefix = 'VT-HMAC ';
-  if (!auth.startsWith(prefix)) return c.text('missing auth', 401);
+  if (!authHeader.startsWith(prefix)) return c.text('missing auth', 401);
   let providedHmac: Uint8Array;
-  try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
+  try { providedHmac = decodeB64uExact(authHeader.slice(prefix.length), 32, 'hmac'); }
   catch { return c.text('hmac length', 401); }
 
   const rawBody = await readCappedBody(c, AUDIT_INGEST_MAX_BYTES);
@@ -460,30 +457,10 @@ app.post('/api/audit-ingest', async (c) => {
   let body: AgentAuditIngestRequest;
   try { body = JSON.parse(new TextDecoder().decode(rawBody)); }
   catch { return c.text('json parse error', 400); }
-  if (typeof body.agent_id !== 'string' || !body.agent_id) return c.text('missing agent_id', 400);
-  // Defensive cap before the HKDF salt step (agent_id is the hostname, ≤255 per
-  // RFC 1123). A forged value can't verify anyway, but bound the input.
-  if (body.agent_id.length > 256) return c.text('agent_id too long', 400);
-
-  // 2. Derive the per-agent key and 3. verify the HMAC over the raw body.
-  //    `t:<token_id>` selects the agent's HOST TOKEN secret (the agent was
-  //    started with `--audit-key vt1.…`); any other agent_id is the legacy
-  //    hostname-salted subkey of the master.
-  const enc = new TextEncoder();
-  let tokenIdHost: string | undefined;
-  if (body.agent_id.startsWith('t:')) {
-    const id = body.agent_id.slice(2);
-    if (!isTokenId(id)) return c.text('bad agent token id', 401);
-    const expected = await hmacSha256(await deriveHostTokenSecret(c.env.VT_AUTH_CF, id), rawBody);
-    if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
-    tokenIdHost = id;
-  } else {
-    // Legacy hostname-salted subkey. It is being deleted, not widened.
-    const key = await hkdfSha256(
-      enc.encode(c.env.VT_AUTH_CF), enc.encode(body.agent_id), enc.encode('vt-agent-audit-v1'), 32);
-    const expected = await hmacSha256(key, rawBody);
-    if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
+  if (typeof body.agent_id !== 'string' || !body.agent_id.startsWith('t:') || !isTokenId(body.agent_id.slice(2))) {
+    return c.text('bad agent token id', 401);
   }
+  const auth: DaemonAuth = { token_id: body.agent_id.slice(2), mac_b64u: b64uEnc(providedHmac), signed_b64u: b64uEnc(rawBody) };
 
   // 4. Replay window on the body timestamp.
   if (typeof body.timestamp_ms !== 'number' || !inReplayWindow(Date.now(), body.timestamp_ms))
@@ -529,7 +506,7 @@ app.post('/api/audit-ingest', async (c) => {
     scope_label: capOrNull(entry.scope_label, 160),
     grant_ttl_s: clampIntOrNull(entry.grant_ttl_s),
     relayed: boolOrNull(entry.relayed),
-    token_id_host: tokenIdHost,
+    auth,
   };
 
   const stub = c.env.ACCOUNT.get(c.env.ACCOUNT.idFromName('account'));
@@ -575,23 +552,21 @@ async function readCappedBody(c: Context, maxBytes = CEREMONY_POST_MAX_BYTES): P
   return body;
 }
 
-// Only daemon challenge/cache requests use this key; audit ingestion derives
-// a per-agent key and deliberately retains its own validation order.
-//
-// The key is the caller's host token: HKDF(VT_AUTH_CF, token_id) for the
-// `VT-Token-Id` header. Stateless here; the DO checks the token is alive and
-// slides its expiry (`tokenId` is returned so the route can forward it). A
-// request without the header gets the same structured 401 as a dead token:
-// the remedy is `vt enroll` either way. One master, one derivation: rotating
-// VT_AUTH_CF invalidates every token, and every host re-enrolls.
-async function readAuthenticatedDaemonBody(
+// Daemon challenge/cache requests: the `Authorization: VT-HMAC <mac>` and
+// `VT-Token-Id` headers, checked for shape before the body is read and capped.
+// The MAC is NOT compared here — the token secret is HKDF(R, token_id) and R
+// lives in the DO — so the exact bytes and the MAC travel with the op and the
+// DO refuses before it touches the token or stores anything. A request without
+// the header gets the same structured 401 as a dead token: the remedy is
+// `vt enroll` either way.
+async function readDaemonBody(
   c: Context<{ Bindings: Env }>,
-): Promise<{ body: Uint8Array; tokenId: string } | Response> {
-  const auth = c.req.header('Authorization') ?? '';
+): Promise<{ body: Uint8Array; auth: DaemonAuth } | Response> {
+  const authHeader = c.req.header('Authorization') ?? '';
   const prefix = 'VT-HMAC ';
-  if (!auth.startsWith(prefix)) return c.text('missing auth', 401);
+  if (!authHeader.startsWith(prefix)) return c.text('missing auth', 401);
   let providedHmac: Uint8Array;
-  try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
+  try { providedHmac = decodeB64uExact(authHeader.slice(prefix.length), 32, 'hmac'); }
   catch { return c.text('hmac length', 401); }
   const tokenHeader = c.req.header('VT-Token-Id');
   if (tokenHeader === undefined) return tokenRefused('token_missing');
@@ -599,9 +574,7 @@ async function readAuthenticatedDaemonBody(
 
   const rawBody = await readCappedBody(c);
   if (!rawBody) return c.text('body too large', 413);
-  const expected = await hmacSha256(await deriveHostTokenSecret(c.env.VT_AUTH_CF, tokenHeader), rawBody);
-  if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
-  return { body: rawBody, tokenId: tokenHeader };
+  return { body: rawBody, auth: { token_id: tokenHeader, mac_b64u: b64uEnc(providedHmac), signed_b64u: b64uEnc(rawBody) } };
 }
 
 // POST /api/approve — PWA submits sealed DEKs after WebAuthn

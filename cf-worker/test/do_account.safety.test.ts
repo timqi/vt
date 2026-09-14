@@ -6,8 +6,8 @@ import { b64uEnc } from '../src/crypto';
 import { seal, cachePublicKey } from '../src/cache_crypto';
 import { deleteKeysBatched } from '../src/storage_batch';
 import {
-  inDO, setDoVar, makeChallenge, makeMeta, signApproval, seedGroup,
-  readEntries, auditRows, nextSalt, sealFakeDek, testEnv, liveTokenId,
+  inDO, configure, makeChallenge, makeMeta, signApproval, seedGroup,
+  readEntries, auditRows, nextSalt, sealFakeDek, cacheSeckey, liveTokenId, daemonAuth,
   bootstrap,
   adminHeaders,
 } from './do_helpers';
@@ -18,8 +18,7 @@ const GROUP = 'g_testgroup00000';
 
 beforeEach(async () => {
   await bootstrap();
-  await setDoVar('CACHE_SECKEY', testEnv.CACHE_SECKEY);
-  await setDoVar('CACHE_ADMIN_EXTEND', '1');
+  await configure({ cache_enabled: true });
 });
 
 it('expires a still-pending challenge when valid verification crosses its TTL', async () => {
@@ -237,17 +236,19 @@ describe('cache read plaintext lifetime', () => {
   it.each(['missing', 'malformed', 'cleanup-failure', 'hit', 'seal-failure'])(
     'wipes every opened buffer on %s', async (outcome) => {
       const tokenId = await liveTokenId();
+      const auth = await daemonAuth(tokenId);
+      const sealedDeks = [await sealFakeDek(), await sealFakeDek()];
+      const cachePk = cachePublicKey(await cacheSeckey());
       await inDO(async ({ inst, state }) => {
         const meta = makeMeta();
         const salts = [nextSalt(), nextSalt()];
-        await inst.writeCache(makeChallenge({ salts_b64u: salts, meta, token_id: tokenId }), 20 * 60,
-          salts.map(() => sealFakeDek()));
+        await inst.writeCache(makeChallenge({ salts_b64u: salts, meta, token_id: tokenId }), 20 * 60, sealedDeks);
         const entries = await state.storage.list({ prefix: 'dek:' });
         const secondKey = [...entries.keys()].find(key => key.endsWith(`:${salts[1]}`))!;
         if (outcome === 'missing') {
           await state.storage.delete(secondKey);
         } else if (outcome === 'malformed' || outcome === 'cleanup-failure') {
-          const sealed = seal(new Uint8Array(31).fill(8), cachePublicKey(testEnv.CACHE_SECKEY));
+          const sealed = seal(new Uint8Array(31).fill(8), cachePk);
           await state.storage.put(secondKey, { ...entries.get(secondKey), sealed_to_cache_b64u: sealed });
         }
         const opened: Uint8Array[] = [];
@@ -267,7 +268,7 @@ describe('cache read plaintext lifetime', () => {
           const request = new Request('https://account.do/op/dek-cache', {
             method: 'POST', body: JSON.stringify({
               daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
-              salts_b64u: salts, meta, token_id: tokenId,
+              salts_b64u: salts, meta, auth,
             }),
           });
           if (outcome === 'seal-failure') {
@@ -293,6 +294,9 @@ describe('cache read plaintext lifetime', () => {
 
 it('keeps cache write, read, extension, and clear within every 128-key storage limit', async () => {
   const tokenId = await liveTokenId();
+  const auth = await daemonAuth(tokenId);
+  // Sealing derives the cache key through the DO; do it before the spies go in.
+  const sealedDeks = await Promise.all(Array.from({ length: 150 }, () => sealFakeDek()));
   await inDO(async ({ inst, state }) => {
     const get = state.storage.get.bind(state.storage);
     const put = state.storage.put.bind(state.storage);
@@ -335,11 +339,11 @@ it('keeps cache write, read, extension, and clear within every 128-key storage l
     try {
       const salts = Array.from({ length: 150 }, nextSalt);
       const ch = makeChallenge({ salts_b64u: salts });
-      await post('create', { challenge: ch, token_id: tokenId });
-      await approve(ch, { cache_ttl_s: 1200, cache_sealed_deks_b64u: salts.map(() => sealFakeDek()) });
+      await post('create', { challenge: ch, auth });
+      await approve(ch, { cache_ttl_s: 1200, cache_sealed_deks_b64u: sealedDeks });
       expect(sizes.put).toEqual([2, 128, 22]);
       const read = await post('dek-cache', {
-        daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)), salts_b64u: salts, meta: ch.meta, token_id: tokenId,
+        daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)), salts_b64u: salts, meta: ch.meta, auth,
       });
       expect(read.source).toBe('cache');
       expect(sizes.get).toEqual([128, 22]);

@@ -124,6 +124,9 @@ td.cache-expired { color: var(--muted); }
 .field { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
 .field > label { margin: 0; }
 .field textarea, .field input[type="text"], .field input[type="password"], .field select { width: 100%; min-width: 0; }
+/* A labelled checkbox row: native control, 44px target, text never alone. */
+.switch { display: flex; flex-direction: row; align-items: center; gap: 10px; min-height: 44px; cursor: pointer; }
+.switch input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
 
 /* Segmented mode switch */
 #modes {

@@ -3,38 +3,44 @@
 Status: implemented. Owns the credential a host presents to the Worker, how it
 is issued, how long it lives, and what the approval surfaces may trust because
 of it. Verify against `cf-worker/src/host_token.ts`, `account_tokens.ts`,
-`do_account.ts` (`opEnrollCreate`, `commitEnroll`, `tokens.touch` call sites),
-`src/cf.rs` (`WorkerAuth`, `enroll`) and `src/client/commands.rs` (`enroll`).
+`account_admin.ts` (`hostTokenSecret`, `verifyHostMac`), `do_account.ts`
+(`authenticateDaemon`, `opEnrollCreate`, `commitEnroll`), `src/cf.rs`
+(`WorkerAuth`, `enroll`) and `src/client/commands.rs` (`enroll`).
 
 ## 1. Problem
 
-Every host used to hold the Worker master (`VT_PASSKEY_TOKEN == VT_AUTH_CF`).
-One leaked config meant rotating the master everywhere, nothing on the approval
-page distinguished hosts except a client-typed hostname, and there was no way
-to cut a single host off.
+Every host used to hold the Worker master. One leaked config meant rotating
+the master everywhere, nothing on the approval page distinguished hosts except
+a client-typed hostname, and there was no way to cut a single host off.
 
 ## 2. Token model
 
 ```
 token      = vt1.<token_id>.<secret_b64u>
 token_id   = b64u(12 random bytes)                                 (public)
-secret     = HKDF-SHA256(ikm = VT_AUTH_CF, salt = token_id,
+secret     = HKDF-SHA256(ikm = R, salt = token_id,
                          info = "vt-host-token-v1", L = 32)
 ```
 
-- **Stateless verification at the edge.** The daemon sends
-  `Authorization: VT-HMAC <mac>` plus `VT-Token-Id: <token_id>`; the Worker
-  re-derives the secret from the master and checks the HMAC before any
-  Durable Object round-trip (`readAuthenticatedDaemonBody`). A host only ever
-  holds its derived secret; the master never leaves the Worker. A request
-  without `VT-Token-Id` is refused before its body is read with the same
-  structured `401 {error: token_missing}` a dead token gets: the master is
-  never accepted as a daemon key, and the DO likewise fails closed (400) on an
-  op body without a `token_id`.
-- **One master, one derivation.** There is no previous-generation fallback:
-  rotating `VT_AUTH_CF` invalidates every token at once (§7). Ordering:
-  syntactic `token_id` check before any KDF, body cap before crypto, one
-  constant-time comparison.
+`R` is the Worker's root key: 32 random bytes generated at bootstrap, stored
+wrapped under `SECRET` and unwrapped only into Durable Object memory
+([worker-slim.md](worker-slim.md) §2). Nothing else derives host tokens.
+
+- **Shape at the edge, MAC in the DO.** The daemon sends
+  `Authorization: VT-HMAC <mac>` plus `VT-Token-Id: <token_id>`. The edge
+  checks the header shapes, refuses a missing `VT-Token-Id` before reading the
+  body with the same structured `401 {error: token_missing}` a dead token gets,
+  caps and reads the body (`readDaemonBody`), and forwards the exact bytes and
+  the MAC with the op. The DO — the only holder of `R` — derives the secret,
+  compares in constant time (`verifyHostMac`), then checks liveness
+  (`authenticateDaemon`); nothing is stored or pushed before both pass, and an
+  op body without `auth` fails closed (400). A host only ever holds its own
+  derived secret. Cost of the split: a request with a bad MAC reaches the DO
+  once; the JSON parse and salt validation at the edge run on capped,
+  unauthenticated input. The `/api/audit-ingest` route follows the same path.
+- **One root, one derivation.** There is no previous-generation fallback: a
+  factory reset (new `R`) invalidates every token at once (§7); rotating
+  `SECRET` through the console keeps `R` and every token.
 - **Stateful liveness in the DO.** `host_token` (SQLite,
   `account_tokens.ts`) records `host, user, enroll_ip, origin, created_ms,
   expires_ms, last_used_ms, last_ip, revoked_ms`. Every authenticated
@@ -52,9 +58,9 @@ secret     = HKDF-SHA256(ikm = VT_AUTH_CF, salt = token_id,
 
 1. CLI `POST /api/enroll {host, user, timestamp_ms}` — **unauthenticated**.
    Three independent bounds because this route can page the phone:
-   per-IP Workers Rate Limiting (`ENROLL_LIMITER`, 3/min; absent → 503, never
-   unthrottled), `ENROLL_PENDING_MAX = 5` concurrently pending enrollments in
-   the DO (429), and the normal 5-minute ceremony TTL.
+   per-IP Workers Rate Limiting (`LIMITER`, key `enroll:<ip>`, 3/min; absent →
+   503, never unthrottled), `ENROLL_PENDING_MAX = 5` concurrently pending
+   enrollments in the DO (429), and the normal 5-minute ceremony TTL.
 2. The DO mints a ceremony with an immutable `EnrollIntent` (claimed host/user,
    verified `CF-Connecting-IP` and `request.cf` country · AS org, and a
    six-digit **pairing code**). `op_kind='enroll'`, no salts, discarded daemon
@@ -85,10 +91,10 @@ Revoked/lapsed rows stay listed for 30 days, then the alarm sweep drops them.
 ## 5. Agent audit push
 
 `vt ssh agent --audit-key vt1.…` uses the Mac's own host token: the secret is
-the HMAC key and `agent_id = t:<token_id>`. The Worker derives the same secret,
-and the DO refuses rows from a revoked/expired token (`isLive`, no sliding — a
-background push is not a use). `--audit-key` alone still accepts the master
-(`HKDF(master, hostname)`); see [agent-audit.md](agent-audit.md).
+the HMAC key and `agent_id = t:<token_id>`. The DO derives the same secret and
+refuses rows from a revoked/expired token (`isLive`, no sliding — a background
+push is not a use). Nothing else is accepted as an audit key; see
+[agent-audit.md](agent-audit.md).
 
 ## 6. Approval-context trim
 
@@ -99,39 +105,38 @@ read NULL for new rows. Decision record: [approval-transparency.md §2b](approva
 
 ## 7. Rollout
 
-1. Deploy the Worker with the `ENROLL_LIMITER` binding
-   ([cf-worker-deploy.md](cf-worker-deploy.md)). A host still holding the bare
-   master is refused with `token_missing` until it enrolls.
+1. Deploy the Worker with the `LIMITER` binding and bootstrap it
+   ([cf-worker-deploy.md](cf-worker-deploy.md)). A host holding a token from a
+   previous root (the `VT_AUTH_CF` build, or a reset) is refused with
+   `hmac mismatch`; one without a token with `token_missing`.
 2. On each host: upgrade `vt`, run `vt enroll` (pass `--url` if the file has
    no `VT_PASSKEY_URL` yet), approve on the phone after comparing the pairing
    code. Unset any `VT_PASSKEY_TOKEN` in the environment — env wins over the
    file.
-3. Macs running the agent with audit push: switch `--audit-key` to the host
-   token written by `vt enroll`; the hostname-keyed audit derivation is the
-   one legacy branch left.
+3. Macs running the agent with audit push: `--audit-key` is the host token
+   written by `vt enroll`; nothing else is accepted.
 
-### Rotating the master (flag day)
+### Rotation and reset
 
-Every host token secret is `HKDF(VT_AUTH_CF, token_id)`, so replacing the master
-invalidates them all at once; there is deliberately no second accepted
-generation (two masters is a wider surface, and a host that never re-enrolls
-would keep an old credential alive).
-
-1. `wrangler secret put VT_AUTH_CF` — the new master. Deploy is not required;
-   secrets take effect on their own. From here every existing token fails with
-   `hmac mismatch` and the agent audit push is refused the same way.
-2. The same day, on each host: `vt enroll` (phone approval, pairing code) and
-   switch any `vt ssh agent --audit-key` to the token it writes. Revoke the
-   rows of hosts that are gone on the tokens tab; the rest lapse in 7 days.
+Rotating `SECRET` (设置 → 轮换 SECRET, then `wrangler secret put SECRET`)
+keeps `R`, so every token keeps verifying. A **factory reset** — a fresh
+`SECRET` without that rotation, then bootstrap again — mints a new `R` and
+invalidates every token at once; there is deliberately no second accepted
+generation (two roots is a wider surface, and a host that never re-enrolls
+would keep an old credential alive). The same day, on each host: `vt enroll`
+(phone approval, pairing code) and switch any `vt ssh agent --audit-key` to the
+token it writes. Revoke the rows of hosts that are gone on the tokens tab; the
+rest lapse in 7 days.
 
 ## 8. Tests
 
 - Worker: `test/host_token.test.ts` (derivation golden vector, token shape,
   pairing code), `test/do_account.host_token.test.ts` (enroll → approve →
   token; challenge/dek-cache auth with sliding expiry and structured refusals;
-  bare master and token-less DO bodies refused; meta trim; audit ingest with
-  `t:`; admin list/revoke; limiter absent → 503; pending cap → 429; master
-  rotation refusing old-master tokens on every route).
+  token-less signatures and auth-less DO bodies refused; meta trim; audit
+  ingest with `t:` and the hostname form rejected; admin list/revoke; limiter
+  absent → 503; pending cap → 429; `SECRET` rotation keeping every token and
+  retiring the old wrap; reset refusing old-root tokens on every route).
 - Rust: `cf::tests::worker_auth_parses_host_token_and_rejects_bare_master`,
   `http_post_sends_token_id_header_only_when_given`,
   `config::tests::upsert_*`, `audit::tests::host_token_audit_key_only_for_host_tokens`.

@@ -2,7 +2,7 @@
 
 The presentation contract for `cf-worker/pwa/`: the approve shell and the
 admin shell. Tags (`ported`, `changed`, `vt`) name each section's relation to
-pier's `docs/design/06-ui-ux.md` as decided in [worker-slim.md](../worker-slim.md) §6.
+pier's `docs/design/06-ui-ux.md` (ported for the Worker slim; [worker-slim.md](../worker-slim.md)).
 [approval-transparency.md](../approval-transparency.md) owns what an approval
 shows and in which order and wins over this file. An explicit user requirement
 wins over a convention; a changed convention updates this file.

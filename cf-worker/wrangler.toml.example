@@ -65,76 +65,24 @@ new_sqlite_classes = ["AccountDO"]
 # `namespace_id` is any integer unique among the rate limits in this account.
 # 3 attempts / minute / IP is plenty for a human.
 [[unsafe.bindings]]
-name = "ENROLL_LIMITER"
+name = "LIMITER"
 type = "ratelimit"
 namespace_id = "1001"
 simple = { limit = 3, period = 60 }
 
-[vars]
-# Public origin / RP id for WebAuthn. Use your own domain.
-WORKER_ORIGIN = "https://vt.example.com"
-RP_ID = "vt.example.com"
-# WebAuthn user-verification policy for APPROVAL ceremonies (approve + reject).
-# Registration is unaffected — enrolling a passkey always requires verification.
+# No [vars]. Everything the operator can set — caching, cache-hit pushes, the
+# approval UV policy, push subscriptions — lives encrypted in the Durable
+# Object and is edited on the admin 设置 tab; the WebAuthn origin is captured
+# at bootstrap (docs/worker-slim.md §4).
 #
-# Empty/absent → the built-in default: `discouraged`, so approving is ONE click in
-# the platform/1Password prompt instead of a click plus a second biometric step.
-# User presence (the tap) is still mandatory and still verified server-side, and
-# the approve URL remains an unguessable 96-bit token with a 5-minute life.
-#
-# Raise it wherever you want the biometric step back — every rule and the client's
-# `vt --uv` request can only RAISE the level, never lower it:
-#
-#   APPROVAL_UV_JSON = '{"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{"prod-db":"required"}}'
-#
-# `by_op` keys are op kinds (decrypt / encrypt / auth / cache-extend / …); `by_host`
-# keys are the client-reported hostname (advisory — it may only raise). Levels are
-# `discouraged` | `preferred` | `required`. A malformed value falls back to
-# `required` everywhere, so a typo costs a prompt, never a weaker ceremony. The
-# admin cache-extension ceremony is pinned to `required` and ignores any attempt
-# here to lower it. See src/uv_policy.ts.
-APPROVAL_UV_JSON = ""
-# Cache-hit (免审批) Web Push notices. Off unless set to 1/true/on/yes — they
-# fire on every DEK-cache and agent Touch-ID-cache hit and bury the approval
-# messages that need a tap. Audit rows are written either way, so cache hits
-# stay visible on the admin audit page.
-CACHE_HIT_NOTIFY = "0"
-# Admin-requested DEK-cache extension (the「延长」buttons on the admin DEK 缓存
-# tab). Off unless set to 1/true/on/yes. A KILL SWITCH, not an authorization: even
-# when on, extending requires a fresh phone Passkey approval and may only request a
-# laddered TTL — 20m / 2h / 8h / 1d / 2d / 1w / 100 years (that last rung is
-# permanent in practice). Extension is measured from the approval (expiry becomes
-# "now + chosen TTL"), never additive, and can never revive an entry that already
-# lapsed.
-#
-# READ THIS BEFORE ENABLING. There is NO total-lifetime ceiling: an entry can be
-# renewed indefinitely, one approval at a time, and the permanent rung means an
-# entry need never expire at all. For as long as a window is open, possession of
-# VT_PASSKEY_TOKEN from the same egress IP and `pwd` decrypts those records with no
-# phone tap. What bounds this is liveness (a lapsed cache is gone for good) and the
-# fact that every hop costs a Passkey approval — not a time budget. To revoke:
-# 清除 on the tab, or rotate CACHE_SECKEY. Trim EXTEND_TTL_WHITELIST in
-# src/cache_policy.ts to remove rungs you do not want reachable, and consider
-# CACHE_HIT_NOTIFY=1 so no-tap decrypts stay visible.
-#
-# Set it HERE, not in the Cloudflare dashboard: `wrangler deploy` replaces the
-# Worker's vars with this file's [vars] block, so a dashboard-only value is
-# silently wiped on the next deploy and the feature turns itself off.
-CACHE_ADMIN_EXTEND = "0"
-
-# Secrets (wrangler secret put — never inlined):
-#   VT_AUTH_CF        32-byte base64url master. Per-host VT_PASSKEY_TOKENs are
-#                     HKDF-derived from it at enrollment (docs/host-token.md), so
-#                     rotating it invalidates every token: re-enroll each host the
-#                     same day. NEVER hand it to a host. Also the KEK over the
-#                     Durable Object's root key (passkeys, config, push
-#                     subscriptions live there, registered on /admin).
-#   CACHE_SECKEY      32-byte base64url X25519 secret key enabling the opt-in DEK
-#                     cache (approve-time TTL → 免审批解密 within IP+pwd scope).
-#                     Generate: `openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'`.
-#                     Empty/absent → caching disabled (every decrypt needs phone).
-#                     Rotate to instantly invalidate all cached DEKs. NEVER inline.
-# Notifications need no secret: phones subscribe to Web Push on the admin 推送
-# tab, and the VAPID key pair lives encrypted in the Durable Object
-# (docs/worker-slim.md §5). Upgrading from the channel builds:
-#   wrangler secret delete PUSHOVER_JSON SLACK_APP_JSON FEISHU_JSON
+# The one secret (wrangler secret put — never inlined):
+#   SECRET   32 random bytes, base64url:
+#              openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | wrangler secret put SECRET
+#            A KEK over the root key stored in the Durable Object; host tokens,
+#            admin sessions, the config blob and the DEK-cache key all derive
+#            from that root key, so this value alone opens nothing. Rotate it
+#            from the 设置 tab (轮换 SECRET), which keeps everything; setting a
+#            fresh value WITHOUT rotating is the factory reset
+#            (docs/cf-worker-deploy.md).
+# Upgrading from the VT_AUTH_CF / CREDENTIALS_JSON / CACHE_SECKEY build:
+#   wrangler secret delete VT_AUTH_CF CREDENTIALS_JSON CACHE_SECKEY

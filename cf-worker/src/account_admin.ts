@@ -10,11 +10,13 @@
 // open the DO input gate.
 
 import type { PushPayload, PushSubscription } from './types';
-import { b64uEnc, b64uDec, decodeB64uExact, hkdfSha256, isB64uString, randomBytes } from './crypto';
+import { b64uEnc, b64uDec, ctEq, decodeB64uExact, hkdfSha256, hmacSha256, isB64uString, randomBytes } from './crypto';
 import { generateVapid, sendPush, type VapidKeys } from './webpush';
 import { type CredentialEntry, parseCredentialEntry, lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
 import { mintSession, verifySession, sessionSetCookie, sessionCookieValue } from './admin_auth';
+import { deriveHostTokenSecret } from './host_token';
+import { parseUvPolicy, type UvPolicy } from './uv_policy';
 import { ADMIN_AUDIT_PATH } from './page';
 import { log, logErr } from './log';
 
@@ -54,6 +56,9 @@ interface Loaded {
   root: Uint8Array;
   kcfg: CryptoKey;
   ksess: Uint8Array;
+  /** X25519 scalar the DEK cache seals to; derived once, used only while
+   *  `cfg.cache_enabled`. */
+  kcache: Uint8Array;
   cfg: Config;
 }
 
@@ -152,8 +157,40 @@ export class AccountAdmin {
       root,
       kcfg: await aesKey(await this.derive(root, 'vt-config-key-v1')),
       ksess: await this.derive(root, 'vt-admin-session-v1'),
+      kcache: await this.derive(root, 'vt-cache-seckey-v1'),
       cfg,
     };
+  }
+
+  // ── Derivations the ceremony path reads (valid once loaded) ───────────
+
+  hostTokenSecret(tokenId: string): Promise<Uint8Array> {
+    if (!this.loaded) throw new Error('config not loaded');
+    return deriveHostTokenSecret(this.loaded.root, tokenId);
+  }
+
+  /** True when `mac_b64u` is HMAC(host token secret, signed) — the daemon body
+   *  check the edge cannot do without `R`. Constant-time; malformed → false. */
+  async verifyHostMac(tokenId: string, macB64u: unknown, signedB64u: unknown): Promise<boolean> {
+    if (!isB64uString(macB64u) || typeof signedB64u !== 'string') return false;
+    let mac: Uint8Array;
+    let signed: Uint8Array;
+    try { mac = b64uDec(macB64u); signed = b64uDec(signedB64u); } catch { return false; }
+    return ctEq(mac, await hmacSha256(await this.hostTokenSecret(tokenId), signed));
+  }
+
+  /** The cache scalar, or null while caching is off (docs/dek-cache.md). */
+  cacheSeckey(): Uint8Array | null {
+    if (!this.loaded) throw new Error('config not loaded');
+    return this.loaded.cfg.cache_enabled ? this.loaded.kcache : null;
+  }
+
+  /** The stored policy was validated on PUT, so an error here is a bug and
+   *  parseUvPolicy's strict fallback is the right answer to it. */
+  uvPolicy(): UvPolicy {
+    const { policy, error } = parseUvPolicy(this.current.uv_policy);
+    if (error) logErr('uv_policy.invalid', new Error(error));
+    return policy;
   }
 
   // ── Load ─────────────────────────────────────────────────────────────
@@ -184,8 +221,9 @@ export class AccountAdmin {
       logErr('config.unreadable', new Error('root:v1 does not unwrap under SECRET'));
       return null;
     }
-    // First success under the new SECRET ends the rotation window (§2).
-    if (rootRec.wraps.length > 1) await this.storage.put(ROOT_KEY, { wraps: [rootRec.wraps[at]!] } satisfies RootRecord);
+    // First success under the NEW SECRET (the appended wrap) ends the rotation
+    // window (§2); under the old one both wraps stay until it is deployed.
+    if (at > 0) await this.storage.put(ROOT_KEY, { wraps: [rootRec.wraps[at]!] } satisfies RootRecord);
     const kcfg = await aesKey(await this.derive(root, 'vt-config-key-v1'));
     const sealed = await this.storage.get<Sealed>(CFG_KEY);
     const pt = sealed ? await openWith(kcfg, CFG_AAD, sealed) : null;
@@ -339,6 +377,32 @@ export class AccountAdmin {
     return new Response(null, { status: 204, headers: { 'Set-Cookie': await this.cookieFor(cur) } });
   }
 
+  // ── Rotation (§2): R stays, a second wrap is appended ────────────────
+
+  /** Mint a new SECRET, wrap R under it beside the current wrap, and return
+   *  the value once for `wrangler secret put SECRET`. The first successful
+   *  load under the new SECRET drops the old wrap (loadFromStorage); a second
+   *  rotation before that replaces the pending wrap, so there are never more
+   *  than two. */
+  private rotateSecret(): Promise<Response> {
+    const run = this.queue.then(async (): Promise<Response> => {
+      const cur = await this.load();
+      if (!cur) return notConfigured();
+      const secret = b64uEnc(randomBytes(32));
+      const kek = await aesKey(await hkdfSha256(
+        new TextEncoder().encode(secret), new Uint8Array(), new TextEncoder().encode('vt-kek-v1'), 32));
+      const fresh = await sealWith(kek, ROOT_AAD, cur.root);
+      const rec = await this.storage.get<RootRecord>(ROOT_KEY);
+      if (!rec?.wraps[0]) return new Response('root missing', { status: 500 });
+      // wraps[0] is the wrap the current SECRET opened (load collapses to it).
+      await this.storage.put(ROOT_KEY, { wraps: [rec.wraps[0], fresh] } satisfies RootRecord);
+      log('admin.secret_rotated', {});
+      return json({ secret });
+    });
+    this.queue = run.catch(() => {});
+    return run;
+  }
+
   // ── Session ops (the DO verified the cookie) ─────────────────────────
 
   private async bumpEpoch(mutate?: (cfg: Config) => void): Promise<Response> {
@@ -358,6 +422,33 @@ export class AccountAdmin {
         return this.bumpEpoch();
       case 'credentials':
         return json({ credentials: cfg.credentials, epoch: cfg.epoch });
+      case 'config': {
+        const { origin, epoch, cache_enabled, cache_hit_notify, uv_policy } = cfg;
+        if (request.method !== 'PUT') return json({ origin, epoch, cache_enabled, cache_hit_notify, uv_policy });
+        let body: Record<string, unknown>;
+        try { body = (await request.json()) as Record<string, unknown>; }
+        catch { return new Response('invalid json', { status: 400 }); }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return new Response('not an object', { status: 400 });
+        for (const k of Object.keys(body)) {
+          if (!['cache_enabled', 'cache_hit_notify', 'uv_policy'].includes(k)) return new Response(`unknown key ${k}`, { status: 400 });
+        }
+        for (const k of ['cache_enabled', 'cache_hit_notify'] as const) {
+          if (k in body && typeof body[k] !== 'boolean') return new Response(`${k} must be a boolean`, { status: 400 });
+        }
+        if ('uv_policy' in body && body.uv_policy !== null) {
+          const { error } = parseUvPolicy(body.uv_policy);
+          if (error) return new Response(`uv_policy: ${error}`, { status: 400 });
+        }
+        const next = await this.write(c => {
+          if ('cache_enabled' in body) c.cache_enabled = body.cache_enabled as boolean;
+          if ('cache_hit_notify' in body) c.cache_hit_notify = body.cache_hit_notify as boolean;
+          if ('uv_policy' in body) c.uv_policy = body.uv_policy;
+        });
+        log('admin.config', { cache_enabled: next.cache_enabled, cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy !== null });
+        return json({ cache_enabled: next.cache_enabled, cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy });
+      }
+      case 'rotate-secret':
+        return this.rotateSecret();
       case 'credentials-add': {
         let entry: CredentialEntry;
         try { entry = parseCredentialEntry(((await request.json()) as { entry?: unknown }).entry); }

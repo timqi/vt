@@ -13,14 +13,15 @@
 //   out   = epk(32) || c
 // open is the symmetric inverse. The output is byte-compatible with the Rust
 // client's dryoc crypto_box_seal_open AND with the PWA's libsodium
-// crypto_box_seal, so: PWA seals to CACHE_PUBKEY → Worker opens here; Worker
-// seals to the daemon pubkey → cf.rs opens. (Chosen over libsodium-wrappers,
-// whose ESM build fails to bundle under esbuild.)
+// crypto_box_seal, so: PWA seals to the cache public key → Worker opens here;
+// Worker seals to the daemon pubkey → cf.rs opens. (Chosen over
+// libsodium-wrappers, whose ESM build fails to bundle under esbuild.)
 //
-// Threat note: CACHE_SECKEY and the opened plaintext DEKs live in the Worker
-// process for the duration of a cache op. This layer protects only against a
-// raw DO-storage dump (entries are sealed to CACHE_PUBKEY); it does NOT protect
-// against Worker compromise. See docs/dek-cache.md §2/§3.
+// Threat note: the cache scalar (HKDF of the root key, account_admin.ts) and
+// the opened plaintext DEKs live in the Worker process for the duration of a
+// cache op. This layer protects only against a raw DO-storage dump (entries
+// are sealed to the cache public key); it does NOT protect against Worker
+// compromise. See docs/dek-cache.md §2/§3.
 
 import nacl from 'tweetnacl';
 import { blake2b } from 'blakejs';
@@ -38,12 +39,9 @@ function sealNonce(epk: Uint8Array, recipientPk: Uint8Array): Uint8Array {
   return blake2b(input, undefined, BOX_NONCEBYTES);
 }
 
-/** Derive the cache X25519 public key from the 32-byte secret key (b64u).
- *  Throws if the secret is missing or malformed — callers treat that as
- *  "caching disabled". */
-export function cachePublicKey(secKeyB64u: string): Uint8Array {
-  const sk = b64uDec(secKeyB64u);
-  if (sk.length !== X25519_KEYBYTES) throw new Error('CACHE_SECKEY: wrong length');
+/** The cache X25519 public key for a 32-byte scalar. */
+export function cachePublicKey(sk: Uint8Array): Uint8Array {
+  if (sk.length !== X25519_KEYBYTES) throw new Error('cache scalar: wrong length');
   return nacl.scalarMult.base(sk);
 }
 
@@ -82,13 +80,12 @@ export function seal(plaintext: Uint8Array, recipientPk: Uint8Array): string {
   }
 }
 
-/** Open a crypto_box_seal produced for CACHE_PUBKEY. Returns null on any
- *  failure (wrong/rotated key, tamper, malformed) so callers treat it as a
- *  cache miss rather than a 500 — REQUIRED so rotating CACHE_SECKEY mid-window
+/** Open a crypto_box_seal produced for the cache public key. Returns null on
+ *  any failure (a previous root key, tamper, malformed) so callers treat it as
+ *  a cache miss rather than a 500 — REQUIRED so a factory reset mid-window
  *  degrades to misses, not an error storm (docs/dek-cache.md M3). */
-export function openToCache(sealedB64u: string, secKeyB64u: string): Uint8Array | null {
+export function openToCache(sealedB64u: string, sk: Uint8Array): Uint8Array | null {
   try {
-    const sk = b64uDec(secKeyB64u);
     if (sk.length !== X25519_KEYBYTES) return null;
     const pk = nacl.scalarMult.base(sk);
     const c = b64uDec(sealedB64u);

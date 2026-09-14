@@ -27,14 +27,21 @@ TTL, a caller can decrypt the approved records without another phone tap.
   so `opDekCache`'s read check, the alarm sweep, `audit.cache_expires_ms`, and the
   admin countdown all stay on their normal code path — expiry logic is where a
   missed special case becomes a cache that outlives its revocation. Nothing revokes
-  such an entry but an explicit admin clear or rotating `CACHE_SECKEY`, it is never
+  such an entry but an explicit admin clear or a factory reset, it is never
   swept, and there is no expiry to prompt a future review; pair it with
-  `CACHE_HIT_NOTIFY = "1"` so each no-tap decrypt stays visible somewhere. The UI
+  缓存命中时推送通知 (`cache_hit_notify`) so each no-tap decrypt stays visible
+  somewhere. The UI
   renders it with the ordinary duration formatter (`36500 天`) rather than a special
   "permanent" label, so no reader has to trust a word over a number.
-- Caching is enabled only when the Worker secret `CACHE_SECKEY` is configured.
-  There is no `VT_DEK_CACHE` environment variable and no separate client-side
-  no-cache flag.
+- Caching is enabled only by the 设置 tab's 启用 DEK 缓存 switch
+  (`config.cache_enabled`, off by default; [worker-slim.md](worker-slim.md)
+  §4). The X25519 scalar entries are sealed to is
+  `HKDF(R, "vt-cache-seckey-v1")` of the Durable Object's root key
+  (`AccountAdmin.cacheSeckey`), so it exists whether caching is on or off and
+  nothing rotates it but a factory reset. Turning caching off makes every
+  probe a miss and every approval page offer `不缓存` only; it deletes nothing
+  (清除全部 does). There is no `VT_DEK_CACHE` environment variable and no
+  separate client-side no-cache flag.
 - A cache key is `dek:{token_id}:{project_h}:{salt_b64u}`. `token_id` is the
   host token the edge verified on the request ([host-token.md](host-token.md))
   and the **hard boundary**: a grant serves only the host that earned it, from
@@ -74,10 +81,9 @@ TTL, a caller can decrypt the approved records without another phone tap.
 - Each write mints one `cache_group_id` (all entries from one approval under one
   key prefix) and stamps an immutable `created_ms`. The group id is the handle
   the admin surface lists, clears, and extends by.
-- A hit sends a best-effort Web Push notice (`CACHE_HIT_NOTIFY = "1"`) to every
-  phone subscribed on the admin 推送 tab — tag `cache:<host>`, TTL 1 h, opening
-  the audit tab. Notifications never block DEK delivery and contain no approval
-  URL.
+- A hit sends a best-effort Web Push notice (`cache_hit_notify`, 设置 tab) to
+  every phone subscribed there — tag `cache:<host>`, TTL 1 h, opening the audit
+  tab. Notifications never block DEK delivery and contain no approval URL.
 
 ## Data flow
 
@@ -94,9 +100,9 @@ later vt read/inject
              CLI verifies source=cache and decrypts locally
 ```
 
-The cache public key is derived at runtime from `CACHE_SECKEY`. The Worker
-uses `tweetnacl` + `blakejs` for the sealed-box compatibility layer; the Rust
-client opens the result with the existing sealed-box implementation.
+The cache public key is derived at runtime from the root-key scalar. The
+Worker uses `tweetnacl` + `blakejs` for the sealed-box compatibility layer; the
+Rust client opens the result with the existing sealed-box implementation.
 
 ## Client network bounds
 
@@ -154,10 +160,11 @@ paths — exhaustive by contract".
 
 ### Extension contract
 
-Extension is off by default (`CACHE_ADMIN_EXTEND`, a kill switch — not an
-authorization). When enabled, an admin selects groups and a TTL and presses
-延长; the Worker then only **mints a pending ceremony**. Nothing expires later
-until a Passkey approves it, and every one of these holds:
+Extension is offered iff caching is enabled (`cache_enabled` — a switch, not
+an authorization; the former `CACHE_ADMIN_EXTEND` knob is gone). An admin
+selects groups and a TTL and presses 延长; the Worker then only **mints a
+pending ceremony**. Nothing expires later until a Passkey approves it, and
+every one of these holds:
 
 1. **Passkey required.** The intent (group ids, TTL, requester) is written onto
    the challenge at request time and never mutated, so the approval finalizes
@@ -205,16 +212,17 @@ until a Passkey approves it, and every one of these holds:
 Residual gap, stated plainly: the approver reads the intent as rendered by the
 Worker, and the assertion covers the challenge rather than a hash of the
 displayed text. A compromised Worker could therefore show one intent and hold
-another — but a compromised Worker already holds `CACHE_SECKEY` and can read
+another — but a compromised Worker already holds the cache scalar and can read
 cached DEKs outright, so this adds no new capability to that adversary. Against
 the adversary the gate is actually for — someone holding only an admin session
 cookie — the Passkey requirement is decisive.
 
 ## Security boundary
 
-`CACHE_SECKEY` is present in the Worker process and protects cached entries if
-Durable Object storage is copied without the running Worker. It does not
-protect against a compromised Worker. `VT_PASSKEY_TOKEN` is the request
+The cache scalar is derived from `R` in the Durable Object and protects cached
+entries if Durable Object storage is copied without `SECRET` (the entries are
+sealed boxes; `R` at rest is wrapped under `SECRET`). It does not protect
+against a compromised Worker. `VT_PASSKEY_TOKEN` is the request
 credential and the cache key's hard half; when a cache entry is live,
 possession of that token and the same reported `project` is sufficient to
 obtain the cached DEK, from any egress IP. Since tokens are per host
@@ -234,9 +242,9 @@ record as a signal worth reviewing. `8h` is a
 workday-session choice for an attended desktop only: for its whole window,
 possession of `VT_PASSKEY_TOKEN` and the same reported `project` decrypts the
 approved records with no phone tap, so do not select it on shared, unattended,
-or CI hosts. Rotate
-`CACHE_SECKEY` or use the admin clear-cache action for emergency invalidation.
-The cache does not re-key existing `vt://` records.
+or CI hosts. Use the admin clear-cache action for emergency invalidation (a
+factory reset also orphans every entry). The cache does not re-key existing
+`vt://` records.
 
 ## Implementation map
 
@@ -251,25 +259,26 @@ The cache does not re-key existing `vt://` records.
 | CLI cache request, `project` collection, and source check | `src/cf.rs`, `src/client.rs` |
 | Admin cache inventory / clear / extend UI | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/cache.js` |
 | Admin audit cache column + per-row clear | `cf-worker/pwa/admin/audit.js` |
-| Deployment secret and rotation | [`cf-worker-deploy.md`](cf-worker-deploy.md) |
+| Cache switch, hit-notify switch, root-key scalar | `cf-worker/src/account_admin.ts` (`Config`, `cacheSeckey`), 设置 tab in `cf-worker/pwa/admin/settings.js` |
+| Deployment, secret rotation, reset | [`cf-worker-deploy.md`](cf-worker-deploy.md) |
 
 ## Verification
 
-1. Deploy a Worker with `CACHE_SECKEY` configured.
+1. Deploy and bootstrap a Worker; turn on 启用 DEK 缓存 on the 设置 tab.
 2. Read a `vt://` record and select `20m` on the approval page.
 3. Read the same record again from the same host inside the same repository
    (any worktree, any egress IP); the second read should not open a phone
    ceremony.
 4. Check the admin audit page for the cache grant and hit.
 5. Open the admin `DEK 缓存` tab: the entry group appears with its remaining time.
-6. With `CACHE_ADMIN_EXTEND = "1"`, select the group and press 延长. First pick a
+6. Select the group and press 延长. First pick a
    duration SHORTER than the time remaining and confirm the button is disabled and
    the note names a usable rung — extension is absolute, so a shorter rung is a
    no-op by definition. Then pick a longer one, approve on a Passkey, and confirm
    the remaining time jumps to `批准时刻 + 时长` and two audit rows appear
    (`cache-extend` approved + `缓存已延长`). Let a cache lapse and confirm it can no
    longer be extended at all — only a fresh phone approval arms a new one.
-7. Rotate `CACHE_SECKEY` or clear the cache, then confirm the next read returns
+7. Clear the cache (or turn caching off), then confirm the next read returns
    to the phone ceremony.
 
 For implementation changes, run the focused Rust/Worker tests and then the

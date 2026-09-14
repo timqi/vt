@@ -4,17 +4,16 @@
 //
 // A host token is `vt1.<token_id>.<secret_b64u>`:
 //   token_id = b64u(12 random bytes)                          (16 chars, public)
-//   secret   = HKDF-SHA256(ikm=VT_AUTH_CF, salt=token_id, info="vt-host-token-v1", 32)
+//   secret   = HKDF-SHA256(ikm=R, salt=token_id, info="vt-host-token-v1", 32)
 //
-// Deriving the secret from the master (the same trick /api/audit-ingest uses)
-// keeps HMAC verification STATELESS at the edge: the Worker reads the token_id
-// from the `VT-Token-Id` header, re-derives the key, and checks the body HMAC
-// before any Durable Object round-trip. Liveness (expiry, revocation, sliding
-// window) is the DO's job — see AccountTokens.touch. The master itself never
-// leaves the Worker; a host only ever holds its own derived secret.
+// R is the root key that lives only in the Durable Object (account_admin.ts),
+// so the body HMAC is verified there: the edge checks the header syntax and
+// caps the body, the DO re-derives the secret and compares before touching the
+// token (AccountAdmin.verifyHostMac, AccountTokens.touch). Nothing but the
+// token_id is stored; a host only ever holds its own derived secret.
 //
-// The Rust side mirrors this in src/cf.rs (`WorkerAuth::parse`) — the two MUST
-// derive the identical secret, pinned by a golden vector in both test suites.
+// The Rust side parses the same string in src/cf.rs (`WorkerAuth::parse`);
+// the derivation is pinned by a golden vector in test/host_token.test.ts.
 
 import { b64uEnc, hkdfSha256, randomBytes } from './crypto';
 
@@ -35,14 +34,13 @@ export function mintTokenId(): string {
   return b64uEnc(randomBytes(12));
 }
 
-export async function deriveHostTokenSecret(master: string, tokenId: string): Promise<Uint8Array> {
+export async function deriveHostTokenSecret(root: Uint8Array, tokenId: string): Promise<Uint8Array> {
   const enc = new TextEncoder();
-  return hkdfSha256(enc.encode(master), enc.encode(tokenId), enc.encode(HOST_TOKEN_INFO), 32);
+  return hkdfSha256(root, enc.encode(tokenId), enc.encode(HOST_TOKEN_INFO), 32);
 }
 
 /** The string a host stores as VT_PASSKEY_TOKEN. */
-export async function formatHostToken(master: string, tokenId: string): Promise<string> {
-  const secret = await deriveHostTokenSecret(master, tokenId);
+export function formatHostToken(tokenId: string, secret: Uint8Array): string {
   return `${HOST_TOKEN_PREFIX}${tokenId}.${b64uEnc(secret)}`;
 }
 

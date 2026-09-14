@@ -44,10 +44,9 @@ export async function hmacSha256(keyBytes: Uint8Array, data: Uint8Array): Promis
   return new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
 }
 
-// HKDF-SHA256 (RFC 5869, extract + expand). Used to derive the per-agent audit
-// key from VT_AUTH_CF: hkdfSha256(VT_AUTH_CF, agent_id, "vt-agent-audit-v1", 32).
-// MUST match the Rust `derive_agent_audit_key` (src/audit.rs) — both feed the
-// same ikm/salt/info, so a row signed by the agent verifies here.
+// HKDF-SHA256 (RFC 5869, extract + expand). Every key the Worker derives from
+// the root key (host tokens, K_cfg, K_sess, the cache scalar) and the KEK from
+// SECRET go through here (account_admin.ts, host_token.ts).
 export async function hkdfSha256(
   ikm: Uint8Array, salt: Uint8Array, info: Uint8Array, len: number,
 ): Promise<Uint8Array> {

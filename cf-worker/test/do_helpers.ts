@@ -16,17 +16,17 @@
 // credential for anything, anywhere.
 
 import { env, runInDurableObject } from 'cloudflare:test';
-import { b64uEnc, b64uDec, sha256 } from '../src/crypto';
+import { b64uEnc, b64uDec, hmacSha256, sha256 } from '../src/crypto';
 import { seal, cachePublicKey } from '../src/cache_crypto';
 import { sessionCookieValue, SESSION_COOKIE } from '../src/admin_auth';
-import type { CacheEntry, Challenge, ChallengeMeta } from '../src/types';
+import { AccountAdmin } from '../src/account_admin';
+import { AccountNotifications } from '../src/account_notifications';
+import { AccountCache } from '../src/account_cache';
+import type { CacheEntry, Challenge, ChallengeMeta, DaemonAuth } from '../src/types';
 
 // ── DO access ──────────────────────────────────────────────────────────────
 
-export const testEnv = env as unknown as {
-  ACCOUNT: DurableObjectNamespace;
-  CACHE_SECKEY: string;
-};
+export const testEnv = env as unknown as { ACCOUNT: DurableObjectNamespace };
 
 /** The origin `bootstrap()` registers: WebAuthn origin, RP id source and
  *  approve-URL base for every test. */
@@ -53,12 +53,48 @@ export function inDO<T>(fn: (h: DoHandle) => T | Promise<T>): Promise<T> {
   ) as Promise<T>;
 }
 
-/** Set a var on the DO's OWN env. The `env` the test file sees is a different
- *  object from the one the DO was constructed with, so a kill-switch test has to
- *  reach inside. Tests reset this in beforeEach — the DO instance (unlike its
- *  storage) is reused across tests in a file. */
-export async function setDoVar(name: string, value: string): Promise<void> {
-  await inDO(({ inst }) => { inst.env[name] = value; });
+/** Set config knobs (cache_enabled, cache_hit_notify, uv_policy) through the
+ *  real PUT op with the session bootstrap() minted. */
+export async function configure(partial: Record<string, unknown>): Promise<void> {
+  const res = await accountStub().fetch('https://account.do/op/admin-config', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json', ...adminHeaders() }, body: JSON.stringify(partial),
+  });
+  await res.text();
+  if (res.status !== 200) throw new Error(`configure: ${res.status}`);
+}
+
+/** What a redeploy with another SECRET does to the singleton: a fresh
+ *  AccountAdmin (and the two collaborators that hold it) over the same
+ *  storage, mirroring the AccountDO constructor. */
+export function redeployWithSecret(secret: string): Promise<void> {
+  return inDO(({ inst }) => {
+    inst.admin = new AccountAdmin(inst.ctx.storage, secret);
+    inst.notifications = new AccountNotifications(inst.ctx, inst.admin);
+    inst.cache = new AccountCache(inst.ctx.storage, () => inst.admin.cacheSeckey());
+  });
+}
+
+/** The DEK-cache scalar of this test's root key (null while caching is off). */
+export function cacheSeckey(): Promise<Uint8Array> {
+  return inDO(({ inst }) => {
+    const sk = inst.admin.cacheSeckey() as Uint8Array | null;
+    if (!sk) throw new Error('cache disabled — configure({ cache_enabled: true }) first');
+    return sk;
+  });
+}
+
+/** The secret a host holding `tokenId` would present, derived from this
+ *  test's root key exactly as the DO does. */
+export function hostSecret(tokenId: string): Promise<Uint8Array> {
+  return inDO(({ inst }) => inst.admin.hostTokenSecret(tokenId));
+}
+
+/** What the edge forwards for a daemon body: the token, the MAC the host
+ *  computed over `signed`, and those bytes. The DO ops verify it before
+ *  anything else, so every direct `create` / `dek-cache` fixture carries one. */
+export async function daemonAuth(tokenId: string, signed = '{}'): Promise<DaemonAuth> {
+  const raw = new TextEncoder().encode(signed);
+  return { token_id: tokenId, mac_b64u: b64uEnc(await hmacSha256(await hostSecret(tokenId), raw)), signed_b64u: b64uEnc(raw) };
 }
 
 // ── Admin session ──────────────────────────────────────────────────────────
@@ -107,16 +143,16 @@ export function nextSalt(): string {
 }
 
 /** A sealed blob writeCache/opDekCache will accept: crypto_box_seal of a 32-byte
- *  fake DEK to the public key derived from the fixture CACHE_SECKEY. */
-export function sealFakeDek(fill = 7): string {
+ *  fake DEK to the cache public key of this test's root key. */
+export async function sealFakeDek(fill = 7): Promise<string> {
   const dek = new Uint8Array(32).fill(fill);
-  return seal(dek, cachePublicKey(testEnv.CACHE_SECKEY));
+  return seal(dek, cachePublicKey(await cacheSeckey()));
 }
 
-export function makeEntry(over: Partial<CacheEntry> = {}): CacheEntry {
+export async function makeEntry(over: Partial<CacheEntry> = {}): Promise<CacheEntry> {
   const now = Date.now();
   return {
-    sealed_to_cache_b64u: sealFakeDek(),
+    sealed_to_cache_b64u: await sealFakeDek(),
     expires_ms: now + 60_000,
     origin_token_id: 'origin0000000000',
     ip: '203.0.113.9',
@@ -139,7 +175,7 @@ export async function seedGroup(
   n: number,
   over: Partial<CacheEntry> = {},
 ): Promise<string[]> {
-  const entry = makeEntry(over);
+  const entry = await makeEntry(over);
   const keys: string[] = [];
   for (let i = 0; i < n; i++) {
     const key = `dek:${FAKE_CTX}:${nextSalt()}`;

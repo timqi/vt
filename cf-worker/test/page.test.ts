@@ -67,6 +67,47 @@ describe('cache creation time rendering', () => {
   });
 });
 
+// No browser here: the shell scripts are loaded into a stub DOM to prove they
+// parse, register their entry points, and only look up ids the shell declares.
+// Real WebAuthn, cookies and the installed PWA are checked by hand
+// (docs/design/ui-ux.md § Validation).
+describe('admin shell scripts against the shell markup', () => {
+  const html = pwa('admin/admin.html');
+  const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]));
+
+  it('declares every id the setup, settings and shell scripts query', () => {
+    for (const js of ['admin/admin.js', 'admin/setup.js', 'admin/settings.js']) {
+      // `'tab-' + key` builds panel ids; the literal ones are what matter here.
+      const wanted = [...pwa(js).matchAll(/(?:\$\(|getElementById\()'#?([a-z][a-z0-9-]*[a-z0-9])'/g)].map(m => m[1]);
+      const missing = wanted.filter(id => !ids.has(id));
+      expect(missing, js).toEqual([]);
+    }
+  });
+
+  it('registers the three shell states and the API base', () => {
+    class Element {
+      hidden = false; textContent = ''; className = ''; innerHTML = ''; value = '';
+      classList = { add() {}, toggle() {} };
+      appendChild() {} setAttribute() {} removeAttribute() {} addEventListener() {}
+      querySelector() { return new Element(); } querySelectorAll() { return []; }
+    }
+    const context: Record<string, unknown> = {
+      location: { pathname: '/admin', hash: '' },
+      document: { getElementById: () => new Element(), createElement: () => new Element(), addEventListener() {}, body: new Element() },
+      addEventListener() {}, TextEncoder, crypto, console,
+    };
+    context.window = context;
+    for (const js of ['common.js', 'admin/admin.js', 'admin/setup.js', 'admin/settings.js']) runInNewContext(pwa(js), context);
+    const vt = context.vt as { api: (p: string) => string; views: Record<string, unknown>; tabs: Record<string, unknown>; showLogin: unknown; apiFetch: unknown };
+    expect(vt.api('credentials')).toBe('/api/admin/credentials');
+    expect(typeof vt.views.setup).toBe('function');
+    expect(typeof vt.tabs.setup).toBe('function');
+    expect(typeof vt.tabs.settings).toBe('function');
+    expect(typeof vt.showLogin).toBe('function');
+    expect(typeof vt.apiFetch).toBe('function');
+  });
+});
+
 describe('renderTemplate', () => {
   it('substitutes every occurrence of a placeholder', () => {
     expect(renderTemplate('a{{X}}b{{X}}c', { X: '-' })).toBe('a-b-c');

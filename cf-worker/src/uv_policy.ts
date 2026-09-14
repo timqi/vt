@@ -1,6 +1,6 @@
 // WebAuthn user-verification (UV) policy for APPROVAL ceremonies — the pure,
-// testable half. The ceremony plumbing lives in index.ts (challenge creation)
-// and do_account.ts (page data + assertion verification).
+// testable half. The ceremony plumbing lives in do_account.ts (opCreate decides
+// the level, page data + assertion verification read it back).
 //
 // Registration is NOT covered here: enrolling a credential stays
 // `userVerification: 'required'` in pwa/admin/setup.js. This module decides only
@@ -50,7 +50,7 @@ export function maxUvLevel(a: UvLevel, b: UvLevel): UvLevel {
   return RANK[b] > RANK[a] ? b : a;
 }
 
-/** Server-side approval policy, parsed from APPROVAL_UV_JSON. */
+/** Server-side approval policy, parsed from `config.uv_policy`. */
 export interface UvPolicy {
   /** Applies to every approval ceremony. */
   default: UvLevel;
@@ -61,7 +61,7 @@ export interface UvPolicy {
   byHost: Record<string, UvLevel>;
 }
 
-/** What a deployment gets with APPROVAL_UV_JSON unset. */
+/** What a deployment gets with `uv_policy: null`. */
 export function defaultUvPolicy(): UvPolicy {
   return { default: DEFAULT_APPROVAL_UV, byOp: {}, byHost: {} };
 }
@@ -76,26 +76,24 @@ function levelMap(v: unknown): Record<string, UvLevel> {
   return out;
 }
 
-/** Parse the APPROVAL_UV_JSON var:
+/** Parse the `uv_policy` object of the config blob (docs/worker-slim.md §4.1),
+ *  the same shape the 设置 tab PUTs:
  *
  *    {"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{"prod":"required"}}
  *
- *  Absent/empty → the default policy, no error. MALFORMED → `required`
- *  everywhere plus an error the caller logs: a typo must not silently read as
- *  "ask for less", and the strict fallback is exactly the pre-policy behaviour,
- *  so the operator sees the extra biometric step and goes looking.
+ *  `null`/absent → the default policy, no error. MALFORMED → `required`
+ *  everywhere plus an error: the PUT refuses it, and a stored one (a bug)
+ *  reads as the strict pre-policy behaviour, never as "ask for less".
  *
  *  Unknown keys and unparseable levels inside a well-formed object are dropped
  *  rather than fatal — one bad op name cannot take the whole policy strict. */
-export function parseUvPolicy(raw: string | undefined): {
+export function parseUvPolicy(obj: unknown): {
   policy: UvPolicy;
   error: string | null;
 } {
-  if (!raw || !raw.trim()) return { policy: defaultUvPolicy(), error: null };
+  if (obj === null || obj === undefined) return { policy: defaultUvPolicy(), error: null };
   const strict: UvPolicy = { default: 'required', byOp: {}, byHost: {} };
-  let obj: unknown;
-  try { obj = JSON.parse(raw); } catch { return { policy: strict, error: 'invalid JSON' }; }
-  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+  if (typeof obj !== 'object' || Array.isArray(obj)) {
     return { policy: strict, error: 'not an object' };
   }
   const o = obj as Record<string, unknown>;

@@ -5,46 +5,17 @@ import type { UvLevel } from './uv_policy';
 export interface Env {
   ACCOUNT: DurableObjectNamespace;
   ASSETS: Fetcher;
-  /** Worker master. Host tokens are HKDF-derived from it (host_token.ts) and
-   *  the agent audit key too; it is never accepted directly as a daemon key.
-   *  Also the KEK over the root key (account_admin.ts). */
-  VT_AUTH_CF: string;
+  /** The one Wrangler secret: a KEK over the root key `R` stored in the
+   *  Durable Object (account_admin.ts, docs/worker-slim.md §2). Every other
+   *  key — host tokens, admin sessions, the config blob, the cache scalar —
+   *  derives from `R`, so this value alone opens nothing. Never logged, never
+   *  sent to a host or a browser. */
+  SECRET: string;
   /** Workers Rate Limiting binding shared by the unauthenticated POSTs: enroll
    *  (`enroll:<ip>`), admin bootstrap and login-challenge (`login:<ip>`).
    *  Absent → those routes refuse (503): an endpoint that can page the phone or
    *  mint a session must never run unthrottled. */
-  ENROLL_LIMITER?: RateLimit;
-  /**
-   * base64url 32-byte X25519 secret key for the opt-in DEK cache. The PWA seals
-   * each cached DEK to the matching public key (derived at runtime via
-   * crypto_scalarmult_base, so operators configure ONE secret and cannot mismatch
-   * the pair); the Worker opens it on a cache hit and re-seals to the requester's
-   * ephemeral pubkey. Empty/absent → DEK caching is disabled and every decrypt
-   * requires a phone approval (the historical behaviour). NEVER logged. */
-  CACHE_SECKEY: string;
-  /** "1" | "true" | "on" | "yes" → Web Push the 免审批 cache-hit notices.
-   *  Anything else, including absent, keeps them off: a cache hit can fire many
-   *  times a minute and the stream buries the approval messages that need a
-   *  human. The audit row is written regardless, so cache hits remain fully
-   *  visible on the admin audit page. */
-  CACHE_HIT_NOTIFY?: string;
-  /** "1" | "true" | "on" | "yes" → the admin cache tab may REQUEST a DEK-cache
-   *  extension. A kill switch, NOT an authorization: even when on, extending
-   *  requires a fresh phone Passkey ceremony (see docs/dek-cache.md §extend), is
-   *  bounded per-hop by EXTEND_TTL_WHITELIST and can never resurrect a lapsed
-   *  entry. Total lifetime is unbounded — every hop needs its own approval. Off by
-   *  default so a deployment that never wants the capability simply does not
-   *  have it (the routes 404 and the UI hides the controls). */
-  CACHE_ADMIN_EXTEND?: string;
-  /** JSON: {"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{…}}.
-   *  Server-side WebAuthn user-verification policy for APPROVAL ceremonies only
-   *  (registration stays `required`). Empty/absent → the built-in default
-   *  (`discouraged`, so the common approval is one click in the passkey prompt);
-   *  malformed → `required` everywhere, i.e. the pre-policy behaviour. Every rule
-   *  and the client's request can only RAISE the level. See uv_policy.ts. */
-  APPROVAL_UV_JSON?: string;
-  WORKER_ORIGIN: string;
-  RP_ID: string;
+  LIMITER?: RateLimit;
 }
 
 // ── Audit (DO SQLite) ──────────────────────────────────────────────────────
@@ -328,7 +299,7 @@ export interface CacheListResponse {
   /** True when the scan hit its cap — some groups are NOT shown. Never silently
    *  truncate: the UI must say so, and 清除全部 still covers everything. */
   truncated: boolean;
-  /** Whether extension requests are enabled (CACHE_ADMIN_EXTEND). */
+  /** Whether extension requests are offered (`config.cache_enabled`). */
   extend_enabled: boolean;
   /** TTL options (seconds) an extension may request. */
   ttl_options_s: number[];
@@ -478,7 +449,7 @@ export interface ApprovePageData {
    *  includes 0 ("不缓存", the default). Empty (only [0]) when caching disabled. */
   cache_options_s: number[];
   /** base64url 32-byte X25519 public key the PWA seals cached DEKs to. Empty
-   *  string when CACHE_SECKEY is unset (caching disabled — PWA hides the UI). */
+   *  string while caching is disabled (PWA hides the UI). */
   cache_pubkey_b64u: string;
   /** Enrollment ceremonies only: the pairing code the approver compares with
    *  the requesting terminal before approving. */
@@ -491,7 +462,7 @@ export interface ApprovePageData {
 // ── DEK cache (opt-in, token+project-scoped) ───────────────────────────────
 
 /** Inbound from daemon via POST /api/dek-cache — the fast path tried before a
- *  ceremony. HMAC(VT_AUTH_CF)-gated like /api/challenge. */
+ *  ceremony. Host-token HMAC-gated like /api/challenge. */
 export interface DekCacheRequest {
   daemon_pubkey_b64u: string;
   /** salts to look up; empty array is rejected (returns miss). */
@@ -515,7 +486,7 @@ export type DekCacheResponse =
  *  where project_h = b64u(SHA-256("vt-dek-ctx-v5" || project)[0..16]); see
  *  docs/dek-cache.md. */
 export interface CacheEntry {
-  /** crypto_box_seal(DEK_raw, CACHE_PUBKEY) — Worker opens with CACHE_SECKEY. */
+  /** crypto_box_seal(DEK_raw, cache public key) — the Worker opens it with the root-key scalar. */
   sealed_to_cache_b64u: string;
   expires_ms: number;
   /** audit: which approval (audit token_id) wrote this entry. */
@@ -594,9 +565,9 @@ export interface AgentAuditIngestRequest {
   entry: AgentAuditEntry;
 }
 
-/** Internal DO op for /op/audit-ingest. The Worker has already verified the
- *  HMAC, capped `meta` (forcing `ip` from CF-Connecting-IP), and bounded the
- *  scalars. The DO inserts a row with source='agent'. */
+/** Internal DO op for /op/audit-ingest. The Worker has capped `meta` (forcing
+ *  `ip` from CF-Connecting-IP) and bounded the scalars; the DO verifies the
+ *  agent's host-token HMAC (`auth`) and inserts a row with source='agent'. */
 export interface DoAuditIngestOp {
   token_id: string;
   outcome: string;
@@ -616,19 +587,29 @@ export interface DoAuditIngestOp {
   grant_ttl_s: number | null;
   /** SQLite has no bool: 0 | 1 | null. */
   relayed: number | null;
-  /** Host token the agent signed with (`agent_id = t:<token_id>`); the DO
-   *  refuses the row when it is revoked/expired. Absent = legacy master key. */
-  token_id_host?: string;
+  /** The host token the agent signed with (`agent_id = t:<token_id>`), the
+   *  MAC and the bytes it covers; the DO refuses the row when the MAC fails or
+   *  the token is revoked/expired. */
+  auth: DaemonAuth;
 }
 
 // ── Internal DO op bodies ──────────────────────────────────────────────────
 
+/** What the edge forwards for a daemon body it could only check the shape of:
+ *  the token id from `VT-Token-Id`, the MAC from `Authorization`, and the exact
+ *  bytes it covered. The DO derives the token secret from the root key and
+ *  compares before it touches the token or stores anything. */
+export interface DaemonAuth {
+  token_id: string;
+  mac_b64u: string;
+  signed_b64u: string;
+}
+
 export interface DoCreateOp {
   challenge: Challenge;
-  /** Host token the daemon authenticated with (HMAC already verified at the
-   *  edge). The DO checks liveness, slides expiry, and overwrites
-   *  `challenge.meta.host` / `user` from the record. */
-  token_id: string;
+  /** The CLI's `--uv` request (raise-only input to the stored level). */
+  uv_request: unknown;
+  auth: DaemonAuth;
 }
 
 export interface DoApproveOp {
@@ -651,8 +632,7 @@ export interface DoDekCacheOp {
   daemon_pubkey_b64u: string;
   salts_b64u: string[];
   meta: ChallengeMeta;
-  /** See DoCreateOp.token_id. */
-  token_id: string;
+  auth: DaemonAuth;
 }
 
 /** Internal DO op for POST /api/admin/cache-extend-request. The DO verified the

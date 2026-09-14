@@ -1,9 +1,10 @@
 'use strict';
 
-// 设置 tab: the session (logout / 退出所有会话) and push subscriptions — this
-// device subscribes with the Worker's VAPID key and posts the result; every
-// row can be tested or removed. Rendering is textContent only; the endpoint's
-// keys never come back from the server.
+// 设置 tab: the session (logout / 退出所有会话), the config knobs (cache,
+// hit notify, UV policy — GET/PUT /api/admin/config), SECRET rotation, and push
+// subscriptions — this device subscribes with the Worker's VAPID key and posts
+// the result; every row can be tested or removed. Rendering is textContent
+// only; the endpoint's keys never come back from the server.
 
 vt.tabs.settings = function (panel) {
   var $ = function (sel) { return panel.querySelector(sel); };
@@ -19,6 +20,59 @@ vt.tabs.settings = function (panel) {
     return resp.json();
   }
 
+  // ── Config ────────────────────────────────────────────────────────────────
+  var cfgStatus = vt.statusLine($('#cfg-status'));
+
+  async function loadConfig() {
+    var resp = await vt.apiFetch(vt.api('config'), { headers: { 'Accept': 'application/json' } });
+    if (!resp.ok) { cfgStatus('读取配置失败 HTTP ' + resp.status, 'error'); return; }
+    var c = await resp.json();
+    $('#cfg-cache').checked = !!c.cache_enabled;
+    $('#cfg-hit-notify').checked = !!c.cache_hit_notify;
+    $('#cfg-uv').value = c.uv_policy == null ? '' : JSON.stringify(c.uv_policy);
+  }
+
+  $('#cfg-save').addEventListener('click', async function () {
+    var btn = this; btn.disabled = true;
+    try {
+      var raw = $('#cfg-uv').value.trim();
+      var uv = null;
+      if (raw) {
+        try { uv = JSON.parse(raw); } catch (e) { cfgStatus('UV 策略不是合法 JSON', 'error'); return; }
+      }
+      var resp = await vt.apiFetch(vt.api('config'), {
+        method: 'PUT', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ cache_enabled: $('#cfg-cache').checked, cache_hit_notify: $('#cfg-hit-notify').checked, uv_policy: uv }),
+      });
+      if (!resp.ok) { cfgStatus('保存失败：' + (await resp.text()), 'error'); return; }
+      cfgStatus('已保存', 'ok');
+      await loadConfig();
+    } finally { btn.disabled = false; }
+  });
+
+  // ── SECRET rotation ───────────────────────────────────────────────────────
+  var rotateStatus = vt.statusLine($('#rotate-status'));
+  $('#rotate-secret').addEventListener('click', async function () {
+    if (!confirm('生成新的 SECRET？需要随后执行 wrangler secret put SECRET。')) return;
+    var btn = this; btn.disabled = true;
+    try {
+      var resp = await vt.postJson('rotate-secret');
+      if (!resp.ok) { rotateStatus('轮换失败 HTTP ' + resp.status, 'error'); return; }
+      $('#rotate-value').value = (await resp.json()).secret;
+      $('#rotate-output').hidden = false;
+      rotateStatus('已生成，请立即部署', 'ok');
+    } finally { btn.disabled = false; }
+  });
+  $('#rotate-copy').addEventListener('click', function () {
+    var ta = $('#rotate-value');
+    ta.select();
+    navigator.clipboard.writeText(ta.value).then(
+      function () { rotateStatus('已复制到剪贴板', 'ok'); },
+      function () { rotateStatus('复制失败，请手动选择文本', 'error'); }
+    );
+  });
+
+  // ── Session ───────────────────────────────────────────────────────────────
   $('#logout').addEventListener('click', async function () {
     await vt.postJson('logout');
     vt.showLogin('已退出登录');
@@ -129,5 +183,6 @@ vt.tabs.settings = function (panel) {
   }
 
   $('#subscribe').addEventListener('click', subscribe);
+  loadConfig();
   init();
 };

@@ -6,11 +6,10 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { AccountAdmin } from '../src/account_admin';
 import { AccountNotifications } from '../src/account_notifications';
 import { b64uEnc } from '../src/crypto';
-import type { Challenge, Env } from '../src/types';
+import type { Challenge } from '../src/types';
 
 const SECRET = 'synthetic-test-kek';
 const ORIGIN = 'https://vt.test.invalid';
-const ENV = { CACHE_HIT_NOTIFY: '' } as Env;
 const ENTRY = { h: 'L0JnHXnwlzt3HXjLqjzbrgit2WcsVKLQIAFOIdeGB3s', i: 'aWQ', k: 'a2V5', p: 'cHVi', l: 'unit', t: 1 };
 
 function fakeStorage(map = new Map<string, unknown>()) {
@@ -135,7 +134,7 @@ describe('push fan-out', () => {
 
     const tasks: Promise<unknown>[] = [];
     const notifications = new AccountNotifications(
-      { waitUntil: (t: Promise<unknown>) => { tasks.push(t); } }, ENV, admin);
+      { waitUntil: (t: Promise<unknown>) => { tasks.push(t); } }, admin);
     const posted: string[] = [];
     vi.stubGlobal('fetch', async (url: string) => {
       posted.push(url);
@@ -157,7 +156,7 @@ describe('push fan-out', () => {
     const tasks: Promise<unknown>[] = [];
     const notifications = new AccountNotifications(
       { waitUntil: (t: Promise<unknown>) => { tasks.push(t); } },
-      ENV, await configured());
+      await configured());
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
     notifications.approval(challenge());

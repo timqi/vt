@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { SELF } from 'cloudflare:test';
 import type { CacheEntry, Challenge } from '../src/types';
 import {
-  inDO, seedGroup, readEntries, setDoVar, doPost, approve, makeMeta, sealFakeDek,
+  inDO, seedGroup, readEntries, configure, doPost, approve, makeMeta, sealFakeDek,
   auditRows, bootstrap, adminHeaders, DoHandle, DoResult,
 } from './do_helpers';
 
@@ -25,9 +25,9 @@ const TTL_2D = 2 * 24 * 3600;
 const TTL_1W = 7 * 24 * 3600;
 const TTL_PERMANENT = 100 * 365 * 24 * 3600;
 
-// The kill switch is a per-instance env read and the DO instance outlives a
-// single test, so put it back to its wrangler.test.toml default every time.
-beforeEach(async () => { await bootstrap(); await setDoVar('CACHE_ADMIN_EXTEND', '0'); });
+// Extension is offered iff caching is (docs/worker-slim.md §4.1); the
+// off-switch cases flip `cache_enabled` after seeding.
+beforeEach(async () => { await bootstrap(); await configure({ cache_enabled: true }); });
 
 function requestExtend(groupIds: string[], ttlS: number): Promise<DoResult> {
   return doPost('cache-extend-create', { group_ids: groupIds, ttl_s: ttlS },
@@ -50,7 +50,6 @@ async function armCeremony(opts: {
   groupId?: string;
 } = {}) {
   const { entries = 2, leftMs = HOUR, ttlS = TTL_1D, over = {} } = opts;
-  await setDoVar('CACHE_ADMIN_EXTEND', '1');
   const keys = await inDO(h => seedGroup(h, entries, {
     expires_ms: Date.now() + leftMs, ...over,
   }));
@@ -91,8 +90,9 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
     expect(ch.extend!.group_ids).toEqual([GROUP]);
   });
 
-  it('is unreachable while CACHE_ADMIN_EXTEND is off — a kill switch, not an authorization', async () => {
+  it('is unreachable while caching is off — a switch, not an authorization', async () => {
     const keys = await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
+    await configure({ cache_enabled: false });
     const res = await requestExtend([GROUP], TTL_1D);
     expect(res.status).toBe(404);
     expect(res.text).toMatch(/disabled/);
@@ -104,7 +104,6 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
   });
 
   it('refuses a TTL that is not an extend-ladder rung', async () => {
-    await setDoVar('CACHE_ADMIN_EXTEND', '1');
     await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
     for (const bad of [3 * 3600, 3 * 24 * 3600, 30 * 24 * 3600, 0, -TTL_1D]) {
       const res = await requestExtend([GROUP], bad);
@@ -114,7 +113,6 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
   });
 
   it('accepts the extend-only rungs a phone approval may never arm', async () => {
-    await setDoVar('CACHE_ADMIN_EXTEND', '1');
     await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
     for (const rung of [TTL_1D, TTL_2D, TTL_1W, TTL_PERMANENT]) {
       const res = await requestExtend([GROUP], rung);
@@ -124,7 +122,6 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
   });
 
   it('refuses a lapsed group outright — only a fresh approval arms a new cache', async () => {
-    await setDoVar('CACHE_ADMIN_EXTEND', '1');
     await inDO(h => seedGroup(h, 2, { expires_ms: Date.now() - MIN }));
     const res = await requestExtend([GROUP], TTL_1W);
     expect(res.status).toBe(409);
@@ -133,7 +130,6 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
   });
 
   it('refuses a request that would not move expiry forward (no_gain)', async () => {
-    await setDoVar('CACHE_ADMIN_EXTEND', '1');
     await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + 3 * DAY }));
     const res = await requestExtend([GROUP], TTL_20M);
     expect(res.status).toBe(409);
@@ -144,7 +140,6 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
     // The Worker route in front of this op forwards the cookie; the DO refuses
     // without one. A session is necessary for the request, and (per the
     // ceremony tests below) still not sufficient for the effect.
-    await setDoVar('CACHE_ADMIN_EXTEND', '1');
     const keys = await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR }));
     const resp = await SELF.fetch('https://vt.test.invalid/api/admin/cache-extend-request', {
       method: 'POST',
@@ -161,7 +156,6 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
   });
 
   it('refuses a drifted group rather than guessing which record was meant', async () => {
-    await setDoVar('CACHE_ADMIN_EXTEND', '1');
     // Same group handle, disagreeing IPs — something wrote across a group boundary.
     await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR, ip: '203.0.113.9' }));
     await inDO(h => seedGroup(h, 1, { expires_ms: Date.now() + HOUR, ip: '198.51.100.4' }));
@@ -279,7 +273,7 @@ describe('opApprove → commitExtend — the only path that moves expires_ms', (
     // the challenge mints no DEKs.
     const res = await approve(ch, {
       cache_ttl_s: TTL_20M,
-      cache_sealed_deks_b64u: [sealFakeDek()],
+      cache_sealed_deks_b64u: [await sealFakeDek()],
     });
     expect(res.status).toBe(200);
 
@@ -288,9 +282,9 @@ describe('opApprove → commitExtend — the only path that moves expires_ms', (
     expect(dekKeysAfter).toEqual(dekKeysBefore);
   });
 
-  it('re-checks the kill switch at commit: switching it off mid-ceremony stops the hop', async () => {
+  it('re-checks the switch at commit: disabling caching mid-ceremony stops the hop', async () => {
     const { keys, ch } = await armCeremony({ leftMs: HOUR, ttlS: TTL_1W });
-    await setDoVar('CACHE_ADMIN_EXTEND', '0');
+    await configure({ cache_enabled: false });
     expect((await approve(ch)).status).toBe(200);
     const after = await inDO(h => readEntries(h, keys));
     for (const e of after) expect(e.expires_ms).toBeLessThan(Date.now() + 2 * HOUR);
@@ -344,7 +338,6 @@ describe('extension has no total-lifetime ceiling', () => {
   });
 
   it('extends a pre-migration entry that has no created_ms and no group id', async () => {
-    await setDoVar('CACHE_ADMIN_EXTEND', '1');
     const keys = await inDO(h => seedGroup(h, 1, {
       expires_ms: Date.now() + HOUR,
       created_ms: undefined,
@@ -411,7 +404,6 @@ describe('extension audit', () => {
       h.inst.audit.setCacheTtl(originToken, TTL_20M, armedExpiry);
     });
 
-    await setDoVar('CACHE_ADMIN_EXTEND', '1');
     await inDO(h => seedGroup(h, 1, {
       expires_ms: armedExpiry, origin_token_id: originToken,
     }));

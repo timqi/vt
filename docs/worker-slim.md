@@ -1,48 +1,34 @@
-# Worker slim — Web Push, passkey admin, config in the DO
+# Worker slim — one secret, passkey admin, config in the DO
 
-Status: **plan**. Owns the `cf-worker/` half of the slim branch after
-[refactor.md](refactor.md) steps 1–3: one Wrangler secret, one notification
-channel, one admin gate, one config store. Each numbered change in §7 is one
-commit; its row here is deleted when it lands and the owning feature doc is
-updated in the same commit. Verify against `cf-worker/src/index.ts`,
-`do_account.ts`, `types.ts` (`Env`) before implementing.
+Status: **implemented**. Owns the `cf-worker/` trust model after the slim: one
+Wrangler secret over a stored root key, one notification channel (Web Push),
+one admin gate (passkey session), one config store (the encrypted blob in the
+Durable Object). §2–§5 are the current contract; verify against
+`cf-worker/src/account_admin.ts`, `admin_auth.ts`, `do_account.ts`, `index.ts`
+and `types.ts` (`Env`). Operator procedures live in
+[cf-worker-deploy.md](cf-worker-deploy.md); the PWA's presentation contract in
+[design/ui-ux.md](design/ui-ux.md).
 
-Fixed by the operator, not reopened here: Web Push replaces Pushover, Slack App
-and Feishu; `SECRET` is the only Wrangler secret; Cloudflare Access and
-`ADMIN_SEG` go, admin is passkey login; nothing is added that the above does
-not need; `dryoc`/`libsodium.js` stay (refactor.md step 4).
-
-## 1. Scope — what leaves
-
-| Leaves | Files / symbols | Operator step |
-| --- | --- | --- |
-| `CACHE_SECKEY` | `Env.CACHE_SECKEY`; the scalar is derived (§2) | `wrangler secret delete CACHE_SECKEY`; existing sealed entries become misses — 清除全部 once |
-| `CACHE_ADMIN_EXTEND` | `cacheAdminExtendEnabled`, `extend_enabled` plumbing; extension is available whenever caching is | remove the `[vars]` line |
-| `CACHE_HIT_NOTIFY`, `APPROVAL_UV_JSON` | `Env` fields; values move to the config blob (§4) | remove the `[vars]` lines; re-enter on the 设置 tab |
-| `WORKER_ORIGIN`, `RP_ID` | `Env` fields; origin is captured at bootstrap (§3.3), RP id is its hostname | remove the `[vars]` lines |
-| `VT_AUTH_CF` (name only) | renamed `SECRET`; derivation unchanged, so host tokens survive | `wrangler secret put SECRET` with the **same value**, then `wrangler secret delete VT_AUTH_CF` |
-| `ENROLL_LIMITER` (name only) | renamed `LIMITER`, shared by enroll and login (§3.2) | rename the binding in `wrangler.toml` |
-
-Landed (step 4): Cloudflare Access, `ADMIN_SEG` and `CREDENTIALS_JSON` are
-gone; admin is the passkey session of §3 at `/admin`, and `root:v1` (§2) exists
-from bootstrap on, so `K_cfg` and `K_sess` already derive from `R`. Operator:
-delete the Access application, `wrangler secret delete CREDENTIALS_JSON`,
-re-register passkeys through `/admin`.
-
-Stays untouched: ceremony routes and their HMAC/replay/body caps, host tokens,
-DEK cache ladders and admin actions, audit table and stream, alarm sweep,
-`approve.js` ceremony, `libsodium.js`.
+Landed, in order: Web Push beside the channels, channels deleted, one admin
+shell, passkey admin auth with `root:v1` from bootstrap (Cloudflare Access,
+`ADMIN_SEG`, `CREDENTIALS_JSON` gone), config in the DO with every derivation
+rooted on `R` (`CACHE_SECKEY`, `CACHE_ADMIN_EXTEND`, `CACHE_HIT_NOTIFY`,
+`APPROVAL_UV_JSON`, `WORKER_ORIGIN`, `RP_ID`, `ACCESS_*` gone; `VT_AUTH_CF` →
+`SECRET`, `ENROLL_LIMITER` → `LIMITER`). Every host token was re-issued once
+by `vt enroll` at that last step, and the hostname-keyed agent audit key went
+with it ([refactor.md](refactor.md) §1).
 
 ## 2. Trust model
 
 `SECRET` is a KEK. The root key `R` (32 random bytes, generated at bootstrap)
-is stored as `root:v1 = {wraps: [AES-256-GCM(K_kek, R)]}`; every other key
-derives from `R`, so `SECRET` alone and DO storage alone are each worthless.
+is stored as `root:v1 = {wraps: [AES-256-GCM(K_kek, R)]}` (AAD `vt-root-v1`);
+every other key derives from `R`, so `SECRET` alone and DO storage alone are
+each worthless.
 
 | Key | ikm | salt | info | Protects |
 | --- | --- | --- | --- | --- |
 | `K_kek` AES-256-GCM | `utf8(SECRET)` | empty | `vt-kek-v1` | `R` at rest |
-| host token secret | `R` | `token_id` | `vt-host-token-v1` | daemon HMAC ([host-token.md](host-token.md)); existing tokens are re-issued by `vt enroll` once, at step 5 |
+| host token secret | `R` | `token_id` | `vt-host-token-v1` | daemon HMAC, compared in the DO ([host-token.md](host-token.md) §2) |
 | `K_cfg` AES-256-GCM | `R` | empty | `vt-config-key-v1` | the config blob at rest (§4) |
 | `K_sess` HMAC | `R` | empty | `vt-admin-session-v1` | admin session cookie (§3.1) |
 | cache X25519 scalar | `R` | empty | `vt-cache-seckey-v1` | DEK sealed boxes; `cachePublicKey` derives the point as today |
@@ -61,11 +47,14 @@ stored under `K_cfg`.
   config, subscriptions and cache entries survive. Nothing is typed into the
   browser; the two wraps live only in the DO and only during the window.
 - **Factory reset** is `R` compromise (DO storage read) or a lost `SECRET`
-  before rotation completes: delete `root:v1` and `cfg:v1` from the console (or
-  redeploy with a fresh DO) ⇒ unconfigured (§4.3): ceremony routes answer
-  `503 not_configured`, `/admin` shows the setup view, every host runs
-  `vt enroll`. Audit rows and the `host_token` table are plaintext SQLite and
-  survive; revoke stale rows by hand.
+  before rotation completes: `wrangler secret put SECRET` with a fresh value
+  *without* rotating. `root:v1` no longer unwraps ⇒ unconfigured (§4.3):
+  ceremony routes answer `503 not_configured`, `/admin` shows the setup view
+  flagged `reset`, and bootstrap replaces root and blob; every host runs
+  `vt enroll`. (Wrangler offers no console for DO keys, so the unreadable root
+  is the reset signal; an attacker who can make it unreadable can write his
+  own.) Audit rows and the `host_token` table are plaintext SQLite and survive;
+  revoke stale rows by hand.
 - **A stolen `SECRET` yields nothing** without DO storage. `SECRET` + DO storage
   yields: forging a live host's token — paging the phone as that host and
   reading its live cached DEKs for their TTL; forging admin sessions — every
@@ -113,7 +102,8 @@ Set-Cookie: …; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800
 | `GET /api/admin/credentials`, `POST …/credentials-add`, `POST …/credentials-revoke` | cookie | §3.4 |
 | `GET/PUT /api/admin/config` | cookie | §4 |
 | `GET /api/admin/push/vapid`, `POST …/push/subscribe`, `…/push/unsubscribe`, `…/push/test` | cookie | §5 |
-| existing `audit`, `audit-stream`, `cache-*`, `clear-cache`, `clear-audit`, `tokens`, `tokens-revoke` | cookie | unchanged bodies; `admin_email` fields become the credential label |
+| `POST /api/admin/rotate-secret` | cookie | §2 rotation; returns `{secret}` once |
+| existing `audit`, `audit-stream`, `cache-*`, `clear-cache`, `clear-audit`, `tokens`, `tokens-revoke` | cookie | unchanged bodies; the former `admin_email` fields are gone — the cookie carries no credential identity, so extend/revoke rows name no operator |
 
 - `LIMITER` is the existing 3/min/IP Workers Rate Limiting binding, keyed
   `enroll:<ip>` by `/api/enroll` and `login:<ip>` by bootstrap and
@@ -125,7 +115,7 @@ Set-Cookie: …; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800
 ### 3.3 Bootstrap
 
 No setup token: before bootstrap the Worker holds nothing worth taking, and a
-stranger who registers first is visible and evictable (step 5). Certificate
+stranger who registers first is visible and evictable (item 5 below). Certificate
 transparency publishes a new hostname within minutes, so treat the window as
 public and bootstrap right after `just deploy-worker`.
 
@@ -139,13 +129,14 @@ public and bootstrap right after `just deploy-worker`.
    `userVerification: 'required'`, `prf`), asserts once for PRF, wraps the
    master and builds the credential entry (`setup.js` byte formats unchanged).
 3. `POST /api/admin/bootstrap {entry}`.
-4. DO, one gated step: `root:v1` exists → `409 already_configured` with
-   `{registered_ms, ip}` of the first credential; else generate `R`, write
-   `root:v1` and `{v:1, origin: <request origin>, epoch:1, credentials:[entry],
-   …defaults}`, return a session cookie. The not-exists check and the puts
-   share the step, so a concurrent stranger receives the 409.
-5. The 409 view shows that time and IP and one line: not you ⇒ delete
-   `root:v1`/`cfg:v1` (factory reset, §2) and redo. Nothing else exists yet.
+4. DO, serialized with every other write: a readable `root:v1` →
+   `409 already_configured` with `{ms, ip}` of the first registration
+   (`config.bootstrap`); else generate `R`, write `root:v1` and `{v:1, origin:
+   <request origin>, epoch:1, credentials:[entry], bootstrap, …defaults}`,
+   return a session cookie (204). A concurrent stranger runs after and
+   receives the 409.
+5. The 409 view shows that time and IP and one line: not you ⇒ factory reset
+   (§2) and redo. Nothing else exists yet.
 6. The console opens on the 设置 tab: enable caching, subscribe this phone.
 
 `origin` is the request origin of the bootstrap call; it is the WebAuthn
@@ -176,6 +167,7 @@ plaintext (JSON) = {
   origin: "https://vt.example.com",   // §3.3, immutable
   epoch: 1,                           // §3.1
   credentials: [ {h, i, k, p, l, t} ],// credentials.ts entry, unchanged bytes
+  bootstrap: { ms, ip },              // first registration, shown on a 409 (§3.3)
   cache_enabled: false,               // was: CACHE_SECKEY present
   cache_hit_notify: false,            // was: CACHE_HIT_NOTIFY
   uv_policy: null,                    // was: APPROVAL_UV_JSON; same object, validated by parseUvPolicy on PUT
@@ -191,8 +183,9 @@ plaintext (JSON) = {
   the same synchronous step as the `put`; ceremony ops read `credentials`,
   `origin`, `uv_policy`, `cache_enabled` from that copy on every request, push
   fan-out reads `vapid`/`push`. The edge reads nothing from config.
-- `uv_policy` moves from `index.ts` into `opCreate`; the raise-only rule,
-  `cache-extend` pin and malformed → `required` behavior are unchanged.
+- `uv_policy` is applied in `opCreate` only, against the verified host; the
+  raise-only rule and the `cache-extend` pin are unchanged. A malformed object
+  is refused at PUT (400); a malformed stored one (a bug) reads as `required`.
 - `PUT /api/admin/config` accepts only `cache_enabled`, `cache_hit_notify`,
   `uv_policy`; anything else in the body is `400`. Disabling caching does not
   delete entries; 清除全部 does.
@@ -297,73 +290,3 @@ shape: pier's `src/web/webpush.ts`; VT ships no dependency and no Node API.
   tap 开启推送 and grant permission. Pushes stop when the icon is removed (the
   next send answers 410 and the row is dropped). Notification taps open
   `/a/<token>` inside the standalone app; WebAuthn works there.
-
-## 6. UI/UX
-
-Pier's `docs/design/06-ui-ux.md` (sibling repo `pier`) ports to
-`docs/design/ui-ux.md` (new; registered in `docs/README.md` by §7 step 3).
-
-Ports verbatim: **Hierarchy** (all); **Materials** — solid for content and
-modals, glass + hairline + shadow for the tab strip only, coordinated radii, no
-page-specific styles; **Layout › Headings** (page head is the slim inset glass
-strip; phone hides the title and wraps); **Editing and forms** minus the
-message-edit bullet; **Motion** (all); **Foundations** minus the Icons bullet;
-**Validation** (all).
-
-Changes: Icons — no icon set and no build step, so status is a text label plus
-a `.badge-*` class, never a glyph alone; **Conversation and activity** → "Audit
-rows": status beyond color, absolute time plus relative when space allows,
-nothing that happened disappears (a cleared table says so); add VT's own
-rules — agent-derived truth lines precede every client-reported line
-([approval-transparency.md](approval-transparency.md)), the cache scope
-sentence sits directly above the duration control, the pairing code is the
-largest element on an enroll approval.
-
-Dropped: Sidebar, Drawer, Meta chips, Dock cards, Rail rows, Palette, Menus,
-Session info, Two-pane views, Model picker, message editing.
-
-Pages: two shells. `pwa/approve.html` (`/a/:token`, unchanged). `pwa/admin/admin.html`
-(`/admin`) renders one of three states from `VT_DATA.state`: **setup** (§3.3),
-**login** (one button), **console** with tabs 审计 · DEK 缓存 · 主机令牌 ·
-Passkey · 设置 (config toggles, UV policy JSON, push subscriptions, 退出所有会话).
-Fewer is not argued for: Passkey is a ceremony with its own flow, the other
-four are distinct data sets already implemented as separate scripts.
-
-## 7. Implementation order
-
-Each step: `just check-worker`, then `just bump-assets` + `just deploy-worker`
-where `pwa/` changed. Steps 1–4 (Web Push added, channels deleted, one admin
-shell, passkey admin auth with `root:v1` from bootstrap) have landed.
-
-| # | Change | Files | Tests moving to rejected-input |
-| --- | --- | --- | --- |
-| 5 | **Config in DO**, one secret, root key | `account_admin.ts` gains `root:v1` (generate/wrap/unwrap `R`, 轮换 SECRET op, two-wrap window per §2), every derivation re-rooted on `R` (host tokens re-enrolled once), `cache_enabled`, `cache_hit_notify`, `uv_policy`, `GET/PUT config`; `opCreate` applies UV; `account_cache.ts`/`cache_crypto.ts` derive the scalar; `CACHE_ADMIN_EXTEND`, `CACHE_HIT_NOTIFY`, `APPROVAL_UV_JSON`, `WORKER_ORIGIN`, `RP_ID`, `CACHE_SECKEY` leave `Env`; `VT_AUTH_CF` → `SECRET`, `ENROLL_LIMITER` → `LIMITER`; 设置 tab; `wrangler.toml.example` (no `[vars]`), `cf-worker-deploy.md` rewrite, `dek-cache.md`, AGENTS.md cache lines; `test/do_helpers.ts` env → `{SECRET, LIMITER?, ACCOUNT, ASSETS}` | `do_account.uv.test.ts` reads policy from config; `do_account.dek_cache.test.ts` adds "`cache_enabled=false` with live entries → miss, approve page offers `[0]`, extend routes 404"; `do_account.host_token.test.ts` rotation case keeps its name with `SECRET` |
-
-## 8. Budget
-
-Non-blank, non-comment lines; `just size` numbers before this plan:
-`cf-worker/src/` 4444 (ceiling 3500), `do_account.ts` 929 (ceiling 750).
-
-| Step | `cf-worker/src/` | `pwa/` (excl. `libsodium.js`) |
-| --- | --- | --- |
-| 1 Web Push | +230 (`webpush` 110, `account_admin` 80, wiring 40) | +80 (sw, manifest, subscribe UI) |
-| 2 channels | −770 (`feishu` 256, `slack_app` 182, `pushover` 78, notifications/notify/index/page/types/do_account 254) | −270 (channels html/js) |
-| 3 shell | −30 | −200 (four shells −344, `admin.html` +60, tabs in `admin.js` +80) |
-| 4 auth | +45 (`access` −126, `admin_auth` +60, admin ops +100, index ±0) | +40 (setup.js API flows −60/+100) |
-| 5 config | −10 | +80 (设置 tab) |
-| **net** | **≈ −535 → ≈ 3.9k** | **≈ −270** |
-
-`do_account.ts` gains ~15 (dispatch) and loses ~40 (channel refs, extend
-switch); admin state lives in `account_admin.ts` (~200 after step 5), which
-has one reason to exist: what the console owns in storage. The area ceiling is
-not reached by this plan plus refactor.md 1–3 (≈ 3.8k); see Q2.
-
-## 9. Open questions for the operator
-
-1. **Admin assets public** — decided and landed in step 3: `pwa/admin/*` is
-   served by the public `/pwa/*` route; the shells hold no data until rendered.
-2. **Ceiling.** After this plan and refactor.md steps 1–3, `cf-worker/src/`
-   lands near 3.8k against the 3.5k ceiling with `account_cache`, `account_audit`,
-   `types` (618, mostly declarations) and `do_account` as the remaining
-   weight. Raise to 4.0k with that sentence, or name the next deletion before
-   step 5 lands?

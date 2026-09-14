@@ -1,7 +1,7 @@
 // Account-local DEK storage. Uses the AccountDO storage and input gate; it
 // cannot authenticate a request, finalize a ceremony, or dispatch notifications.
 
-import { Env, Challenge, ChallengeMeta, CacheEntry, CacheExtendIntent } from './types';
+import { Challenge, ChallengeMeta, CacheEntry, CacheExtendIntent } from './types';
 import { b64uEnc, isB64uString, decodeB64uExact, sha256, randomBytes } from './crypto';
 import { seal, openToCache } from './cache_crypto';
 import { planExtend, isAllowedApproveTtl, groupIdOf, isExtendableGroupId } from './cache_policy';
@@ -79,9 +79,11 @@ interface CacheExtendResult {
 }
 
 export class AccountCache {
+  /** `seckey` is the X25519 scalar derived from the root key while
+   *  `cache_enabled`, null otherwise (AccountAdmin.cacheSeckey). */
   constructor(
     private readonly storage: DurableObjectStorage,
-    private readonly env: Pick<Env, 'CACHE_SECKEY'>,
+    private readonly seckey: () => Uint8Array | null,
   ) {}
 
   // Read an arbitrary number of keys, in the batches the platform accepts.
@@ -172,9 +174,8 @@ export class AccountCache {
     // Approve ladder only: the multi-day rungs are extension-only, so a tampered
     // approve body cannot skip the deliberate extension ceremony.
     if (!isAllowedApproveTtl(ttlS)) return reject(`ttl ${ttlS} not approvable`);
-    if (!this.env.CACHE_SECKEY || !this.env.CACHE_SECKEY.trim()) {
-      return reject('CACHE_SECKEY unset (caching disabled)');
-    }
+    const sk = this.seckey();
+    if (!sk) return reject('caching disabled');
     const salts = ch.salts_b64u;
     // Auth-only ceremonies (no salts) have nothing to cache; a length mismatch
     // means the PWA and challenge disagree — refuse rather than store garbage.
@@ -188,10 +189,10 @@ export class AccountCache {
     for (const s of sealedList) {
       try { decodeB64uExact(s, 80, 'cache_sealed_dek'); }
       catch { return reject('cache_sealed_dek malformed'); }
-      const probe = openToCache(s, this.env.CACHE_SECKEY);
+      const probe = openToCache(s, sk);
       if (!probe || probe.length !== 32) {
         probe?.fill(0);
-        return reject('cache_sealed_dek does not open to CACHE_PUBKEY');
+        return reject('cache_sealed_dek does not open to the cache key');
       }
       probe.fill(0);
     }
@@ -232,7 +233,8 @@ export class AccountCache {
 
   async read(tokenId: string, meta: ChallengeMeta, salts: string[], daemonPk: Uint8Array): Promise<string | null> {
     if (salts.length === 0 || salts.length > 256) return null;
-    if (!this.env.CACHE_SECKEY || !this.env.CACHE_SECKEY.trim()) return null;
+    const sk = this.seckey();
+    if (!sk) return null;
     for (const s of salts) { if (!isB64uString(s)) return null; }
 
     const ctx = await cacheCtx(tokenId, meta.project ?? '');
@@ -252,11 +254,11 @@ export class AccountCache {
       for (const key of keys) {
         const entry = map.get(key);
         if (!entry || entry.expires_ms <= now) continue;
-        const dek = openToCache(entry.sealed_to_cache_b64u, this.env.CACHE_SECKEY);
+        const dek = openToCache(entry.sealed_to_cache_b64u, sk);
         if (!dek || dek.length !== 32) {
           dek?.fill(0);
-          // Undecryptable (e.g. CACHE_SECKEY rotated, M3): uniformly miss and
-          // lazily drop the orphaned entry, never surface a 500.
+          // Undecryptable (sealed under a previous root key, M3): uniformly
+          // miss and lazily drop the orphaned entry, never surface a 500.
           orphaned.push(key);
           continue;
         }
@@ -346,7 +348,7 @@ export class AccountCache {
   }
 
   // Commit an APPROVED extension. AccountDO calls this only after the WebAuthn
-  // assertion verified, the challenge was consumed, and the kill switch and TTL
+  // assertion verified, the challenge was consumed, and the cache switch and TTL
   // were rechecked. Results describe acknowledged effects for the DO's audit.
   //
   // Per group, per storage batch: re-read the entries and apply planExtend to the

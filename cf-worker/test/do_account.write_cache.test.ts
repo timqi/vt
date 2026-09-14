@@ -15,7 +15,7 @@ import {
   isAllowedApproveTtl, isAllowedExtendTtl,
 } from '../src/cache_policy';
 import {
-  inDO, setDoVar, doPost, approve, makeChallenge, sealFakeDek, nextSalt,
+  inDO, configure, doPost, approve, makeChallenge, sealFakeDek, nextSalt, daemonAuth,
   allDekKeys, auditRows, testEnv, DoHandle, liveTokenId,
   bootstrap,
 } from './do_helpers';
@@ -27,20 +27,18 @@ const TTL_1D = 24 * 3600;
 const TTL_1W = 7 * 24 * 3600;
 const TTL_PERMANENT = 100 * 365 * 24 * 3600;
 
-// The DO instance survives a test; its env does not get rolled back with storage.
 beforeEach(async () => {
   await bootstrap();
-  await setDoVar('CACHE_SECKEY', testEnv.CACHE_SECKEY);
-  await setDoVar('CACHE_ADMIN_EXTEND', '0');
+  await configure({ cache_enabled: true });
 });
 
 /** Create a normal decrypt ceremony carrying `n` salts, ready to approve. */
 async function createCeremony(n = 2) {
   const salts = Array.from({ length: n }, () => nextSalt());
   const ch = makeChallenge({ salts_b64u: salts });
-  const res = await doPost('create', { challenge: ch, token_id: await liveTokenId() });
+  const res = await doPost('create', { challenge: ch, auth: await daemonAuth(await liveTokenId()) });
   expect(res.status).toBe(200);
-  return { ch, salts, sealed: salts.map((_, i) => sealFakeDek(i + 1)) };
+  return { ch, salts, sealed: await Promise.all(salts.map((_, i) => sealFakeDek(i + 1))) };
 }
 
 async function entriesOf(h: DoHandle): Promise<CacheEntry[]> {
@@ -91,9 +89,9 @@ describe('writeCache — approve-ladder only', () => {
     expect(await inDO(allDekKeys)).toEqual([]);
   });
 
-  it('writes nothing when CACHE_SECKEY is unset — caching is opt-in', async () => {
-    await setDoVar('CACHE_SECKEY', '');
+  it('writes nothing while caching is disabled — caching is opt-in', async () => {
     const { ch, sealed } = await createCeremony(1);
+    await configure({ cache_enabled: false });
     expect((await approve(ch, { cache_ttl_s: TTL_8H, cache_sealed_deks_b64u: sealed })).status)
       .toBe(200);
     expect(await inDO(allDekKeys)).toEqual([]);

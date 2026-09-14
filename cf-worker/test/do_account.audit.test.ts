@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AccountAudit, auditKey } from '../src/account_audit';
 import type { AdminWsMessage, DoAuditIngestOp } from '../src/types';
-import { inDO, makeChallenge, makeMeta, nextToken, liveTokenId, bootstrap } from './do_helpers';
+import { inDO, makeChallenge, makeMeta, nextToken, liveTokenId, bootstrap, daemonAuth } from './do_helpers';
 
 beforeEach(bootstrap);
 
@@ -12,6 +12,8 @@ function agentOp(): DoAuditIngestOp {
     peer_exe: 'ssh', key_fp: 'synthetic-fingerprint', dest: 'test-destination',
     scope_family: 'destination', scope_label: 'test scope', grant_ttl_s: 1200,
     relayed: 0,
+    // audit.agent() never reads it; the DO op verifies it before calling in.
+    auth: { token_id: 'unused0000000000', mac_b64u: '', signed_b64u: '' },
   };
 }
 
@@ -65,14 +67,15 @@ describe('AccountAudit persistence and projection', () => {
 
   it('suppresses duplicate insert broadcasts through the DO create and ingest routes', async () => {
     const tokenId = await liveTokenId();
+    const auth = await daemonAuth(tokenId);
     await inDO(async ({ inst, state }) => {
       const ch = makeChallenge();
-      const op = { ...agentOp(), outcome: 'approved' };
+      const op = { ...agentOp(), outcome: 'approved', auth };
       const broadcast = vi.spyOn(inst.audit, 'broadcastRow');
       try {
         for (let i = 0; i < 2; i++) {
           const created = await inst.fetch(new Request('https://account.do/op/create', {
-            method: 'POST', body: JSON.stringify({ challenge: ch, token_id: tokenId }),
+            method: 'POST', body: JSON.stringify({ challenge: ch, auth }),
           }));
           expect(created.status).toBe(200);
           await created.text();

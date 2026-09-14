@@ -19,10 +19,10 @@ and update the relevant document in the same change.
 | Deploy the phone approval Worker | [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/index.ts`, `cf-worker/src/do_account.ts` |
 | Admin login, bootstrap, passkey add/revoke | [`worker-slim.md`](worker-slim.md) §3, [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/admin_auth.ts` (session cookie), `cf-worker/src/account_admin.ts` (root key, config blob, bootstrap/login), `cf-worker/src/credentials.ts`, `cf-worker/pwa/admin/setup.js` |
 | Understand Worker audit and Web Push notifications | [`cf-worker-deploy.md`](cf-worker-deploy.md), [`worker-slim.md`](worker-slim.md) §5 | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts`, `cf-worker/src/webpush.ts`, `cf-worker/src/account_admin.ts` |
-| Tune approval user verification (UV) | [`cf-worker-deploy.md`](cf-worker-deploy.md#approval-user-verification-approval_uv_json) | `cf-worker/src/uv_policy.ts` (policy), `cf-worker/src/webauthn.ts` (enforcement), `cf-worker/pwa/approve.js` |
+| Tune approval user verification (UV) | [`cf-worker-deploy.md`](cf-worker-deploy.md#6-settings-设置-tab) | `cf-worker/src/uv_policy.ts` (policy), `cf-worker/src/account_admin.ts` (`uv_policy` in the config blob), `cf-worker/src/webauthn.ts` (enforcement), `cf-worker/pwa/approve.js` |
 | Understand DEK caching | [`dek-cache.md`](dek-cache.md) | `cf-worker/src/do_account.ts` (ceremony and audit), `cf-worker/src/account_cache.ts` (cache storage), `cf-worker/src/storage_batch.ts` (shared batch deletion and prefix paging), `src/cf.rs` |
 | Follow the slim refactor (deletions, cache key v5) | [`refactor.md`](refactor.md) (plan) | `cf-worker/src/account_cache.ts` |
-| Slim the Worker (Web Push, passkey admin login, config in the DO, one secret) | [`worker-slim.md`](worker-slim.md) (plan) | `cf-worker/src/index.ts`, `cf-worker/src/do_account.ts`, `cf-worker/src/types.ts` (`Env`) |
+| Worker trust model: `SECRET`, root key, config blob, rotation, reset | [`worker-slim.md`](worker-slim.md) §2, §4 | `cf-worker/src/account_admin.ts`, `cf-worker/src/types.ts` (`Env`) |
 | Change the PWA's look, controls, or page states (approve and admin shells) | [`design/ui-ux.md`](design/ui-ux.md) | `cf-worker/pwa/approve.js` (`vt.mountApprove`), `cf-worker/pwa/common.js`, `cf-worker/pwa/admin/admin.html` + `admin.js` (shell, tabs, dialog), `cf-worker/pwa/admin/admin.css` |
 | Use SSH identities | [`README.md` — portable identity](../README.md#portable-ssh-identity-for-git-vt) | `src/ssh_sign.rs`, `src/client.rs` |
 | Understand agent signing, identity selection, and decrypt-then-sign fallback | [`sign-vt-design.md`](sign-vt-design.md) | `src/ssh_sign.rs` (`resolve_identities`, `decide_sign_route`), `src/client.rs` (`VTClient::sign_vt`), `src/server_macos/ssh_agent/handlers.rs` (`handle_sign_vt`) |
@@ -59,7 +59,7 @@ ownership or entry points change.
 |---|---|
 | CLI command or flag | `README.md`, `src/main.rs` help, and the feature doc |
 | `VT_*` variable or config-file behavior | `config.example.toml`, `README.md`, `src/config.rs` |
-| Worker secret, route, or admin page | `cf-worker-deploy.md`, `cf-worker/wrangler.toml.example`, relevant channel/cache doc; `design/ui-ux.md` for a new control or page state |
+| Worker secret, config knob, route, or admin page | `cf-worker-deploy.md`, `worker-slim.md` §4, `cf-worker/wrangler.toml.example`, relevant cache doc; `design/ui-ux.md` for a new control or page state |
 | Wire format or exit code | `structured-errors.md` and protocol tests |
 | Security invariant | the relevant design doc plus a code comment/test |
 

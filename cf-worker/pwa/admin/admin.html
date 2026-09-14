@@ -91,7 +91,7 @@
     </section>
 
     <section class="tab-panel" id="tab-cache" hidden>
-      <p class="hint">当前<strong>真实存在</strong>的 DEK 缓存（按授予它的那次审批分组）。在有效期内，持有 <code>VT_PASSKEY_TOKEN</code> 且来源 IP 与工作目录一致的调用者可<strong>免手机审批</strong>解密这些记录，所以此处的每一行都是一份仍然生效的授权。清除立即生效；<strong>延长必须经手机 Passkey 重新批准</strong>，每次延长把有效期重设为「批准时刻 + 所选时长」，可反复续期，但<strong>已过期的缓存无法续期</strong>——只能重新审批。</p>
+      <p class="hint">当前<strong>真实存在</strong>的 DEK 缓存（按授予它的那次审批分组）。在有效期内，持有同一 <code>VT_PASSKEY_TOKEN</code> 且项目（git 公共目录，否则为工作目录）一致的调用者可<strong>免手机审批</strong>解密这些记录，所以此处的每一行都是一份仍然生效的授权。清除立即生效；<strong>延长必须经手机 Passkey 重新批准</strong>，每次延长把有效期重设为「批准时刻 + 所选时长」，可反复续期，但<strong>已过期的缓存无法续期</strong>——只能重新审批。</p>
       <section class="filters">
         <label>状态 <select class="f-live">
           <option value="live">仅有效</option>
@@ -125,7 +125,7 @@
     </section>
 
     <section class="tab-panel" id="tab-tokens" hidden>
-      <p class="hint">每台主机经 <code>vt enroll</code> + 手机 Passkey 审批后获得<strong>自己的</strong> <code>VT_PASSKEY_TOKEN</code>。令牌有效期 7 天，<strong>每次使用自动重设为「此刻 + 7 天」</strong>；到期或被吊销后该主机的解密请求会被拒绝，需重新 enroll。吊销立即生效，不需要 Passkey。此处不显示令牌密文（Worker 从不存储它）。轮换主密钥 <code>VT_AUTH_CF</code> 会让所有令牌立即失效，每台主机需重新 enroll。</p>
+      <p class="hint">每台主机经 <code>vt enroll</code> + 手机 Passkey 审批后获得<strong>自己的</strong> <code>VT_PASSKEY_TOKEN</code>。令牌有效期 7 天，<strong>每次使用自动重设为「此刻 + 7 天」</strong>；到期或被吊销后该主机的解密请求会被拒绝，需重新 enroll。吊销立即生效，不需要 Passkey。此处不显示令牌密文（Worker 从不存储它）。令牌派生自 Worker 的根密钥：轮换 <code>SECRET</code> 不影响令牌，恢复出厂（重新引导）会让所有令牌失效，每台主机需重新 enroll。</p>
       <section class="filters">
         <label>状态 <select class="f-live">
           <option value="live">仅有效</option>
@@ -189,8 +189,39 @@
         </section>
       </section>
       <section class="card">
+        <div class="card-head"><h2>缓存与审批</h2></div>
+        <p class="hint">设置保存在 Durable Object 的加密配置里，保存即生效。关闭缓存不会删除已有条目（用 DEK 缓存页的「清除全部」）；命中通知每次免审批解密都会推送，默认关闭。UV 策略只能提高审批的验证级别，格式见 <code>docs/cf-worker-deploy.md</code>；留空为默认（<code>discouraged</code>）。</p>
+        <div class="field">
+          <label class="switch"><input id="cfg-cache" type="checkbox"> <span>启用 DEK 缓存（审批页提供缓存时长，可申请延长）</span></label>
+        </div>
+        <div class="field">
+          <label class="switch"><input id="cfg-hit-notify" type="checkbox"> <span>缓存命中时推送通知</span></label>
+        </div>
+        <div class="field">
+          <label for="cfg-uv">UV 策略（JSON）</label>
+          <textarea id="cfg-uv" rows="3" placeholder='{"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{"prod-db":"required"}}'></textarea>
+        </div>
+        <section class="actions">
+          <button id="cfg-save" type="button">保存</button>
+          <span id="cfg-status" class="status" role="status" aria-live="polite"></span>
+        </section>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>SECRET</h2></div>
+        <p class="hint">Worker 唯一的 Wrangler secret，只用来包裹根密钥；轮换不影响 Passkey、主机令牌、推送订阅与缓存。点击后新值<strong>只显示一次</strong>：执行 <code>wrangler secret put SECRET</code> 粘贴它。新旧两个值在此期间都有效，Worker 第一次以新值启动后旧值即作废。</p>
+        <section class="actions">
+          <button id="rotate-secret" type="button" class="danger">轮换 SECRET</button>
+          <span id="rotate-status" class="status" role="status" aria-live="polite"></span>
+        </section>
+        <section id="rotate-output" class="card" hidden>
+          <div class="card-head"><h2>新 SECRET</h2><button id="rotate-copy" type="button" class="ghost">复制</button></div>
+          <textarea id="rotate-value" rows="2" readonly></textarea>
+          <p class="hint"><code>wrangler secret put SECRET</code>，粘贴上面的值。关闭本页后无法再次查看；未及时部署可再次轮换。</p>
+        </section>
+      </section>
+      <section class="card">
         <div class="card-head"><h2>推送</h2></div>
-        <p class="hint">Web Push 直接送达本设备，无第三方。iOS 16.4+：Safari → 分享 → 添加到主屏幕，从图标打开本页再点「开启推送」；移除图标即停止推送。审批、enroll 与缓存命中（需 <code>CACHE_HIT_NOTIFY</code>）都走这里。</p>
+        <p class="hint">Web Push 直接送达本设备，无第三方。iOS 16.4+：Safari → 分享 → 添加到主屏幕，从图标打开本页再点「开启推送」；移除图标即停止推送。审批、enroll 与缓存命中（需开启上面的命中通知）都走这里。</p>
         <section class="actions">
           <button id="subscribe" type="button" disabled>开启推送</button>
           <input id="push-label" type="text" placeholder="设备名，如 iphone" maxlength="64" aria-label="设备名">

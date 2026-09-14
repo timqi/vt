@@ -114,7 +114,7 @@ size:
     row 'src/client/'        "$(count src/client.rs src/client/*.rs)" 1800
     row 'src/server_macos/'  "$(count src/server_macos/*.rs src/server_macos/ssh_agent/*.rs)" 4500
     row 'root src/*.rs'      "$(count $(ls src/*.rs | grep -v -e /core.rs -e /client.rs))" 2000
-    row 'cf-worker/src/'     "$(count cf-worker/src/*.ts)"       3500
+    row 'cf-worker/src/'     "$(count cf-worker/src/*.ts)"       4000
     echo
     echo 'Modules over 750:'
     for f in $(fd -e rs -e ts . src cf-worker/src); do

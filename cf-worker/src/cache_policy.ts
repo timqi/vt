@@ -47,9 +47,9 @@ export const EXTEND_TTL_WHITELIST = new Set([
 // SECURITY NOTE: this rung opts a record OUT of the phone-approval premise for
 // practical purposes. Liveness is what bounds every other rung — stop approving and
 // the capability dies on its own — and an entry on this one never lapses, so
-// nothing revokes it but an explicit admin clear or rotating CACHE_SECKEY, and it
-// is never swept. There is also no expiry to prompt a future review. Consider
-// CACHE_HIT_NOTIFY=1 alongside it so each no-tap decrypt remains visible somewhere.
+// nothing revokes it but an explicit admin clear or a factory reset, and it is
+// never swept. There is also no expiry to prompt a future review. Consider
+// cache_hit_notify alongside it so each no-tap decrypt remains visible somewhere.
 
 // The cap is PER OPERATION, not per entry lifetime: one extension may move expiry
 // to at most `now + max(EXTEND_TTL_WHITELIST)`. Total lifetime is deliberately

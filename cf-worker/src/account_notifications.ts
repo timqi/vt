@@ -2,7 +2,7 @@
 // finalize a challenge and never run on the ceremony path: every send is a
 // waitUntil task, and the CLI is never told whether it landed.
 
-import { Env, Challenge, ChallengeMeta, DoAuditIngestOp, PushPayload } from './types';
+import { Challenge, ChallengeMeta, DoAuditIngestOp, PushPayload } from './types';
 import { buildApprovalMessage, buildCacheHitMessage } from './notify';
 import { sendPush } from './webpush';
 import { AccountAdmin } from './account_admin';
@@ -14,15 +14,6 @@ import { logErr } from './log';
 // audit table still records every hit — the notice is a heads-up, not a ledger.
 const AGENT_CACHE_NOTIFY_MIN_INTERVAL_MS = 60 * 1000;
 
-// Cache-hit 免审批 notices are opt-in and OFF by default — they fire on every
-// no-human-in-the-loop decrypt and bury the approval messages that do need a
-// tap. Set CACHE_HIT_NOTIFY = "1" | "true" | "on" | "yes" in wrangler.toml
-// [vars] to restore the push. The audit row is written either way.
-function cacheHitNotifyEnabled(env: Pick<Env, 'CACHE_HIT_NOTIFY'>): boolean {
-  const v = (env.CACHE_HIT_NOTIFY ?? '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'on' || v === 'yes';
-}
-
 const chSalts = (ch: Challenge): number =>
   Array.isArray(ch.salts_b64u) ? ch.salts_b64u.length : 0;
 
@@ -32,7 +23,6 @@ export class AccountNotifications {
 
   constructor(
     private readonly ctx: Pick<DurableObjectState, 'waitUntil'>,
-    private readonly env: Pick<Env, 'CACHE_HIT_NOTIFY'>,
     private readonly admin: AccountAdmin,
   ) {}
 
@@ -72,10 +62,12 @@ export class AccountNotifications {
 
   // 免审批 notice shared by the Worker DEK-cache hit (opDekCache) and the agent
   // Touch-ID-cache hit (agentCacheHit); `note` names the skipped factor when it
-  // isn't the default phone approval. Opt-in (CACHE_HIT_NOTIFY): silence drops
-  // only the real-time FYI — the audit row is written unconditionally.
+  // isn't the default phone approval. Opt-in (`cache_hit_notify`, 设置 tab, off
+  // by default: hits can fire many times a minute and bury the approvals that
+  // need a tap): silence drops only the real-time FYI — the audit row is
+  // written unconditionally.
   cacheHit(meta: ChallengeMeta, salts: number, note?: string): void {
-    if (!cacheHitNotifyEnabled(this.env)) return;
+    if (!this.admin.current.cache_hit_notify) return;
     const { title, body } = buildCacheHitMessage(meta, salts, note);
     this.push({
       v: 1, kind: 'cache_hit', title, body,

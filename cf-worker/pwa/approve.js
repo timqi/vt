@@ -168,7 +168,7 @@
         }
 
         // ── DEK-cache duration selector ──────────────────────────────────
-        // Shown only when the worker offers caching (CACHE_SECKEY set) AND this
+        // Shown only when the worker offers caching (cache_enabled) AND this
         // ceremony has DEKs to cache. Default = 0 ("不缓存").
         (function renderCacheOptions() {
             var optsList = data.cache_options_s || [];

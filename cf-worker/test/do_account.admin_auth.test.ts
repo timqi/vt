@@ -15,7 +15,7 @@ import {
   TEST_ORIGIN, TEST_CREDENTIAL_ENTRY,
 } from './do_helpers';
 
-type Env = Record<string, unknown> & { ENROLL_LIMITER?: unknown };
+type Env = Record<string, unknown> & { LIMITER?: unknown };
 const IP = '203.0.113.9';
 
 async function viaRouter(path: string, init: RequestInit & { headers?: Record<string, string> } = {}, e: Env = env as unknown as Env) {
@@ -46,7 +46,7 @@ async function login(headers: Record<string, string> = {}) {
 describe('bootstrap', () => {
   it('needs the rate limiter, an https Origin and a well-formed entry', async () => {
     const e = { ...(env as unknown as Env) };
-    delete e.ENROLL_LIMITER;
+    delete e.LIMITER;
     const body = JSON.stringify({ entry: TEST_CREDENTIAL_ENTRY });
     expect((await viaRouter('/api/admin/bootstrap', { method: 'POST', body, headers: { Origin: TEST_ORIGIN } }, e)).status).toBe(503);
     expect((await viaRouter('/api/admin/bootstrap', { method: 'POST', body })).status).toBe(400);
@@ -109,7 +109,7 @@ describe('login', () => {
     for (let i = 0; i < 5; i++) expect((await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' })).status).toBe(200);
     expect((await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' })).status).toBe(429);
     const e = { ...(env as unknown as Env) };
-    delete e.ENROLL_LIMITER;
+    delete e.LIMITER;
     expect((await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' }, e)).status).toBe(503);
   });
 
@@ -164,6 +164,31 @@ describe('session verification in the DO', () => {
     expect((await viaRouter('/api/admin/tokens', { headers: forged })).status).toBe(401);
     expect((await viaRouter('/api/admin/clear-cache', { method: 'POST', body: '{}', headers: forged })).status).toBe(401);
     expect((await doGet('tokens-list', forged)).status).toBe(401);
+  });
+
+  it('routes GET/PUT config and rotate-secret with the session, refusing them without', async () => {
+    const put = (body: unknown, headers: Record<string, string> = adminHeaders()) => SELF.fetch(`${TEST_ORIGIN}/api/admin/config`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body),
+    });
+    const denied = await put({ cache_enabled: true }, {});
+    expect(denied.status).toBe(401);
+    await denied.text();
+    const ok = await put({ cache_enabled: true, uv_policy: { default: 'required' } });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ cache_enabled: true, cache_hit_notify: false, uv_policy: { default: 'required' } });
+    const bad = await put({ cache_enabled: true, origin: 'https://evil.test.invalid' });
+    expect(bad.status).toBe(400);
+    await bad.text();
+    const got = await SELF.fetch(`${TEST_ORIGIN}/api/admin/config`, { headers: adminHeaders() });
+    expect(await got.json()).toMatchObject({ cache_enabled: true, origin: TEST_ORIGIN, epoch: 1 });
+    const rotate = await SELF.fetch(`${TEST_ORIGIN}/api/admin/rotate-secret`, { method: 'POST', headers: adminHeaders() });
+    expect(rotate.status).toBe(200);
+    const { secret } = await rotate.json() as { secret: string };
+    expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    // The new value is shown once and never stored in the clear.
+    await inDO(async ({ state }) => {
+      expect(JSON.stringify([await state.storage.get('root:v1'), await state.storage.get('cfg:v1')])).not.toContain(secret);
+    });
   });
 
   it('forwards the cookie through the router and no-stores every admin payload', async () => {
