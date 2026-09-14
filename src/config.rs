@@ -28,7 +28,7 @@ pub fn config_path() -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
-    dirs::home_dir().map(|h| h.join(".config").join("vt").join("config.toml"))
+    std::env::home_dir().map(|h| h.join(".config").join("vt").join("config.toml"))
 }
 
 /// True for keys we allow a config file to populate: VT-namespaced uppercase

@@ -95,7 +95,7 @@ impl ResolvedConfig {
             file_populated_keys,
             |key| std::env::var(key),
             super::config_path(),
-            dirs::home_dir(),
+            std::env::home_dir(),
         )
     }
 

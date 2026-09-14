@@ -246,7 +246,7 @@ fn resolve_workspace(peer_pid: Option<i32>) -> WorkspaceResolution {
     let Some(cwd) = process::get_cwd(pid) else {
         return WorkspaceResolution::Unavailable;
     };
-    let home = dirs::home_dir();
+    let home = std::env::home_dir();
     if let Some(root) = find_git_root(&cwd) {
         if workspace_root_acceptable(&root, &cwd, home.as_deref()) {
             return match workspace_identity(&root) {
@@ -387,7 +387,7 @@ impl BindState {
 /// return the first host name. Cosmetic only — the grant is keyed on the
 /// host key bytes, never on this name.
 fn known_hosts_name(hostkey: &KeyData) -> Option<String> {
-    let path = dirs::home_dir()?.join(".ssh").join("known_hosts");
+    let path = std::env::home_dir()?.join(".ssh").join("known_hosts");
     let content = std::fs::read_to_string(path).ok()?;
     known_hosts_name_in(&content, hostkey)
 }
@@ -427,7 +427,7 @@ fn decrypt_scope_for_basis(basis: ScopedBasis<'_>, secret_type: u8, salt: &[u8])
 /// Contract a `$HOME` prefix to `~` for prompt display. Display-only —
 /// grants and digests always bind the canonical absolute path.
 fn contract_home(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = std::env::home_dir() {
         let home = home.to_string_lossy();
         if let Some(rest) = path.strip_prefix(home.as_ref()) {
             if rest.is_empty() {
@@ -1071,7 +1071,7 @@ mod tests {
 
     #[test]
     fn contract_home_display_only() {
-        let home = dirs::home_dir()
+        let home = std::env::home_dir()
             .expect("home")
             .to_string_lossy()
             .into_owned();
@@ -1408,7 +1408,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let canonical = std::fs::canonicalize(&dir).unwrap();
         if find_git_root(&canonical).is_some()
-            || cwd_fallback_acceptable(&canonical, dirs::home_dir().as_deref())
+            || cwd_fallback_acceptable(&canonical, std::env::home_dir().as_deref())
         {
             // Defensive: scenario requires an excluded, non-git cwd.
             return;

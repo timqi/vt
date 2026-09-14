@@ -488,7 +488,7 @@ fn now_ms() -> u64 {
 /// `~/.local/state/vt/inject` — the sidecar directory (same on macOS and Linux
 /// for a single recovery path). `None` if the home dir can't be resolved.
 fn inject_state_dir() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".local").join("state").join("vt").join("inject"))
+    std::env::home_dir().map(|h| h.join(".local").join("state").join("vt").join("inject"))
 }
 
 /// Make `p` absolute (without requiring it to exist — the target is about to

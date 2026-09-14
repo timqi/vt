@@ -108,7 +108,7 @@ async fn keygen_unix(
 
 #[cfg(unix)]
 fn default_key_path() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir().context("cannot resolve home directory")?;
+    let home = std::env::home_dir().context("cannot resolve home directory")?;
     Ok(home.join(DEFAULT_REL_PATH))
 }
 
@@ -482,7 +482,7 @@ fn upstream_agent_sock() -> Result<std::path::PathBuf> {
             return Ok(std::path::PathBuf::from(sock));
         }
     }
-    let home = dirs::home_dir().context("cannot resolve home directory")?;
+    let home = std::env::home_dir().context("cannot resolve home directory")?;
     Ok(home.join(".ssh").join("vt.sock"))
 }
 

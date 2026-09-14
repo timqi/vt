@@ -1519,7 +1519,7 @@ pub async fn run_ssh_agent(
     ui_token: Option<[u8; 32]>,
 ) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
+    let home = std::env::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
     let socket_path = home.join(".ssh").join("vt.sock");
     // Acquire ownership before Keychain reads. The guard survives every exit
     // path and the signal task, and never removes another socket.
