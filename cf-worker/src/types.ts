@@ -145,9 +145,8 @@ export interface Challenge {
    *  server-side at creation as `max(policy, client request)` and never rewritten
    *  afterwards. The approval page asks for it and the assertion check enforces
    *  it, both from this stored field — a caller cannot downgrade a ceremony at
-   *  verify time. ABSENT on challenges created by a pre-policy Worker, which are
-   *  verified at `required` (uv_policy.challengeUvLevel). */
-  uv?: UvLevel;
+   *  verify time. */
+  uv: UvLevel;
   status: ChallengeStatus;
   /** present after approval: sealed_box([DEK_0||...||DEK_n]) to daemon_pubkey */
   sealed_deks_b64u?: string;
@@ -561,10 +560,9 @@ export interface AgentAuditEntry {
 }
 
 /** Inbound to POST /api/audit-ingest. Signed with `VT-HMAC` over the raw body.
- *  `agent_id` selects the key the Worker derives to verify: `t:<token_id>` →
- *  that host token's secret (host_token.ts), anything else → the legacy
- *  hostname-salted HKDF of the master (crypto.ts hkdfSha256). `hostname` is
- *  display-only. */
+ *  `agent_id` is `t:<token_id>` and selects the host token whose secret
+ *  (host_token.ts) the DO verifies against; any other shape is refused at the
+ *  edge. `hostname` is display-only. */
 export interface AgentAuditIngestRequest {
   timestamp_ms: number;
   agent_id: string;
@@ -613,7 +611,8 @@ export interface DaemonAuth {
 }
 
 export interface DoCreateOp {
-  challenge: Challenge;
+  /** The DO decides `uv` (opCreate); the edge never sends one. */
+  challenge: Omit<Challenge, 'uv'>;
   /** The CLI's `--uv` request (raise-only input to the stored level). */
   uv_request: unknown;
   auth: DaemonAuth;

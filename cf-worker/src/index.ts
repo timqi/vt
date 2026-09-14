@@ -14,7 +14,7 @@
 import { Hono, type Context } from 'hono';
 import { Env } from './types';
 import { b64uEnc, decodeB64uExact, challengeHash, randomBytes, inReplayWindow } from './crypto';
-import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DaemonAuth, DoAuditIngestOp, DoCreateOp, DoDekCacheOp, EnrollRequest, EnrollResponse, DoEnrollCreateOp } from './types';
+import { ApprovePageData, ChallengeRequest, ChallengeResponse, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DaemonAuth, DoAuditIngestOp, DoCreateOp, DoDekCacheOp, EnrollRequest, EnrollResponse, DoEnrollCreateOp } from './types';
 import { isTokenId } from './host_token';
 import { log, logErr, tokenPrefix } from './log';
 import { escapeJsonForHtml, renderTemplate, pageVars, type PageChrome } from './page';
@@ -318,7 +318,7 @@ app.post('/api/challenge', async (c) => {
   const approveHash = await challengeHash(daemonPk, workerNonce, body.timestamp_ms, saltArrays, 'approve');
   const rejectHash  = await challengeHash(daemonPk, workerNonce, body.timestamp_ms, saltArrays, 'reject');
 
-  const ch: Challenge = {
+  const ch: DoCreateOp['challenge'] = {
     approve_token: approveToken,
     poll_token: pollToken,
     daemon_pubkey_b64u: body.daemon_pubkey_b64u,

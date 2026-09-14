@@ -8,8 +8,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   parseUvPolicy, defaultUvPolicy, effectiveUvLevel,
-  parseUvLevel, maxUvLevel, challengeUvLevel,
-  DEFAULT_APPROVAL_UV, LEGACY_CHALLENGE_UV,
+  parseUvLevel, maxUvLevel,
+  DEFAULT_APPROVAL_UV,
 } from '../src/uv_policy';
 
 const DECRYPT = { op_kind: 'decrypt', host: 'laptop' };
@@ -100,14 +100,5 @@ describe('client request folds in as a raise only', () => {
     for (const asked of [undefined, null, '', 'REQUIRED', 'yes', 7, {}]) {
       expect(effectiveUvLevel(loose, DECRYPT, asked)).toBe('discouraged');
     }
-  });
-});
-
-describe('stored ceremony level', () => {
-  it('verifies a pre-policy challenge at required', () => {
-    expect(LEGACY_CHALLENGE_UV).toBe('required');
-    expect(challengeUvLevel(undefined)).toBe('required');
-    expect(challengeUvLevel('bogus')).toBe('required');
-    expect(challengeUvLevel('discouraged')).toBe('discouraged');
   });
 });

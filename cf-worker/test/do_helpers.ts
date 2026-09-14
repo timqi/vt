@@ -262,6 +262,7 @@ export function makeChallenge(over: Partial<Challenge> = {}): Challenge {
     reject_challenge_hash_b64u: b64uEnc(new Uint8Array(32).fill(4)),
     salts_b64u: [],
     meta: makeMeta(),
+    uv: 'required',
     status: 'pending',
     created_ms: Date.now(),
     ...over,

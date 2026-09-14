@@ -32,12 +32,6 @@ const RANK: Record<UvLevel, number> = { discouraged: 0, preferred: 1, required: 
 /** Level an approval ceremony gets when nothing raises it. */
 export const DEFAULT_APPROVAL_UV: UvLevel = 'discouraged';
 
-/** Level assumed for a stored challenge that carries no `uv` — i.e. one created
- *  by a pre-policy Worker during a rolling deploy. Those ceremonies were served
- *  a page that asked for `required`, so verifying them at `required` is both
- *  correct and the fail-closed direction. */
-export const LEGACY_CHALLENGE_UV: UvLevel = 'required';
-
 /** Accept only the three spec levels. Anything else — absent, misspelled, a
  *  non-string from a client body — is "no opinion", never a level. */
 export function parseUvLevel(v: unknown): UvLevel | null {
@@ -133,10 +127,4 @@ export function effectiveUvLevel(
     if (rule) level = maxUvLevel(level, rule);
   }
   return level;
-}
-
-/** The level a STORED ceremony is verified at. Server state only — see
- *  LEGACY_CHALLENGE_UV for the absent case. */
-export function challengeUvLevel(uv: unknown): UvLevel {
-  return parseUvLevel(uv) ?? LEGACY_CHALLENGE_UV;
 }

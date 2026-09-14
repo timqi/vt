@@ -25,7 +25,7 @@ import { lookupByCredentialId } from './credentials';
 import { verifyAssertion } from './webauthn';
 import { cachePublicKey, discardedBoxPublicKey } from './cache_crypto';
 import { isAllowedExtendTtl, approveTtlOptions, extendTtlOptions, planExtend } from './cache_policy';
-import { challengeUvLevel, effectiveUvLevel } from './uv_policy';
+import { effectiveUvLevel } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
 import { AccountAudit, auditKey } from './account_audit';
 import { checkAdopt, isName, nameLabel } from './account_names';
@@ -460,19 +460,22 @@ export class AccountDO extends DurableObject<Env> {
     let parsed: DoCreateOp;
     try { parsed = await request.json() as DoCreateOp; }
     catch { return badRequest('invalid json'); }
-    const challenge = parsed.challenge;
-    if (!challenge || typeof challenge.approve_token !== 'string' || typeof challenge.poll_token !== 'string') {
+    const body = parsed.challenge;
+    if (!body || typeof body.approve_token !== 'string' || typeof body.poll_token !== 'string') {
       return badRequest('invalid challenge');
     }
-    const t = await this.authenticateDaemon(parsed.auth, challenge.meta?.ip ?? '', true);
+    const t = await this.authenticateDaemon(parsed.auth, body.meta?.ip ?? '', true);
     if (t instanceof Response) return t;
     // The record — not the body — says which host/user this is.
-    challenge.meta = { ...challenge.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
-    challenge.token_id = t.token_id;
-    // Decided HERE, once, from the stored policy plus the client's raise-only
-    // request, against the VERIFIED host: the approval page and the assertion
-    // check both read it back, so neither the phone nor the CLI can lower it.
-    challenge.uv = effectiveUvLevel(this.admin.uvPolicy(), challenge.meta, parsed.uv_request);
+    const meta = { ...body.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
+    // `uv` is decided HERE, once, from the stored policy plus the client's
+    // raise-only request, against the VERIFIED host: the approval page and the
+    // assertion check both read it back, so neither the phone nor the CLI can
+    // lower it.
+    const challenge: Challenge = {
+      ...body, meta, token_id: t.token_id,
+      uv: effectiveUvLevel(this.admin.uvPolicy(), meta, parsed.uv_request),
+    };
     await this.storeAndAnnounce(challenge);
     return Response.json({ meta: challenge.meta, approve_url: `${this.admin.current.origin}/a/${challenge.approve_token}` });
   }
@@ -535,7 +538,7 @@ export class AccountDO extends DurableObject<Env> {
         expectedChallenge: expected,
         rpId: new URL(this.admin.current.origin).hostname,
         expectedOrigin: this.admin.current.origin,
-        userVerification: challengeUvLevel(ch.uv),
+        userVerification: ch.uv,
       });
     } catch (e) {
       logErr('webauthn.verify_failed', e, { at: tokenPrefix(ch.approve_token) });
@@ -1116,7 +1119,7 @@ export class AccountDO extends DurableObject<Env> {
       // What the page asks the authenticator for. Server state, so a tampered
       // page can only make the ceremony fail its own verification, never pass a
       // weaker one.
-      user_verification: challengeUvLevel(ch.uv),
+      user_verification: ch.uv,
       metadata: ch.meta,
       records: this.audit.names.resolve(ch.salts_b64u, ch.meta.names ?? []),
       cache_options_s: cacheOptionsS,

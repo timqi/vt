@@ -19,18 +19,9 @@ const HOUR = 60 * 60_000;
 beforeEach(bootstrap);
 
 /** Store a pending challenge the CLI requested at `uv` (raise-only over the
- *  default policy, so the stored level equals it). Omit it for a pre-policy
- *  one: that is written straight into storage, since `create` always decides
- *  a level against the verified host. */
-async function pending(uv?: Challenge['uv']): Promise<Challenge> {
+ *  default policy, so the stored level equals it). */
+async function pending(uv: Challenge['uv']): Promise<Challenge> {
   const ch = makeChallenge();
-  if (!uv) {
-    await inDO(async ({ inst, state }) => {
-      await state.storage.put({ [`ch:${ch.approve_token}`]: ch, [`pt:${ch.poll_token}`]: ch.approve_token });
-      inst.audit.create(ch);
-    });
-    return ch;
-  }
   const res = await doPost('create', { challenge: ch, uv_request: uv, auth: await daemonAuth(await liveTokenId()) });
   expect(res.status).toBe(200);
   ch.uv = uv;
@@ -87,12 +78,6 @@ describe('the page is served the ceremony’s own level', () => {
       expect((await pageData(ch.approve_token)).user_verification).toBe(uv);
     }
   });
-
-  it('shows required for a challenge minted before the policy existed', async () => {
-    const ch = await pending();
-    expect(ch.uv).toBeUndefined();
-    expect((await pageData(ch.approve_token)).user_verification).toBe('required');
-  });
 });
 
 describe('the assertion is checked against that same level', () => {
@@ -116,11 +101,6 @@ describe('the assertion is checked against that same level', () => {
     expect(stored!.sealed_deks_b64u).toBeUndefined();
     // The same authenticator with UV set goes through.
     expect((await approve(ch, {}, FLAGS_UP_UV)).status).toBe(200);
-  });
-
-  it('refuses a presence-only assertion on a pre-policy challenge', async () => {
-    const ch = await pending();
-    expect((await approve(ch, {}, FLAGS_UP_ONLY)).status).toBe(401);
   });
 
   it('still demands user presence at every level', async () => {
