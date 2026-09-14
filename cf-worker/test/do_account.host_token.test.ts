@@ -281,13 +281,13 @@ describe('SECRET rotation and reset', () => {
     const wraps = () => inDO(h => h.state.storage.get<{ wraps: unknown[] }>('root:v1').then(r => r!.wraps.length));
     expect(await wraps()).toBe(2);
     // Both values open R while the window is open …
-    expect((await withSecret('test-kek-not-a-secret')).loaded).not.toBeNull();
+    expect((await withSecret(env.SECRET)).loaded).not.toBeNull();
     expect(await wraps()).toBe(2);
     // … and the first load under the new one collapses to a single wrap.
     const under = await withSecret(fresh);
     expect(under.loaded).not.toBeNull();
     expect(await wraps()).toBe(1);
-    expect((await withSecret('test-kek-not-a-secret')).loaded).toBeNull();
+    expect((await withSecret(env.SECRET)).loaded).toBeNull();
     // The token secret is R's, not SECRET's: the enrolled host is untouched.
     expect(await under.admin.hostTokenSecret(tokenId)).toEqual(await hostSecret(tokenId));
     const body = challengeBody();
@@ -337,7 +337,7 @@ describe('SECRET rotation and reset', () => {
 
   it('refuses a token-less signature under either generation', async () => {
     const body = challengeBody();
-    for (const key of ['test-kek-not-a-secret', 'a-fresh-secret']) {
+    for (const key of [env.SECRET, 'a-fresh-secret']) {
       const raw = new TextEncoder().encode(JSON.stringify(body));
       const mac = await hmacSha256(new TextEncoder().encode(key), raw);
       const res = await post('/api/challenge', body, { Authorization: `VT-HMAC ${b64uEnc(mac)}` });
