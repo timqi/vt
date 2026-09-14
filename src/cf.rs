@@ -71,7 +71,9 @@ pub const HOST_TOKEN_PREFIX: &str = "vt1.";
 /// Worker needs to re-derive it (`VT-Token-Id` header). Nothing but a host
 /// token parses: the Worker has no token-less request path.
 pub struct WorkerAuth {
-    key: Zeroizing<Vec<u8>>,
+    /// The token's 32-byte secret: the HMAC key for every daemon request and,
+    /// via `--audit-key`, the agent's audit push.
+    pub key: Zeroizing<[u8; 32]>,
     pub token_id: String,
 }
 
@@ -95,18 +97,13 @@ impl WorkerAuth {
         }
         let secret: [u8; 32] = decode_b64u_exact(secret_b64u, "VT_PASSKEY_TOKEN secret")?;
         Ok(Self {
-            key: Zeroizing::new(secret.to_vec()),
+            key: Zeroizing::new(secret),
             token_id: id.to_owned(),
         })
     }
 
     fn auth_header(&self, body: &[u8]) -> String {
-        hmac_auth_header_raw(&self.key, body)
-    }
-
-    /// Raw HMAC key: the token's 32-byte secret.
-    pub fn key_bytes(&self) -> &[u8] {
-        &self.key
+        hmac_auth_header_raw(&*self.key, body)
     }
 }
 
@@ -1197,7 +1194,6 @@ mod tests {
         let tok = "vt1.AAAAAAAAAAAAAAAA.iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI";
         let parsed = WorkerAuth::parse(tok).unwrap();
         assert_eq!(parsed.token_id, "AAAAAAAAAAAAAAAA");
-        assert_eq!(parsed.key.len(), 32);
         // Same body, same key → same MAC as the Worker computes with the derived
         // secret (crypto-level parity is pinned by the b64u secret above, which
         // is the Worker test suite's golden vector for this id).

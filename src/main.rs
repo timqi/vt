@@ -37,14 +37,14 @@ fn build_audit_push_config(
             return AuditPushConfig::disabled();
         }
     };
-    match audit::host_token_audit_key(raw) {
-        Some((token_id, key)) => AuditPushConfig::new(
+    match cf::WorkerAuth::parse(raw) {
+        Ok(auth) => AuditPushConfig::new(
             url.clone(),
-            key,
-            format!("t:{token_id}"),
+            auth.key,
+            format!("t:{}", auth.token_id),
             caller_meta::get_hostname(),
         ),
-        None => {
+        Err(_) => {
             tracing::warn!(
                 "audit push disabled: --audit-key must be this Mac's host token (vt1.…, from `vt enroll`)"
             );
@@ -53,7 +53,6 @@ fn build_audit_push_config(
     }
 }
 
-mod audit;
 mod caller_meta;
 mod cf;
 mod client;

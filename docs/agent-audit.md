@@ -1,8 +1,9 @@
 # Agent audit push (fire-and-forget)
 
 Status: **implemented**. This page documents the wire contract, security
-tradeoffs, and provisioning. The implementation is in `src/audit.rs`,
-`src/server_macos/audit.rs`, and `cf-worker/src/crypto.ts`; deferred items at
+tradeoffs, and provisioning. The implementation is in `src/main.rs`
+(`build_audit_push_config`), `src/server_macos/audit.rs`, and
+`cf-worker/src/crypto.ts`; deferred items at
 the end are intentionally not part of the current feature.
 
 The macOS SSH agent (`src/server_macos/ssh_agent.rs`) emits one record per
@@ -46,7 +47,8 @@ per-host key from; any other `agent_id` form is a rejected input
 (`bad agent token id`).
 
 - The **agent** keeps only the 32-byte token secret in memory
-  (`host_token_audit_key`, `src/audit.rs`); the flag value remains visible in
+  (`cf::WorkerAuth::parse` in `build_audit_push_config`, `src/main.rs`); the
+  flag value remains visible in
   `ps`, as any command-line secret does.
 - The **Worker** edge checks the header shape and the 64 KB cap, reads
   `agent_id` (unverified — it only selects the token), and forwards the raw
