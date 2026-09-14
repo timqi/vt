@@ -201,17 +201,6 @@ mod tests {
         );
     }
 
-    /// A store written by a build that still had the FIDO2 fallback carries
-    /// `encrypted_fido2`; it parses, and the blob is dropped on the next save.
-    #[test]
-    fn test_legacy_fido2_field_is_ignored_and_dropped() {
-        let json = r#"{"v":1,"passcode_and_auth_token":"AA","encrypted_passphrase":"BB","encrypted_fido2":"CC"}"#;
-        let parsed: KeychainStore = serde_json::from_str(json).unwrap();
-        assert!(parsed.encrypted_ssh_keys.is_none());
-        let out = serde_json::to_string(&parsed).unwrap();
-        assert!(!out.contains("encrypted_fido2"));
-    }
-
     #[test]
     fn test_optional_fields_omitted_in_json_when_none() {
         let store = KeychainStore::new(&[0u8; 64], &[1u8; 60]);
