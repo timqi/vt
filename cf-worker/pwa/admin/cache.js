@@ -270,8 +270,8 @@
     pickTd.appendChild(pick);
     tr.appendChild(pickTd);
 
-    // 目标: host over user · directory. The full directory is the hover title —
-    // it is half the cache binding, so it must stay inspectable.
+    // 目标: host over user · directory. The full directory is the hover title;
+    // the key binds the host token plus the project the approval reported.
     cell2(tr, g.host || '—',
       (g.user || '?') + (g.pwd ? ' · ' + shortPath(g.pwd) : ''),
       { mainCls: 'trunc-host',
@@ -279,15 +279,15 @@
           + '\n来源审批: ' + g.origin_token_id,
         subCls: 'trunc-sub',
         subHover: '用户: ' + (g.user || '—') + '\n工作目录: ' + (g.pwd || '—')
-          + '\n\n（目录与来源 IP 共同构成缓存绑定，两者一致才会命中）' });
+          + '\n\n（缓存绑定该主机的令牌与客户端自报的项目，两者一致才会命中）' });
 
-    // 命令: the command over the bound source IP (the hard half of the binding).
+    // 命令: the command over the source IP at approval (audit metadata).
     cell2(tr, commandSummary(g.command, 120), g.ip,
       { mainCls: 'trunc-cmd',
         mainHover: (g.command || '—') + (g.ppid_cmd ? '\n\n父进程: ' + g.ppid_cmd : ''),
         subCls: 'mono',
-        subHover: '来源 IP: ' + (g.ip || '—')
-          + '\n（Worker 侧取自 CF-Connecting-IP，客户端无法伪造）' });
+        subHover: '批准时来源 IP: ' + (g.ip || '—')
+          + '\n（Worker 侧取自 CF-Connecting-IP，仅作审计，不参与绑定）' });
 
     // 条目: live count, with the swept-but-present total only when they differ.
     cell2(tr, String(g.live), g.entries !== g.live ? '共 ' + g.entries : '',
@@ -446,7 +446,7 @@
       // approval page states it too, but say it before the request is even made.
       if (ttlIsLong(ttl)) {
         parts.push('⚠ ' + ttlLabel(ttl) + '内这 ' + gainers.length
-          + ' 组记录的解密将持续免手机审批（同一来源 IP + 工作目录）');
+          + ' 组记录的解密将持续免手机审批（同一主机令牌 + 项目）');
         warn = true;
       }
       parts.push('批准后有效期重设为「批准时刻 + ' + ttlLabel(ttl) + '」，可再次延长');

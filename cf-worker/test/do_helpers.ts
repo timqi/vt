@@ -145,6 +145,7 @@ export function makeMeta(over: Partial<ChallengeMeta> = {}): ChallengeMeta {
     host: 'testbox',
     user: 'tester',
     pwd: '/home/tester/repo',
+    project: '/home/tester/repo/.git',
     ppid_cmd: 'zsh -c fake',
     ip: '203.0.113.9',
     reason: '',

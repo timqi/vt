@@ -60,7 +60,7 @@ const ADMIN_SEG = 'kestrel';
 // while admin.css stays stale, which desyncs markup from styles. The .html
 // page shells need no token — the Worker reads them server-side per request.)
 // Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
-const ASSET_VER = '20260914-e7f8038';
+const ASSET_VER = '20260914-3a9d162';
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
@@ -99,6 +99,7 @@ function capChallengeMeta(raw: Partial<ChallengeMeta> | undefined, connectingIp:
     host:       capMeta(raw?.host, 100),
     user:       capMeta(raw?.user, 64),
     pwd:        capMeta(raw?.pwd, 200),
+    project:    capMeta(raw?.project, 200),
     ppid_cmd:   capMeta(raw?.ppid_cmd, 200),
     ip:         capMeta(connectingIp, 64),
     reason:     capMeta(raw?.reason, 200),

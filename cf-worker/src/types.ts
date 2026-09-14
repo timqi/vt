@@ -322,7 +322,7 @@ export interface CacheGroupSummary {
   /** Entry creation time (epoch ms); null for pre-migration entries. Forensic
    *  only — extension is measured from the approval, not from creation. */
   created_ms: number | null;
-  /** Worker-derived source IP the entries are bound to. */
+  /** Worker-derived source IP at approval (audit metadata; not bound). */
   ip: string;
   ppid_cmd: string;
   /** Joined from the origin audit row (same fields the audit tab already shows
@@ -382,6 +382,10 @@ export interface ChallengeMeta {
   user: string;
   /** Current working directory of the vt CLI */
   pwd: string;
+  /** The CLI's project root: the repository's common git dir when inside one,
+   *  else the cwd. Client-reported and advisory; the DEK cache narrows its
+   *  token-bound key on it (account_cache.ts). */
+  project: string;
   /** Parent process command line — which shell / script invoked vt */
   ppid_cmd: string;
   ip: string;
@@ -485,11 +489,6 @@ export interface ApprovePageData {
   /** base64url 32-byte X25519 public key the PWA seals cached DEKs to. Empty
    *  string when CACHE_SECKEY is unset (caching disabled — PWA hides the UI). */
   cache_pubkey_b64u: string;
-  /** `cacheScopePwd(metadata.pwd)` — the directory scope a cache armed by this
-   *  approval would answer for (worktree suffixes stripped). Display only: it
-   *  tells the approver the reuse scope, while `metadata.pwd` keeps the literal
-   *  working directory. */
-  cache_scope_pwd: string;
   /** Enrollment ceremonies only: the pairing code the approver compares with
    *  the requesting terminal before approving. */
   enroll_pair_code?: string;
@@ -498,7 +497,7 @@ export interface ApprovePageData {
   host_verified: boolean;
 }
 
-// ── DEK cache (opt-in, IP+pwd-scoped) ──────────────────────────────────────
+// ── DEK cache (opt-in, token+project-scoped) ───────────────────────────────
 
 /** Inbound from daemon via POST /api/dek-cache — the fast path tried before a
  *  ceremony. HMAC(VT_AUTH_CF)-gated like /api/challenge. */
@@ -507,10 +506,10 @@ export interface DekCacheRequest {
   /** salts to look up; empty array is rejected (returns miss). */
   salts_b64u: string[];
   timestamp_ms: number;
-  /** Display meta (same shape as the challenge request). `meta.pwd` is the
-   *  client-reported half of the cache binding ctx (ctx = IP + cacheScopePwd(pwd));
-   *  IP is the worker-derived hard boundary. The rest is stored on the hit audit
-   *  row so a cache hit carries the same context as a ceremony decrypt. */
+  /** Display meta (same shape as the challenge request). `meta.project` is the
+   *  client-reported, advisory half of the cache key; the host token that
+   *  authenticated the request is the hard half. The rest is stored on the hit
+   *  audit row so a cache hit carries the same context as a ceremony decrypt. */
   meta?: Partial<ChallengeMeta>;
 }
 
@@ -521,17 +520,16 @@ export type DekCacheResponse =
   | { source: 'cache'; sealed_deks_b64u: string }
   | { miss: true };
 
-/** A single cached DEK in DO storage, keyed `dek:{ctx}:{salt_b64u}` where
- *  ctx = b64u(SHA-256("vt-dek-ctx-v4" || len(ip) || ip || cacheScopePwd(pwd))).
- *  The pwd is normalized so git-worktree siblings share one scope; see
- *  docs/dek-cache.md §2.5. */
+/** A single cached DEK in DO storage, keyed `dek:{token_id}:{project_h}:{salt_b64u}`
+ *  where project_h = b64u(SHA-256("vt-dek-ctx-v5" || project)[0..16]); see
+ *  docs/dek-cache.md. */
 export interface CacheEntry {
   /** crypto_box_seal(DEK_raw, CACHE_PUBKEY) — Worker opens with CACHE_SECKEY. */
   sealed_to_cache_b64u: string;
   expires_ms: number;
   /** audit: which approval (audit token_id) wrote this entry. */
   origin_token_id: string;
-  /** binding context, stored redundantly for audit/forensics. */
+  /** Worker-derived source IP at approval; audit/forensics only, not bound. */
   ip: string;
   /** Legacy (pre-trim entries only); no longer written. */
   ppid?: number;
@@ -657,7 +655,7 @@ export interface DoApproveOp {
 
 /** Internal DO op for POST /api/dek-cache. The Worker builds `meta` (capping the
  *  client-supplied fields and overwriting `meta.ip` from CF-Connecting-IP, never
- *  trusting the body's IP). `meta.ip` + `meta.ppid` form the cache binding ctx. */
+ *  trusting the body's IP). `token_id` + `meta.project` form the cache key. */
 export interface DoDekCacheOp {
   daemon_pubkey_b64u: string;
   salts_b64u: string[];

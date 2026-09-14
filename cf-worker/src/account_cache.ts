@@ -4,7 +4,8 @@
 import { Env, Challenge, ChallengeMeta, CacheEntry, CacheExtendIntent } from './types';
 import { b64uEnc, isB64uString, decodeB64uExact, sha256, randomBytes } from './crypto';
 import { seal, openToCache } from './cache_crypto';
-import { planExtend, isAllowedApproveTtl, groupIdOf, isExtendableGroupId, cacheScopePwd } from './cache_policy';
+import { planExtend, isAllowedApproveTtl, groupIdOf, isExtendableGroupId } from './cache_policy';
+import { isTokenId } from './host_token';
 import { logErr } from './log';
 import { STORAGE_BATCH, deleteKeysBatched, listPrefixPages } from './storage_batch';
 
@@ -13,46 +14,35 @@ import { STORAGE_BATCH, deleteKeysBatched, listPrefixPages } from './storage_bat
 // the view is partial rather than imply completeness.
 const CACHE_LIST_SCAN_MAX = 20000;
 
-// DEK cache entry key. ctx binds the entry to (a) the requester's worker-derived
-// IP (CF-Connecting-IP — unspoofable by the client, the hard boundary) AND (b)
-// the client-reported working directory (pwd), normalized by cacheScopePwd. A
-// lookup recomputes ctx from the same IP + scope, so a request from a different
-// egress IP OR an unrelated cwd finds no key (a clean miss, no oracle).
+// DEK cache entry key: `dek:{token_id}:{project_h}:{salt_b64u}`.
 //
-// pwd is CLIENT-REPORTED, so — like the removed ppid — it is advisory: a fully
-// compromised local host can spoof it, so it does not widen the real (IP) hard
-// boundary. Its value is same-host blast-radius reduction: a process decrypting
-// from an UNRELATED directory misses the cache, so a cached grant for one project
-// tree does not silently serve another. Crucially — and unlike ppid — pwd is
-// STABLE across orchestrated callers (Claude Code, CI, make, tmux) that spawn a
-// fresh shell per command from the same project dir, so the cache still hits.
+// token_id is the hard boundary: the host token the edge verified on THIS
+// request (host_token.ts), so a cached grant serves only the host that earned
+// it, wherever its egress IP goes. `meta.ip` stays on the entry as audit
+// metadata only. project_h is the client-reported `project` (the repository's
+// common git dir, else the cwd — src/cf.rs), hashed under the ctx tag and
+// truncated to 16 bytes. It is advisory, as `pwd` was: a compromised host can
+// spoof it, so it never widens the token boundary; it narrows it so one
+// project's grant does not serve an unrelated tree on the same host, while
+// every worktree of one repository shares the grant.
 //
-// The ppid left the ctx because it is BOTH spoofable AND unstable (getppid()
-// changes every call under orchestrators, so the cache never hit); it has
-// since left the wire entirely. The tag names the derivation so a change to
-// it can never share a storage key with the old one. The hard guarantee:
-// within the TTL, possession of VT_PASSKEY_TOKEN behind the SAME egress IP;
-// the pwd scope only narrows it further, it never widens beyond that IP.
-//
-// Normalization happens HERE, not at the call sites, so no future caller can
-// key a write and a read on different halves of the rule.
-async function cacheCtx(ip: string, pwd: string): Promise<string> {
+// The tag names the derivation, so a bumped derivation can never share a
+// storage key with the old one; v4 (`dek:{ctx}:{salt}`) entries are unreachable
+// and lapse or are cleared from the admin tab. Derived HERE for reads and
+// writes alike, so no caller can key the two on different rules.
+async function cacheCtx(tokenId: string, project: string): Promise<string> {
+  // Fail closed: a key with an empty token half would be one every host could
+  // reach. opCreate/opDekCache already refuse such bodies; this is the seam's
+  // own guard, so a throw here is a DO bug surfacing as a 500, never a hit.
+  if (!isTokenId(tokenId)) throw new Error('cache ctx without token_id');
   const enc = new TextEncoder();
-  const tag = enc.encode('vt-dek-ctx-v4');
-  const ipBytes = enc.encode(ip);
-  const pwdBytes = enc.encode(cacheScopePwd(pwd));
-  // Length-prefix the IP so (ip="a", pwd="bc") and (ip="ab", pwd="c") can't
-  // collide into the same digest. IP has no NUL, so a NUL separator is
-  // unambiguous, but an explicit u32 length is simplest and future-proof.
-  const lenPrefix = new Uint8Array(4);
-  new DataView(lenPrefix.buffer).setUint32(0, ipBytes.length, false);
-  const buf = new Uint8Array(tag.length + lenPrefix.length + ipBytes.length + pwdBytes.length);
-  let o = 0;
-  buf.set(tag, o); o += tag.length;
-  buf.set(lenPrefix, o); o += lenPrefix.length;
-  buf.set(ipBytes, o); o += ipBytes.length;
-  buf.set(pwdBytes, o);
-  return b64uEnc(await sha256(buf));
+  const tag = enc.encode('vt-dek-ctx-v5');
+  const projectBytes = enc.encode(project);
+  const buf = new Uint8Array(tag.length + projectBytes.length);
+  buf.set(tag, 0);
+  buf.set(projectBytes, tag.length);
+  const projectH = b64uEnc((await sha256(buf)).slice(0, 16));
+  return `${tokenId}:${projectH}`;
 }
 
 function cacheKey(ctx: string, saltB64u: string): string {
@@ -60,9 +50,9 @@ function cacheKey(ctx: string, saltB64u: string): string {
 }
 
 // One aggregated DEK-cache group, as scanned from storage. `keys` holds the
-// `dek:{ctx}:{salt}` storage keys and is populated ONLY for the extension commit
-// — it must never reach a response body (the ctx digest plus a known IP would let
-// a reader brute-force the client-reported `pwd` offline).
+// `dek:{token_id}:{project_h}:{salt}` storage keys and is populated ONLY for the
+// extension commit — it must never reach a response body (the project hash would
+// let a reader brute-force the client-reported `project` path offline).
 interface CacheAgg {
   group_id: string;
   keys: string[];
@@ -169,8 +159,8 @@ export class AccountCache {
     return { ...result, groups: hit.size };
   }
 
-  // Write one cache entry per salt, keyed by ctx(IP,pwd)+salt. Caller has
-  // already verified the WebAuthn assertion, so this is authorized. INVARIANT
+  // Write one cache entry per salt, keyed by ctx(token_id, project)+salt. Caller
+  // has already verified the WebAuthn assertion, so this is authorized. INVARIANT
   // (M1): we only reach here because the PHONE sent cache material (the PWA
   // produces it solely when the human picks TTL > 0) — the Worker cannot
   // fabricate a cache entry the user did not authorize.
@@ -206,8 +196,11 @@ export class AccountCache {
       probe.fill(0);
     }
 
+    // Ceremonies no host token opened (enroll, extension) carry no salts and
+    // were rejected above; a salted ceremony without one is a Worker bug.
+    if (!isTokenId(ch.token_id)) return reject('missing token_id');
     const ip = ch.meta.ip ?? '';
-    const ctx = await cacheCtx(ip, ch.meta.pwd ?? '');
+    const ctx = await cacheCtx(ch.token_id, ch.meta.project ?? '');
     const createdMs = Date.now();
     const expires = createdMs + ttlS * 1000;
     // One group handle per write: unique, random, and independent of the
@@ -237,14 +230,12 @@ export class AccountCache {
     return { ok: true, expires_ms: expires, group_id: groupId };
   }
 
-  async read(meta: ChallengeMeta, salts: string[], daemonPk: Uint8Array): Promise<string | null> {
-    const ip = meta.ip ?? '';
-    const pwd = meta.pwd ?? '';
+  async read(tokenId: string, meta: ChallengeMeta, salts: string[], daemonPk: Uint8Array): Promise<string | null> {
     if (salts.length === 0 || salts.length > 256) return null;
     if (!this.env.CACHE_SECKEY || !this.env.CACHE_SECKEY.trim()) return null;
     for (const s of salts) { if (!isB64uString(s)) return null; }
 
-    const ctx = await cacheCtx(ip, pwd);
+    const ctx = await cacheCtx(tokenId, meta.project ?? '');
     // Batch the lookups (M2): the whole key set is read before anything is
     // decided, so response timing does not leak the position of the first miss.
     // Batched via getKeysBatched because salts may run to 256, twice the
@@ -289,8 +280,8 @@ export class AccountCache {
 
   // One aggregated group as scanned from storage. `keys` is populated only when
   // the caller needs to mutate/delete (kept out of the listing response, which
-  // must never expose a `dek:{ctx}:{salt}` key: ctx plus a known IP would turn the
-  // listing into an offline oracle for the client-reported `pwd`).
+  // must never expose a storage key: its project hash would turn the listing
+  // into an offline oracle for the client-reported `project` path).
   private static aggInit(groupId: string, e: CacheEntry): CacheAgg {
     return {
       group_id: groupId,

@@ -16,8 +16,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { b64uEnc } from '../src/crypto';
 import {
-  inDO, setDoVar, doPost, approve, makeChallenge, makeMeta,
-  sealFakeDek, nextSalt, allDekKeys, testEnv, liveTokenId,
+  inDO, setDoVar, doPost, approve, makeChallenge, makeMeta, makeEntry, FAKE_CTX,
+  sealFakeDek, nextSalt, allDekKeys, auditRows, testEnv, liveTokenId,
 } from './do_helpers';
 
 const TTL_8H = 8 * 3600;
@@ -25,15 +25,20 @@ const TTL_8H = 8 * 3600;
 // Any 32 bytes: the response is sealed TO this key, and nothing here opens it.
 const DAEMON_PK_B64U = b64uEnc(new Uint8Array(32).fill(11));
 
+// The host token is the cache key's hard half, so one test = one token: the
+// ceremony that arms and the probe that reads must present the same one.
+let tokenId: string;
+
 beforeEach(async () => {
   await setDoVar('CACHE_SECKEY', testEnv.CACHE_SECKEY);
+  tokenId = await liveTokenId();
 });
 
 /** Run a real ceremony over `n` salts and approve it with an 8h cache. */
 async function armCache(n: number, meta = makeMeta()): Promise<string[]> {
   const salts = Array.from({ length: n }, () => nextSalt());
   const ch = makeChallenge({ salts_b64u: salts, meta });
-  expect((await doPost('create', { challenge: ch, token_id: await liveTokenId() })).status).toBe(200);
+  expect((await doPost('create', { challenge: ch, token_id: tokenId })).status).toBe(200);
   const res = await approve(ch, {
     cache_ttl_s: TTL_8H,
     cache_sealed_deks_b64u: salts.map((_, i) => sealFakeDek((i % 251) + 1)),
@@ -43,14 +48,14 @@ async function armCache(n: number, meta = makeMeta()): Promise<string[]> {
   return salts;
 }
 
-/** The read the Rust client performs. `meta` must carry the same ip + pwd the
- *  ceremony did — they ARE the binding ctx. */
-async function read(salts: string[], over = {}) {
+/** The read the Rust client performs. `meta.project` must match the ceremony's
+ *  — it is the advisory half of the key; the token is the hard half. */
+async function read(salts: string[], over = {}, token = tokenId) {
   return doPost('dek-cache', {
     daemon_pubkey_b64u: DAEMON_PK_B64U,
     salts_b64u: salts,
     meta: makeMeta(over),
-    token_id: await liveTokenId(),
+    token_id: token,
   });
 }
 
@@ -98,25 +103,63 @@ describe('opDekCache — batched reads', () => {
     expect(res.json).toEqual({ miss: true });
   });
 
-  // Binding is per-ctx, not per-chunk, so this one needs no large salt set.
-  it('misses when the binding pwd differs, even for armed salts', async () => {
+  // Binding is per-key, not per-chunk, so these need no large salt set.
+  it('misses when the reported project differs, even for armed salts', async () => {
     const salts = await armCache(4);
-    const res = await read(salts, { pwd: '/home/tester/elsewhere' });
+    const res = await read(salts, { project: '/home/tester/elsewhere/.git' });
     expect(res.status).toBe(200);
     expect(res.json).toEqual({ miss: true });
   });
 
-  it('shares normalized worktree scope while preserving literal metadata and the IP boundary', async () => {
+  it('misses for another live host token on the same project, IP and directory', async () => {
+    const salts = await armCache(4);
+    expect((await read(salts, {}, await liveTokenId())).json).toEqual({ miss: true });
+    expect((await read(salts)).json).toMatchObject({ source: 'cache' });
+  });
+
+  it('hits across egress IP and cwd within one project; pwd/ip stay literal in audit and listing', async () => {
     const writtenPwd = '/home/tester/repo.feature';
     const readPwd = '/home/tester/repo.main';
     const salts = await armCache(2, makeMeta({ pwd: writtenPwd }));
-    expect((await read(salts, { pwd: readPwd })).json).toMatchObject({ source: 'cache' });
-    expect((await read(salts, { pwd: readPwd, ip: '198.51.100.4' })).json).toEqual({ miss: true });
+    expect((await read(salts, { pwd: readPwd, ip: '198.51.100.4' })).json).toMatchObject({ source: 'cache' });
     await inDO(({ state }) => {
-      expect(state.storage.sql.exec('SELECT pwd FROM audit ORDER BY id').toArray())
-        .toEqual([{ pwd: writtenPwd }, { pwd: readPwd }]);
+      expect(state.storage.sql.exec('SELECT pwd, ip FROM audit ORDER BY id').toArray())
+        .toEqual([{ pwd: writtenPwd, ip: '203.0.113.9' }, { pwd: readPwd, ip: '198.51.100.4' }]);
     });
     const listing = await doPost('cache-list', {});
-    expect((listing.json as { groups: Array<{ pwd: string }> }).groups[0]!.pwd).toBe(writtenPwd);
+    const g = (listing.json as { groups: Array<{ pwd: string; ip: string }> }).groups[0]!;
+    expect(g.pwd).toBe(writtenPwd);
+    expect(g.ip).toBe('203.0.113.9');
+  });
+
+  // Rejected input: the v4 layout `dek:{ctx}:{salt}` (ctx = IP + normalized pwd)
+  // has no token half. Such entries are never read — no dual-read — but they
+  // stay listable and clearable until they lapse.
+  it('never serves a v4-shaped entry, which stays listable and clearable', async () => {
+    const salt = nextSalt();
+    await inDO(h => h.state.storage.put(`dek:${FAKE_CTX}:${salt}`, makeEntry()));
+    expect((await read([salt])).json).toEqual({ miss: true });
+    const listing = await doPost('cache-list', {});
+    expect((listing.json as { groups: unknown[] }).groups).toHaveLength(1);
+    expect((await doPost('clear-cache', {})).json).toEqual({ cleared: 1 });
+  });
+});
+
+describe('opDekCache / writeCache — token_id is the hard half', () => {
+  it('refuses a probe without a token before touching the cache', async () => {
+    const salts = await armCache(2);
+    const res = await doPost('dek-cache', {
+      daemon_pubkey_b64u: DAEMON_PK_B64U, salts_b64u: salts, meta: makeMeta(),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('records write_failed instead of arming a key without a token half', async () => {
+    const salts = [nextSalt(), nextSalt()];
+    await inDO(async ({ inst }) => {
+      await inst.writeCache(makeChallenge({ salts_b64u: salts }), TTL_8H, salts.map(() => sealFakeDek()));
+    });
+    expect(await inDO(allDekKeys)).toEqual([]);
+    expect((await inDO(auditRows)).map(r => r.status)).toEqual(['write_failed']);
   });
 });

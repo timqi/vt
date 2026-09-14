@@ -244,7 +244,7 @@ describe('cache read plaintext lifetime', () => {
       await inDO(async ({ inst, state }) => {
         const meta = makeMeta();
         const salts = [nextSalt(), nextSalt()];
-        await inst.writeCache(makeChallenge({ salts_b64u: salts, meta }), 20 * 60,
+        await inst.writeCache(makeChallenge({ salts_b64u: salts, meta, token_id: tokenId }), 20 * 60,
           salts.map(() => sealFakeDek()));
         const entries = await state.storage.list({ prefix: 'dek:' });
         const secondKey = [...entries.keys()].find(key => key.endsWith(`:${salts[1]}`))!;

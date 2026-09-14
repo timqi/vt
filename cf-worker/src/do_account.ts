@@ -4,7 +4,7 @@
 // Storage keys:
 //   ch:{approve_token}        →  Challenge JSON
 //   pt:{poll_token}           →  approve_token (WS tag routing)
-//   dek:{ctx}:{salt_b64u}     →  CacheEntry (opt-in DEK cache; ctx binds IP+pwd)
+//   dek:{token_id}:{project_h}:{salt_b64u}  →  CacheEntry (opt-in DEK cache)
 //
 // WebSocket hibernation: WS clients connect via Worker GET /api/dek, which
 // forwards to the DO. The DO hibernates the WS tagged with the poll_token so
@@ -24,7 +24,7 @@ import { verifyAssertion } from './webauthn';
 import { cachePublicKey, discardedBoxPublicKey } from './cache_crypto';
 import {
   isAllowedExtendTtl, approveTtlOptions, extendTtlOptions,
-  isExtendableGroupId, cacheScopePwd,
+  isExtendableGroupId,
 } from './cache_policy';
 import { challengeUvLevel, effectiveUvLevel, parseUvPolicy } from './uv_policy';
 import { log, logErr, tokenPrefix } from './log';
@@ -732,6 +732,7 @@ export class AccountDO extends DurableObject<Env> {
       host: intent.host,
       user: intent.user,
       pwd: '',
+      project: '',
       ppid_cmd: '',
       ip: intent.ip,
       reason: '',
@@ -784,7 +785,7 @@ export class AccountDO extends DurableObject<Env> {
     return Response.json({ revoked });
   }
 
-  // Fast path: look up cached DEKs for (IP, salts). All-or-nothing — any
+  // Fast path: look up cached DEKs for (token, project, salts). All-or-nothing — any
   // missing/expired/undecryptable salt yields a uniform miss (no oracle for
   // which salts are cached). On a full hit, re-seal each DEK to the requester's
   // ephemeral daemon pubkey so only this caller can open the response. Skips the
@@ -801,12 +802,12 @@ export class AccountDO extends DurableObject<Env> {
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
-    // ip (worker-derived from CF-Connecting-IP, already forced by capChallengeMeta)
-    // IP + pwd are the cache binding ctx.
+    // ip is worker-derived (forced by capChallengeMeta); audit metadata only.
     const ip = body.meta.ip ?? '';
     // A probe is an authenticated use: same liveness check + sliding refresh as
     // a ceremony, and the hit audit row names the token's host/user. Same
-    // fail-closed rule as opCreate for a body without a token.
+    // fail-closed rule as opCreate for a body without a token — which is also
+    // the cache key's hard half.
     if (typeof body.token_id !== 'string') return badRequest('missing token_id');
     const t = this.tokens.touch(body.token_id, ip, Date.now());
     if (!t.ok) return tokenRefused(t.reason);
@@ -819,7 +820,7 @@ export class AccountDO extends DurableObject<Env> {
       return Response.json({ miss: true } satisfies DekCacheResponse);
     };
 
-    const sealedB64u = await this.cache.read(meta, salts, daemonPk);
+    const sealedB64u = await this.cache.read(body.token_id, meta, salts, daemonPk);
     if (sealedB64u === null) return miss();
 
     // Audit the hit with the requester's full meta (host/user/command/…), so the
@@ -1056,6 +1057,7 @@ export class AccountDO extends DurableObject<Env> {
       host: 'admin',
       user: op.admin_email ?? '',
       pwd: '',
+      project: '',
       ppid_cmd: '',
       ip: op.admin_ip ?? '',
       reason: '延长已授权的 DEK 缓存有效期',
@@ -1321,10 +1323,6 @@ export class AccountDO extends DurableObject<Env> {
       metadata: ch.meta,
       cache_options_s: cacheOptionsS,
       cache_pubkey_b64u: cachePubkeyB64u,
-      // The reuse scope the approval would arm — normalized, so an approver on a
-      // worktree path sees that the grant also covers the trunk and its siblings.
-      // metadata.pwd keeps the literal directory next to it.
-      cache_scope_pwd: cacheScopePwd(ch.meta.pwd ?? ''),
       ...(ch.enroll ? { enroll_pair_code: ch.enroll.pair_code } : {}),
       host_verified: !!ch.token_id,
     };

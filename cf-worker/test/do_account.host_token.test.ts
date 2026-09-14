@@ -252,7 +252,7 @@ describe('authenticating with a host token', () => {
     const body = challengeBody({ meta: { ...makeMeta(), tty: '/dev/pts/1', ppid: 7, ssh_client: '10.0.0.1 1 22' } });
     const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body));
     const ch = await inDO(h => h.state.storage.get<Challenge>(`ch:${res.json.approve_token}`));
-    expect(Object.keys(ch!.meta).sort()).toEqual(['command', 'host', 'ip', 'ip_prev', 'op_kind', 'ppid_cmd', 'pwd', 'reason', 'user']);
+    expect(Object.keys(ch!.meta).sort()).toEqual(['command', 'host', 'ip', 'ip_prev', 'op_kind', 'ppid_cmd', 'project', 'pwd', 'reason', 'user']);
   });
 });
 

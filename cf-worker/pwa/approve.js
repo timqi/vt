@@ -59,19 +59,19 @@
         cacheSec.hidden = true;
         cacheSec.appendChild(el('h2', null, '缓存解密授权'));
         var warn = el('p', 'hint cache-warn');
-        // Cache ctx binds source IP (hard) + working-directory scope (advisory)
-        // — see docs/dek-cache.md. The copy states each half's trust level so the
+        // Cache key binds the host token (hard) + project (advisory) — see
+        // docs/dek-cache.md. The copy states each half's trust level so the
         // promised boundary matches the implemented one. Built as nodes to keep
         // the <strong> emphasis under CSP.
         warn.appendChild(document.createTextNode('选择后，在该时长内、'));
-        warn.appendChild(el('strong', null, '同一来源 IP（已验证）且同一缓存范围（客户端自报目录，归一化后）'));
+        warn.appendChild(el('strong', null, '同一主机令牌（已验证）且同一项目（客户端自报）'));
         warn.appendChild(document.createTextNode('对这些记录的解密将'));
         warn.appendChild(el('strong', null, '免手机审批'));
         warn.appendChild(document.createTextNode('。默认不缓存。'));
         cacheSec.appendChild(warn);
-        // The reuse scope this approval would arm. Worker-computed from the
-        // reported pwd (worktree suffixes stripped), so `pier.stable` and `pier`
-        // share one cache — the approver must see that before tapping 同意.
+        // The reuse scope this approval would arm: the client-reported project
+        // (its repository's common git dir, so every worktree shares one cache)
+        // — the approver must see that before tapping 同意.
         refs.cacheScope = el('p', 'hint cache-scope');
         refs.cacheScope.hidden = true;
         cacheSec.appendChild(refs.cacheScope);
@@ -192,15 +192,15 @@
             var optsList = data.cache_options_s || [];
             var pk = data.cache_pubkey_b64u || '';
             if (!pk || optsList.length <= 1) return;
-            var scope = data.cache_scope_pwd || '';
+            var scope = (data.metadata && data.metadata.project) || '';
             if (scope) {
                 refs.cacheScope.innerHTML = '';
-                refs.cacheScope.appendChild(document.createTextNode('缓存范围: '));
+                refs.cacheScope.appendChild(document.createTextNode('缓存范围（项目）: '));
                 refs.cacheScope.appendChild(el('strong', null, scope));
                 var literal = (data.metadata && data.metadata.pwd) || '';
                 if (literal && literal !== scope) {
                     refs.cacheScope.appendChild(
-                        document.createTextNode('（本次目录 ' + literal + '，同范围的其他目录也将命中）'));
+                        document.createTextNode('（本次目录 ' + literal + '，同一项目的其他目录也将命中）'));
                 }
                 refs.cacheScope.hidden = false;
             }
