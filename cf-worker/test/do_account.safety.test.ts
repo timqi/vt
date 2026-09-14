@@ -1,7 +1,6 @@
 // Fault-injection regressions for the authority/effect boundary. Spies are
 // installed inside the DO context and restored before isolated-storage cleanup.
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import nacl from 'tweetnacl';
 import { b64uEnc } from '../src/crypto';
 import { seal, cachePublicKey } from '../src/cache_crypto';
 import { deleteKeysBatched } from '../src/storage_batch';
@@ -233,7 +232,7 @@ describe('cache read plaintext lifetime', () => {
       const tokenId = await liveTokenId();
       const auth = await daemonAuth(tokenId);
       const sealedDeks = [await sealFakeDek(), await sealFakeDek()];
-      const cachePk = cachePublicKey(await cacheSeckey());
+      const cachePk = await cachePublicKey(await cacheSeckey());
       await inDO(async ({ inst, state }) => {
         const meta = makeMeta();
         const salts = [nextSalt(), nextSalt()];
@@ -243,21 +242,23 @@ describe('cache read plaintext lifetime', () => {
         if (outcome === 'missing') {
           await state.storage.delete(secondKey);
         } else if (outcome === 'malformed' || outcome === 'cleanup-failure') {
-          const sealed = seal(new Uint8Array(31).fill(8), cachePk);
+          const sealed = await seal(new Uint8Array(31).fill(8), cachePk);
           await state.storage.put(secondKey, { ...entries.get(secondKey), sealed_to_cache_b64u: sealed });
         }
+        // openToCache views the ArrayBuffer AES-GCM hands back, so the buffer
+        // captured here is the one the read path must wipe.
         const opened: Uint8Array[] = [];
-        const open = nacl.box.open;
-        const openSpy = vi.spyOn(nacl.box, 'open').mockImplementation((...args) => {
-          const value = open(...args);
-          if (value) opened.push(value);
+        const decrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+        const openSpy = vi.spyOn(crypto.subtle, 'decrypt').mockImplementation(async (...args) => {
+          const value = await decrypt(...args);
+          opened.push(new Uint8Array(value));
           return value;
         });
         const cleanup = outcome === 'cleanup-failure'
           ? vi.spyOn(state.storage, 'delete').mockRejectedValue(new Error('injected cleanup failure'))
           : undefined;
         const sealing = outcome === 'seal-failure'
-          ? vi.spyOn(nacl.box, 'keyPair').mockImplementation(() => { throw new Error('injected seal failure'); })
+          ? vi.spyOn(crypto.subtle, 'generateKey').mockImplementation(async () => { throw new Error('injected seal failure'); })
           : undefined;
         try {
           const request = new Request('https://account.do/op/dek-cache', {

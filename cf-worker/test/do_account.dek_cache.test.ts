@@ -147,6 +147,26 @@ describe('opDekCache — batched reads', () => {
     expect((await read(salts)).json).toEqual({ miss: true });
   });
 
+  // Rejected input: an entry sealed by the previous release's libsodium
+  // crypto_box_seal (docs/sealed-box-v1.md, Rollout). The operator step is
+  // 清除全部 DEK 缓存; one left behind must be a miss that removes itself, never
+  // an open under the old algorithm and never a 500.
+  it('misses on a pre-v1 libsodium entry and sweeps it', async () => {
+    const salts = await armCache(2);
+    const LIBSODIUM_BOX = 'JEYfUWAkbFlSTgjZD-GXcSHkANGFWCT637UiLWtBRUu-uQjaKW_GFnZplKkhLMm3h0-ch65fczHafJozQnVbdv4F-eyFxUbJuJoIzb9Anvw';
+    const [first] = await inDO(async h => {
+      const keys = await allDekKeys(h);
+      const entry = (await h.state.storage.get<Record<string, unknown>>(keys[0]!))!;
+      await h.state.storage.put(keys[0]!, { ...entry, sealed_to_cache_b64u: LIBSODIUM_BOX });
+      return keys;
+    });
+    const res = await read(salts);
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ miss: true });
+    expect(await inDO(allDekKeys)).not.toContain(first);
+    expect(await inDO(allDekKeys)).toHaveLength(1);
+  });
+
   it('never serves a v4-shaped entry, which stays listable and clearable', async () => {
     const salt = nextSalt();
     await inDO(async h => h.state.storage.put(`dek:${FAKE_CTX}:${salt}`, await makeEntry()));

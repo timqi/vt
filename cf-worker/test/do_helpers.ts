@@ -149,11 +149,11 @@ export function nextSalt(): string {
   return b64uEnc(new Uint8Array(16).map((_, i) => i < 4 ? (saltCounter >>> (8 * (3 - i))) & 0xff : (saltCounter * 31 + i) & 0xff));
 }
 
-/** A sealed blob writeCache/opDekCache will accept: crypto_box_seal of a 32-byte
+/** A sealed blob writeCache/opDekCache will accept: sealed_box of a 32-byte
  *  fake DEK to the cache public key of this test's root key. */
 export async function sealFakeDek(fill = 7): Promise<string> {
   const dek = new Uint8Array(32).fill(fill);
-  return seal(dek, cachePublicKey(await cacheSeckey()));
+  return seal(dek, await cachePublicKey(await cacheSeckey()));
 }
 
 export async function makeEntry(over: Partial<CacheEntry> = {}): Promise<CacheEntry> {

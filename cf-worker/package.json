@@ -9,9 +9,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "blakejs": "^1.2.1",
-    "hono": "^4.7.5",
-    "tweetnacl": "^1.0.3"
+    "hono": "^4.7.5"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.8.71",

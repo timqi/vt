@@ -385,7 +385,7 @@ export interface ChallengeResponse {
 export interface ApproveRequest {
   approve_token: string;
   credential_id_b64u: string;
-  /** sealed_box(daemon_pubkey, [DEK_0||...||DEK_n]) from libsodium */
+  /** sealed_box(daemon_pubkey, [DEK_0||...||DEK_n]) (docs/sealed-box-v1.md) */
   sealed_deks_b64u: string;
   client_data_json_b64u: string;
   authenticator_data_b64u: string;
@@ -404,7 +404,7 @@ export interface ApproveRequest {
   cache_ttl_s?: number;
   /**
    * One entry per salt, in the same order as the challenge's salts_b64u: each is
-   * crypto_box_seal(DEK_i, CACHE_PUBKEY) produced by the PWA. Only sent when
+   * sealed_box(DEK_i, CACHE_PUBKEY) produced by the PWA. Only sent when
    * cache_ttl_s > 0. */
   cache_sealed_deks_b64u?: string[];
   /** Names the approver typed on the page, one per unnamed salt at most: stored
@@ -490,7 +490,7 @@ export type DekCacheResponse =
  *  where project_h = b64u(SHA-256("vt-dek-ctx-v5" || project)[0..16]); see
  *  docs/dek-cache.md. */
 export interface CacheEntry {
-  /** crypto_box_seal(DEK_raw, cache public key) — the Worker opens it with the root-key scalar. */
+  /** sealed_box(DEK_raw, cache public key) — the Worker opens it with the root-key scalar. */
   sealed_to_cache_b64u: string;
   expires_ms: number;
   /** audit: which approval (audit token_id) wrote this entry. */

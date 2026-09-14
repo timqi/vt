@@ -160,14 +160,14 @@ export class AccountCache {
     if (salts.length === 0 || !Array.isArray(sealedList) || sealedList.length !== salts.length) {
       return reject('cache_sealed_deks length mismatch');
     }
-    // Each blob must be crypto_box_seal(32-byte DEK) = 32 + 48 = 80 bytes AND
-    // must actually open to CACHE_PUBKEY. Verifying at write time turns a stale
+    // Each blob must be sealed_box(32-byte DEK) = 32 + 48 = 80 bytes AND must
+    // actually open to CACHE_PUBKEY. Verifying at write time turns a stale
     // /wrong cache_pubkey on the phone into one logged error here, instead of
     // silent permanent cache misses + lazy-delete churn at read time (N1).
     for (const s of sealedList) {
       try { decodeB64uExact(s, 80, 'cache_sealed_dek'); }
       catch { return reject('cache_sealed_dek malformed'); }
-      const probe = openToCache(s, sk);
+      const probe = await openToCache(s, sk);
       if (!probe || probe.length !== 32) {
         probe?.fill(0);
         return reject('cache_sealed_dek does not open to the cache key');
@@ -232,11 +232,12 @@ export class AccountCache {
       for (const key of keys) {
         const entry = map.get(key);
         if (!isLive(entry, now)) continue;
-        const dek = openToCache(entry.sealed_to_cache_b64u, sk);
+        const dek = await openToCache(entry.sealed_to_cache_b64u, sk);
         if (!dek || dek.length !== 32) {
           dek?.fill(0);
-          // Undecryptable (sealed under a previous root key, M3): uniformly
-          // miss and lazily drop the orphaned entry, never surface a 500.
+          // Undecryptable (a previous root key, M3, or the pre-v1 libsodium
+          // format): uniformly miss and drop the dead entry — never a 500,
+          // never a second algorithm (docs/sealed-box-v1.md, Rollout).
           orphaned.push(key);
           continue;
         }
@@ -249,7 +250,7 @@ export class AccountCache {
       if (dekParts.length !== salts.length) return null;
       flat = new Uint8Array(dekParts.length * 32);
       for (let i = 0; i < dekParts.length; i++) flat.set(dekParts[i]!, i * 32);
-      sealedB64u = seal(flat, daemonPk);
+      sealedB64u = await seal(flat, daemonPk);
     } finally {
       flat?.fill(0);
       dekParts.forEach(d => d.fill(0));

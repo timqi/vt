@@ -731,7 +731,7 @@ export class AccountDO extends DurableObject<Env> {
   // biometric step whatever `uv_policy` does to the hot decrypt path.
   private async mintAdminCeremony(now: number, meta: ChallengeMeta, intent: Pick<Challenge, 'enroll' | 'extend'>): Promise<Challenge> {
     const workerNonce = randomBytes(16);
-    const daemonPk = discardedBoxPublicKey();
+    const daemonPk = await discardedBoxPublicKey();
     const ch: Challenge = {
       approve_token: b64uEnc(randomBytes(12)),
       poll_token: b64uEnc(randomBytes(12)),
@@ -1104,7 +1104,7 @@ export class AccountDO extends DurableObject<Env> {
     let cacheOptionsS: number[] = [0];
     let cachePubkeyB64u = '';
     if (ch.salts_b64u.length > 0) {
-      cachePubkeyB64u = b64uEnc(cachePublicKey(this.admin.cacheSeckey()));
+      cachePubkeyB64u = b64uEnc(await cachePublicKey(this.admin.cacheSeckey()));
       cacheOptionsS = [0, ...approveTtlOptions()];
     }
 
