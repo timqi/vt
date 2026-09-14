@@ -252,8 +252,9 @@ Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
 
 Run focused tests before the relevant repository gates: `cargo test`, `just check`
 (host + Linux GNU Rust checks), and `just check-worker` (dependency setup,
-TypeScript + Vitest). Linux gates do not validate macOS-only code or native
-Touch ID/Keychain/UI behavior; use macOS CI and native checks where needed.
+TypeScript + Vitest). `just check-darwin` type-checks `server_macos` from Linux;
+nothing on Linux runs it or native Touch ID/Keychain/UI behavior — use macOS
+CI and native checks where needed.
 Report checks not run. Recipes live in [justfile](justfile).
 
 Worker deployment: [docs/cf-worker-deploy.md](docs/cf-worker-deploy.md),

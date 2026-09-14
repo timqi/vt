@@ -32,9 +32,9 @@ a "rejected input" test.
 
 ## 2. Landed
 
-The AI-agent hook and the FIDO2 fallback are gone. `cargo check --target
-aarch64-apple-darwin` on Linux still stops at `ring`'s C build (rustls via
-`reqwest`/`tokio-tungstenite`); macOS-only code is validated on macOS CI.
+The AI-agent hook and the FIDO2 fallback are gone. `just check-darwin`
+type-checks the macOS tree from Linux behind a stub `cc` (ring's C build
+emits empty objects); running it still needs macOS.
 
 ## 3. Landed
 

@@ -121,6 +121,21 @@ size:
         n=$(count "$f"); [ "$n" -gt 750 ] && row "  $f" "$n" 750 || true
     done
 
+# Type-check the macOS tree from Linux: a stub `cc` lets ring's C build "succeed"
+# (empty objects; check only, never link). Needs `rustup target add aarch64-apple-darwin`.
+check-darwin:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT
+    cat > "$dir/cc" <<'SH'
+    #!/bin/bash
+    for a in "$@"; do case "$a" in -E|*detect_compiler_family*) echo clang; exit 0;; '-?') exit 1;; esac; done
+    out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -o*) out="${1#-o}"; shift;; *) shift;; esac; done
+    [ -n "$out" ] && : > "$out"; exit 0
+    SH
+    chmod +x "$dir/cc"
+    CC_aarch64_apple_darwin="$dir/cc" cargo check --target aarch64-apple-darwin --all-targets
+
 # Run the Rust unit + integration tests
 test:
     cargo test --all-targets
