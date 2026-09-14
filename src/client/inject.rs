@@ -1786,14 +1786,10 @@ mod tests {
             Option<ssh_agent_lib::proto::Extension>,
             ssh_agent_lib::error::AgentError,
         > {
-            use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
             use crate::core::wire::{ExtBody, ExtResponse, WIRE_VERSION};
             use crate::core::{DecryptInput, DecryptReq, DecryptResItem};
             assert_eq!(extension.name, "decrypt@vt");
-            let cipher = AesGcmCrypto::new(&decode_auth_cipher_from_b64("AA").unwrap()).unwrap();
-            let request: DecryptReq =
-                serde_json::from_slice(&cipher.decrypt(extension.details.as_ref()).unwrap())
-                    .unwrap();
+            let request: DecryptReq = serde_json::from_slice(extension.details.as_ref()).unwrap();
             let data: Vec<_> = request
                 .items
                 .into_iter()
@@ -1818,7 +1814,7 @@ mod tests {
             .unwrap();
             Ok(Some(ssh_agent_lib::proto::Extension {
                 name: extension.name,
-                details: ssh_agent_lib::proto::Unparsed::from(cipher.encrypt(&bytes).unwrap()),
+                details: ssh_agent_lib::proto::Unparsed::from(bytes),
             }))
         }
     }
@@ -1862,7 +1858,6 @@ mod tests {
                     Some(dir.join("config").to_string_lossy().into_owned()),
                 ] {
                     let config = crate::config::ResolvedConfig::resolve(
-                        Some("AA".into()),
                         Vec::new(),
                         |key| match key {
                             "VT_BACKEND" => Some("agent".into()),

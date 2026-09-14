@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::audit::{self, AgentAuditContext, AgentAuditEntry, AuditPushConfig};
 use super::authorization::{new_engine, sleep_diverged};
-use super::security::{derive_passcode_ciphers, load_mac_cipher};
+use super::security::{derive_passcode_cipher, load_mac_cipher};
 use super::store::KeychainStore;
 use crate::core::authorization::{
     AuthorizationEngine, AuthorizationFailure, AuthorizationPermit, AuthorizationRequest,
@@ -47,8 +47,8 @@ pub const EXT_RUN: &str = "run@vt";
 pub const EXT_SIGN: &str = "sign@vt";
 pub const EXT_DIAG: &str = "diag@vt";
 /// Token-gated shell status/revoke channel (docs/app-bundle.md §5).
-/// Plaintext (pre-cipher) like `session-bind@openssh.com`; NOT in the vt
-/// cipher-path match below and NOT permitted by the relay filter.
+/// Dispatched before the lock check like `session-bind@openssh.com`; NOT in
+/// the vt handler match below and NOT permitted by the relay filter.
 pub const EXT_UI_STATUS: &str = "ui-status@vt";
 
 fn agent_err(e: anyhow::Error) -> AgentError {
@@ -205,8 +205,8 @@ fn hash_lock_passphrase(passphrase: &str) -> [u8; 32] {
 // design is conservative: empty allowlist disables the feature entirely,
 // argv[0] is resolved against the allowlist before any Touch ID prompt, the
 // child's env is a fresh allowlist (not a denylist scrub of the agent's env),
-// and concurrent `run@vt` calls are serialized so a remote attacker holding
-// VT_AUTH cannot queue dozens of prompts at the user.
+// and concurrent `run@vt` calls are serialized so a remote peer on a
+// forwarded socket cannot queue dozens of prompts at the user.
 
 /// Parsed `--run-allow` flag. An empty allowlist means `run@vt` is disabled
 /// outright. Slash-bearing entries match argv[0] post-canonicalization;
@@ -334,21 +334,21 @@ const RUN_REQ_ARGV_MAX_BYTES: usize = 8 * 1024;
 
 /// Cap on the size of free-form display strings (`DecryptReq.command`,
 /// `AuthReq.reason`) the agent will sanitize and render. Without this, a
-/// hostile peer holding a forwarded `VT_AUTH` could push arbitrarily large
+/// hostile peer on a forwarded socket could push arbitrarily large
 /// strings and amplify per-prompt CPU/memory work. Generous compared to
 /// the few-hundred-char display caps so we never reject legitimate input.
 const PROMPT_DISPLAY_MAX_BYTES: usize = 8 * 1024;
 
-/// Cap on the number of items in a single encrypt@vt / decrypt@vt batch. A
-/// peer holding `VT_AUTH` can call these without a Touch ID gate (encrypt) or
+/// Cap on the number of items in a single encrypt@vt / decrypt@vt batch. Any
+/// peer on the socket can call these without a Touch ID gate (encrypt) or
 /// before one (decrypt parse), so an unbounded batch is a CPU/RAM
 /// amplification vector (e.g. 500k HKDF+AES ops, ~24 MB response). Generous
 /// vs. any real file/env scan, so legitimate batches are never rejected.
 const MAX_CRYPTO_BATCH: usize = 4096;
 
 /// Environment variables passed through to the spawned child. The list is
-/// deliberately short: it MUST NOT include any vt credentials (VT_AUTH,
-/// VT_PASSKEY_*), the forwarded SSH agent socket (SSH_AUTH_SOCK,
+/// deliberately short: it MUST NOT include any vt credentials
+/// (VT_PASSKEY_*), the forwarded SSH agent socket (SSH_AUTH_SOCK,
 /// SSH_AGENT_PID), GPG agent info, or any dynamic-linker injection vector
 /// (DYLD_*, LD_*, PYTHONPATH, RUBYOPT, NODE_OPTIONS, PERL5LIB). Adding a
 /// new entry here is a security-sensitive decision — see codex review in
@@ -385,7 +385,7 @@ pub struct AuthCacheTtls {
 /// linger in memory.
 fn load_all_keys() -> Result<HashMap<String, PrivateKey>> {
     let store = KeychainStore::load()?;
-    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let passphrase_cipher = derive_passcode_cipher(&store)?;
     let (mac_cipher, _mac_key) = load_mac_cipher(&store, &passphrase_cipher)?;
     let entries = decode_ssh_keys(&store, &mac_cipher)?;
     let mut keys = HashMap::new();
@@ -790,7 +790,7 @@ fn spawn_lock_finalizer(
 /// Spawn `exe` with `args` as a detached background process. Returns the
 /// child PID for logging. The child:
 /// - inherits a freshly-built environment containing only `RUN_ENV_PASSTHROUGH`
-///   variables (so `VT_AUTH`, `SSH_AUTH_SOCK`, `DYLD_*`, etc. are dropped),
+///   variables (so `VT_PASSKEY_*`, `SSH_AUTH_SOCK`, `DYLD_*`, etc. are dropped),
 /// - has stdin/stdout/stderr redirected to `/dev/null`,
 /// - starts in `$HOME` (or `/` if `HOME` is unset),
 /// - calls `setsid` and closes fds >= 3 via `pre_exec` so it cannot interact
@@ -1049,8 +1049,8 @@ impl Session for VtSshSession {
         // Clone the key out and drop the read-lock BEFORE the Touch ID prompt.
         // Holding the `keys` read-guard across authorization (which can
         // block on a human for up to ~30s) would starve every writer
-        // (add/remove/unlock) for the prompt's duration — a non-VT_AUTH peer can
-        // trigger SIGN_REQUESTs to weaponize this. (Mirrors handle_sign_vt.)
+        // (add/remove/unlock) for the prompt's duration — any peer can trigger
+        // SIGN_REQUESTs to weaponize this. (Mirrors handle_sign_vt.)
         let privkey = {
             let keys = self.keys.read().await;
             keys.get(&fp_str).ok_or(AgentError::Failure)?.clone()
@@ -1137,12 +1137,12 @@ impl Session for VtSshSession {
 
     async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
         // `session-bind@openssh.com` is a standard OpenSSH extension: plain
-        // SSH-wire bytes, never VT_AUTH-encrypted. It MUST be intercepted
-        // before the lock check and the keychain/auth-cipher path below —
-        // binding grants nothing by itself, must work on connections opened
-        // while the agent is locked, and would otherwise fail to decrypt so
-        // destination caching would silently never engage. It also must not
-        // touch the idle clock — it precedes any human-gated operation. A
+        // SSH-wire bytes, not a JSON vt request. It MUST be intercepted
+        // before the lock check and the keychain path below — binding grants
+        // nothing by itself, must work on connections opened while the agent
+        // is locked, and would otherwise be refused so destination caching
+        // would silently never engage. It also must not touch the idle
+        // clock — it precedes any human-gated operation. A
         // bind that fails to decode (host certificate, unsupported curve) is
         // refused without changing state, mirroring `BindState::apply`. See
         // docs/authorization-scopes-v2.md §3.1.
@@ -1166,10 +1166,10 @@ impl Session for VtSshSession {
                 Err(()) => Err(AgentError::Failure),
             };
         }
-        // `ui-status@vt` is the shell's token-gated plaintext channel
+        // `ui-status@vt` is the shell's token-gated channel
         // (docs/app-bundle.md §5). Like session-bind it precedes the lock
         // check (a locked agent must still report `locked: true`), the
-        // keychain/auth-cipher path (the shell holds no VT_AUTH), and the
+        // keychain path (it reads no store), and the
         // idle-clock touch (it is meant to be polled; keeping the agent
         // "active" would defeat the idle revocation). A missing or wrong
         // token fails unstructured — indistinguishable from an unknown
@@ -1178,11 +1178,9 @@ impl Session for VtSshSession {
             return self.handle_ui_status(&extension).await;
         }
         if self.locked.load(Ordering::Acquire) {
-            // The lock check fires before keychain ciphers are derived, so
-            // we have no `auth_cipher` to encrypt a structured envelope
-            // with. Surface as an unstructured SSH-wire failure — clients
-            // map this to `ErrKind::Generic` (exit 1) and show a hint to
-            // run `ssh-add -X`. See docs/structured-errors.md.
+            // Stays an unstructured SSH-wire failure: a locked agent answers
+            // like a non-vt agent, so clients keep one path (Transport, exit
+            // 1, `ssh-add -X` hint) for both. See docs/structured-errors.md.
             return Err(AgentError::Failure);
         }
 
@@ -1202,29 +1200,16 @@ impl Session for VtSshSession {
             self.touch_activity().await;
         }
 
-        // Load the store once, derive auth + passphrase ciphers, drop the
+        // Load the store once, derive the passphrase cipher, drop the
         // store. Mac_cipher is loaded on demand inside the encrypt/decrypt
         // arms so the decrypted master key only lives across that operation.
         //
-        // Both failure modes here stay unstructured: `KeychainStore::load`
-        // fails before any cipher exists, and `derive_passcode_ciphers` IS
-        // the function that produces `auth_cipher`, so its failure means
-        // we have no key to encrypt a structured reply with. The client
-        // surfaces these as `ErrKind::Generic` via SSH-wire failure.
+        // Both failure modes here stay unstructured: they precede dispatch,
+        // so no handler has picked an `ErrKind` yet. The client surfaces
+        // them as `Transport` via SSH-wire failure.
         let store = KeychainStore::load().map_err(agent_err)?;
-        let (auth_cipher, passphrase_cipher) =
-            derive_passcode_ciphers(&store).map_err(agent_err)?;
-
-        // Decrypt the extension details with auth cipher (verifies VT_AUTH).
-        // Stays unstructured: without VT_AUTH we have no key to encrypt a
-        // structured reply, and emitting an unencrypted envelope would be a
-        // presence oracle for "is this socket a vt agent?".
-        let decrypted = auth_cipher
-            .decrypt(extension.details.as_ref())
-            .map_err(|_| {
-                tracing::warn!("Extension auth failed (wrong VT_AUTH?)");
-                AgentError::Failure
-            })?;
+        let passphrase_cipher = derive_passcode_cipher(&store).map_err(agent_err)?;
+        let payload = extension.details.as_ref();
 
         // Dispatch into a per-extension handler that returns either
         // serialized ok-body bytes (containing DEKs for encrypt/decrypt —
@@ -1235,17 +1220,17 @@ impl Session for VtSshSession {
         // up as unstructured.
         let dispatch: Result<HandlerSuccess, WireFailure> = match extension.name.as_str() {
             EXT_ENCRYPT => {
-                self.handle_encrypt(&decrypted, &store, &passphrase_cipher)
+                self.handle_encrypt(payload, &store, &passphrase_cipher)
                     .await
             }
             EXT_DECRYPT => {
-                self.handle_decrypt(&decrypted, &store, &passphrase_cipher)
+                self.handle_decrypt(payload, &store, &passphrase_cipher)
                     .await
             }
-            EXT_AUTH => self.handle_auth(&decrypted).await,
-            EXT_RUN => self.handle_run(&decrypted).await,
-            EXT_SIGN => self.handle_sign_vt(&decrypted).await,
-            EXT_DIAG => self.handle_diag(&decrypted).await,
+            EXT_AUTH => self.handle_auth(payload).await,
+            EXT_RUN => self.handle_run(payload).await,
+            EXT_SIGN => self.handle_sign_vt(payload).await,
+            EXT_DIAG => self.handle_diag(payload).await,
             _ => unreachable!(),
         };
 
@@ -1278,9 +1263,9 @@ impl Session for VtSshSession {
             ),
         };
 
-        // Encrypt the successful response before committing a pending grant.
-        // If envelope encryption fails, HandlerSuccess drops its non-cloneable
-        // permit and no approval becomes reusable.
+        // The envelope is complete before a pending grant is committed, so a
+        // serialization failure above drops HandlerSuccess and its
+        // non-cloneable permit: no approval becomes reusable.
         //
         // The commit-failure arm below is defensive: while this permit is
         // alive its security read guard blocks epoch advancement, so
@@ -1288,7 +1273,7 @@ impl Session for VtSshSession {
         // releases the guard before this point, note that the operation has
         // already executed — a client retrying the resulting Transient error
         // would re-run a non-idempotent handler (run@vt spawns twice).
-        let mut encrypted_response = auth_cipher.encrypt(&envelope_bytes).map_err(agent_err)?;
+        let mut response = envelope_bytes;
         if let Some(permit) = authorization {
             // Captured before commit consumes the permit; used only after the
             // guard is released — a blocking notify while the permit is live
@@ -1296,7 +1281,7 @@ impl Session for VtSshSession {
             let reuse_remaining = permit.reuse_remaining();
             if let Err((kind, detail)) = commit_authorization(permit).await {
                 tracing::warn!("authorization commit invalidated after operation success");
-                let error_envelope = Zeroizing::new(
+                response = Zeroizing::new(
                     serde_json::to_vec(&ErrEnvelope {
                         v: WIRE_VERSION,
                         status: "err",
@@ -1305,15 +1290,16 @@ impl Session for VtSshSession {
                     })
                     .map_err(|e| agent_err(e.into()))?,
                 );
-                encrypted_response = auth_cipher.encrypt(&error_envelope).map_err(agent_err)?;
             } else {
                 self.fire_cache_hit_note(cache_hit_note, reuse_remaining);
             }
         }
 
+        // `Zeroizing<Vec<u8>>` → `Vec<u8>`: the copy is the wire buffer
+        // ssh-agent-lib owns; the zeroizing original drops here.
         Ok(Some(Extension {
             name: extension.name,
-            details: Unparsed::from(encrypted_response),
+            details: Unparsed::from(response.to_vec()),
         }))
     }
 
@@ -1339,7 +1325,7 @@ impl Session for VtSshSession {
                 let key_openssh_str = key_openssh.to_string();
                 tokio::task::spawn_blocking(move || {
                     KeychainStore::modify(|store| {
-                        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+                        let passphrase_cipher = derive_passcode_cipher(store)?;
                         let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
                         let mut entries = decode_ssh_keys(store, &mac_cipher).unwrap_or_default();
                         if !entries.iter().any(|e| e.fingerprint == fp_for_modify) {
@@ -1375,7 +1361,7 @@ impl Session for VtSshSession {
         let fp_for_modify = fp_str.clone();
         match tokio::task::spawn_blocking(move || {
             KeychainStore::modify(|store| {
-                let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+                let passphrase_cipher = derive_passcode_cipher(store)?;
                 let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
                 let mut entries = decode_ssh_keys(store, &mac_cipher).unwrap_or_default();
                 entries.retain(|e| e.fingerprint != fp_for_modify);
@@ -1400,7 +1386,7 @@ impl Session for VtSshSession {
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
         match tokio::task::spawn_blocking(|| {
             KeychainStore::modify(|store| {
-                let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+                let passphrase_cipher = derive_passcode_cipher(store)?;
                 let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
                 encode_ssh_keys_into(store, &mac_cipher, &[])?;
                 Ok(())
@@ -2016,9 +2002,9 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
     }
 
     #[tokio::test]
-    async fn extension_intercepts_plaintext_session_bind_before_auth_cipher() {
+    async fn extension_intercepts_session_bind_before_keychain() {
         // The seam most likely to regress: session-bind is plain SSH wire
-        // bytes and must be handled before the keychain/auth-cipher path —
+        // bytes and must be handled before the keychain path —
         // this test passes precisely because no keychain access happens.
         let mut session = test_session(300, 0);
         session.peer_is_ssh_client = true;
@@ -2079,7 +2065,7 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
 
         // Wrong token refused; correct token answers WITHOUT keychain access
         // (this test has no keychain store — like the session-bind test, it
-        // passes precisely because the plaintext path never derives ciphers).
+        // passes precisely because this path never loads the store).
         let mut session = test_session(300, 300);
         session.ui_token = Some(token);
         session.authorization =

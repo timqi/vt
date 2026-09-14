@@ -1,8 +1,7 @@
 //! Optional config-file fallback for VT's environment-based configuration.
 //!
 //! VT has historically been configured purely through environment variables
-//! (`VT_AUTH`, `VT_PASSKEY_URL`, `VT_PASSKEY_TOKEN`, the `VT_GIT_SSH_*` pair,
-//! …). This module adds a *fallback* layer: a flat TOML file at
+//! (`VT_PASSKEY_URL`, `VT_PASSKEY_TOKEN`, the `VT_GIT_SSH_*` pair, …). This module adds a *fallback* layer: a flat TOML file at
 //! `~/.config/vt/config.toml` (override with `$VT_CONFIG`) whose `VT_*` keys
 //! are loaded into the process environment **only when the matching env var is
 //! not already set**. Environment variables therefore always win; the file is
@@ -57,8 +56,8 @@ pub fn insecure_config_mode(_path: &Path) -> Option<u32> {
     None
 }
 
-/// Best-effort permission check: the file holds secrets (`VT_AUTH`,
-/// `VT_PASSKEY_TOKEN`), so warn (don't fail) if it is group/other accessible.
+/// Best-effort permission check: the file holds secrets (`VT_PASSKEY_TOKEN`),
+/// so warn (don't fail) if it is group/other accessible.
 fn warn_if_world_readable(path: &Path) {
     if let Some(mode) = insecure_config_mode(path) {
         tracing::warn!(
@@ -319,23 +318,21 @@ pub fn load_agent_file_config() -> AgentFileConfig {
 // ---------------------------------------------------------------------------
 
 /// Routing preference between the two transport paths, read from
-/// `VT_BACKEND` (env var, or config.toml via the hydration above).
-///
-/// Historically the selector was implicit: `VT_AUTH` present → try the SSH
-/// agent first. With the config-file fallback, `VT_AUTH` presence is ambient
-/// (a copied config.toml silently enables agent probing), so `VT_BACKEND`
-/// makes the intent explicit per host.
+/// `VT_BACKEND` (env var, or config.toml via the hydration above). The only
+/// routing input: the agent socket is kernel-owned, so nothing a client holds
+/// makes the agent path more or less trustworthy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    /// Try the SSH agent when `VT_AUTH` is set; fall back to the passkey
-    /// ceremony on recoverable errors. The historical (and default) behavior.
+    /// Try the SSH agent socket when it exists; fall back to the passkey
+    /// ceremony on recoverable errors (socket missing, non-vt agent, agent
+    /// cannot deliver). The default.
     #[default]
     Auto,
     /// SSH agent only — never fall back to the passkey ceremony. Errors out
     /// when the agent is unreachable instead of silently paging the phone.
     Agent,
-    /// Passkey ceremony only — never probe the agent socket, even when
-    /// `VT_AUTH` is set (e.g. a config.toml shared with agent-reaching hosts).
+    /// Passkey ceremony only — never probe the agent socket (e.g. hosts where
+    /// `$SSH_AUTH_SOCK` is an unrelated ssh-agent).
     Passkey,
 }
 
@@ -437,14 +434,13 @@ mod tests {
 
     #[test]
     fn allowed_keys() {
-        assert!(is_allowed_key("VT_AUTH"));
         assert!(is_allowed_key("VT_PASSKEY_TOKEN"));
         assert!(is_allowed_key("VT_GIT_SSH_PRIVATE_KEY"));
         assert!(!is_allowed_key("VT_")); // too short
         assert!(!is_allowed_key("PATH"));
-        assert!(!is_allowed_key("vt_auth")); // lowercase
-        assert!(!is_allowed_key("VT_auth")); // mixed
-        assert!(!is_allowed_key("VTAUTH")); // missing underscore prefix shape
+        assert!(!is_allowed_key("vt_backend")); // lowercase
+        assert!(!is_allowed_key("VT_backend")); // mixed
+        assert!(!is_allowed_key("VTBACKEND")); // missing underscore prefix shape
     }
 
     #[test]

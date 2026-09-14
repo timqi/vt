@@ -1,7 +1,7 @@
 //! Pure cross-platform crypto primitives.
 //!
-//! This module owns AES-256-GCM encryption, the auth-token → cipher-key
-//! derivation, and the passphrase-secret derivation. It has no I/O and no
+//! This module owns AES-256-GCM encryption and the passphrase-secret
+//! derivation. It has no I/O and no
 //! platform-specific dependencies — anything that touches the macOS keychain
 //! lives in `crate::server_macos::security`.
 
@@ -78,17 +78,6 @@ fn derive_passphrase_secret_with_term(passcode: &[u8; 32], term: &str) -> Result
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash[..32]);
     Ok(key)
-}
-
-/// Decode a base64-url-no-pad auth token (as exported by `vt init` in
-/// `VT_AUTH`) and double-SHA256 it into a 32-byte AES-GCM key.
-pub fn decode_auth_cipher_from_b64(b64_token: &str) -> Result<[u8; 32]> {
-    // The decoded bytes are the raw VT_AUTH secret; scrub them after hashing.
-    let token_bytes = Zeroizing::new(BASE64_URL_SAFE_NO_PAD.decode(b64_token)?);
-    let hash = Sha256::digest(Sha256::digest(token_bytes.as_slice()));
-    let mut token = [0u8; 32];
-    token.copy_from_slice(&hash[..32]);
-    Ok(token)
 }
 
 pub struct AesGcmCrypto {

@@ -2,7 +2,7 @@
 //! export/import/rotate-passcode/rebind`.
 
 use super::security::{
-    create_and_save_passcode_passphrase, derive_passcode_ciphers, local_authentication,
+    create_and_save_passcode_passphrase, derive_passcode_cipher, local_authentication,
     rewrap_passphrase,
 };
 use super::store::{KeychainStore, WRAP_V1, WRAP_V2};
@@ -30,7 +30,7 @@ pub async fn export_secret() -> Result<()> {
         ))?;
     }
     let store = KeychainStore::load()?;
-    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let passphrase_cipher = derive_passcode_cipher(&store)?;
     let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
     let decrypted_passphrase = passphrase_cipher
         .decrypt(&encrypted_passphrase)
@@ -97,7 +97,7 @@ pub async fn rotate_passcode() -> Result<()> {
         ))?;
     }
     let store = KeychainStore::load()?;
-    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let passphrase_cipher = derive_passcode_cipher(&store)?;
     let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
     let decrypted_passphrase = passphrase_cipher.decrypt(&encrypted_passphrase).context(
         "Failed to decrypt passphrase. Run `vt secret rebind` first if the binary moved.",
@@ -117,7 +117,7 @@ pub async fn rotate_passcode() -> Result<()> {
 /// label), or back to v1 with `--to-v1` before rolling back to an old
 /// binary. `--old-bin-path` supplies the path term for v1 stores written by
 /// a binary at a different location (docs/app-bundle.md §2). Runs under the
-/// store flock; preserves VT_AUTH and SSH keys byte-for-byte.
+/// store flock; preserves the passcode blob and SSH keys byte-for-byte.
 pub async fn rebind(old_bin_path: Option<String>, to_v1: bool) -> Result<()> {
     if !local_authentication("rebind master key wrap") {
         Err(anyhow::anyhow!(

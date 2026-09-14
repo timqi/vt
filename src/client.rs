@@ -16,7 +16,6 @@ pub use inject::{inject, inject_recover, supervisor_main, SUPERVISOR_SUBCOMMAND}
 use crate::caller_meta::{collect_client_meta, get_hostname};
 use crate::cf;
 use crate::config::{ClientRoute, ResolvedConfig};
-use crate::core::crypto::{decode_auth_cipher_from_b64, AesGcmCrypto};
 use crate::core::wire::{ErrKind, WIRE_VERSION};
 use crate::core::{
     client_encrypt_v2, AuthReq, AuthRes, DecryptReq, EncryptItem, EncryptReq, EncryptResItem,
@@ -76,7 +75,7 @@ fn transport<E: Into<anyhow::Error>>(e: E) -> anyhow::Error {
     anyhow::Error::from(VtClientError::Transport(e.into()))
 }
 
-/// Parse a decrypted agent envelope. Returns the inner `data` JSON bytes on
+/// Parse an agent envelope. Returns the inner `data` JSON bytes on
 /// success (still potentially containing DEKs — caller is responsible for
 /// scrubbing); maps the `err` variant to `VtClientError::Agent` and version
 /// mismatch to `ErrKind::ProtocolVersion`.
@@ -110,7 +109,8 @@ struct ParsedEnvelope<'a> {
 ///
 /// Falls back for:
 /// - Transport failures (socket talk, envelope parse, version mismatch,
-///   unstructured `AgentError::Failure`).
+///   unstructured `AgentError::Failure`) — this is how a non-vt agent on
+///   `$SSH_AUTH_SOCK` answers, so `auto` can probe the socket blindly.
 /// - Agent errors where the agent self-reports it cannot deliver key
 ///   material on this host (`SessionLocked`, `NoGuiSession`,
 ///   `NotInitialized`, `AgentLocked`, `Generic`, `Transient`, `Unknown`,
@@ -212,18 +212,17 @@ impl VTClient {
         })
     }
 
-    /// True when the SSH-agent path is usable: `VT_AUTH` set and not pinned
-    /// away by `VT_BACKEND=passkey`. Gates agent-identity discovery in
-    /// `vt ssh connect`: `sign@vt` needs this key, so discovery only makes
-    /// sense when the agent path is in play.
-    pub(crate) fn has_auth_token(&self) -> bool {
+    /// True when the route may use the SSH-agent path (not pinned away by
+    /// `VT_BACKEND=passkey`). Gates agent-identity discovery in
+    /// `vt ssh connect`: discovered keys sign only via `sign@vt`.
+    pub(crate) fn uses_agent(&self) -> bool {
         self.route.uses_agent()
     }
 
     /// Try to send an extension request via the SSH agent socket.
     ///
     /// On the success arm returns `Ok(Some(bytes))` where `bytes` is the
-    /// already-decrypted inner `data` body (i.e. the JSON the agent's
+    /// inner `data` body (i.e. the JSON the agent's
     /// per-extension handler produced — `Vec<EncryptResItem>`,
     /// `Vec<DecryptResItem>`, or `AuthRes`).
     ///
@@ -235,56 +234,40 @@ impl VTClient {
     ///   structured `ExtResponse::Err` envelope.
     /// - `VtClientError::Transport(_)` for SSH-wire failures, envelope parse
     ///   errors, version mismatch, or unstructured `AgentError::Failure`
-    ///   (e.g. agent lock or wrong `VT_AUTH` — see docs/structured-errors.md
-    ///   for why those stay unstructured).
+    ///   (agent lock, non-vt agent — see docs/structured-errors.md for why
+    ///   those stay unstructured).
     #[cfg(unix)]
     fn try_agent_extension(
         config: &ResolvedConfig,
         name: &str,
         payload: &[u8],
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        // No VT_AUTH → caller hasn't opted in to the SSH-agent path; skip it
-        // and let agent_call_or_fallback route to the CF passkey ceremony.
-        // This also avoids decoding an empty auth token when $SSH_AUTH_SOCK
-        // happens to point at an unrelated ssh-agent (common on Linux).
-        let auth_token = config.auth_token();
-        if auth_token.is_empty() {
-            return Ok(None);
-        }
-
         let stream = match Self::connect_agent_socket(config)? {
             Some(s) => s,
             None => return Ok(None),
         };
 
-        let auth_key = decode_auth_cipher_from_b64(auth_token).map_err(transport)?;
-        let auth_cipher = AesGcmCrypto::new(&auth_key).map_err(transport)?;
-        let encrypted_payload = auth_cipher.encrypt(payload).map_err(transport)?;
-
         let ext = Extension {
             name: name.to_string(),
-            details: Unparsed::from(encrypted_payload),
+            details: Unparsed::from(payload.to_vec()),
         };
 
         let mut client = ssh_agent_lib::blocking::Client::new(stream);
         // SSH-wire `SSH_AGENT_FAILURE` lands here — the agent took the
-        // unstructured path (agent lock, wrong VT_AUTH, internal error
-        // before cipher derivation). We surface a generic error and let the
-        // caller's CLI message suggest `ssh-add -X`.
+        // unstructured path (agent lock, store load failure) or is not a vt
+        // agent at all. We surface a generic error and let the caller's CLI
+        // message suggest `ssh-add -X`.
         let response = client
             .extension(ext)
             .map_err(|e| transport(anyhow::anyhow!("{}", e)))?;
 
         match response {
             Some(resp) => {
-                // The decrypted payload is the ExtResponse envelope. Wrap
-                // in Zeroizing so any inner DEK bytes are wiped on drop
-                // once we've extracted the `data` body.
-                let envelope_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
-                    auth_cipher
-                        .decrypt(resp.details.as_ref())
-                        .map_err(transport)?,
-                );
+                // The payload is the ExtResponse envelope. Wrap in Zeroizing
+                // so any inner DEK bytes are wiped on drop once we've
+                // extracted the `data` body.
+                let envelope_bytes: Zeroizing<Vec<u8>> =
+                    Zeroizing::new(resp.details.as_ref().to_vec());
                 Ok(Some(parse_envelope(&envelope_bytes)?))
             }
             None => Err(transport(anyhow::anyhow!(
@@ -323,10 +306,9 @@ impl VTClient {
     /// This is a BLOCKING socket call — callers on an async context MUST invoke
     /// it via `tokio::task::spawn_blocking` (see `sign_vt`).
     ///
-    /// NOTE: the listing is unauthenticated and does NOT require `VT_AUTH`, but
-    /// the discovered keys can only be *signed* via `sign@vt`, which DOES need
-    /// `VT_AUTH`. Callers must gate discovery on [`has_auth_token`] (as
-    /// `resolve_identities` does) or the keys will fail at sign time.
+    /// NOTE: the discovered keys can only be *signed* via `sign@vt`, so callers
+    /// must gate discovery on [`VTClient::uses_agent`] (as `resolve_identities`
+    /// does) or the keys will fail at sign time under a passkey pin.
     #[cfg(unix)]
     pub(crate) fn list_agent_identities(&self) -> Result<Vec<ssh_agent_lib::proto::Identity>> {
         let stream = match Self::connect_agent_socket(&self.config)? {
@@ -342,8 +324,7 @@ impl VTClient {
     /// Wrap `try_agent_extension` with the routing policy:
     ///
     /// - `VT_BACKEND=passkey` → `Ok(None)` immediately, without probing the
-    ///   agent socket (a shared config.toml may set `VT_AUTH` on hosts where
-    ///   `$SSH_AUTH_SOCK` points at an unrelated ssh-agent).
+    ///   agent socket.
     /// - `VT_BACKEND=agent` → never fall back: socket-missing becomes an
     ///   actionable error, agent errors propagate unfiltered.
     /// - `auto` (default) → translate `Ok(None)` (socket missing/refused) and
@@ -508,9 +489,9 @@ impl VTClient {
             flags,
             meta: collect_client_meta(),
         };
-        // Without VT_AUTH, or with a passkey pin, skip the agent socket and
-        // return the fallback signal. Decrypt-then-sign routes through this
-        // same client, so it also preserves an agent-only pin.
+        // With a passkey pin, skip the agent socket and return the fallback
+        // signal. Decrypt-then-sign routes through this same client, so it
+        // also preserves an agent-only pin.
         if !self.route.uses_agent() {
             return Ok(None);
         }
@@ -591,18 +572,11 @@ impl VTClient {
     /// Ask the local agent to run an allowlisted program. SSH-agent path
     /// only — there is no CF passkey fallback, because the whole feature
     /// only makes sense when "local" means "the Mac at the other end of the
-    /// forwarded agent socket". If `VT_AUTH` is unset (no agent path
-    /// configured) we refuse here instead of silently failing further down.
+    /// forwarded agent socket". A passkey pin is refused here instead of
+    /// silently failing further down.
     pub async fn run(&self, argv: Vec<String>, reason: Option<&str>) -> Result<()> {
         #[cfg(unix)]
         {
-            if self.config.auth_token().is_empty() {
-                anyhow::bail!(
-                    "vt run requires the SSH-agent path (set VT_AUTH and ensure \
-                     SSH_AUTH_SOCK / ~/.ssh/vt.sock points at a vt agent — there \
-                     is no phone-passkey fallback for run@vt)"
-                );
-            }
             if !self.route.uses_agent() {
                 anyhow::bail!(
                     "vt run is agent-only, but VT_BACKEND=passkey disables the agent path"
@@ -722,14 +696,12 @@ mod tests {
 
     #[tokio::test]
     async fn resolved_routes_control_agent_probes_and_fallbacks() {
-        for (backend, auth, route) in [
-            ("agent", "AA", ClientRoute::Agent),
-            ("auto", "AA", ClientRoute::AutoAgent),
-            ("auto", "", ClientRoute::AutoPasskey),
-            ("passkey", "AA", ClientRoute::Passkey),
+        for (backend, route) in [
+            ("agent", ClientRoute::Agent),
+            ("auto", ClientRoute::Auto),
+            ("passkey", ClientRoute::Passkey),
         ] {
             let config = ResolvedConfig::resolve(
-                Some(auth.into()),
                 Vec::new(),
                 |key| match key {
                     "VT_BACKEND" => Some(backend.into()),
@@ -744,7 +716,7 @@ mod tests {
             );
             let client = VTClient::new(config).unwrap();
             assert_eq!(client.route, route);
-            assert_eq!(client.has_auth_token(), route.uses_agent());
+            assert_eq!(client.uses_agent(), route.uses_agent());
             assert!(
                 client.config.passkey_config().is_err(),
                 "worker validation stays lazy"
@@ -761,11 +733,107 @@ mod tests {
         }
     }
 
+    /// Fake agent: `auth@vt` answers a plain OK envelope, `encrypt@vt` an
+    /// `SSH_AGENT_FAILURE` (what a non-vt agent sends), `decrypt@vt` bytes
+    /// that are not an envelope, `sign@vt` a structured rejection.
+    struct MixedAgent;
+
+    impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for MixedAgent {
+        fn new_session(
+            &mut self,
+            _: &tokio::net::UnixStream,
+        ) -> impl ssh_agent_lib::agent::Session {
+            Self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ssh_agent_lib::agent::Session for MixedAgent {
+        async fn extension(
+            &mut self,
+            extension: Extension,
+        ) -> std::result::Result<Option<Extension>, ssh_agent_lib::error::AgentError> {
+            let details = match extension.name.as_str() {
+                "auth@vt" => {
+                    // The request is the plain JSON the client serialized.
+                    let req: AuthReq = serde_json::from_slice(extension.details.as_ref())
+                        .expect("plain JSON request");
+                    assert_eq!(req.reason, "fixture");
+                    wrap_ok_envelope(br#"{"approved":true}"#)
+                }
+                "encrypt@vt" => return Err(ssh_agent_lib::error::AgentError::Failure),
+                "decrypt@vt" => b"not an envelope".to_vec(),
+                "sign@vt" => fake_err_envelope("auth_rejected", None),
+                other => panic!("unexpected extension {other}"),
+            };
+            Ok(Some(Extension {
+                name: extension.name,
+                details: Unparsed::from(details),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_envelopes_and_backend_only_fallback_against_a_live_socket() {
+        let dir = std::env::temp_dir().join(format!("vt-client-mixed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(ssh_agent_lib::agent::listen(listener, MixedAgent));
+        let socket_str = socket.to_string_lossy().into_owned();
+        for backend in ["auto", "agent"] {
+            let client = VTClient::new(ResolvedConfig::resolve(
+                Vec::new(),
+                |key| match key {
+                    "VT_BACKEND" => Some(backend.into()),
+                    "SSH_AUTH_SOCK" => Some(socket_str.clone()),
+                    _ => None,
+                },
+                None,
+                None,
+            ))
+            .unwrap();
+            let auth = serde_json::to_vec(&AuthReq {
+                host: "h".into(),
+                reason: "fixture".into(),
+                meta: Default::default(),
+            })
+            .unwrap();
+            let body = client
+                .agent_call_or_fallback("auth@vt", auth)
+                .await
+                .unwrap()
+                .expect("plain OK envelope is the agent answer");
+            assert_eq!(&body[..], br#"{"approved":true}"#);
+            // Non-vt answers are recoverable in `auto` only.
+            let failure = client.agent_call_or_fallback("encrypt@vt", vec![]).await;
+            let garbage = client.agent_call_or_fallback("decrypt@vt", vec![]).await;
+            if backend == "auto" {
+                assert!(failure.unwrap().is_none());
+                assert!(garbage.unwrap().is_none());
+            } else {
+                assert!(failure.is_err());
+                assert!(garbage.is_err());
+            }
+            // A structured rejection never falls back, whatever the backend.
+            let rejected = client
+                .agent_call_or_fallback("sign@vt", vec![])
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                rejected.downcast_ref::<VtClientError>(),
+                Some(VtClientError::Agent(ErrKind::AuthRejected, _))
+            ));
+        }
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn decrypt_empty_fast_path_and_cf_failures_survive_agent_fallback() {
         for backend in ["auto", "passkey"] {
             let client = VTClient::new(ResolvedConfig::resolve(
-                Some("unused".into()),
                 Vec::new(),
                 |key| match key {
                     "VT_BACKEND" => Some(backend.into()),

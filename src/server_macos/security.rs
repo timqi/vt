@@ -1,6 +1,4 @@
 use anyhow::{ensure, Result};
-use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -469,23 +467,21 @@ pub fn local_authentication(reason: &str) -> bool {
     authenticate(reason).is_success()
 }
 
-/// Build the initial KeychainStore (passcode + auth_token + encrypted
-/// passphrase) and write it as a single keychain item. Used by `vt init`,
+/// Build the initial KeychainStore (passcode blob + encrypted passphrase)
+/// and write it as a single keychain item. Used by `vt init`,
 /// `vt secret import`, and `vt secret rotate-passcode` — all three either
 /// create the store fresh (init/import) or replace it wholesale (rotate),
 /// so this single call is the only write.
 pub fn create_and_save_passcode_passphrase(real_passphrase: &[u8; 32]) -> Result<()> {
     use super::store::KeychainStore;
 
-    let origin_auth_token = AesGcmCrypto::generate_key();
-    let hash = Sha256::digest(Sha256::digest(origin_auth_token));
-    let mut auth_token = [0u8; 32];
-    auth_token.copy_from_slice(&hash[..32]);
-
+    // 64 bytes: the passcode, then 32 random bytes nothing reads. The second
+    // half was the retired VT_AUTH token; keeping the width means stores
+    // written before and after the removal are byte-compatible.
     let passcode = AesGcmCrypto::generate_key();
-    let mut passcode_and_auth_token = Vec::with_capacity(passcode.len() + auth_token.len());
+    let mut passcode_and_auth_token = Vec::with_capacity(64);
     passcode_and_auth_token.extend_from_slice(&passcode);
-    passcode_and_auth_token.extend_from_slice(&auth_token);
+    passcode_and_auth_token.extend_from_slice(&AesGcmCrypto::generate_key());
 
     // New stores are always wrap v2 (KeychainStore::new sets wrap_v).
     let passphrase_secret = derive_passphrase_secret_v2(&passcode)?;
@@ -501,11 +497,6 @@ pub fn create_and_save_passcode_passphrase(real_passphrase: &[u8; 32]) -> Result
     }
     store.save()?;
     tracing::info!("keychain store saved!");
-
-    tracing::info!(
-        "export VT_AUTH={};",
-        BASE64_URL_SAFE_NO_PAD.encode(origin_auth_token)
-    );
     Ok(())
 }
 
@@ -548,28 +539,25 @@ pub fn load_mac_cipher(
     Ok((cipher, key))
 }
 
-/// Derive `(auth_cipher, passphrase_cipher)` from the passcode bytes inside
-/// an already-loaded store, selecting the wrap derivation by `store.wrap_v`.
+/// Derive the passphrase cipher from the passcode bytes inside an
+/// already-loaded store, selecting the wrap derivation by `store.wrap_v`.
 /// Pure CPU work; does not touch the keychain.
-pub fn derive_passcode_ciphers(
-    store: &super::store::KeychainStore,
-) -> Result<(AesGcmCrypto, AesGcmCrypto)> {
-    let (passcode_arr, auth_token) = split_passcode(store)?;
+pub fn derive_passcode_cipher(store: &super::store::KeychainStore) -> Result<AesGcmCrypto> {
+    let passcode_arr = split_passcode(store)?;
     let passphrase_secret = wrap_secret_for(store.wrap_v, &passcode_arr, None)?;
-    let passphrase_cipher = AesGcmCrypto::new(&passphrase_secret)?;
-    let auth_cipher = AesGcmCrypto::new(&auth_token)?;
-
-    Ok((auth_cipher, passphrase_cipher))
+    AesGcmCrypto::new(&passphrase_secret)
 }
 
-fn split_passcode(store: &super::store::KeychainStore) -> Result<([u8; 32], [u8; 32])> {
+/// The passcode is the first half of the 64-byte blob; the length check stays
+/// so a truncated or foreign store fails here rather than in the unwrap.
+fn split_passcode(store: &super::store::KeychainStore) -> Result<[u8; 32]> {
     let passcode = store.passcode_and_auth_token_bytes()?;
     ensure!(
         passcode.len() == 64,
         "Passcode length is {}, expected 64",
         passcode.len()
     );
-    Ok((passcode[..32].try_into()?, passcode[32..].try_into()?))
+    Ok(passcode[..32].try_into()?)
 }
 
 /// Wrap-key derivation for a given `wrap_v`. `bin_path` only applies to v1
@@ -591,15 +579,15 @@ fn wrap_secret_for(wrap_v: u32, passcode: &[u8; 32], bin_path: Option<&str>) -> 
 /// callers wrap it in `KeychainStore::modify` for the cross-process flock.
 /// Tries, in order: the store's recorded wrap, then (for v1 stores) the
 /// explicit `old_bin_path` string — the old binary need not exist, only its
-/// path enters the derivation. Preserves `passcode_and_auth_token` (VT_AUTH),
-/// and `encrypted_ssh_keys` untouched.
+/// path enters the derivation. Preserves `passcode_and_auth_token` and
+/// `encrypted_ssh_keys` untouched.
 pub(super) fn rewrap_passphrase(
     store: &mut super::store::KeychainStore,
     old_bin_path: Option<&str>,
     target_wrap: u32,
 ) -> Result<()> {
     use super::store::WRAP_V1;
-    let (passcode_arr, _) = split_passcode(store)?;
+    let passcode_arr = split_passcode(store)?;
     let encrypted = store.encrypted_passphrase_bytes()?;
 
     let mut candidates: Vec<(u32, Option<String>)> = vec![(store.wrap_v, None)];
@@ -638,7 +626,7 @@ pub(super) fn rewrap_passphrase(
 
 /// Transparent wrap v1→v2 upgrade, run at agent startup (docs/app-bundle.md
 /// §2). Under the store flock: re-checks `wrap_v == 1`, rewraps only
-/// `encrypted_passphrase`, never touches passcode/auth_token/SSH
+/// `encrypted_passphrase`, never touches the passcode blob or SSH
 /// blobs. Returns Ok(false) if the store is absent or already v2; unwrap
 /// failure (binary already moved before upgrading) is left to
 /// `vt secret rebind` and reported as an error for the caller to log.
@@ -683,10 +671,9 @@ mod tests {
         use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
 
         let passcode = AesGcmCrypto::generate_key();
-        let auth_token = AesGcmCrypto::generate_key();
         let mut passcode_and_auth_token = Vec::new();
         passcode_and_auth_token.extend_from_slice(&passcode);
-        passcode_and_auth_token.extend_from_slice(&auth_token);
+        passcode_and_auth_token.extend_from_slice(&AesGcmCrypto::generate_key());
 
         let master = AesGcmCrypto::generate_key();
         let old_path = "/old/install/location/vt";
@@ -762,17 +749,6 @@ mod tests {
         store.wrap_v = 99;
         let err = rewrap_passphrase(&mut store, None, WRAP_V2).unwrap_err();
         assert!(err.to_string().contains("wrap version 99"), "{err}");
-    }
-
-    #[test]
-    #[ignore]
-    fn test_encrypt_body() {
-        let body = r#"{"items":[]}"#.to_string();
-        let store = super::super::store::KeychainStore::load().expect("load keychain store");
-        let (cipher, _) = derive_passcode_ciphers(&store).expect("derive auth cipher");
-        let encrypted = cipher.encrypt(body.as_bytes()).expect("encrypt body");
-        let decrypted = cipher.decrypt(&encrypted).expect("decrypt body");
-        assert_eq!(decrypted, body.as_bytes());
     }
 
     #[test]

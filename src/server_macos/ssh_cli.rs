@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use ssh_key::private::PrivateKey;
 use ssh_key::HashAlg;
 
-use super::security::{derive_passcode_ciphers, load_mac_cipher, local_authentication};
+use super::security::{derive_passcode_cipher, load_mac_cipher, local_authentication};
 use super::ssh_agent::{decode_ssh_keys, encode_ssh_keys_into, SshKeyEntry};
 use super::store::KeychainStore;
 
@@ -76,7 +76,7 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
     let comment_for_modify = comment.clone();
     let key_openssh_str = key_openssh.to_string();
     KeychainStore::modify(|store| {
-        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+        let passphrase_cipher = derive_passcode_cipher(store)?;
         let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
         let mut entries = decode_ssh_keys(store, &mac_cipher)?;
         if !entries.iter().any(|e| e.fingerprint == fp_for_modify) {
@@ -97,7 +97,7 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
 
 pub fn ssh_list() -> Result<()> {
     let store = KeychainStore::load().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let passphrase_cipher = derive_passcode_cipher(&store)?;
     let (mac_cipher, _mac_key) = load_mac_cipher(&store, &passphrase_cipher)?;
     let entries = decode_ssh_keys(&store, &mac_cipher)?;
     if entries.is_empty() {
@@ -126,7 +126,7 @@ pub fn ssh_remove(fingerprint: &str) -> Result<()> {
     let needle = fingerprint.to_string();
     let mut removed_info: Option<String> = None;
     KeychainStore::modify(|store| {
-        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+        let passphrase_cipher = derive_passcode_cipher(store)?;
         let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
         let mut entries = decode_ssh_keys(store, &mac_cipher)?;
 
@@ -172,7 +172,7 @@ pub fn ssh_remove_all() -> Result<()> {
     }
 
     KeychainStore::modify(|store| {
-        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+        let passphrase_cipher = derive_passcode_cipher(store)?;
         let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
         encode_ssh_keys_into(store, &mac_cipher, &[])?;
         Ok(())
@@ -191,7 +191,7 @@ pub fn ssh_comment(fingerprint: &str, comment: &str) -> Result<()> {
     let new_comment = comment.to_string();
     let mut updated_info: Option<(String, String)> = None;
     KeychainStore::modify(|store| {
-        let (_, passphrase_cipher) = derive_passcode_ciphers(store)?;
+        let passphrase_cipher = derive_passcode_cipher(store)?;
         let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
         let mut entries = decode_ssh_keys(store, &mac_cipher)?;
 
@@ -245,7 +245,7 @@ pub fn ssh_show(fingerprint: &str) -> Result<()> {
     }
 
     let store = KeychainStore::load().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let (_, passphrase_cipher) = derive_passcode_ciphers(&store)?;
+    let passphrase_cipher = derive_passcode_cipher(&store)?;
     let (mac_cipher, _mac_key) = load_mac_cipher(&store, &passphrase_cipher)?;
     let entries = decode_ssh_keys(&store, &mac_cipher)?;
 

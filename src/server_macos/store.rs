@@ -44,7 +44,9 @@ pub struct KeychainStore {
     /// stores written before this field existed read as wrap v1.
     #[serde(default = "default_wrap_v")]
     pub wrap_v: u32,
-    /// base64 of 64 bytes: passcode (32B) + auth_token (32B).
+    /// base64 of 64 bytes: passcode (32B) + 32 unread bytes. The tail held the
+    /// retired VT_AUTH token; the field name and width stay so existing
+    /// stores need no migration.
     pub passcode_and_auth_token: String,
     /// base64 of AES-GCM ciphertext (nonce || ct) wrapping the 32-byte master passphrase.
     pub encrypted_passphrase: String,

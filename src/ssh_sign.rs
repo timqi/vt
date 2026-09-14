@@ -248,9 +248,10 @@ async fn connect_unix(
 ) -> Result<()> {
     // 1. Resolve which identity/identities to advertise. An explicit pubkey
     //    (VT_GIT_SSH_PUB / ~/.config/vt/git-ssh.pub) takes precedence and may
-    //    carry a vt:// record for the decrypt-then-sign fallback; otherwise, with
-    //    VT_AUTH set, discover ALL keys from the upstream vt agent (each signs via
-    //    `sign@vt`). See `resolve_identities` for the full precedence + errors.
+    //    carry a vt:// record for the decrypt-then-sign fallback; otherwise, on
+    //    an agent-capable route, discover ALL keys from the upstream vt agent
+    //    (each signs via `sign@vt`). See `resolve_identities` for the full
+    //    precedence + errors.
     let identities = resolve_identities(&vt_client).await?;
 
     // 2. Best-effort audit context from our own argv (we are git's child).
@@ -388,7 +389,7 @@ async fn load_pubkey_line_opt() -> Result<Option<String>> {
 /// Precedence:
 /// 1. **Explicit pubkey** (`VT_GIT_SSH_PUB` env, else `~/.config/vt/git-ssh.pub`):
 ///    one identity, optionally carrying a `vt://` record for decrypt-then-sign.
-/// 2. **Agent discovery** — only when `VT_AUTH` is set (`sign@vt` needs it):
+/// 2. **Agent discovery** — unless `VT_BACKEND=passkey` pins the agent away:
 ///    list ALL keys the upstream vt agent holds and advertise every one
 ///    (`vt_url: None`). Signing routes through `sign@vt` per key.
 /// 3. Otherwise an actionable error.
@@ -420,10 +421,10 @@ async fn resolve_identities(client: &VTClient) -> Result<Vec<SignerIdentity>> {
         );
     }
 
-    // 2. Agent discovery — gated on VT_AUTH (sign@vt needs the derived key;
-    //    discovery from a foreign $SSH_AUTH_SOCK agent would only fail at sign
-    //    time). list_agent_identities is BLOCKING → spawn_blocking.
-    if client.has_auth_token() {
+    // 2. Agent discovery — gated on the route (under a passkey pin `sign@vt`
+    //    never runs, so discovered keys would only fail at sign time).
+    //    list_agent_identities is BLOCKING → spawn_blocking.
+    if client.uses_agent() {
         let client = client.clone();
         let ids = tokio::task::spawn_blocking(move || client.list_agent_identities())
             .await
@@ -439,9 +440,9 @@ async fn resolve_identities(client: &VTClient) -> Result<Vec<SignerIdentity>> {
     // 3. Nothing to advertise.
     bail!(
         "no SSH identity for `vt ssh connect`: set VT_GIT_SSH_PUB (or write \
-         ~/.config/vt/git-ssh.pub), or start `vt ssh agent` with a key loaded and \
-         VT_AUTH set so connect can discover it. If $SSH_AUTH_SOCK points at a \
-         non-vt agent, unset it."
+         ~/.config/vt/git-ssh.pub), or start `vt ssh agent` with a key loaded so \
+         connect can discover it. If $SSH_AUTH_SOCK points at a non-vt agent, \
+         unset it."
     )
 }
 
@@ -638,8 +639,8 @@ fn decide_sign_route(outcome: Result<Option<(String, Vec<u8>)>>, has_vt_url: boo
 
 /// Pure op-filter for the `--forward-real-agent` relay: which agent-protocol
 /// extensions may cross from the forwarded (remote) side to the UPSTREAM real
-/// vt agent. Decided on the CLEARTEXT `name` only — `details` is an opaque
-/// AES-GCM(VT_AUTH) blob the relay never decrypts (it holds no VT_AUTH).
+/// vt agent. Decided on the `name` only — `details` is forwarded verbatim and
+/// never parsed, so the relay cannot filter by key or record.
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum ExtensionRoute {
@@ -657,7 +658,7 @@ enum ExtensionRoute {
 /// falling back to decrypt-then-sign (which lands the raw seed in remote
 /// process memory — relaying keeps the private key on the Mac and only the
 /// signature crosses). sign@vt can name ANY upstream agent key and the relay
-/// cannot filter by key (the payload is opaque), so the upstream prompt names
+/// does not parse payloads to filter by key, so the upstream prompt names
 /// the requested key and marks the relay origin, and its cache grants are
 /// narrowed to this connection. diag@vt is relayed so a remote `vt doctor`
 /// can ask the upstream agent how it classifies this relay connection —
@@ -780,8 +781,8 @@ impl ssh_agent_lib::agent::Session for SignerSession {
 
     /// `--forward-real-agent` relay: forward whitelisted vt extensions
     /// VERBATIM to the upstream real agent (`route_extension` filters on the
-    /// cleartext name; `details` stays an opaque encrypted blob — the relay
-    /// holds no VT_AUTH and cannot read or forge payloads). Everything else —
+    /// name; `details` is never parsed here — the upstream agent alone
+    /// authorizes what the payload asks for). Everything else —
     /// notably run@vt — is refused with `SSH_AGENT_FAILURE`, which is also the
     /// pre-existing behavior for all extensions when the flag is off.
     async fn extension(

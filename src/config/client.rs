@@ -9,7 +9,6 @@ use super::Backend;
 
 pub const CLIENT_CONFIG_KEYS: &[&str] = &[
     "VT_BACKEND",
-    "VT_AUTH",
     "VT_PASSKEY_URL",
     "VT_PASSKEY_TOKEN",
     "VT_GIT_SSH_PRIVATE_KEY",
@@ -17,21 +16,23 @@ pub const CLIENT_CONFIG_KEYS: &[&str] = &[
     "VT_PASSKEY_UV",
 ];
 
+/// Transport route decided by `VT_BACKEND` alone. The agent socket is the
+/// kernel-owned boundary, so `auto` always probes it; a missing socket or a
+/// non-vt agent is the recoverable fallback to the Worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientRoute {
     Agent,
-    AutoAgent,
+    Auto,
     Passkey,
-    AutoPasskey,
 }
 
 impl ClientRoute {
     pub fn uses_agent(self) -> bool {
-        matches!(self, Self::Agent | Self::AutoAgent)
+        matches!(self, Self::Agent | Self::Auto)
     }
 
     pub fn allows_passkey_fallback(self) -> bool {
-        self == Self::AutoAgent
+        self == Self::Auto
     }
 }
 
@@ -57,18 +58,14 @@ impl std::fmt::Display for PasskeyState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RoutingError {
     InvalidBackend(String),
-    AgentAuthMissing,
     PasskeyUrlMissing,
-    NoPath,
 }
 
 impl std::fmt::Display for RoutingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidBackend(message) => f.write_str(message),
-            Self::AgentAuthMissing => f.write_str("VT_BACKEND=agent requires VT_AUTH for the SSH agent path"),
             Self::PasskeyUrlMissing => f.write_str("VT_BACKEND=passkey requires VT_PASSKEY_URL + VT_PASSKEY_TOKEN for the phone passkey ceremony"),
-            Self::NoPath => f.write_str("no decryption path configured — set VT_AUTH for the SSH agent path, or VT_PASSKEY_URL + VT_PASSKEY_TOKEN for the phone passkey ceremony"),
         }
     }
 }
@@ -79,7 +76,6 @@ impl std::error::Error for RoutingError {}
 // a misconfigured plaintext SSH private key in its diagnostic values.
 #[derive(Clone)]
 pub struct ResolvedConfig {
-    auth_token: String,
     /// Requested WebAuthn user-verification level for the phone ceremony
     /// (`--uv`, else `VT_PASSKEY_UV`, else the file). Advisory: the Worker
     /// applies `max(its policy, this)`, so it can only ever ask for MORE
@@ -93,13 +89,8 @@ pub struct ResolvedConfig {
 }
 
 impl ResolvedConfig {
-    pub fn capture(
-        auth: Option<String>,
-        uv: Option<String>,
-        file_populated_keys: Vec<String>,
-    ) -> Self {
+    pub fn capture(uv: Option<String>, file_populated_keys: Vec<String>) -> Self {
         Self::from_lookup(
-            auth,
             uv,
             file_populated_keys,
             |key| std::env::var(key),
@@ -109,7 +100,6 @@ impl ResolvedConfig {
     }
 
     fn from_lookup(
-        auth: Option<String>,
         uv: Option<String>,
         file_populated_keys: Vec<String>,
         mut lookup: impl FnMut(&str) -> Result<String, std::env::VarError>,
@@ -120,15 +110,7 @@ impl ResolvedConfig {
             .iter()
             .map(|&key| (key, lookup(key)))
             .collect();
-        let auth_token = auth
-            .or_else(|| {
-                values
-                    .get("VT_AUTH")
-                    .and_then(|value| value.as_ref().ok())
-                    .cloned()
-            })
-            .unwrap_or_default();
-        // Same precedence as `auth`: the flag wins, else the env/file value.
+        // The flag wins, else the env/file value.
         let passkey_uv = uv
             .or_else(|| {
                 values
@@ -138,7 +120,6 @@ impl ResolvedConfig {
             })
             .filter(|v| !v.is_empty());
         Self {
-            auth_token,
             passkey_uv,
             values,
             file_populated_keys,
@@ -150,14 +131,12 @@ impl ResolvedConfig {
 
     #[cfg(test)]
     pub(crate) fn resolve(
-        auth: Option<String>,
         file_populated_keys: Vec<String>,
         mut lookup: impl FnMut(&str) -> Option<String>,
         config_path: Option<PathBuf>,
         home: Option<PathBuf>,
     ) -> Self {
         Self::from_lookup(
-            auth,
             None,
             file_populated_keys,
             |key| lookup(key).ok_or(std::env::VarError::NotPresent),
@@ -178,23 +157,15 @@ impl ResolvedConfig {
         self.raw_value(key).ok()
     }
 
-    pub fn auth_token(&self) -> &str {
-        &self.auth_token
-    }
-
     pub fn route(&self) -> Result<ClientRoute, RoutingError> {
         let backend = Backend::parse(self.value("VT_BACKEND").unwrap_or_default())
             .map_err(RoutingError::InvalidBackend)?;
-        let has_auth = !self.auth_token.is_empty();
         let has_url = self.value("VT_PASSKEY_URL").is_some();
         match backend {
-            Backend::Agent if !has_auth => Err(RoutingError::AgentAuthMissing),
             Backend::Passkey if !has_url => Err(RoutingError::PasskeyUrlMissing),
-            _ if !has_auth && !has_url => Err(RoutingError::NoPath),
             Backend::Agent => Ok(ClientRoute::Agent),
             Backend::Passkey => Ok(ClientRoute::Passkey),
-            Backend::Auto if has_auth => Ok(ClientRoute::AutoAgent),
-            Backend::Auto => Ok(ClientRoute::AutoPasskey),
+            Backend::Auto => Ok(ClientRoute::Auto),
         }
     }
 
@@ -254,9 +225,8 @@ mod tests {
     use super::*;
     use std::env::VarError;
 
-    fn config(auth: Option<&str>, values: &[(&str, &str)]) -> ResolvedConfig {
+    fn config(values: &[(&str, &str)]) -> ResolvedConfig {
         ResolvedConfig::resolve(
-            auth.map(str::to_owned),
             Vec::new(),
             |key| {
                 values
@@ -270,56 +240,51 @@ mod tests {
     }
 
     #[test]
-    fn routing_matrix_preserves_pins_and_lazy_worker_validation() {
+    fn routing_matrix_is_backend_only_with_lazy_worker_validation() {
         for backend in ["auto", "agent", "passkey"] {
-            for auth in [None, Some(""), Some("auth")] {
-                for url in [None, Some(""), Some("https://worker.invalid")] {
-                    for token in [None, Some(""), Some("token")] {
-                        let mut values = vec![("VT_BACKEND", backend)];
-                        if let Some(url) = url {
-                            values.push(("VT_PASSKEY_URL", url));
-                        }
-                        if let Some(token) = token {
-                            values.push(("VT_PASSKEY_TOKEN", token));
-                        }
-                        let cfg = config(auth, &values);
-                        let has_auth = auth.is_some_and(|s| !s.is_empty());
-                        let expected = match backend {
-                            "agent" if !has_auth => Err(RoutingError::AgentAuthMissing),
-                            "passkey" if url.is_none() => Err(RoutingError::PasskeyUrlMissing),
-                            _ if !has_auth && url.is_none() => Err(RoutingError::NoPath),
-                            "agent" => Ok(ClientRoute::Agent),
-                            "passkey" => Ok(ClientRoute::Passkey),
-                            _ if has_auth => Ok(ClientRoute::AutoAgent),
-                            _ => Ok(ClientRoute::AutoPasskey),
-                        };
-                        assert_eq!(
-                            cfg.route(),
-                            expected,
-                            "backend={backend}, auth={auth:?}, url={url:?}, token={token:?}"
-                        );
-                        assert_eq!(
-                            cfg.passkey_config().is_ok(),
-                            url.is_some_and(|s| !s.is_empty())
-                                && token.is_some_and(|s| !s.is_empty())
-                        );
+            for url in [None, Some(""), Some("https://worker.invalid")] {
+                for token in [None, Some(""), Some("token")] {
+                    let mut values = vec![("VT_BACKEND", backend)];
+                    if let Some(url) = url {
+                        values.push(("VT_PASSKEY_URL", url));
                     }
+                    if let Some(token) = token {
+                        values.push(("VT_PASSKEY_TOKEN", token));
+                    }
+                    let cfg = config(&values);
+                    let expected = match backend {
+                        "passkey" if url.is_none() => Err(RoutingError::PasskeyUrlMissing),
+                        "agent" => Ok(ClientRoute::Agent),
+                        "passkey" => Ok(ClientRoute::Passkey),
+                        _ => Ok(ClientRoute::Auto),
+                    };
+                    assert_eq!(
+                        cfg.route(),
+                        expected,
+                        "backend={backend}, url={url:?}, token={token:?}"
+                    );
+                    assert_eq!(
+                        cfg.passkey_config().is_ok(),
+                        url.is_some_and(|s| !s.is_empty()) && token.is_some_and(|s| !s.is_empty())
+                    );
                 }
             }
         }
+        // A retired VT_AUTH value is inert: it neither routes nor is captured.
+        let cfg = config(&[("VT_AUTH", "stale"), ("VT_BACKEND", "auto")]);
+        assert_eq!(cfg.route(), Ok(ClientRoute::Auto));
+        assert_eq!(cfg.value("VT_AUTH"), None);
     }
 
     #[test]
-    fn snapshot_preserves_cli_precedence_and_empty_environment_values() {
+    fn snapshot_is_immutable_and_preserves_empty_environment_values() {
         let mut values = BTreeMap::from([
-            ("VT_AUTH", "env-auth".to_owned()),
             ("VT_BACKEND", "auto".to_owned()),
             ("VT_PASSKEY_URL", "https://worker.invalid".to_owned()),
             ("VT_PASSKEY_TOKEN", "file-token".to_owned()),
             ("SSH_AUTH_SOCK", "/original.sock".to_owned()),
         ]);
         let cfg = ResolvedConfig::resolve(
-            Some("cli-auth".into()),
             vec!["VT_PASSKEY_TOKEN".into()],
             |key| values.get(key).cloned(),
             Some(PathBuf::from("/config.toml")),
@@ -327,23 +292,11 @@ mod tests {
         );
         values.insert("VT_PASSKEY_TOKEN", "changed".into());
         values.insert("SSH_AUTH_SOCK", "/changed.sock".into());
-        assert_eq!(cfg.auth_token(), "cli-auth");
-        assert_eq!(cfg.value("VT_AUTH"), Some("env-auth"));
         assert_eq!(cfg.passkey_config().unwrap().worker_auth, "file-token");
         assert_eq!(cfg.socket_path().unwrap(), Path::new("/original.sock"));
         assert_eq!(cfg.file_populated_keys, ["VT_PASSKEY_TOKEN"]);
         assert_eq!(
-            config(Some(""), &[("VT_AUTH", "env")]).route(),
-            Err(RoutingError::NoPath)
-        );
-        assert_eq!(
-            config(None, &[("VT_AUTH", "env")]).route(),
-            Ok(ClientRoute::AutoAgent)
-        );
-        assert_eq!(
-            config(None, &[("SSH_AUTH_SOCK", "")])
-                .socket_path()
-                .unwrap(),
+            config(&[("SSH_AUTH_SOCK", "")]).socket_path().unwrap(),
             Path::new("")
         );
     }
@@ -352,7 +305,6 @@ mod tests {
     fn passkey_uv_prefers_the_flag_and_stays_absent_when_unset() {
         let uv = |flag: Option<&str>, env: Option<&str>| {
             ResolvedConfig::from_lookup(
-                None,
                 flag.map(str::to_owned),
                 Vec::new(),
                 |key| match key {
@@ -372,7 +324,7 @@ mod tests {
         assert_eq!(uv(None, None), None);
         assert_eq!(uv(None, Some("preferred")), Some("preferred".to_owned()));
         assert_eq!(uv(Some("required"), None), Some("required".to_owned()));
-        // The flag wins over the env/file value, like --auth does.
+        // The flag wins over the env/file value.
         assert_eq!(
             uv(Some("required"), Some("discouraged")),
             Some("required".to_owned())
@@ -387,7 +339,6 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let invalid = std::ffi::OsString::from_vec(vec![0xff]);
         let cfg = ResolvedConfig::from_lookup(
-            Some("auth".into()),
             None,
             Vec::new(),
             |key| match key {
@@ -399,7 +350,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(cfg.route(), Ok(ClientRoute::AutoAgent));
+        assert_eq!(cfg.route(), Ok(ClientRoute::Auto));
         assert!(cfg.value("VT_PASSKEY_URL").is_none());
         let error = cfg.passkey_config().err().unwrap();
         assert_eq!(
@@ -410,13 +361,13 @@ mod tests {
 
     #[test]
     fn invalid_configuration_is_captured_without_failing_unrelated_commands() {
-        let cfg = config(None, &[("VT_BACKEND", "typo")]);
+        let cfg = config(&[("VT_BACKEND", "typo")]);
         assert!(matches!(cfg.route(), Err(RoutingError::InvalidBackend(_))));
         assert_eq!(
-            config(None, &[]).socket_path().unwrap(),
+            config(&[]).socket_path().unwrap(),
             Path::new("/test-home/.ssh/vt.sock")
         );
-        let missing = ResolvedConfig::resolve(None, Vec::new(), |_| None, None, None);
+        let missing = ResolvedConfig::resolve(Vec::new(), |_| None, None, None);
         assert!(missing.socket_path().is_err());
         assert_eq!(missing.passkey_state(), PasskeyState::Unconfigured);
     }

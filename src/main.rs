@@ -74,15 +74,6 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        env = "VT_AUTH",
-        hide_env = true,
-        help = "SSH-agent auth token (macOS, optional). When unset the CLI uses the CF passkey ceremony (env: VT_AUTH)"
-    )]
-    auth: Option<String>,
-
-    #[arg(
-        long,
-        global = true,
         env = "VT_PASSKEY_UV",
         hide_env = true,
         value_name = "discouraged|preferred|required",
@@ -515,7 +506,7 @@ async fn run(cli: Cli, config: config::ResolvedConfig) -> Result<()> {
             args,
         } => {
             // Recovery only moves the ciphertext backup back over the target —
-            // no decryption, so no VT_AUTH required.
+            // no decryption, so no client route required.
             if *recover {
                 return client::inject_recover();
             }
@@ -563,13 +554,12 @@ fn main() {
 
     // Fallback layer: populate any unset VT_* env var from
     // ~/.config/vt/config.toml (override path via $VT_CONFIG). Env vars always
-    // win. Must run before Cli::parse() (clap reads VT_AUTH from env) and while
-    // still single-threaded (before the tokio runtime is built).
+    // win. Must run before Cli::parse() (clap reads VT_PASSKEY_UV from env) and
+    // while still single-threaded (before the tokio runtime is built).
     let file_populated_keys = config::hydrate_env_from_file();
 
     let cli = Cli::parse();
-    let config =
-        config::ResolvedConfig::capture(cli.auth.clone(), cli.uv.clone(), file_populated_keys);
+    let config = config::ResolvedConfig::capture(cli.uv.clone(), file_populated_keys);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

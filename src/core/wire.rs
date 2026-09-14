@@ -1,8 +1,8 @@
 //! Cross-platform wire envelope for vt extension responses.
 //!
 //! Every `encrypt@vt` / `decrypt@vt` / `auth@vt` response — success or failure
-//! — is serialized as an [`ExtResponse<T>`] before being auth-cipher-encrypted
-//! and stuffed into the SSH-agent extension reply. This lets the client
+//! — is serialized as an [`ExtResponse<T>`] and carried as plain JSON in the
+//! SSH-agent extension reply. This lets the client
 //! distinguish "user rejected Touch ID" from "screen is locked" from
 //! "agent returned a malformed response", and map each to a stable exit code
 //! (see [`ErrKind::exit_code`]).
@@ -10,13 +10,13 @@
 //! Two failure paths intentionally do NOT use this envelope and instead
 //! collapse to `AgentError::Failure`:
 //!
-//! 1. `auth_cipher` decryption failure on the incoming request payload — we
-//!    have no key with which to encrypt a structured reply.
-//! 2. The `ssh-add -x` lock check fires before keychain ciphers are derived;
-//!    sending a structured response would require running keychain I/O for
-//!    every locked request.
+//! 1. The `ssh-add -x` lock check fires before any keychain I/O; a locked
+//!    agent answers like a non-vt agent would, so the client's `ssh-add -X`
+//!    hint stays on one path.
+//! 2. Store load / wrap-cipher derivation failure precedes dispatch, so no
+//!    handler exists yet to pick an `ErrKind`.
 //!
-//! Both surface to the client as a parse error → [`ErrKind::Generic`].
+//! Both surface to the client as `VtClientError::Transport` (exit 1).
 //!
 //! See `docs/structured-errors.md` for the full design rationale.
 //!

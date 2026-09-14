@@ -192,11 +192,11 @@ pub struct EncryptReq {
 
 /// One agent-generated `(salt, dek)` pair. Client uses these locally to AEAD
 /// encrypt the corresponding plaintext and assemble the v2 URL. The DEK
-/// crosses the wire encrypted under `auth_cipher` and is zeroized after use
+/// crosses the local agent socket in the clear and is zeroized after use
 /// on both sides.
 ///
 /// NOTE: there is intentionally no `salt` field on the *request* side. Letting
-/// a client supply a salt would let an attacker holding `VT_AUTH` extract the
+/// a client supply a salt would let any peer on the socket extract the
 /// salt from a stored `vt://0{salt||ct}` URL, request its DEK via
 /// `encrypt@vt` (no Touch ID), and decrypt the ciphertext locally — bypassing
 /// the Touch ID gate that protects `decrypt@vt`. Salt MUST originate inside
@@ -476,8 +476,8 @@ pub struct DiagPeerReport {
 pub const UI_STATUS_ACTION_STATUS: &str = "status";
 pub const UI_STATUS_ACTION_REVOKE_ALL: &str = "revoke_all";
 
-/// Request: shell → agent for `ui-status@vt`. Plaintext JSON (the shell
-/// holds no VT_AUTH), gated by the 32-byte spawn token the shell passed the
+/// Request: shell → agent for `ui-status@vt`. Plaintext JSON like every
+/// vt extension, gated by the 32-byte spawn token the shell passed the
 /// agent over an inherited pipe at startup. Like `diag@vt` it never resets
 /// the idle clock; unlike `diag@vt` a valid token sees the WHOLE grant
 /// store — the one deliberate exception to caller-scoped visibility.

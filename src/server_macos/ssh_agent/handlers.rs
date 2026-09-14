@@ -107,9 +107,8 @@ impl VtSshSession {
         // for each requested SecretType. The agent NEVER receives plaintext
         // on this path. The salt is generated server-side (never accepted
         // from the client) — this is the security invariant that prevents
-        // an attacker holding `VT_AUTH` from extracting a salt from a
-        // stored vt://0{salt||ct} URL and requesting its DEK to bypass
-        // Touch ID.
+        // any peer on the socket from extracting a salt from a stored
+        // vt://0{salt||ct} URL and requesting its DEK to bypass Touch ID.
         let req: EncryptReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
         if req.types.len() > MAX_CRYPTO_BATCH {
@@ -171,7 +170,7 @@ impl VtSshSession {
         // An empty batch has nothing to authorize; without this guard it
         // would fall through to the uncached always-prompt path and put a
         // "decrypt 0 secrets" dialog in front of the user — free prompt spam
-        // for any peer holding VT_AUTH.
+        // for any peer on the socket.
         if req.items.is_empty() {
             return Err((ErrKind::BadRequest, Some(DETAIL_BATCH_EMPTY)));
         }
@@ -415,9 +414,9 @@ impl VtSshSession {
         )))
     }
 
-    /// `ui-status@vt` (docs/app-bundle.md §5): plaintext, token-gated
-    /// status/revoke channel for the VT.app shell. Runs BEFORE the lock
-    /// check and the VT_AUTH cipher path, never touches the idle clock, is
+    /// `ui-status@vt` (docs/app-bundle.md §5): token-gated status/revoke
+    /// channel for the VT.app shell. Runs BEFORE the lock check and the
+    /// Keychain store load, never touches the idle clock, is
     /// never cached and never audit-pushed. The only whole-store grant
     /// visibility in the agent — every failure mode is an unstructured
     /// `AgentError::Failure` so a prober without the token cannot even
@@ -622,11 +621,10 @@ impl VtSshSession {
         Ok(HandlerSuccess::authorized(bytes, permit))
     }
 
-    /// `sign@vt`: VT_AUTH-gated signing with a Keychain-held key, displaying vt
-    /// execution context (host/command/meta) in the Touch ID prompt. Unlike the
-    /// standard `SIGN_REQUEST` path, the request is authenticated by the
-    /// auth-cipher envelope and carries human context. The private key never
-    /// leaves the agent.
+    /// `sign@vt`: signing with a Keychain-held key, displaying vt execution
+    /// context (host/command/meta) in the Touch ID prompt. Unlike the standard
+    /// `SIGN_REQUEST` path, the request carries human context (advisory,
+    /// sanitized). The private key never leaves the agent.
     ///
     /// Uses the same `Operation::Sign` grant store as standard `SIGN_REQUEST`.
     /// Local callers get a kernel-verified workspace scope (one approval
