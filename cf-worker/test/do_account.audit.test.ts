@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { AccountAudit, auditKey } from '../src/account_audit';
 import type { AdminWsMessage, DoAuditIngestOp } from '../src/types';
-import { inDO, makeChallenge, makeMeta, nextToken } from './do_helpers';
+import { inDO, makeChallenge, makeMeta, nextToken, liveTokenId } from './do_helpers';
 
 function agentOp(): DoAuditIngestOp {
   return {
@@ -62,6 +62,7 @@ describe('AccountAudit persistence and projection', () => {
   });
 
   it('suppresses duplicate insert broadcasts through the DO create and ingest routes', async () => {
+    const tokenId = await liveTokenId();
     await inDO(async ({ inst, state }) => {
       const ch = makeChallenge();
       const op = { ...agentOp(), outcome: 'approved' };
@@ -69,7 +70,7 @@ describe('AccountAudit persistence and projection', () => {
       try {
         for (let i = 0; i < 2; i++) {
           const created = await inst.fetch(new Request('https://account.do/op/create', {
-            method: 'POST', body: JSON.stringify({ challenge: ch }),
+            method: 'POST', body: JSON.stringify({ challenge: ch, token_id: tokenId }),
           }));
           expect(created.status).toBe(200);
           await created.text();

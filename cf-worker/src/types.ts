@@ -6,14 +6,12 @@ export interface Env {
   ACCOUNT: DurableObjectNamespace;
   ASSETS: Fetcher;
   /** Worker master. Host tokens are HKDF-derived from it (host_token.ts) and
-   *  the agent audit key too; during the migration window it is also still
-   *  accepted directly as the daemon HMAC key (legacy hosts without a token). */
+   *  the agent audit key too; it is never accepted directly as a daemon key. */
   VT_AUTH_CF: string;
   /** PREVIOUS-generation Worker master, accepted as a fallback so rotating
    *  VT_AUTH_CF is rolling instead of a fleet-wide flag day: a host token whose
    *  secret was derived from the old master keeps verifying until that host
-   *  re-enrolls. HOST-TOKEN PATHS ONLY — the legacy bare-master branch never
-   *  falls back to it. Empty/absent → no previous generation (the default, and
+   *  re-enrolls. Empty/absent → no previous generation (the default, and
    *  the state to return to once every host shows `cur` on the tokens tab). A
    *  secret: Wrangler secret storage, never inlined in wrangler.toml. */
   VT_AUTH_CF_PREV?: string;
@@ -216,8 +214,9 @@ export interface Challenge {
    *  the unauthenticated requester claimed plus what the edge verified. Like
    *  `extend`, immutable after creation; approving mints exactly this token. */
   enroll?: EnrollIntent;
-  /** Host token the daemon authenticated this ceremony with (absent on the
-   *  legacy master path). Lets the approval page label host/user as verified. */
+  /** Host token the daemon authenticated this ceremony with. Absent only on
+   *  ceremonies no daemon opened (enroll, cache extension); the approval page
+   *  labels host/user as verified when it is present. */
   token_id?: string;
   /** Set by commitEnroll in the same put that flips status to 'approved': the
    *  token_id minted for this ceremony. The secret is re-derived (never stored)
@@ -386,9 +385,9 @@ export interface SlackAppMsgRef {
 /** Display context for one approval. Trust levels differ per field and the
  *  surfaces label them accordingly (docs/approval-transparency.md):
  *   - `ip` — Worker-derived (CF-Connecting-IP), always.
- *   - `host` / `user` — from the host-token record when the request carried a
- *     token (verified at enrollment); client-claimed on the legacy master path
- *     and on agent audit rows (the agent names the session host).
+ *   - `host` / `user` — from the host-token record on daemon ceremonies
+ *     (verified at enrollment); client-claimed on agent audit rows (the agent
+ *     names the session host).
  *   - everything else — client-claimed.
  *  Dropped from the wire (columns kept, NULL): tty, ppid, ssh_client. */
 export interface ChallengeMeta {
@@ -655,12 +654,11 @@ export interface DoCreateOp {
   challenge: Challenge;
   /** Host token the daemon authenticated with (HMAC already verified at the
    *  edge). The DO checks liveness, slides expiry, and overwrites
-   *  `challenge.meta.host` / `user` from the record. Absent = legacy master. */
-  token_id?: string;
+   *  `challenge.meta.host` / `user` from the record. */
+  token_id: string;
   /** Master generation that verified the HMAC; recorded on the token row so the
-   *  admin tab can show who is still on the previous one. Only meaningful
-   *  alongside `token_id`. */
-  key_gen?: MasterKeyGen;
+   *  admin tab can show who is still on the previous one. */
+  key_gen: MasterKeyGen;
 }
 
 export interface DoApproveOp {
@@ -684,9 +682,9 @@ export interface DoDekCacheOp {
   salts_b64u: string[];
   meta: ChallengeMeta;
   /** See DoCreateOp.token_id. */
-  token_id?: string;
+  token_id: string;
   /** See DoCreateOp.key_gen. */
-  key_gen?: MasterKeyGen;
+  key_gen: MasterKeyGen;
 }
 
 /** Internal DO op for POST /{ADMIN_SEG}/api/cache-extend-request. The Worker has

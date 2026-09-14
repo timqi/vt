@@ -7,7 +7,7 @@ import { seal, cachePublicKey } from '../src/cache_crypto';
 import { deleteKeysBatched } from '../src/storage_batch';
 import {
   inDO, setDoVar, makeChallenge, makeMeta, signApproval, seedGroup,
-  readEntries, auditRows, nextSalt, sealFakeDek, testEnv,
+  readEntries, auditRows, nextSalt, sealFakeDek, testEnv, liveTokenId,
 } from './do_helpers';
 import type { Challenge, CacheExtendIntent } from '../src/types';
 
@@ -240,6 +240,7 @@ describe('challenge alarm sweep', () => {
 describe('cache read plaintext lifetime', () => {
   it.each(['missing', 'malformed', 'cleanup-failure', 'hit', 'seal-failure'])(
     'wipes every opened buffer on %s', async (outcome) => {
+      const tokenId = await liveTokenId();
       await inDO(async ({ inst, state }) => {
         const meta = makeMeta();
         const salts = [nextSalt(), nextSalt()];
@@ -270,7 +271,7 @@ describe('cache read plaintext lifetime', () => {
           const request = new Request('https://account.do/op/dek-cache', {
             method: 'POST', body: JSON.stringify({
               daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
-              salts_b64u: salts, meta,
+              salts_b64u: salts, meta, token_id: tokenId,
             }),
           });
           if (outcome === 'seal-failure') {
@@ -295,6 +296,7 @@ describe('cache read plaintext lifetime', () => {
 });
 
 it('keeps cache write, read, extension, and clear within every 128-key storage limit', async () => {
+  const tokenId = await liveTokenId();
   await inDO(async ({ inst, state }) => {
     const get = state.storage.get.bind(state.storage);
     const put = state.storage.put.bind(state.storage);
@@ -337,11 +339,11 @@ it('keeps cache write, read, extension, and clear within every 128-key storage l
     try {
       const salts = Array.from({ length: 150 }, nextSalt);
       const ch = makeChallenge({ salts_b64u: salts });
-      await post('create', { challenge: ch });
+      await post('create', { challenge: ch, token_id: tokenId });
       await approve(ch, { cache_ttl_s: 1200, cache_sealed_deks_b64u: salts.map(() => sealFakeDek()) });
       expect(sizes.put).toEqual([2, 128, 22]);
       const read = await post('dek-cache', {
-        daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)), salts_b64u: salts, meta: ch.meta,
+        daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)), salts_b64u: salts, meta: ch.meta, token_id: tokenId,
       });
       expect(read.source).toBe('cache');
       expect(sizes.get).toEqual([128, 22]);

@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import type { Challenge } from '../src/types';
 import {
   inDO, doPost, doGet, setDoVar, makeChallenge, approve, reject, seedGroup,
-  FLAGS_UP_ONLY, FLAGS_UP_UV,
+  FLAGS_UP_ONLY, FLAGS_UP_UV, liveTokenId,
 } from './do_helpers';
 
 const HOUR = 60 * 60_000;
@@ -21,10 +21,19 @@ beforeEach(async () => {
   await setDoVar('CACHE_ADMIN_EXTEND', '0');
 });
 
-/** Store a pending challenge created with `uv` (omit for a pre-policy one). */
+/** Store a pending challenge created with `uv`. Omit it for a pre-policy one:
+ *  that is written straight into storage, since `create` now always decides a
+ *  level against the verified host. */
 async function pending(uv?: Challenge['uv']): Promise<Challenge> {
   const ch = makeChallenge(uv ? { uv } : {});
-  const res = await doPost('create', { challenge: ch });
+  if (!uv) {
+    await inDO(async ({ inst, state }) => {
+      await state.storage.put({ [`ch:${ch.approve_token}`]: ch, [`pt:${ch.poll_token}`]: ch.approve_token });
+      inst.audit.create(ch);
+    });
+    return ch;
+  }
+  const res = await doPost('create', { challenge: ch, token_id: await liveTokenId() });
   expect(res.status).toBe(200);
   return ch;
 }

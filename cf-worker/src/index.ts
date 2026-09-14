@@ -3,8 +3,7 @@
 // Endpoints sit at the root (no secret path prefix). Security rests on:
 //   • /api/challenge, /api/dek-cache — HMAC over the request body keyed on the
 //     caller's host token (HKDF(VT_AUTH_CF, token_id), see host_token.ts), whose
-//     liveness the DO then checks; the bare master is still accepted for
-//     not-yet-enrolled hosts (migration window)
+//     liveness the DO then checks
 //   • /api/enroll           — unauthenticated, per-IP rate limited; mints a
 //     Passkey ceremony that issues a host token
 //   • /api/audit-ingest     — HMAC(HKDF(VT_AUTH_CF, agent_id)) over the request body
@@ -29,6 +28,7 @@ import {
   escapeJsonForHtml, renderTemplate, isAdminAssetPath,
   pageVars, adminVars, channelVars, type AdminTab, type PageChrome,
 } from './page';
+import { tokenRefused } from './do_account';
 
 export { AccountDO } from './do_account';
 
@@ -606,8 +606,8 @@ app.post('/api/audit-ingest', async (c) => {
     }
     tokenIdHost = id;
   } else {
-    // Legacy hostname-salted subkey: no previous-generation fallback, same as
-    // the bare-master daemon branch. It is being deleted, not widened.
+    // Legacy hostname-salted subkey: no previous-generation fallback. It is
+    // being deleted, not widened.
     const key = await hkdfSha256(
       enc.encode(c.env.VT_AUTH_CF), enc.encode(body.agent_id), enc.encode('vt-agent-audit-v1'), 32);
     const expected = await hmacSha256(key, rawBody);
@@ -707,20 +707,17 @@ async function readCappedBody(c: Context, maxBytes = CEREMONY_POST_MAX_BYTES): P
 // Only daemon challenge/cache requests use this key; audit ingestion derives
 // a per-agent key and deliberately retains its own validation order.
 //
-// Two key sources, chosen by the `VT-Token-Id` header:
-//   • present → host token: key = HKDF(VT_AUTH_CF, token_id). Stateless here;
-//     the DO checks the token is alive and slides its expiry (`tokenId` is
-//     returned so the route can forward it). If that fails and VT_AUTH_CF_PREV
-//     is set, the same check runs once more under the previous master, so a
-//     master rotation is rolling rather than a fleet-wide flag day (`keyGen`
-//     says which one verified; the DO records it for the admin tab).
-//   • absent  → legacy: key = the master itself. Kept for hosts that have not
-//     run `vt enroll` yet; logged so the operator can see who is still on it.
-//     Deliberately NO previous-generation fallback: this branch is being
-//     deleted, not widened.
+// The key is the caller's host token: HKDF(VT_AUTH_CF, token_id) for the
+// `VT-Token-Id` header. Stateless here; the DO checks the token is alive and
+// slides its expiry (`tokenId` is returned so the route can forward it). A
+// request without the header gets the same structured 401 as a dead token:
+// the remedy is `vt enroll` either way. If that fails and VT_AUTH_CF_PREV is
+// set, the same check runs once more under the previous master, so a master
+// rotation is rolling rather than a fleet-wide flag day (`keyGen` says which
+// one verified; the DO records it for the admin tab).
 async function readAuthenticatedDaemonBody(
   c: Context<{ Bindings: Env; Variables: AccessVars }>,
-): Promise<{ body: Uint8Array; tokenId?: string; keyGen?: MasterKeyGen } | Response> {
+): Promise<{ body: Uint8Array; tokenId: string; keyGen: MasterKeyGen } | Response> {
   const auth = c.req.header('Authorization') ?? '';
   const prefix = 'VT-HMAC ';
   if (!auth.startsWith(prefix)) return c.text('missing auth', 401);
@@ -728,16 +725,11 @@ async function readAuthenticatedDaemonBody(
   try { providedHmac = decodeB64uExact(auth.slice(prefix.length), 32, 'hmac'); }
   catch { return c.text('hmac length', 401); }
   const tokenHeader = c.req.header('VT-Token-Id');
-  if (tokenHeader !== undefined && !isTokenId(tokenHeader)) return c.text('bad token id', 401);
+  if (tokenHeader === undefined) return tokenRefused('token_missing');
+  if (!isTokenId(tokenHeader)) return c.text('bad token id', 401);
 
   const rawBody = await readCappedBody(c);
   if (!rawBody) return c.text('body too large', 413);
-  if (tokenHeader === undefined) {
-    const expected = await hmacSha256(new TextEncoder().encode(c.env.VT_AUTH_CF), rawBody);
-    if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
-    log('auth.legacy_master', { path: new URL(c.req.url).pathname });
-    return { body: rawBody };
-  }
   const cur = await hmacSha256(await deriveHostTokenSecret(c.env.VT_AUTH_CF, tokenHeader), rawBody);
   if (ctEq(providedHmac, cur)) return { body: rawBody, tokenId: tokenHeader, keyGen: 'cur' };
   const prevMaster = c.env.VT_AUTH_CF_PREV ?? '';

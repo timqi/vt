@@ -16,7 +16,7 @@ import {
 } from '../src/cache_policy';
 import {
   inDO, setDoVar, doPost, approve, makeChallenge, sealFakeDek, nextSalt,
-  allDekKeys, auditRows, testEnv, DoHandle,
+  allDekKeys, auditRows, testEnv, DoHandle, liveTokenId,
 } from './do_helpers';
 
 const TTL_20M = 20 * 60;
@@ -36,7 +36,7 @@ beforeEach(async () => {
 async function createCeremony(n = 2) {
   const salts = Array.from({ length: n }, () => nextSalt());
   const ch = makeChallenge({ salts_b64u: salts });
-  const res = await doPost('create', { challenge: ch });
+  const res = await doPost('create', { challenge: ch, token_id: await liveTokenId() });
   expect(res.status).toBe(200);
   return { ch, salts, sealed: salts.map((_, i) => sealFakeDek(i + 1)) };
 }

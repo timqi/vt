@@ -17,7 +17,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { b64uEnc } from '../src/crypto';
 import {
   inDO, setDoVar, doPost, approve, makeChallenge, makeMeta,
-  sealFakeDek, nextSalt, allDekKeys, testEnv,
+  sealFakeDek, nextSalt, allDekKeys, testEnv, liveTokenId,
 } from './do_helpers';
 
 const TTL_8H = 8 * 3600;
@@ -33,7 +33,7 @@ beforeEach(async () => {
 async function armCache(n: number, meta = makeMeta()): Promise<string[]> {
   const salts = Array.from({ length: n }, () => nextSalt());
   const ch = makeChallenge({ salts_b64u: salts, meta });
-  expect((await doPost('create', { challenge: ch })).status).toBe(200);
+  expect((await doPost('create', { challenge: ch, token_id: await liveTokenId() })).status).toBe(200);
   const res = await approve(ch, {
     cache_ttl_s: TTL_8H,
     cache_sealed_deks_b64u: salts.map((_, i) => sealFakeDek((i % 251) + 1)),
@@ -45,11 +45,12 @@ async function armCache(n: number, meta = makeMeta()): Promise<string[]> {
 
 /** The read the Rust client performs. `meta` must carry the same ip + pwd the
  *  ceremony did — they ARE the binding ctx. */
-function read(salts: string[], over = {}) {
+async function read(salts: string[], over = {}) {
   return doPost('dek-cache', {
     daemon_pubkey_b64u: DAEMON_PK_B64U,
     salts_b64u: salts,
     meta: makeMeta(over),
+    token_id: await liveTokenId(),
   });
 }
 

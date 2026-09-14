@@ -123,6 +123,19 @@ export async function allDekKeys(h: DoHandle): Promise<string[]> {
   return [...(await h.state.storage.list<CacheEntry>({ prefix: 'dek:' })).keys()];
 }
 
+/** Insert a live host_token row for makeMeta()'s host/user and return its id.
+ *  The DO ops refuse a body without one, so every direct `create` / `dek-cache`
+ *  fixture needs it; going through /api/enroll is the host_token suite's job. */
+export async function liveTokenId(): Promise<string> {
+  const tokenId = nextToken('hst');
+  const meta = makeMeta();
+  await inDO(({ inst }) => inst.tokens.create({
+    token_id: tokenId, host: meta.host, user: meta.user, enroll_ip: meta.ip,
+    origin: '', approve_token_id: '',
+  }, Date.now()));
+  return tokenId;
+}
+
 // ── Challenge fixtures ─────────────────────────────────────────────────────
 
 export function makeMeta(over: Partial<ChallengeMeta> = {}): ChallengeMeta {

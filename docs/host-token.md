@@ -26,13 +26,17 @@ secret     = HKDF-SHA256(ikm = VT_AUTH_CF, salt = token_id,
   `Authorization: VT-HMAC <mac>` plus `VT-Token-Id: <token_id>`; the Worker
   re-derives the secret from the master and checks the HMAC before any
   Durable Object round-trip (`readAuthenticatedDaemonBody`). A host only ever
-  holds its derived secret; the master never leaves the Worker.
+  holds its derived secret; the master never leaves the Worker. A request
+  without `VT-Token-Id` is refused before its body is read with the same
+  structured `401 {error: token_missing}` a dead token gets: the master is
+  never accepted as a daemon key, and the DO likewise fails closed (400) on an
+  op body without a `token_id`.
 - **Two master generations, so rotation rolls.** When `VT_AUTH_CF_PREV` is
   non-empty and the HMAC does not verify under `VT_AUTH_CF`, the same
   constant-time check runs once more against a secret derived from the previous
   master. Host-token paths only (`/api/challenge`, `/api/dek-cache`, and the
-  `t:<token_id>` form of `/api/audit-ingest`): the legacy bare-master and
-  hostname-salted branches never fall back, they are being deleted. The
+  `t:<token_id>` form of `/api/audit-ingest`): the legacy hostname-salted
+  audit branch never falls back, it is being deleted. The
   ordering is unchanged — syntactic `token_id` check before any KDF, body cap
   before crypto. A `prev` verification is logged `auth.prev_master` (path +
   token_id, never key material) and stamped on the row as `last_key_gen`, which
@@ -50,10 +54,6 @@ secret     = HKDF-SHA256(ikm = VT_AUTH_CF, salt = token_id,
   `meta.host` / `meta.user` from the record and sets `meta.ip_prev` when the
   token's previous use came from a different IP. The approval page labels them
   已验证 and `ApprovePageData.host_verified` says which path produced them.
-- **Legacy master, migration window only.** A request without `VT-Token-Id`
-  is verified against the bare master and logged `auth.legacy_master`; host/user
-  stay client-claimed there. Remove this branch once every host has enrolled.
-
 ## 3. Enrollment (`vt enroll [--url]`)
 
 1. CLI `POST /api/enroll {host, user, timestamp_ms}` — **unauthenticated**.
@@ -106,16 +106,15 @@ read NULL for new rows. Decision record: [approval-transparency.md §2b](approva
 ## 7. Rollout
 
 1. Deploy the Worker with the `ENROLL_LIMITER` binding
-   ([cf-worker-deploy.md](cf-worker-deploy.md)). Existing hosts keep working
-   on the master (logged as `auth.legacy_master`).
+   ([cf-worker-deploy.md](cf-worker-deploy.md)). A host still holding the bare
+   master is refused with `token_missing` until it enrolls.
 2. On each host: upgrade `vt`, run `vt enroll` (pass `--url` if the file has
    no `VT_PASSKEY_URL` yet), approve on the phone after comparing the pairing
    code. Unset any `VT_PASSKEY_TOKEN` in the environment — env wins over the
    file.
 3. Macs running the agent with audit push: switch `--audit-key` to the host
-   token written by `vt enroll`.
-4. When `auth.legacy_master` stops appearing, delete the legacy branch in
-   `readAuthenticatedDaemonBody` and the hostname-keyed audit derivation.
+   token written by `vt enroll`; the hostname-keyed audit derivation is the
+   one legacy branch left.
 
 ### Rotating the master (rolling, no flag day)
 
@@ -147,7 +146,8 @@ default): one derivation, one comparison, no fallback.
 - Worker: `test/host_token.test.ts` (derivation golden vector, token shape,
   pairing code), `test/do_account.host_token.test.ts` (enroll → approve →
   token; challenge/dek-cache auth with sliding expiry and structured refusals;
-  legacy path; meta trim; audit ingest with `t:`; admin list/revoke; limiter
+  bare master and token-less DO bodies refused; meta trim; audit ingest with
+  `t:`; admin list/revoke; limiter
   absent → 503; pending cap → 429; the `VT_AUTH_CF_PREV` rotation window —
   cur/prev/neither, PREV absent or empty, `last_key_gen`, and both legacy
   branches refusing the fallback).

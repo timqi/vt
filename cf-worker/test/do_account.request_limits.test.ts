@@ -4,12 +4,17 @@ import { describe, it, expect, vi } from 'vitest';
 import { env } from 'cloudflare:test';
 import app from '../src/index';
 import { b64uEnc, hmacSha256 } from '../src/crypto';
+import { deriveHostTokenSecret } from '../src/host_token';
 import { makeMeta } from './do_helpers';
 
 const CAP = 256 * 1024;
-const KEY = 'throwaway-request-limit-test-key';
+const MASTER = 'throwaway-request-limit-test-key';
+const TOKEN_ID = 'limitsTokenId000';
+// The edge verifies statelessly, so a well-formed token_id and its derived
+// secret are enough here; liveness is the DO's job (host_token suite).
+const KEY = await deriveHostTokenSecret(MASTER, TOKEN_ID);
 const encoder = new TextEncoder();
-const headers = { Authorization: `VT-HMAC ${b64uEnc(new Uint8Array(32))}` };
+const headers = { Authorization: `VT-HMAC ${b64uEnc(new Uint8Array(32))}`, 'VT-Token-Id': TOKEN_ID };
 const routes = [
   ['/api/challenge', CAP],
   ['/api/dek-cache', CAP],
@@ -26,7 +31,7 @@ async function post(path: string, body: BodyInit, extraHeaders: Record<string, s
   }
   const response = await app.fetch(new Request(`https://vt.test.invalid${path}`, {
     method: 'POST', body, headers: requestHeaders,
-  }), { ...env, VT_AUTH_CF: KEY });
+  }), { ...env, VT_AUTH_CF: MASTER });
   const text = await response.text();
   return { status: response.status, text };
 }
@@ -83,9 +88,27 @@ describe.each(['/api/challenge', '/api/dek-cache'])('%s HMAC boundary', (path) =
     expect(await post(path, '{')).toEqual({ status: 401, text: 'hmac mismatch' });
   });
 
+  it('refuses a request without VT-Token-Id before reading the body, with the enroll hint', async () => {
+    // The bare master is no longer a key: signing with it and omitting the
+    // header is rejected structurally, the same 401 shape a dead token gets.
+    let reads = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull() { reads++; throw new Error('body must not be read'); },
+    }, { highWaterMark: 0 });
+    const res = await post(path, stream, { 'VT-Token-Id': undefined, 'Content-Length': String(CAP + 1) });
+    expect(res.status).toBe(401);
+    expect(JSON.parse(res.text)).toMatchObject({ error: 'token_missing' });
+    expect(reads).toBe(0);
+    const body = encoder.encode('{}');
+    const tag = await hmacSha256(encoder.encode(MASTER), body);
+    const signed = await post(path, body, { 'VT-Token-Id': undefined, Authorization: `VT-HMAC ${b64uEnc(tag)}` });
+    expect(signed.status).toBe(401);
+    expect(JSON.parse(signed.text)).toMatchObject({ error: 'token_missing' });
+  });
+
   it('preserves the JSON error after a valid HMAC, including an empty body', async () => {
     for (const text of ['', '{']) {
-      const tag = await hmacSha256(encoder.encode(KEY), encoder.encode(text));
+      const tag = await hmacSha256(KEY, encoder.encode(text));
       expect(await post(path, text, { Authorization: `VT-HMAC ${b64uEnc(tag)}` }))
         .toEqual({ status: 400, text: 'json parse error' });
     }
@@ -101,7 +124,7 @@ describe.each(['/api/challenge', '/api/dek-cache'])('%s HMAC boundary', (path) =
       daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
       timestamp_ms: 0, salts_b64u: [], meta: makeMeta(),
     }) + '\t\n');
-    const tag = await hmacSha256(encoder.encode(KEY), bytes);
+    const tag = await hmacSha256(KEY, bytes);
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(bytes.slice(0, 13));
@@ -118,7 +141,7 @@ describe.each(['/api/challenge', '/api/dek-cache'])('%s HMAC boundary', (path) =
 
   it('rejects changes to bytes covered by an otherwise valid HMAC', async () => {
     const bytes = encoder.encode('{"timestamp_ms":0}');
-    const tag = await hmacSha256(encoder.encode(KEY), bytes);
+    const tag = await hmacSha256(KEY, bytes);
     expect(await post(path, encoder.encode('{"timestamp_ms":1}'), {
       Authorization: `VT-HMAC ${b64uEnc(tag)}`,
     })).toEqual({ status: 401, text: 'hmac mismatch' });
@@ -130,7 +153,7 @@ describe.each(['/api/challenge', '/api/dek-cache'])('%s HMAC boundary', (path) =
       timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta(),
     };
     const bytes = encoder.encode(JSON.stringify(body));
-    const tag = await hmacSha256(encoder.encode(KEY), bytes);
+    const tag = await hmacSha256(KEY, bytes);
     const fetch = vi.fn(async (_url: string, _init: RequestInit) => Response.json({ miss: true }));
     const account = {
       idFromName: vi.fn(() => 'synthetic-account-id'),
@@ -138,8 +161,8 @@ describe.each(['/api/challenge', '/api/dek-cache'])('%s HMAC boundary', (path) =
     };
     const response = await app.fetch(new Request(`https://vt.test.invalid${path}`, {
       method: 'POST', body: bytes,
-      headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}`, 'CF-Connecting-IP': '203.0.113.42' },
-    }), { ...env, VT_AUTH_CF: KEY, ACCOUNT: account });
+      headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}`, 'VT-Token-Id': TOKEN_ID, 'CF-Connecting-IP': '203.0.113.42' },
+    }), { ...env, VT_AUTH_CF: MASTER, ACCOUNT: account });
     expect(response.status).toBe(200);
     const result = await response.json() as Record<string, unknown>;
     expect(fetch).toHaveBeenCalledOnce();
@@ -149,6 +172,7 @@ describe.each(['/api/challenge', '/api/dek-cache'])('%s HMAC boundary', (path) =
     const forwarded = JSON.parse(init.body as string);
     if (path === '/api/challenge') {
       expect(url).toBe('https://account.do/op/create');
+      expect(forwarded.token_id).toBe(TOKEN_ID);
       expect(forwarded.challenge).toMatchObject({
         daemon_pubkey_b64u: body.daemon_pubkey_b64u, timestamp_ms: body.timestamp_ms,
         salts_b64u: [], status: 'pending', meta: { ip: '203.0.113.42' },
@@ -158,7 +182,7 @@ describe.each(['/api/challenge', '/api/dek-cache'])('%s HMAC boundary', (path) =
     } else {
       expect(url).toBe('https://account.do/op/dek-cache');
       expect(forwarded).toMatchObject({
-        daemon_pubkey_b64u: body.daemon_pubkey_b64u, salts_b64u: [], meta: { ip: '203.0.113.42' },
+        daemon_pubkey_b64u: body.daemon_pubkey_b64u, salts_b64u: [], meta: { ip: '203.0.113.42' }, token_id: TOKEN_ID,
       });
       expect(result).toEqual({ miss: true });
     }

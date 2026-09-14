@@ -139,9 +139,10 @@ function enrollSummary(intent: EnrollIntent): string {
   return lines.join('\n');
 }
 
-// Structured 401 for a dead host token. The body is what the CLI shows the
-// user, so it names the remedy instead of just the status.
-function tokenRefused(reason: string): Response {
+// Structured 401 for a missing or dead host token. The body is what the CLI
+// shows the user, so it names the remedy (`vt enroll`) instead of just the
+// status; the edge uses it for a request without VT-Token-Id.
+export function tokenRefused(reason: string): Response {
   return Response.json({ error: reason, hint: 'run `vt enroll` on this host' }, { status: 401 });
 }
 
@@ -425,19 +426,20 @@ export class AccountDO extends DurableObject<Env> {
     if (!challenge || typeof challenge.approve_token !== 'string' || typeof challenge.poll_token !== 'string') {
       return badRequest('invalid challenge');
     }
-    // Host-token path: refuse a dead token BEFORE anything is stored or pushed,
-    // and let the record — not the body — say which host/user this is.
-    if (parsed.token_id !== undefined) {
-      const t = this.tokens.touch(parsed.token_id, challenge.meta?.ip ?? '', Date.now(), parsed.key_gen);
-      if (!t.ok) return tokenRefused(t.reason);
-      challenge.meta = { ...challenge.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
-      challenge.token_id = parsed.token_id;
-      // The Worker decided `uv` against the CLAIMED host; re-apply the policy
-      // with the verified one. Raise-only by construction (max of the stored
-      // level and the by_host rule), so a spoofed claim can never lower it.
-      const { policy } = parseUvPolicy(this.env.APPROVAL_UV_JSON);
-      challenge.uv = effectiveUvLevel(policy, challenge.meta, challenge.uv);
-    }
+    // The edge only forwards token-authenticated requests; a body without one
+    // is a Worker bug, and the DO fails closed rather than trusting the claim.
+    if (typeof parsed.token_id !== 'string') return badRequest('missing token_id');
+    // Refuse a dead token BEFORE anything is stored or pushed, and let the
+    // record — not the body — say which host/user this is.
+    const t = this.tokens.touch(parsed.token_id, challenge.meta?.ip ?? '', Date.now(), parsed.key_gen);
+    if (!t.ok) return tokenRefused(t.reason);
+    challenge.meta = { ...challenge.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
+    challenge.token_id = parsed.token_id;
+    // The Worker decided `uv` against the CLAIMED host; re-apply the policy
+    // with the verified one. Raise-only by construction (max of the stored
+    // level and the by_host rule), so a spoofed claim can never lower it.
+    const { policy } = parseUvPolicy(this.env.APPROVAL_UV_JSON);
+    challenge.uv = effectiveUvLevel(policy, challenge.meta, challenge.uv);
     await this.storeAndAnnounce(challenge);
     return Response.json({ meta: challenge.meta });
   }
@@ -799,17 +801,16 @@ export class AccountDO extends DurableObject<Env> {
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
     }
-    let meta = body.meta;
     // ip (worker-derived from CF-Connecting-IP, already forced by capChallengeMeta)
     // IP + pwd are the cache binding ctx.
-    const ip = meta.ip ?? '';
+    const ip = body.meta.ip ?? '';
     // A probe is an authenticated use: same liveness check + sliding refresh as
-    // a ceremony, and the hit audit row names the token's host/user.
-    if (body.token_id !== undefined) {
-      const t = this.tokens.touch(body.token_id, ip, Date.now(), body.key_gen);
-      if (!t.ok) return tokenRefused(t.reason);
-      meta = { ...meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
-    }
+    // a ceremony, and the hit audit row names the token's host/user. Same
+    // fail-closed rule as opCreate for a body without a token.
+    if (typeof body.token_id !== 'string') return badRequest('missing token_id');
+    const t = this.tokens.touch(body.token_id, ip, Date.now(), body.key_gen);
+    if (!t.ok) return tokenRefused(t.reason);
+    const meta = { ...body.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
     const salts = body.salts_b64u;
     const miss = (): Response => {
       // No audit row for misses (per design): a miss is a routine fallback and

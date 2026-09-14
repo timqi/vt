@@ -3,12 +3,13 @@ import { env } from 'cloudflare:test';
 import app from '../src/index';
 import { AccountNotifications } from '../src/account_notifications';
 import { b64uEnc, hmacSha256 } from '../src/crypto';
+import { deriveHostTokenSecret } from '../src/host_token';
 import * as feishu from '../src/feishu';
 import * as slackApp from '../src/slack_app';
 import * as pushover from '../src/pushover';
 import * as notify from '../src/notify';
 import type { Challenge, Env, DoAuditIngestOp } from '../src/types';
-import { accountStub, inDO, makeChallenge, makeMeta } from './do_helpers';
+import { accountStub, inDO, makeChallenge, makeMeta, liveTokenId } from './do_helpers';
 
 const FEISHU_JSON = JSON.stringify({
   app_id: 'test-app', app_secret: 'synthetic-test-value', receive_id: 'test-user',
@@ -288,12 +289,13 @@ describe('AccountNotifications delivery contract', () => {
 describe('approval route notification contract', () => {
   it('awaits stateless delivery and returns push_warning without failing the created ceremony', async () => {
     const key = 'synthetic-notification-route-key';
+    const tokenId = await liveTokenId();
     const encoder = new TextEncoder();
     const body = encoder.encode(JSON.stringify({
       daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
       timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta(),
     }));
-    const tag = await hmacSha256(encoder.encode(key), body);
+    const tag = await hmacSha256(await deriveHostTokenSecret(key, tokenId), body);
     let finishSend!: (warning: string) => void;
     let markStarted!: () => void;
     const started = new Promise<void>(resolve => { markStarted = resolve; });
@@ -313,7 +315,7 @@ describe('approval route notification contract', () => {
     try {
       let completed = false;
       const pending = app.fetch(new Request('https://vt.test.invalid/api/challenge', {
-        method: 'POST', body, headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}` },
+        method: 'POST', body, headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}`, 'VT-Token-Id': tokenId },
       }), {
         ...env, VT_AUTH_CF: key, ACCOUNT: account,
         PUSHOVER_JSON: JSON.stringify({ app_token: 'synthetic-token', user_key: 'synthetic-user' }),

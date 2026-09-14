@@ -43,6 +43,7 @@ async function tokenHeaders(tokenId: string, body: unknown, master = MASTER) {
   return { Authorization: `VT-HMAC ${b64uEnc(mac)}`, 'VT-Token-Id': tokenId };
 }
 
+/** The pre-enroll shape: HMAC keyed on the master itself, no VT-Token-Id. */
 async function legacyHeaders(body: unknown) {
   const raw = new TextEncoder().encode(JSON.stringify(body));
   const mac = await hmacSha256(new TextEncoder().encode(MASTER), raw);
@@ -223,15 +224,27 @@ describe('authenticating with a host token', () => {
     expect((await tokenRow(tokenId))!.expires_ms).toBeGreaterThan(issued.expires_ms - 60_000);
   });
 
-  it('still accepts the bare master during migration, keeping client-claimed host/user', async () => {
+  it('refuses the bare master on both daemon routes, storing and auditing nothing', async () => {
+    // A host that never ran `vt enroll` signs with VT_AUTH_CF itself and sends
+    // no VT-Token-Id. That was the migration branch; it now gets the same
+    // structured 401 as a dead token, so the CLI prints the enroll hint.
     const body = challengeBody();
-    const res = await post('/api/challenge', body, await legacyHeaders(body));
-    expect(res.status).toBe(200);
-    const ch = await inDO(h => h.state.storage.get<Challenge>(`ch:${res.json.approve_token}`));
-    expect(ch!.meta.host).toBe('spoofed');
-    expect(ch!.meta.ip_prev).toBeUndefined();
-    expect(ch!.token_id).toBeUndefined();
-    expect((await doGet(`page?approve_token=${res.json.approve_token}`)).json.host_verified).toBe(false);
+    const before = await inDO(h => h.state.storage.list({ prefix: 'ch:' }).then(m => m.size));
+    for (const path of ['/api/challenge', '/api/dek-cache']) {
+      const res = await post(path, body, await legacyHeaders(body));
+      expect(res.status).toBe(401);
+      expect(res.json).toMatchObject({ error: 'token_missing' });
+    }
+    expect(await inDO(h => h.state.storage.list({ prefix: 'ch:' }).then(m => m.size))).toBe(before);
+  });
+
+  it('fails closed inside the DO when a body arrives without a token_id', async () => {
+    // Only the edge can reach these ops; a missing token_id there is a Worker
+    // bug, and the DO must not fall back to the client-claimed host/user.
+    const ch = { ...challengeBody(), approve_token: 'a'.repeat(16), poll_token: 'p'.repeat(16), status: 'pending', created_ms: Date.now() };
+    expect((await doPost('create', { challenge: ch })).status).toBe(400);
+    expect((await doPost('dek-cache', { ...challengeBody(), salts_b64u: [b64uEnc(new Uint8Array(16))] })).status).toBe(400);
+    expect(await inDO(h => h.state.storage.get(`ch:${ch.approve_token}`))).toBeUndefined();
   });
 
   it('records the master generation that verified the use', async () => {
@@ -244,10 +257,11 @@ describe('authenticating with a host token', () => {
   });
 
   it('drops tty / ppid / ssh_client from the stored meta', async () => {
+    const { tokenId } = await enrollApproved();
     const body = challengeBody({ meta: { ...makeMeta(), tty: '/dev/pts/1', ppid: 7, ssh_client: '10.0.0.1 1 22' } });
-    const res = await post('/api/challenge', body, await legacyHeaders(body));
+    const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body));
     const ch = await inDO(h => h.state.storage.get<Challenge>(`ch:${res.json.approve_token}`));
-    expect(Object.keys(ch!.meta).sort()).toEqual(['command', 'host', 'ip', 'op_kind', 'ppid_cmd', 'pwd', 'reason', 'user']);
+    expect(Object.keys(ch!.meta).sort()).toEqual(['command', 'host', 'ip', 'ip_prev', 'op_kind', 'ppid_cmd', 'pwd', 'reason', 'user']);
   });
 });
 
@@ -308,18 +322,15 @@ describe('previous-generation master (VT_AUTH_CF_PREV)', () => {
     expect((await tokenRow(tokenId))!.last_key_gen).toBe('prev');
   });
 
-  it('does NOT extend the legacy bare-master branch', async () => {
-    // A host with no VT-Token-Id signing with the OLD master: that branch is
-    // being deleted, not widened, so PREV must not rescue it.
+  it('refuses the bare master under either generation', async () => {
     const body = challengeBody();
-    const res = await post('/api/challenge', body, await legacyHeaders(body), rotatedEnv());
-    expect(res.status).toBe(401);
-    expect(res.text).toBe('hmac mismatch');
-    // The new master on that same branch still works, unchanged.
-    const raw = new TextEncoder().encode(JSON.stringify(body));
-    const mac = await hmacSha256(new TextEncoder().encode(NEW_MASTER), raw);
-    const ok = await post('/api/challenge', body, { Authorization: `VT-HMAC ${b64uEnc(mac)}` }, rotatedEnv());
-    expect(ok.status).toBe(200);
+    for (const master of [MASTER, NEW_MASTER]) {
+      const raw = new TextEncoder().encode(JSON.stringify(body));
+      const mac = await hmacSha256(new TextEncoder().encode(master), raw);
+      const res = await post('/api/challenge', body, { Authorization: `VT-HMAC ${b64uEnc(mac)}` }, rotatedEnv());
+      expect(res.status).toBe(401);
+      expect(res.json).toMatchObject({ error: 'token_missing' });
+    }
   });
 
   it('accepts an audit push under the previous master, but not on the legacy agent key', async () => {
