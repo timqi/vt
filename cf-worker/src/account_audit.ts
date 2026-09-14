@@ -4,26 +4,18 @@
 import { Challenge, ChallengeMeta, DoAuditIngestOp, AdminWsMessage, AuditRow, AuditQueryResponse } from './types';
 import { b64uEnc } from './crypto';
 import { AccountNames } from './account_names';
-import { logErr } from './log';
+import { log, logErr } from './log';
 
 const AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
-// REST queries and broadcasts expose exactly the same fields.
+// REST queries and broadcasts expose exactly the same fields: every column of
+// the table, so this list is also the schema initialize() checks against.
 const AUDIT_SELECT_COLS =
   `id, token_id, created_ms, finalized_ms, status, op_kind, command, reason,
    host, user, pwd, tty, ppid_cmd, ssh_client, ip, salts, latency_ms,
    verify_failures, cache_ttl_s, cache_expires_ms, ppid, source, seq,
    peer_exe, key_fp, dest, scope_family, scope_label, grant_ttl_s, relayed, records, project`;
-
-// Columns added after the per-challenge schema shipped, in the order they
-// landed. An older table gains each one it lacks by ALTER (rows preserved); a
-// fresh table already has them all from CREATE. `source` backfills existing
-// rows through its DEFAULT — SQLite allows that on ADD COLUMN.
-const ADDED_COLUMNS = [
-  'cache_ttl_s INTEGER', 'ppid INTEGER', "source TEXT NOT NULL DEFAULT 'ceremony'", 'seq INTEGER',
-  'peer_exe TEXT', 'key_fp TEXT', 'dest TEXT', 'scope_family TEXT', 'scope_label TEXT',
-  'grant_ttl_s INTEGER', 'relayed INTEGER', 'cache_expires_ms INTEGER', 'records TEXT', 'project TEXT',
-];
+const AUDIT_COLUMN_NAMES = AUDIT_SELECT_COLS.split(',').map(c => c.trim());
 
 // The stored form of AuditRow.records: `[salt_b64u, claimed]` pairs, or null.
 function recordPairs(salts: unknown, names: unknown): string | null {
@@ -55,16 +47,14 @@ export class AccountAudit {
 
   // Called by AccountDO inside blockConcurrencyWhile before any operation.
   initialize(): void {
-    // Migrate away from any pre-existing per-event audit schema (older builds
-    // of this branch used audit(ts_ms,event,token_prefix,...)). Audit data is
-    // non-critical and per-event rows can't be faithfully converted to
-    // per-challenge rows, so drop & rebuild rather than ALTER.
-    const columns = () => new Set(
-      this.sql.exec<{ name: string }>(`PRAGMA table_info(audit)`).toArray().map(c => c.name));
-    let have = columns();
-    if (have.size > 0 && !have.has('token_id')) {
+    // There is no migration: audit is non-critical and 90-day retention bounds
+    // the loss, so a table whose column set differs from the current schema is
+    // dropped and recreated (logged once), never ALTERed.
+    const have = this.sql.exec<{ name: string }>(`PRAGMA table_info(audit)`).toArray().map(c => c.name);
+    if (have.length > 0
+        && (have.length !== AUDIT_COLUMN_NAMES.length || have.some(c => !AUDIT_COLUMN_NAMES.includes(c)))) {
+      log('audit.schema_rebuilt', { dropped_columns: have.length, expected_columns: AUDIT_COLUMN_NAMES.length });
       this.sql.exec(`DROP TABLE audit`);
-      have = new Set();
     }
     // One row per challenge (keyed by token_id). The lifecycle events
     // (created → approved/rejected/expired, plus verify_failures) are stages
@@ -92,25 +82,23 @@ export class AccountAudit {
          salts INTEGER,
          latency_ms INTEGER,
          verify_failures INTEGER NOT NULL DEFAULT 0,
-         ${ADDED_COLUMNS.join(',\n       ')}
+         cache_ttl_s INTEGER,
+         cache_expires_ms INTEGER,
+         ppid INTEGER,
+         source TEXT NOT NULL DEFAULT 'ceremony',
+         seq INTEGER,
+         peer_exe TEXT,
+         key_fp TEXT,
+         dest TEXT,
+         scope_family TEXT,
+         scope_label TEXT,
+         grant_ttl_s INTEGER,
+         relayed INTEGER,
+         records TEXT,
+         project TEXT
        )`,
     );
-    // Additive migrations for an older table: the `have` snapshot predates every
-    // ALTER, which is fine because each name is checked exactly once. seq is
-    // backfilled with id (a valid monotonic ordering) so `after_seq` catch-up
-    // covers historical rows; cache_expires_ms is deliberately not backfilled
-    // (a pre-migration row's true expiry is unknown; NULL = the old inference).
-    if (have.size > 0) {
-      for (const col of ADDED_COLUMNS) {
-        if (have.has(col.split(' ')[0]!)) continue;
-        this.sql.exec(`ALTER TABLE audit ADD COLUMN ${col}`);
-        if (col === 'seq INTEGER') this.sql.exec(`UPDATE audit SET seq = id WHERE seq IS NULL`);
-      }
-    }
     this.names.initialize();
-    // Drop the short-lived standalone cache_audit table from an earlier build
-    // of this branch — its events now live in the unified audit table.
-    this.sql.exec(`DROP TABLE IF EXISTS cache_audit`);
     // idx_audit_created serves the retention DELETE (created_ms range); the
     // /api/admin/audit cursor query uses the implicit primary-key (id) index.
     this.sql.exec(

@@ -13,14 +13,11 @@ recoverable errors), `inject` including `-r` file mode, `run@vt`, PAM `auth`,
 `diag@vt`, `ui-status@vt`, agent audit push, Worker DEK cache
 with its approve/extend ladders and admin.
 
-## 1. Delete migration layers
+## 1. Migration layers (landed)
 
-| Leaves | Files | Operator step |
-| --- | --- | --- |
-| Audit SQLite rebuilds | `account_audit.ts`: the `DROP TABLE audit` for the per-event table of an early build and `DROP TABLE IF EXISTS cache_audit`, with their comments | none; one deploy after this release has run on every account |
-
-Rule: a compatibility branch is removed, never widened, and its test moves to
-a "rejected input" test.
+Keychain wrap v1 and the audit SQLite rebuilds are gone. Rule: a
+compatibility branch is removed, never widened, and its test moves to a
+"rejected input" test.
 
 ## 2. Decide, then do or drop
 

@@ -125,6 +125,12 @@ on the default. The admin audit page has a `source` filter and column.
 The 90-day retention sweep (`AUDIT_RETENTION_MS`, by `created_ms`) covers agent
 rows for free.
 
+The table has no migrations: `AccountAudit.initialize()` compares the existing
+column set with `AUDIT_SELECT_COLS` and, on any difference, drops and recreates
+the table (one `audit.schema_rebuilt` log line). Retention already bounds what
+a rebuild discards; a schema change therefore costs one account's audit history,
+never an ALTER path.
+
 ## Provisioning
 
 ```bash

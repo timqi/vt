@@ -163,28 +163,37 @@ describe('AccountAudit persistence and projection', () => {
     });
   });
 
-  it('preserves historical rows through the existing additive migrations', async () => {
+  it('rebuilds a mismatched audit schema and keeps a matching one', async () => {
     await inDO(({ state }) => {
       const sql = state.storage.sql;
-      sql.exec('DROP TABLE audit');
-      sql.exec(`CREATE TABLE audit (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, token_id TEXT UNIQUE NOT NULL,
-        created_ms INTEGER NOT NULL, finalized_ms INTEGER, status TEXT NOT NULL,
-        op_kind TEXT, command TEXT, reason TEXT, host TEXT, user TEXT, pwd TEXT,
-        tty TEXT, ppid_cmd TEXT, ssh_client TEXT, ip TEXT, salts INTEGER,
-        latency_ms INTEGER, verify_failures INTEGER NOT NULL DEFAULT 0
-      )`);
-      sql.exec("INSERT INTO audit (token_id, created_ms, status) VALUES ('historical', 123, 'approved')");
+      const columns = () => sql.exec<{ name: string }>('PRAGMA table_info(audit)').toArray().map(c => c.name);
       const audit = new AccountAudit(sql, () => []);
       audit.initialize();
-      audit.initialize();
-      const row = audit.query(new URLSearchParams()).rows[0]!;
-      expect(row).toMatchObject({
-        token_id: 'historical', created_ms: 123, status: 'approved', seq: row.id,
-        source: 'ceremony', cache_ttl_s: null, cache_expires_ms: null, peer_exe: null, project: null,
-      });
+      const expected = columns();
       audit.create(makeChallenge());
-      expect(audit.query(new URLSearchParams()).snapshot_seq).toBeGreaterThan(row.seq);
+      const logged = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        // Matching schema: rows survive, nothing is logged.
+        audit.initialize();
+        expect(audit.query(new URLSearchParams()).rows).toHaveLength(1);
+        expect(logged).not.toHaveBeenCalled();
+        // Older column set (no migration exists for it): dropped and recreated once.
+        sql.exec('DROP TABLE audit');
+        sql.exec(`CREATE TABLE audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, token_id TEXT UNIQUE NOT NULL,
+          created_ms INTEGER NOT NULL, status TEXT NOT NULL
+        )`);
+        sql.exec("INSERT INTO audit (token_id, created_ms, status) VALUES ('historical', 123, 'approved')");
+        audit.initialize();
+        expect(columns()).toEqual(expected);
+        expect(audit.query(new URLSearchParams()).rows).toEqual([]);
+        expect(logged).toHaveBeenCalledOnce();
+        expect(JSON.parse(logged.mock.calls[0]![0] as string)).toMatchObject({ event: 'audit.schema_rebuilt' });
+        audit.create(makeChallenge());
+        expect(audit.query(new URLSearchParams()).rows).toHaveLength(1);
+      } finally {
+        logged.mockRestore();
+      }
     });
   });
 });

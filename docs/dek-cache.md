@@ -63,7 +63,7 @@ TTL, a caller can decrypt the approved records without another phone tap.
   audit row and the hit push show the resolved name, else the claim tagged 自报, else the salt's
   first 8 characters (`K0g8nyJ5…`, the same handle on every surface, in
   `code` on the console). Audit rows also carry the challenge's `project`
-  (NULL before the column existed): its directory name sits beside the host,
+  (NULL when the challenge carried none): its directory name sits beside the host,
   the full path in the detail sheet.
 - A cache key is `dek:{token_id}:{project_h}:{salt_b64u}`. `token_id` is the
   host token the edge verified on the request ([host-token.md](host-token.md))
