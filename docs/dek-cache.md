@@ -17,9 +17,8 @@ TTL, a caller can decrypt the approved records without another phone tap.
   ceiling from birth and every extension of it was a no-op.
 - The cap is **per operation, not per lifetime**: one extension sets each
   selected entry's expiry to `now + chosen TTL`, and an entry may be renewed
-  indefinitely — one Passkey-approved hop at a time. `MAX_EXTEND_TTL_MS`
-  follows the ladder, so trimming `EXTEND_TTL_WHITELIST` shortens the longest
-  single hop.
+  indefinitely — one Passkey-approved hop at a time. The longest single hop
+  is the top rung of `EXTEND_TTL_WHITELIST`; trimming the ladder shortens it.
 - What bounds renewal is **liveness, not a budget**: an extension can only continue
   a window that has not yet lapsed. Once a cache expires it is gone for good and
   only a fresh phone approval can arm a new one.

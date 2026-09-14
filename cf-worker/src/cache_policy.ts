@@ -72,7 +72,6 @@ export const EXTEND_TTL_WHITELIST = new Set([
 // (extension only ever continues a LIVE grant), expiry never moves backwards, the
 // per-hop TTL is laddered, and every hop is audited with the approver's identity.
 // Trim EXTEND_TTL_WHITELIST to shorten the longest single hop.
-export const MAX_EXTEND_TTL_MS = Math.max(...EXTEND_TTL_WHITELIST) * 1000;
 
 /** Why an entry was left untouched by an extension. Tallied across the commit so
  *  the audit row can explain a partial result instead of silently doing nothing. */

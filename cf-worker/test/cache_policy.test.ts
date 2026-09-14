@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   planExtend, isAllowedApproveTtl, isAllowedExtendTtl,
-  APPROVE_TTL_WHITELIST, EXTEND_TTL_WHITELIST, MAX_EXTEND_TTL_MS,
+  APPROVE_TTL_WHITELIST, EXTEND_TTL_WHITELIST,
   approveTtlOptions, extendTtlOptions,
 } from '../src/cache_policy';
 
@@ -47,12 +47,11 @@ describe('policy constants', () => {
     expect(isAllowedApproveTtl(100 * 365 * 24 * 3600)).toBe(false);
   });
 
-  // The per-hop cap is derived from the extend ladder, so trimming the ladder
-  // shortens the longest single grant automatically.
-  it('derives the per-hop cap from the extend ladder', () => {
-    expect(MAX_EXTEND_TTL_MS).toBe(Math.max(...EXTEND_TTL_WHITELIST) * 1000);
-    expect(MAX_EXTEND_TTL_MS).toBe(100 * 365 * 24 * 3600 * 1000);
-    expect(MAX_EXTEND_TTL_MS).toBeGreaterThan(Math.max(...APPROVE_TTL_WHITELIST) * 1000);
+  // The longest single hop is the extend ladder's top rung, so trimming the
+  // ladder shortens the longest single grant automatically.
+  it('caps a single hop at the extend ladder top rung', () => {
+    expect(Math.max(...EXTEND_TTL_WHITELIST)).toBe(100 * 365 * 24 * 3600);
+    expect(Math.max(...EXTEND_TTL_WHITELIST)).toBeGreaterThan(Math.max(...APPROVE_TTL_WHITELIST));
   });
 
   it('accepts only approve-ladder TTLs at approval time', () => {
@@ -81,7 +80,7 @@ describe('policy constants', () => {
 
   it('keeps every extend rung within the per-hop cap', () => {
     for (const t of extendTtlOptions()) {
-      expect(t * 1000).toBeLessThanOrEqual(MAX_EXTEND_TTL_MS);
+      expect(t).toBeLessThanOrEqual(Math.max(...EXTEND_TTL_WHITELIST));
     }
   });
 });

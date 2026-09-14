@@ -8,10 +8,8 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { CacheEntry } from '../src/types';
-// @ts-expect-error — Vite raw import, for the "computed, never hardcoded" check.
-import cachePolicySource from '../src/cache_policy.ts?raw';
 import {
-  APPROVE_TTL_WHITELIST, EXTEND_TTL_WHITELIST, MAX_EXTEND_TTL_MS,
+  APPROVE_TTL_WHITELIST, EXTEND_TTL_WHITELIST,
   isAllowedApproveTtl, isAllowedExtendTtl,
 } from '../src/cache_policy';
 import {
@@ -164,22 +162,14 @@ describe('two ladders, one rule', () => {
     for (const r of APPROVE_TTL_WHITELIST) expect(EXTEND_TTL_WHITELIST.has(r)).toBe(true);
   });
 
-  it('computes the longest single hop FROM the extend ladder, never a literal', () => {
-    // Structural: the constant is a fold over the ladder, so editing the ladder
-    // moves it. A hardcoded number here would silently outlive a trimmed ladder.
-    const decl = (cachePolicySource as string)
-      .split('\n')
-      .find(l => l.startsWith('export const MAX_EXTEND_TTL_MS'));
-    expect(decl).toBe('export const MAX_EXTEND_TTL_MS = Math.max(...EXTEND_TTL_WHITELIST) * 1000;');
-
-    // Behavioural: it is exactly the top rung, and trimming rungs off the top
-    // shortens it — 1w and the permanent rung removed → the cap falls to 2d.
-    expect(MAX_EXTEND_TTL_MS).toBe(Math.max(...EXTEND_TTL_WHITELIST) * 1000);
+  it('caps the longest single hop at the extend ladder top rung', () => {
+    // Trimming rungs off the top shortens the longest hop — 1w and the
+    // permanent rung removed → the cap falls to 2d.
     const maxOf = (ladder: Iterable<number>) => Math.max(...ladder) * 1000;
+    expect(maxOf(EXTEND_TTL_WHITELIST)).toBe(TTL_PERMANENT * 1000);
     const trimmed = [...EXTEND_TTL_WHITELIST].filter(s => s <= 2 * TTL_1D);
     expect(maxOf(trimmed)).toBe(2 * TTL_1D * 1000);
-    expect(maxOf(trimmed)).toBeLessThan(MAX_EXTEND_TTL_MS);
-    expect(maxOf(EXTEND_TTL_WHITELIST)).toBe(MAX_EXTEND_TTL_MS);
+    expect(maxOf(trimmed)).toBeLessThan(maxOf(EXTEND_TTL_WHITELIST));
   });
 
   it('keeps the permanent rung a finite far-future TTL, not a sentinel', () => {

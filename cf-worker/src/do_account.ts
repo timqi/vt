@@ -136,8 +136,6 @@ function enrollSummary(intent: EnrollIntent): string {
 // capability-gated there, never by an admin session. Everything else is an
 // admin op and needs a verified session cookie (docs/worker-slim.md §3).
 const PUBLIC_OPS = new Set(['create', 'approve', 'reject', 'dek-cache', 'audit-ingest', 'page', 'enroll-create']);
-// Reachable before a session exists: the shell state, bootstrap and login.
-const OPEN_ADMIN_OPS = new Set(['admin-state', 'admin-bootstrap', 'admin-login-challenge', 'admin-login']);
 
 // One log line per decision, then the audit row's terminal state. `latency`
 // is decision − creation (age for an expiry).
