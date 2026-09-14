@@ -3,10 +3,16 @@
 use crate::core::sanitize_for_display as sanitize;
 
 pub fn get_hostname() -> String {
-    hostname::get()
-        .unwrap_or_else(|_| "unknown".into())
-        .to_string_lossy()
-        .to_string()
+    // gethostname(3); 256 covers every platform's HOST_NAME_MAX+1.
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is writable for `buf.len()` bytes; gethostname writes at
+    // most that many and the NUL scan below never reads past it.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return "unknown".into();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 /// Collect the per-process display fields shared by both the CF ceremony
