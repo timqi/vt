@@ -19,7 +19,7 @@ use rand::RngCore;
 use serde::Serialize;
 use zeroize::Zeroizing;
 
-use crate::cf::{cf_post_with_timeout, hmac_auth_header_raw, ChallengeMeta};
+use crate::cf::{cf_post_with_timeout, hmac_auth_header, ChallengeMeta};
 
 /// Agent-derived audit context: kernel/agent-authoritative fields that ride
 /// as top-level siblings of the client-claimed `meta`
@@ -214,7 +214,7 @@ async fn push_once_with_retry(
         hostname: &cfg.hostname,
         entry,
     })?;
-    let auth = hmac_auth_header_raw(&cfg.key[..], &body);
+    let auth = hmac_auth_header(&cfg.key[..], &body);
     let url = format!("{}/api/audit-ingest", cfg.url);
 
     // Up to 2 attempts: retry ONLY on a transport error or a 5xx. A 4xx is a

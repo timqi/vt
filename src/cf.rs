@@ -103,22 +103,19 @@ impl WorkerAuth {
     }
 
     fn auth_header(&self, body: &[u8]) -> String {
-        hmac_auth_header_raw(&*self.key, body)
+        hmac_auth_header(&*self.key, body)
     }
 }
 
-pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+/// The `VT-HMAC <b64u>` Authorization header for `body` under the host
+/// token's 32-byte secret (daemon requests and the agent audit push alike).
+pub(crate) fn hmac_auth_header(key: &[u8], body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().into()
-}
-
-/// Build the `VT-HMAC <b64u>` Authorization header for `body` signed with a
-/// raw byte key. The agent audit path signs with an HKDF-derived 32-byte key
-/// (not a UTF-8 string), so the signing primitive must accept raw bytes.
-pub(crate) fn hmac_auth_header_raw(key: &[u8], body: &[u8]) -> String {
-    let mac = hmac_sha256(key, body);
-    format!("VT-HMAC {}", URL_SAFE_NO_PAD.encode(mac))
+    mac.update(body);
+    format!(
+        "VT-HMAC {}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
 }
 
 fn decode_b64u_exact<const N: usize>(b64u: &str, what: &str) -> Result<[u8; N]> {
@@ -1199,7 +1196,7 @@ mod tests {
         // is the Worker test suite's golden vector for this id).
         assert_eq!(
             parsed.auth_header(b"{}"),
-            hmac_auth_header_raw(
+            hmac_auth_header(
                 &URL_SAFE_NO_PAD
                     .decode("iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI")
                     .unwrap(),
