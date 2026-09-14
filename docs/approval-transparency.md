@@ -157,9 +157,9 @@ Worker side (`cf-worker`):
 
 - **C1 — trust labeling on the approve page** (`pwa/approve.js`): the
   `ip` row is labeled `IP（已验证）`; a footnote under the field list
-  states `除 IP 外均为客户端自报信息，仅供参考`. The `记录 · N 条` row
-  (N from `salts_b64u.length`, worker-derived) lists the records by name —
-  see C5.
+  states `除 IP 外均为客户端自报信息，仅供参考`. The decision line carries
+  `记录 N 条` (N from `salts_b64u.length`, worker-derived); the record names
+  sit directly beneath it — see C5.
 - **C5 — record names** ([dek-cache.md](dek-cache.md)): a name the operator
   owns (adopted or typed on the console, keyed by the record's salt) is a
   **truth line** — the Worker resolved it from its own table, the client
