@@ -17,8 +17,8 @@ use super::{
     agent_err, authorization_failure_wire, cache_hit_note_for, fingerprint_str, sanitize_prompt,
     sanitize_prompt_multiline, sign_data_with_privkey, spawn_detached, HandlerSuccess,
     VtSshSession, WireFailure, DETAIL_BAD_REQUEST_JSON, DETAIL_BATCH_EMPTY, DETAIL_BATCH_TOO_LARGE,
-    DETAIL_DISPLAY_FIELD_TOO_LARGE, DETAIL_INTERNAL_SERIALIZE, DETAIL_LEGACY_DISABLED,
-    DETAIL_NOT_INITIALIZED, DETAIL_RUN_ARGV_EMPTY, DETAIL_RUN_ARGV_TOO_LARGE, DETAIL_RUN_DISABLED,
+    DETAIL_DISPLAY_FIELD_TOO_LARGE, DETAIL_INTERNAL_SERIALIZE, DETAIL_NOT_INITIALIZED,
+    DETAIL_RUN_ARGV_EMPTY, DETAIL_RUN_ARGV_TOO_LARGE, DETAIL_RUN_DISABLED,
     DETAIL_RUN_NOT_ALLOWLISTED, DETAIL_RUN_SPAWN_FAILED, DETAIL_SIGN_BAD_PUBKEY,
     DETAIL_SIGN_FAILED, DETAIL_SIGN_KEYS_LOAD, DETAIL_SIGN_KEY_NOT_IN_AGENT,
     DETAIL_UNKNOWN_SECRET_TYPE, MAX_CRYPTO_BATCH, PROMPT_COMMAND_MAX_LINES,
@@ -29,9 +29,9 @@ use crate::core::authorization::{AuthorizationRequest, GrantScope, Operation, Re
 use crate::core::crypto::{derive_dek, AesGcmCrypto};
 use crate::core::wire::ErrKind;
 use crate::core::{
-    legacy_decrypt, AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, DiagCacheReport,
-    DiagPeerReport, DiagReq, DiagRes, EncryptReq, EncryptResItem, RunReq, RunRes, SignReq, SignRes,
-    UiStatusReq, UiStatusRes, SALT_LEN,
+    AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, DiagCacheReport, DiagPeerReport,
+    DiagReq, DiagRes, EncryptReq, EncryptResItem, RunReq, RunRes, SignReq, SignRes, UiStatusReq,
+    UiStatusRes, SALT_LEN,
 };
 
 fn plural_secrets(n: usize) -> &'static str {
@@ -180,28 +180,14 @@ impl VtSshSession {
         // accept them from a malformed `DecryptInput::V2`, the downstream
         // decrypt would fail on AAD mismatch, but the cache could be
         // polluted with `t.as_byte() == b'_'` entries in the meantime.
-        let mut legacy_count = 0usize;
         let mut v2_inputs: Vec<(crate::core::SecretType, [u8; SALT_LEN])> =
             Vec::with_capacity(req.items.len());
-        for item in &req.items {
-            match item {
-                DecryptInput::V2 {
-                    t: crate::core::SecretType::UNKNOWN,
-                    ..
-                } => {
-                    tracing::warn!("decrypt@vt rejecting v2 item with UNKNOWN type");
-                    return Err((ErrKind::BadRequest, Some(DETAIL_UNKNOWN_SECRET_TYPE)));
-                }
-                DecryptInput::V2 { t, salt } => v2_inputs.push((*t, *salt)),
-                DecryptInput::Legacy { .. } => legacy_count += 1,
+        for DecryptInput::V2 { t, salt } in &req.items {
+            if *t == crate::core::SecretType::UNKNOWN {
+                tracing::warn!("decrypt@vt rejecting v2 item with UNKNOWN type");
+                return Err((ErrKind::BadRequest, Some(DETAIL_UNKNOWN_SECRET_TYPE)));
             }
-        }
-
-        // Fail fast on `--no-legacy-decrypt`: if the agent is configured to
-        // reject legacy URLs, surface a dedicated kind before prompting the
-        // user. We still let pure-v2 batches through here.
-        if self.disable_legacy_decrypt && legacy_count > 0 {
-            return Err((ErrKind::LegacyDisabled, Some(DETAIL_LEGACY_DISABLED)));
+            v2_inputs.push((*t, *salt));
         }
 
         // Verify that the stored master key is present and decryptable before
@@ -220,36 +206,23 @@ impl VtSshSession {
             header_with_who(&format!("decrypt {} {}", n, plural_secrets(n)), "on", &who);
         self.append_relay_origin(&mut local_auth_message);
         self.append_caller_line(&mut local_auth_message);
-        // Pure-v2 batches use one atomic scope per record and require an all-of
-        // hit. Any legacy member makes the entire request explicitly Fresh.
+        // One atomic scope per record; reuse requires an all-of hit.
         // The reuse line is agent-derived truth and is appended BEFORE the
         // client-reported body/meta below, for the same reason as the relay
         // origin marker: a hostile caller must not be able to pad the one
         // line that says the tap creates a standing grant off-screen.
-        let (scopes, reuse, reuse_label) = if legacy_count > 0 {
-            (
-                vec![GrantScope::fresh(Operation::Decrypt)],
-                ReusePolicy::Fresh,
-                None,
-            )
-        } else {
-            let (scopes, reuse_label) = self.decrypt_scopes(&v2_inputs, &req.host, &req.meta.pwd);
-            let display = reuse_label.clone().unwrap_or_default();
-            let scopes: Vec<GrantScope> = scopes
-                .into_iter()
-                .map(|scope| scope.with_display(display.clone()))
-                .collect();
-            append_reuse_line(
-                &mut local_auth_message,
-                &reuse_label,
-                self.cache_ttls.decrypt_secs,
-            );
-            (
-                scopes,
-                ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs),
-                reuse_label,
-            )
-        };
+        let (scopes, reuse_label) = self.decrypt_scopes(&v2_inputs, &req.host, &req.meta.pwd);
+        let display = reuse_label.clone().unwrap_or_default();
+        let scopes: Vec<GrantScope> = scopes
+            .into_iter()
+            .map(|scope| scope.with_display(display.clone()))
+            .collect();
+        append_reuse_line(
+            &mut local_auth_message,
+            &reuse_label,
+            self.cache_ttls.decrypt_secs,
+        );
+        let reuse = ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs);
         let audit_ctx = self.audit_ctx_scoped(
             scopes.first().and_then(GrantScope::family),
             &reuse_label,
@@ -299,36 +272,14 @@ impl VtSshSession {
                 return Err(authorization_failure_wire(&failure));
             }
         };
-        let (mac_cipher, mac_key) = load_mac_cipher(store, passphrase_cipher)
+        let (_mac_cipher, mac_key) = load_mac_cipher(store, passphrase_cipher)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
         let mut result: Vec<DecryptResItem> = Vec::with_capacity(req.items.len());
-        for item in req.items {
-            match item {
-                DecryptInput::V2 { t: _, salt } => {
-                    let dek = derive_dek(&mac_key, &salt);
-                    result.push(DecryptResItem::V2 {
-                        dek,
-                        err_message: String::new(),
-                    });
-                }
-                DecryptInput::Legacy { url } => {
-                    if self.disable_legacy_decrypt {
-                        // Should be unreachable: we returned LegacyDisabled
-                        // above before prompting. Keep a defensive arm so
-                        // the per-item err is still well-formed.
-                        result.push(DecryptResItem::Legacy {
-                            result: String::new(),
-                            err_message: "legacy decryption disabled on this agent".to_string(),
-                        });
-                    } else {
-                        let item = legacy_decrypt(&mac_cipher, &url);
-                        result.push(DecryptResItem::Legacy {
-                            result: item.result,
-                            err_message: item.err_message,
-                        });
-                    }
-                }
-            }
+        for DecryptInput::V2 { salt, .. } in req.items {
+            result.push(DecryptResItem::V2 {
+                dek: derive_dek(&mac_key, &salt),
+                err_message: String::new(),
+            });
         }
         drop(mac_key);
         let bytes = Zeroizing::new(
@@ -337,10 +288,8 @@ impl VtSshSession {
         );
         // Scrub DEKs inside the response Vec before drop. `bytes` already
         // carries them (still wiped via `Zeroizing` below).
-        for item in result.iter_mut() {
-            if let DecryptResItem::V2 { dek, .. } = item {
-                dek.zeroize();
-            }
+        for DecryptResItem::V2 { dek, .. } in result.iter_mut() {
+            dek.zeroize();
         }
         let note = cache_hit_note_for(&permit, "decrypt", &reuse_label);
         Ok(HandlerSuccess::authorized(bytes, permit).with_cache_hit_note(note))

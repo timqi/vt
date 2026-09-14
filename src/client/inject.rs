@@ -1756,6 +1756,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Deterministic v2 fixtures: the child process rebuilds the same URLs.
+    const GOOD_DEK: [u8; 32] = [7; 32];
+    const GOOD_SALT: [u8; 16] = [1; 16];
+
+    fn mixed_record(salt: [u8; 16]) -> String {
+        crate::core::client_encrypt_v2(
+            crate::core::SecretType::RAW,
+            &salt,
+            &GOOD_DEK,
+            b"synthetic plaintext",
+        )
+        .unwrap()
+    }
+
     struct MixedDecryptAgent;
 
     impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for MixedDecryptAgent {
@@ -1787,18 +1801,15 @@ mod tests {
             let data: Vec<_> = request
                 .items
                 .into_iter()
-                .map(|item| {
-                    let DecryptInput::Legacy { url } = item else {
-                        panic!("legacy test request expected")
-                    };
-                    if url == "vt://mac/0good" {
-                        DecryptResItem::Legacy {
-                            result: "synthetic plaintext".into(),
+                .map(|DecryptInput::V2 { salt, .. }| {
+                    if salt == GOOD_SALT {
+                        DecryptResItem::V2 {
+                            dek: GOOD_DEK,
                             err_message: String::new(),
                         }
                     } else {
-                        DecryptResItem::Legacy {
-                            result: String::new(),
+                        DecryptResItem::V2 {
+                            dek: [0; 32],
                             err_message: "synthetic decrypt failure".into(),
                         }
                     }
@@ -1820,11 +1831,13 @@ mod tests {
     fn inject_mixed_failure_does_not_mutate_env_file_or_execute() {
         const CHILD: &str = "VT_TEST_INJECT_MIXED_CHILD";
         const ENV_SECRET: &str = "VT_TEST_INJECT_VALUE";
+        let good = mixed_record(GOOD_SALT);
+        let good_line = format!("key: {good}");
         let Some(dir) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
             let dir = std::env::temp_dir().join(format!("vt-inject-mixed-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let target = dir.join("config");
-            std::fs::write(&target, b"key: vt://mac/0good").unwrap();
+            std::fs::write(&target, good_line.as_bytes()).unwrap();
             // Isolate environment mutation and exec(): the unfixed code starts
             // this shell instead of returning to the test harness.
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1833,13 +1846,13 @@ mod tests {
                 .status().unwrap();
             assert!(status.success());
             assert!(!dir.join("command-started").exists());
-            assert_eq!(std::fs::read(&target).unwrap(), b"key: vt://mac/0good");
+            assert_eq!(std::fs::read(&target).unwrap(), good_line.as_bytes());
             std::fs::remove_dir_all(dir).unwrap();
             return;
         };
         let socket = dir.join("agent.sock");
         std::env::set_var("SSH_AUTH_SOCK", &socket);
-        std::env::set_var(ENV_SECRET, "vt://mac/0good");
+        std::env::set_var(ENV_SECRET, &good);
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1870,7 +1883,7 @@ mod tests {
                         "printf ran > \"$1\"".into(),
                         "sh".into(),
                         dir.join("command-started").to_string_lossy().into_owned(),
-                        "vt://mac/0bad".into(),
+                        mixed_record([2; 16]),
                     ];
                     let err = inject(
                         client,
@@ -1883,10 +1896,10 @@ mod tests {
                     .await
                     .unwrap_err();
                     assert!(err.to_string().contains("synthetic decrypt failure"));
-                    assert_eq!(std::env::var(ENV_SECRET).unwrap(), "vt://mac/0good");
+                    assert_eq!(std::env::var(ENV_SECRET).unwrap(), good);
                     assert_eq!(
                         std::fs::read(dir.join("config")).unwrap(),
-                        b"key: vt://mac/0good"
+                        good_line.as_bytes()
                     );
                     assert!(!dir.join(".config.vt-backup").exists());
                     assert!(!dir.join("command-started").exists());

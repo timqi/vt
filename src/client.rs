@@ -435,8 +435,7 @@ impl VTClient {
     /// v2 envelope decrypt. Each input `vt://...` URL is parsed locally; v2
     /// URLs send only their salt to the agent (which returns a per-record
     /// DEK after Touch ID), and the inner ciphertext is decrypted client-side
-    /// here. Legacy URLs are forwarded as-is and the agent returns the
-    /// finished plaintext / TOTP code (legacy behavior).
+    /// here. Unparseable URLs fail per item and never reach a transport.
     pub async fn decrypt(
         &self,
         host: &str,
@@ -451,10 +450,16 @@ impl VTClient {
         #[cfg(unix)]
         {
             let batch = DecryptBatch::parse(urls);
+            let items = batch.agent_items();
+            // Nothing decryptable: no prompt, every record reports its own
+            // parse error.
+            if items.is_empty() {
+                return batch.finish_agent(Vec::new());
+            }
             let wire = DecryptReq {
                 host: host.to_string(),
                 command: command.to_string(),
-                items: batch.agent_items(),
+                items,
                 meta: collect_client_meta(),
             };
             let payload = serde_json::to_vec(&wire)?;
@@ -552,7 +557,7 @@ impl VTClient {
         Ok(out)
     }
 
-    async fn cf_decrypt(&self, command: &str, batch: DecryptBatch<'_>) -> Result<Vec<ItemResult>> {
+    async fn cf_decrypt(&self, command: &str, batch: DecryptBatch) -> Result<Vec<ItemResult>> {
         let config = self
             .config
             .passkey_config()
@@ -778,22 +783,21 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty());
-            for urls in [
-                vec!["vt://mac/0YWJj".into()],
-                vec!["bad".into()],
-                vec![crate::core::client_encrypt_v2(
-                    crate::core::SecretType::RAW,
-                    &[1; 16],
-                    &[2; 32],
-                    b"fixture",
-                )
-                .unwrap()],
-            ] {
-                // An invalid URL cannot contact a phone or agent. Even a batch
-                // without v2 records must still propagate the ceremony failure.
-                let error = client.decrypt("host", "test", &urls).await.unwrap_err();
-                assert!(format!("{error:#}").contains("relative URL without a base"));
-            }
+            // Unparseable records, including retired `vt://mac/` ones, fail
+            // in place without contacting a phone or agent.
+            let urls = ["vt://mac/0YWJj".into(), "bad".into()];
+            let results = client.decrypt("host", "test", &urls).await.unwrap();
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(Result::is_err));
+            let urls = [crate::core::client_encrypt_v2(
+                crate::core::SecretType::RAW,
+                &[1; 16],
+                &[2; 32],
+                b"fixture",
+            )
+            .unwrap()];
+            let error = client.decrypt("host", "test", &urls).await.unwrap_err();
+            assert!(format!("{error:#}").contains("relative URL without a base"));
         }
     }
 

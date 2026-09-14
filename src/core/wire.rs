@@ -94,7 +94,8 @@ pub enum ErrKind {
     AgentLocked,
     /// Request JSON malformed, unknown `SecretType`, mismatched batch shape.
     BadRequest,
-    /// Agent started with `--no-legacy-decrypt` and a legacy URL was sent.
+    /// Reserved: was "legacy URL sent to an agent started with
+    /// `--no-legacy-decrypt`". Kept so exit code 21 stays unassigned.
     LegacyDisabled,
     /// Client and agent disagree on [`WIRE_VERSION`].
     ProtocolVersion,
@@ -138,9 +139,7 @@ impl ErrKind {
             ErrKind::NotInitialized => "vt: agent is not initialized — run `vt init`",
             ErrKind::AgentLocked => "vt: agent is locked — unlock with `ssh-add -X`",
             ErrKind::BadRequest => "vt: agent rejected the request as malformed",
-            ErrKind::LegacyDisabled => {
-                "vt: legacy vt:// URLs are disabled on this agent (--no-legacy-decrypt)"
-            }
+            ErrKind::LegacyDisabled => "vt: legacy vt:// URLs are not supported by this agent",
             ErrKind::ProtocolVersion => {
                 "vt: client and agent protocol versions do not match — reinstall both"
             }

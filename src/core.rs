@@ -1,11 +1,7 @@
 pub mod authorization;
-mod compat;
 pub mod crypto;
 pub mod session;
 pub mod wire;
-
-#[cfg(any(target_os = "macos", test))]
-pub use compat::legacy_decrypt;
 
 use crate::core::crypto::AesGcmCrypto;
 
@@ -196,8 +192,8 @@ pub struct EncryptReq {
 
 /// One agent-generated `(salt, dek)` pair. Client uses these locally to AEAD
 /// encrypt the corresponding plaintext and assemble the v2 URL. The DEK
-/// crosses the wire encrypted under `auth_cipher` (same as legacy plaintext
-/// did) and is zeroized after use on both sides.
+/// crosses the wire encrypted under `auth_cipher` and is zeroized after use
+/// on both sides.
 ///
 /// NOTE: there is intentionally no `salt` field on the *request* side. Letting
 /// a client supply a salt would let an attacker holding `VT_AUTH` extract the
@@ -212,17 +208,13 @@ pub struct EncryptResItem {
     pub err_message: String,
 }
 
-/// One item in a `decrypt@vt` request. v2 items carry only the salt; the
-/// inner ciphertext is decrypted locally by the client. Legacy items carry
-/// the full URL string and continue to be decrypted server-side until users
-/// have migrated.
+/// One item in a `decrypt@vt` request. Items carry only the salt; the inner
+/// ciphertext is decrypted locally by the client. Single-variant enums keep
+/// the `{"V2":{...}}` wire tag the removed legacy variant shared.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum DecryptInput {
     /// v2: `vt://{type}{b64(salt||ct)}` — agent only sees the salt.
     V2 { t: SecretType, salt: [u8; SALT_LEN] },
-    /// Legacy v0/v1: `vt://mac/{type}{b64(ct)}` — agent decrypts and may run
-    /// TOTP server-side (legacy behavior).
-    Legacy { url: String },
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -238,8 +230,6 @@ pub struct DecryptReq {
 pub enum DecryptResItem {
     /// Per-record DEK; client uses it to decrypt the inner ciphertext locally.
     V2 { dek: [u8; 32], err_message: String },
-    /// Plaintext or legacy-side-computed TOTP code.
-    Legacy { result: String, err_message: String },
 }
 
 /// Request from a (typically remote) client → local agent for `run@vt`.
@@ -525,23 +515,18 @@ pub struct UiStatusRes {
 /// Parsed `vt://...` URL. Strict parser (no `url::Url`, no normalization).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VtUrl {
-    /// New envelope format: `vt://{type}{b64(salt(16)||ct||tag(16))}`.
+    /// Envelope format: `vt://{type}{b64(salt(16)||ct||tag(16))}`.
     V2 {
         t: SecretType,
         salt: [u8; SALT_LEN],
         inner_ct: Vec<u8>,
     },
-    /// Legacy: `vt://mac/{type}{b64(nonce(12)||ct||tag(16))}`.
-    Legacy { t: SecretType, body_b64: String },
 }
 
 impl VtUrl {
     pub fn parse(s: &str) -> Result<Self> {
-        // Legacy first: it has the longer prefix.
-        if let Some(rest) = s.strip_prefix("vt://mac/") {
-            return compat::parse_legacy(rest);
-        }
-        // v2: `vt://{type}{b64}`. No further `/` allowed.
+        // v2: `vt://{type}{b64}`. No further `/` allowed, so the retired
+        // `vt://mac/` records fail here as any other malformed record.
         if let Some(rest) = s.strip_prefix("vt://") {
             ensure!(!rest.contains('/'), "v2 vt URL must not contain '/'");
             // Byte access keeps non-ASCII type bytes from panicking on a slice.
@@ -860,20 +845,15 @@ mod tests {
         assert!(url.starts_with("vt://0"), "got: {}", url);
         assert!(!url.contains("mac/"), "v2 URL must not contain `mac/`");
 
-        let parsed = VtUrl::parse(&url).unwrap();
-        match parsed {
-            VtUrl::V2 {
-                t,
-                salt: s,
-                inner_ct,
-            } => {
-                assert_eq!(t, SecretType::RAW);
-                assert_eq!(s, salt);
-                let pt = client_decrypt_v2(t, &dek, &s, &inner_ct).unwrap();
-                assert_eq!(pt, "hello");
-            }
-            _ => panic!("expected V2"),
-        }
+        let VtUrl::V2 {
+            t,
+            salt: s,
+            inner_ct,
+        } = VtUrl::parse(&url).unwrap();
+        assert_eq!(t, SecretType::RAW);
+        assert_eq!(s, salt);
+        let pt = client_decrypt_v2(t, &dek, &s, &inner_ct).unwrap();
+        assert_eq!(pt, "hello");
     }
 
     #[test]
@@ -896,13 +876,9 @@ mod tests {
         // Encrypt as TOTP, then try to decrypt as RAW — type byte is in AAD,
         // tag must mismatch.
         let url = client_encrypt_v2(SecretType::TOTP, &salt, &dek, b"JBSWY3DPEHPK3PXP").unwrap();
-        let parsed = VtUrl::parse(&url).unwrap();
-        if let VtUrl::V2 { salt, inner_ct, .. } = parsed {
-            let bad = client_decrypt_v2(SecretType::RAW, &dek, &salt, &inner_ct);
-            assert!(bad.is_err(), "RAW decrypt of TOTP-AAD ciphertext must fail");
-        } else {
-            panic!("expected V2");
-        }
+        let VtUrl::V2 { salt, inner_ct, .. } = VtUrl::parse(&url).unwrap();
+        let bad = client_decrypt_v2(SecretType::RAW, &dek, &salt, &inner_ct);
+        assert!(bad.is_err(), "RAW decrypt of TOTP-AAD ciphertext must fail");
     }
 
     #[test]
@@ -910,17 +886,18 @@ mod tests {
         let dek = fixture_dek();
         let salt = [0x11u8; SALT_LEN];
         let url = client_encrypt_v2(SecretType::RAW, &salt, &dek, b"abc").unwrap();
-        let mut parsed = VtUrl::parse(&url).unwrap();
-        if let VtUrl::V2 { ref mut salt, .. } = parsed {
-            salt[0] ^= 0xFF; // flip a salt byte
-        }
-        if let VtUrl::V2 { t, salt, inner_ct } = parsed {
-            // Salt is fed into HKDF (different DEK) and as nonce — both change,
-            // but the test caller doesn't re-derive DEK; it uses the original
-            // dek, which simulates an attacker mutating the URL. Tag must fail.
-            let bad = client_decrypt_v2(t, &dek, &salt, &inner_ct);
-            assert!(bad.is_err());
-        }
+        let VtUrl::V2 {
+            t,
+            mut salt,
+            inner_ct,
+        } = VtUrl::parse(&url).unwrap();
+        // Flip a salt byte. Salt is fed into HKDF (different DEK) and as
+        // nonce — both change, but the test caller doesn't re-derive DEK; it
+        // uses the original dek, which simulates an attacker mutating the
+        // URL. Tag must fail.
+        salt[0] ^= 0xFF;
+        let bad = client_decrypt_v2(t, &dek, &salt, &inner_ct);
+        assert!(bad.is_err());
     }
 
     #[test]
@@ -938,38 +915,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_legacy_still_works() {
-        let s = "vt://mac/0AAAAAAAAAA";
-        let parsed = VtUrl::parse(s).unwrap();
-        match parsed {
-            VtUrl::Legacy { t, body_b64 } => {
-                assert_eq!(t, SecretType::RAW);
-                assert_eq!(body_b64, "AAAAAAAAAA");
-            }
-            _ => panic!("expected Legacy"),
+    fn parse_rejects_legacy_mac_records() {
+        // Pre-2.0 `vt://mac/` records are no longer readable: every shape the
+        // removed parser accepted (or rejected) now fails as a malformed v2
+        // URL, and the message carries no legacy-specific hint.
+        for legacy in [
+            "vt://mac/0AAAAAAAAAA",
+            "vt://mac/1YWJj",
+            "vt://mac/_YWJj",
+            "vt://mac/0abc=",
+            "vt://mac/é-padding",
+            "vt://mac/",
+        ] {
+            let error = VtUrl::parse(legacy).unwrap_err().to_string();
+            assert_eq!(error, "v2 vt URL must not contain '/'", "{legacy}");
         }
     }
 
     #[test]
     fn parse_rejects_non_ascii_v2_type_byte() {
-        // Reachable via attacker-controlled `DecryptInput::Legacy { url }`; must
-        // not panic on byte-slicing at a non-char boundary.
+        // Reachable from any client-supplied URL; must not panic on
+        // byte-slicing at a non-char boundary.
         let bad = "vt://é-padding";
         let res = VtUrl::parse(bad);
         assert!(res.is_err(), "non-ASCII v2 type byte must be rejected");
-    }
-
-    #[test]
-    fn parse_rejects_non_ascii_legacy_type_byte() {
-        let bad = "vt://mac/é-padding";
-        let res = VtUrl::parse(bad);
-        assert!(res.is_err(), "non-ASCII legacy type byte must be rejected");
-    }
-
-    #[test]
-    fn parse_rejects_empty_legacy_body() {
-        let res = VtUrl::parse("vt://mac/");
-        assert!(res.is_err());
     }
 
     #[test]
@@ -990,18 +959,6 @@ mod tests {
         // Type byte `_` is reserved for UNKNOWN; v2 must reject.
         let bad = format!("vt://_{}", BASE64_URL_SAFE_NO_PAD.encode([0u8; 32]));
         assert!(VtUrl::parse(&bad).is_err());
-    }
-
-    #[test]
-    fn legacy_decrypt_v2_url_errors() {
-        // legacy_decrypt only handles legacy URLs.
-        let key = [0xAAu8; 32];
-        let cipher = AesGcmCrypto::new(&key).unwrap();
-        let dek = fixture_dek();
-        let salt = [0x11u8; SALT_LEN];
-        let v2 = client_encrypt_v2(SecretType::RAW, &salt, &dek, b"x").unwrap();
-        let res = legacy_decrypt(&cipher, &v2);
-        assert!(!res.err_message.is_empty());
     }
 
     #[test]

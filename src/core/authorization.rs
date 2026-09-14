@@ -107,8 +107,8 @@ pub struct GrantScope {
 pub const DESTINATION_SUBJECT: SubjectId = (0, 0);
 
 impl GrantScope {
-    /// An explicitly non-reusable scope. `auth@vt`, `run@vt`, legacy decrypt,
-    /// and callers without a resolvable subject use this constructor.
+    /// An explicitly non-reusable scope. `auth@vt`, `run@vt`, and callers
+    /// without a resolvable subject use this constructor.
     pub fn fresh(operation: Operation) -> Self {
         Self {
             operation,

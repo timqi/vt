@@ -78,7 +78,7 @@ original agent error's code.
 | `NotInitialized`     | handler cannot validate or load master-key material after auth-cipher derivation | 13 |
 | `AgentLocked`        | reserved; `ssh-add -x` currently causes an unstructured failure | 14 |
 | `BadRequest`         | malformed request, unknown v2 decrypt type, size/empty-batch checks, or run allowlist refusal | 20 |
-| `LegacyDisabled`     | agent started with `--no-legacy-decrypt`                     | 21        |
+| `LegacyDisabled`     | reserved; was "legacy URL under `--no-legacy-decrypt`", never emitted since legacy records were removed | 21 |
 | `ProtocolVersion`    | `v` mismatch between client and agent                        | 22        |
 | `Transient`          | authorization invalidated; also the defensive invalidated-commit mapping | 75 |
 
@@ -91,6 +91,9 @@ non-idempotent operation is safe (see "Cache and side-effect invariants").
 Per-item errors **inside successful batch envelopes** retain the wire
 `err_message` strings. The client converts record results to `ItemResult`
 (`Result<String, ItemError>`); per-record failures do not acquire an `ErrKind`.
+A record that fails `VtUrl::parse` (malformed, or a retired `vt://mac/` record)
+is an `ItemError` in its input position; it takes no wire slot, and a batch with
+no parseable record contacts neither agent nor Worker.
 Envelope errors fail the whole request, while an `ok` batch may contain partial
 failure. Callers decide how to handle that batch; single-item command failures
 default to exit `1`.
@@ -109,8 +112,8 @@ interactive, while the other needs a GUI session.
 The operations in `src/server_macos/ssh_agent/handlers.rs` return
 `HandlerSuccess` or `WireFailure`, a tuple of
 `(ErrKind, Option<&'static str>)`. For example, `handle_decrypt` rejects an
-unknown v2 type as `BadRequest`, and any legacy member under
-`--no-legacy-decrypt` as `LegacyDisabled`, before authorization.
+unknown v2 type as `BadRequest` before authorization. Unparseable records never
+reach the agent: the client fails them per item (see below).
 
 Not every failure can use the envelope:
 
@@ -213,11 +216,10 @@ dispatcher owns response encryption and permit commitment:
    signature (and, for extensions, encrypted response) consumes it with
    `commit()`. Operation, serialization, or encryption failure adds no grant.
 
-2. **Decrypt grants**: pure-v2 batches use all-of lookup. A partial hit followed
-   by rejection leaves existing entries untouched and adds none. For approvals
+2. **Decrypt grants**: batches use all-of lookup. A partial hit followed by
+   rejection leaves existing entries untouched and adds none. For approvals
    eligible for reuse, the complete deduplicated scope set is committed only
-   after successful response encryption. Any legacy member makes the entire
-   request fresh.
+   after successful response encryption.
 
 3. **Strict TTL**: committing an equal or wider policy never extends a
    still-valid grant. A shorter policy cannot reuse a wider grant and replaces
@@ -315,7 +317,6 @@ without backend fallback masking it.
 |-----------------|----------------------------------------|
 | Reject an `auth@vt` prompt | `AuthRejected`, exit `10`; requires a real human rejection, not a programmatic-denial test. |
 | Lock with `ssh-add -x`, then call the agent | Unstructured SSH failure, client `Transport`, exit `1`; unlock afterward with `ssh-add -X`. No automatic hint is guaranteed. |
-| Send legacy decrypt input under `--no-legacy-decrypt` | `LegacyDisabled`, exit `21`, before prompting. |
 | Send an unknown v2 decrypt type | `BadRequest`, exit `20`, before prompting; requires a crafted authenticated request, not an ordinary CLI URL. |
 | Call `auth@vt` while screen-locked/off-console or without a GUI session | `SessionLocked`/`NoGuiSession`, exits `11`/`12`; pure classifier tests do not establish native behavior. |
 | Wrong `VT_AUTH` or initial store/cipher setup failure | Unstructured failure, exit `1`; no structured-detail disclosure to an unauthenticated caller. |

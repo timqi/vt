@@ -130,7 +130,7 @@ enum Commands {
     },
     /// Decrypt an existing vt protocol as plaintext
     Read {
-        #[arg(help = "A string in vt protocol format, e.g. vt://mac/0xxxx")]
+        #[arg(help = "A string in vt protocol format, e.g. vt://0xxxx")]
         vt: String,
 
         #[arg(long, help = "Reason shown in the bio auth prompt")]
@@ -366,7 +366,7 @@ pub enum SshCommands {
         auth_cache_duration: Option<u64>,
         #[arg(
             long = "decrypt-auth-cache-duration",
-            help = "Decrypt approval reuse duration in seconds; 0 (default) = prompt every time. Only v2 envelope URLs are cache-eligible; legacy items always prompt. Grants bind to the caller's git workspace (kernel-derived), or per relay connection when forwarded. Kept separate from the sign duration because a cached decrypt grant releases per-record DEK material. config.toml [agent].decrypt_auth_cache_duration overrides the default."
+            help = "Decrypt approval reuse duration in seconds; 0 (default) = prompt every time. Grants bind to the caller's git workspace (kernel-derived), or per relay connection when forwarded. Kept separate from the sign duration because a cached decrypt grant releases per-record DEK material. config.toml [agent].decrypt_auth_cache_duration overrides the default."
         )]
         decrypt_auth_cache_duration: Option<u64>,
         #[arg(
@@ -375,12 +375,6 @@ pub enum SshCommands {
             help = "Disable the system notification fired when a cached grant satisfies sign/decrypt without a Touch ID prompt. Also configurable as [agent].cache_hit_notify in config.toml."
         )]
         no_cache_hit_notify: bool,
-        #[arg(
-            long = "no-legacy-decrypt",
-            default_value_t = false,
-            help = "Reject legacy v0/v1 vt:// URLs on decrypt@vt; only v2 envelope URLs are accepted. Use this once you've migrated all stored secrets to the v2 format."
-        )]
-        no_legacy_decrypt: bool,
         #[arg(
             long = "run-allow",
             help = "Comma-separated allowlist for `run@vt` (e.g. `zed,code,/Applications/Zed.app/Contents/MacOS/cli`). Bare names match argv[0] without `/` and are resolved via the agent's own PATH; entries containing `/` must be absolute and match argv[0] post-canonicalization. Unset falls back to config.toml [agent].run_allow, then empty (run@vt disabled)."
@@ -491,7 +485,6 @@ async fn run(cli: Cli, config: config::ResolvedConfig) -> Result<()> {
                 auth_cache_duration,
                 decrypt_auth_cache_duration,
                 no_cache_hit_notify,
-                no_legacy_decrypt,
                 run_allow,
                 audit_url,
                 audit_key,
@@ -544,7 +537,6 @@ async fn run(cli: Cli, config: config::ResolvedConfig) -> Result<()> {
                         sign_secs,
                         decrypt_secs,
                     },
-                    *no_legacy_decrypt,
                     run_allow,
                     std::sync::Arc::new(audit_push),
                     notify_cache_hits,

@@ -246,7 +246,7 @@ for how long:
 | Local caller outside any git repository | The caller's **exact working directory** (kernel-derived, a separate grant family from git workspaces) |
 | Local caller from a broad shared directory (`$HOME`, `/`, temp roots) | The **calling application** (kernel-derived parent process): repeated requests from the same app instance — e.g. a daemon probing `gh` through the hook — share one approval; grants die when the app exits |
 | Forwarded / relay traffic (`ssh -A`, `--forward-real-agent`) | vt extensions (`decrypt@vt`, `sign@vt`) are confined **per connection**: a remote host can reuse only its own approvals and never rides local grants. Raw SSH signs arriving through a forwarding-capable connection are never cached at all |
-| OpenSSH < 8.9, `auth@vt`, `run@vt`, legacy URLs | Never cached — always prompts |
+| OpenSSH < 8.9, `auth@vt`, `run@vt` | Never cached — always prompts |
 
 `--ssh-auth-cache-duration <SECS>` and `--decrypt-auth-cache-duration <SECS>`
 are separate knobs (a cached decrypt grant releases per-record DEK material,
@@ -317,7 +317,7 @@ vt://{type}{data}
 Records printed by `vt create` contain an authenticated envelope, not just
 base64-encoded plaintext.
 
-> Legacy `vt://mac/…` records (pre-2.0) remain readable for migration; convert them to the current envelope format with `vt rewrap`.
+> Legacy `vt://mac/…` records (pre-2.0) are no longer readable and fail as invalid records. Convert them with `vt rewrap --no-dry-run` on the previous release before upgrading.
 
 ## Environment Variables
 

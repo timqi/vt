@@ -531,11 +531,6 @@ pub struct VtSshAgentFactory {
     /// 0 = Fresh (always prompt); named fields prevent sign/decrypt
     /// transposition (see [`AuthCacheTtls`]).
     cache_ttls: AuthCacheTtls,
-    /// When true, `decrypt@vt` rejects `Legacy` items (v0/v1 URLs). v2 envelope
-    /// items continue to work. Lets users who have fully migrated harden the
-    /// agent so the "agent emits plaintext over wire" path can never be
-    /// triggered.
-    disable_legacy_decrypt: bool,
     /// run@vt allowlist. Empty = feature disabled.
     run_allow: Arc<RunAllowlist>,
     /// Fire-and-forget audit push config. Cloned per session like `run_allow`.
@@ -557,7 +552,6 @@ impl VtSshAgentFactory {
     fn new(
         keys: HashMap<String, PrivateKey>,
         cache_ttls: AuthCacheTtls,
-        disable_legacy_decrypt: bool,
         run_allow: RunAllowlist,
         audit_push: Arc<AuditPushConfig>,
         notify_cache_hits: bool,
@@ -575,7 +569,6 @@ impl VtSshAgentFactory {
             idle_cleared: Arc::new(RwLock::new(false)),
             authorization,
             cache_ttls,
-            disable_legacy_decrypt,
             run_allow: Arc::new(run_allow),
             audit_push,
             notify_cache_hits,
@@ -607,7 +600,6 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             workspace: std::sync::OnceLock::new(),
             bind_state: BindState::Unbound,
             destination_label: None,
-            disable_legacy_decrypt: self.disable_legacy_decrypt,
             notify_cache_hits: self.notify_cache_hits,
             ui_token: self.ui_token,
             idle_timeout_secs: self.idle_timeout_secs,
@@ -660,7 +652,6 @@ struct VtSshSession {
     /// Display label for the bound destination, computed once per bind so a
     /// sign burst does not re-read known_hosts.
     destination_label: Option<String>,
-    disable_legacy_decrypt: bool,
     /// Cache-hit transparency notifications (docs/app-bundle.md §3).
     notify_cache_hits: bool,
     /// Spawn token gating `ui-status@vt`; `None` refuses every request.
@@ -880,7 +871,6 @@ fn spawn_detached(exe: &std::path::Path, args: &[String]) -> std::io::Result<u32
 const DETAIL_BAD_REQUEST_JSON: &str = "request body could not be parsed";
 const DETAIL_UNKNOWN_SECRET_TYPE: &str = "v2 request used an unknown SecretType";
 const DETAIL_NOT_INITIALIZED: &str = "agent store could not be unlocked — run `vt init`";
-const DETAIL_LEGACY_DISABLED: &str = "legacy decryption disabled (--no-legacy-decrypt)";
 const DETAIL_AUTH_REJECTED: &str = "authentication was declined";
 const DETAIL_SCREEN_LOCKED: &str = "screen is locked";
 const DETAIL_NO_GUI: &str = "no active GUI session";
@@ -1516,7 +1506,6 @@ pub async fn run_ssh_agent(
     print_env: bool,
     idle_timeout_secs: u64,
     cache_ttls: AuthCacheTtls,
-    disable_legacy_decrypt: bool,
     run_allow: RunAllowlist,
     audit_push: Arc<AuditPushConfig>,
     notify_cache_hits: bool,
@@ -1559,7 +1548,6 @@ pub async fn run_ssh_agent(
     let factory = VtSshAgentFactory::new(
         keys,
         cache_ttls,
-        disable_legacy_decrypt,
         run_allow,
         audit_push,
         notify_cache_hits,
@@ -1568,9 +1556,6 @@ pub async fn run_ssh_agent(
     );
     if audit_enabled {
         tracing::info!("Agent audit push enabled");
-    }
-    if disable_legacy_decrypt {
-        tracing::info!("Legacy decrypt path disabled — only v2 envelope URLs accepted");
     }
     if run_allow_empty {
         tracing::info!("run@vt disabled (no --run-allow entries)");
@@ -1705,7 +1690,6 @@ pub async fn run_ssh_agent(
 pub async fn start_ssh_agent(
     idle_timeout_secs: u64,
     cache_ttls: AuthCacheTtls,
-    disable_legacy_decrypt: bool,
     run_allow: RunAllowlist,
     audit_push: Arc<AuditPushConfig>,
     notify_cache_hits: bool,
@@ -1715,7 +1699,6 @@ pub async fn start_ssh_agent(
         true,
         idle_timeout_secs,
         cache_ttls,
-        disable_legacy_decrypt,
         run_allow,
         audit_push,
         notify_cache_hits,
@@ -2008,7 +1991,6 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
             workspace: std::sync::OnceLock::from(WorkspaceResolution::NoRoot),
             bind_state: BindState::Unbound,
             destination_label: None,
-            disable_legacy_decrypt: false,
             notify_cache_hits: false,
             ui_token: None,
             idle_timeout_secs: 1800,

@@ -22,9 +22,8 @@ that operation's risk actually lives:
 | local caller with no `.git` root | key fingerprint / secret × **cwd directory** | Outside any repository the kernel-derived cwd itself is the activity — a distinct grant family from workspaces (§4a). |
 | local caller from a broad shared cwd ($HOME, `/`, temp roots) | key fingerprint / secret × **parent application** | Daemons and GUI helpers launch from shared directories; the kernel-derived parent process is the activity (§4a parent-app arm). |
 | `sign@vt` via relay **or plain-ssh** connection | key fingerprint × claimed pwd, bounded **per connection** | Unchanged from V1: a connection that can carry forwarded remote traffic reuses only its own approvals and never reaches the workspace arm. |
-| `decrypt@vt` local, pure v2 | secret `(type, salt)` × **workspace** | Secrets belong to projects. "I am working in this project" is the approval unit. |
-| `decrypt@vt` via relay or plain-ssh connection, pure v2 | secret `(type, salt)` × claimed host/pwd, bounded per connection | Unchanged from V1. |
-| legacy-containing `decrypt@vt` | — | Fresh, unchanged. |
+| `decrypt@vt` local | secret `(type, salt)` × **workspace** | Secrets belong to projects. "I am working in this project" is the approval unit. |
+| `decrypt@vt` via relay or plain-ssh connection | secret `(type, salt)` × claimed host/pwd, bounded per connection | Unchanged from V1. |
 | `auth@vt` | — | Fresh by definition: it attests "a human is present now". |
 | `run@vt` | — | Fresh. A future reusable policy needs exe identity + argv digest + `max_uses`; out of scope. |
 
@@ -328,7 +327,7 @@ common case, and repeating a `workspace` keyword on every prompt added no
 information. The narrower fallback families keep their prefix so "this
 exact directory" / "this app" can never read as a repository scope.
 
-Fresh operations (`auth@vt`, `run@vt`, legacy decrypt, unbound-ssh sign)
+Fresh operations (`auth@vt`, `run@vt`, unbound-ssh sign)
 show no reuse line. The approved range and the displayed range must be the
 same sentence; handlers build the label from the same fd-derived data the
 scope digest uses (§4.3).
@@ -374,7 +373,7 @@ remains read-only, prompt-free, and must still not reset the idle clock.
   confinement, `run@vt` refusal. The relay's own filter continues to refuse
   `session-bind@openssh.com` (it is not in the allow-list), so remote hosts
   cannot bind the upstream connection.
-- `auth@vt`/`run@vt` fresh-always; legacy decrypt fresh; `--no-legacy-decrypt`.
+- `auth@vt`/`run@vt` fresh-always.
 - Idle/lock/wake/sweep machinery and audit labels/outcomes.
 
 ## 9. Non-goals
@@ -448,8 +447,7 @@ Engine tests are untouched. New/changed coverage:
    pwd-outside-workspace ⇒ Fresh, fd-derived dev/ino + path binding.
 5. `sign@vt` local=workspace vs relay=per-connection classification; raw
    commit-sign and sign@vt sharing the workspace scope family.
-6. Decrypt batches: workspace scope per `(type, salt)`, all-of hit,
-   legacy ⇒ fresh (existing tests adapted).
+6. Decrypt batches: workspace scope per `(type, salt)`, all-of hit.
 7. CLI: duration 0 ⇒ Fresh for that operation; >0 ⇒ StrictTtl; mode flags
    rejected/absent.
 8. Diag: new basis strings, live counts scoped as specified; doctor

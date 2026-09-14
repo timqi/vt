@@ -14,8 +14,7 @@ The mechanism is shared; the risk policy is not:
 | Operation | Reuse policy |
 |---|---|
 | raw SSH sign / `sign@vt` | configured sign TTL, only with a reusable scope |
-| pure-v2 `decrypt@vt` | configured decrypt TTL, only with a reusable scope |
-| legacy-containing `decrypt@vt` | fresh for the whole batch |
+| `decrypt@vt` | configured decrypt TTL, only with a reusable scope |
 | `auth@vt` | always fresh |
 | `run@vt` | always fresh, after allowlist validation |
 
@@ -143,12 +142,12 @@ Sign handlers validate the request and resolve the requested key before asking
 for one sign scope. [sign-vt-design.md](sign-vt-design.md) owns identity routing,
 wire fields, and the security differences of decrypt-then-sign fallback.
 
-Decrypt validates parsing, batch limits, non-emptiness, `UNKNOWN` types, legacy
-policy, and key-store availability before lookup. Pure-v2 batches require an
-all-of hit for their `(type, salt)` resources. A partial hit prompts once and
-successful execution commits the full deduplicated set. Rejection or operation
-failure preserves existing entries and adds none. Any legacy item makes the
-whole request Fresh.
+Decrypt validates parsing, batch limits, non-emptiness, `UNKNOWN` types, and
+key-store availability before lookup. Batches require an all-of hit for their
+`(type, salt)` resources. A partial hit prompts once and successful execution
+commits the full deduplicated set. Rejection or operation failure preserves
+existing entries and adds none. Unparseable records (including retired
+`vt://mac/` ones) fail on the client and never reach the agent.
 
 `auth@vt` remains Fresh. `run@vt` resolves a canonical executable against the
 allowlist and sanitizes its prompt before Fresh authorization. Spawn occurs
