@@ -480,12 +480,18 @@ pub fn create_and_save_passcode_passphrase(real_passphrase: &[u8; 32]) -> Result
     let aes = AesGcmCrypto::new(&passphrase_secret)?;
     let encrypted_passphrase = aes.encrypt(real_passphrase)?;
 
-    // Preserve any pre-existing SSH keys on rotate. The rotated passcode does
-    // not change `real_passphrase` (the master key for the SSH ciphertext), so
-    // that blob remains decryptable.
+    // Carry the SSH-key blob over only when the master it is sealed under is
+    // the one being written (rotate-passcode). `secret import` of a different
+    // master would otherwise leave a blob no path can open or clear.
     let mut store = KeychainStore::new(&passcode_and_auth_token, &encrypted_passphrase);
     if let Ok(existing) = KeychainStore::load() {
-        store.encrypted_ssh_keys = existing.encrypted_ssh_keys;
+        let same_master = derive_passcode_cipher(&existing)
+            .and_then(|c| load_mac_key(&existing, &c))
+            .map(|k| k.as_slice() == real_passphrase)
+            .unwrap_or(false);
+        if same_master {
+            store.encrypted_ssh_keys = existing.encrypted_ssh_keys;
+        }
     }
     store.save()?;
     tracing::info!("keychain store saved!");
