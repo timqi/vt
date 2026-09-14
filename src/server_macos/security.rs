@@ -547,7 +547,7 @@ fn split_passcode(store: &super::store::KeychainStore) -> Result<[u8; 32]> {
     Ok(passcode[..32].try_into()?)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use tracing_test::traced_test;

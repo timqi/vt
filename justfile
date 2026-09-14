@@ -98,25 +98,38 @@ check:
 size:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Non-blank, non-comment lines; a Rust file is cut at its first `#[cfg(test)]`.
+    # Non-blank, non-comment lines (`//`, `/* */`); every `#[cfg(test)]` item is
+    # skipped to its closing brace at the attribute's indentation (rustfmt puts
+    # it there), so a test-only fn early in a file hides nothing after it.
     count() {
         local total=0 n
         for f in "$@"; do
-            n=$(awk '/^#\[cfg\(test\)\]/{exit} !/^[[:space:]]*(\/\/|$)/{c++} END{print c+0}' "$f")
+            n=$(awk '
+                block { if (index($0, "*/")) block = 0; next }
+                skip {
+                    if (first) { first = 0; if ($0 ~ /[;}][[:space:]]*$/) skip = 0; next }
+                    if ($0 ~ ("^" ind "}")) skip = 0
+                    next
+                }
+                /^[[:space:]]*#\[cfg\(test\)\]/ { match($0, /^[[:space:]]*/); ind = substr($0, 1, RLENGTH); skip = 1; first = 1; next }
+                /^[[:space:]]*\/\*/ { if (!index($0, "*/")) block = 1; next }
+                !/^[[:space:]]*(\/\/|$)/ { c++ }
+                END { print c + 0 }' "$f")
             total=$((total + n))
         done
         echo "$total"
     }
+    files() { fd -e rs -e ts -E '*.test.ts' . "$@"; }
     row() { printf '%-22s %6s %6s\n' "$1" "$2" "$3"; }
     row Area Lines Ceiling
-    row 'src/core/'          "$(count src/core.rs src/core/*.rs)"   1700
-    row 'src/client/'        "$(count src/client.rs src/client/*.rs)" 1800
-    row 'src/server_macos/'  "$(count src/server_macos/*.rs src/server_macos/ssh_agent/*.rs)" 4500
-    row 'root src/*.rs'      "$(count $(ls src/*.rs | grep -v -e /core.rs -e /client.rs))" 2000
-    row 'cf-worker/src/'     "$(count cf-worker/src/*.ts)"       4100
+    row 'src/core/'          "$(count src/core.rs $(files src/core))"   1700
+    row 'src/client/'        "$(count src/client.rs $(files src/client))" 1800
+    row 'src/server_macos/'  "$(count $(files src/server_macos))" 4500
+    row 'root src/*.rs'      "$(count $(ls src/*.rs | grep -v -e /core.rs -e /client.rs) $(files src/config))" 2000
+    row 'cf-worker/src/'     "$(count $(files cf-worker/src))"       4100
     echo
     echo 'Modules over 750:'
-    for f in $(fd -e rs -e ts . src cf-worker/src); do
+    for f in $(files src cf-worker/src); do
         n=$(count "$f"); [ "$n" -gt 750 ] && row "  $f" "$n" 750 || true
     done
 

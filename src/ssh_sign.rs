@@ -1060,7 +1060,7 @@ mod relay_detection_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
     use ed25519_dalek::SigningKey;
