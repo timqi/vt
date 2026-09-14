@@ -109,7 +109,9 @@ pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Resu
         command.push_str("\nreason: ");
         command.push_str(&sanitize_for_display(r, 200));
     }
-    let res = vt_client.decrypt(&get_hostname(), &command, &[vt]).await?;
+    let res = vt_client
+        .decrypt(&get_hostname(), &command, &[vt], &[])
+        .await?;
     let value = single_item_result(res, "Error decrypting item")?;
     // Interactive terminal: end the line so the shell prompt doesn't overwrite
     // or obscure a plaintext with no trailing newline (redrawing prompts like
@@ -126,14 +128,17 @@ pub async fn read(vt_client: VTClient, vt: String, reason: Option<&str>) -> Resu
     Ok(())
 }
 
+/// `names[i]` labels `original_str_vec[i]` (env var name, file basename, `""`
+/// for argv); a record found in several inputs takes the first label.
 pub(super) async fn decrypt_from_multi_str(
     vt_client: VTClient,
     original_str_vec: Vec<String>,
+    names: &[String],
     command: String,
 ) -> Result<Vec<String>> {
-    let plan = SubstitutionPlan::new(original_str_vec);
+    let plan = SubstitutionPlan::new(original_str_vec, names);
     let res = vt_client
-        .decrypt(&get_hostname(), &command, &plan.encrypted)
+        .decrypt(&get_hostname(), &command, &plan.encrypted, &plan.names)
         .await?;
     plan.apply(res)
 }
@@ -143,20 +148,23 @@ pub(super) async fn decrypt_from_multi_str(
 struct SubstitutionPlan {
     originals: Vec<String>,
     encrypted: Vec<String>,
+    names: Vec<String>,
     spans: Vec<Vec<(std::ops::Range<usize>, usize)>>,
 }
 
 impl SubstitutionPlan {
-    fn new(originals: Vec<String>) -> Self {
+    fn new(originals: Vec<String>, labels: &[String]) -> Self {
         let mut encrypted = Vec::new();
+        let mut names = Vec::new();
         let mut indices = std::collections::HashMap::new();
         let mut spans = Vec::with_capacity(originals.len());
-        for text in &originals {
+        for (i, text) in originals.iter().enumerate() {
             let mut matches = Vec::new();
             let mut cursor = 0;
             for url in iter_vt_urls(text) {
                 let index = *indices.entry(url).or_insert_with(|| {
                     encrypted.push(url.to_string());
+                    names.push(labels.get(i).cloned().unwrap_or_default());
                     encrypted.len() - 1
                 });
                 // The scanner returns slices in encounter order. Searching
@@ -170,6 +178,7 @@ impl SubstitutionPlan {
         Self {
             originals,
             encrypted,
+            names,
             spans,
         }
     }
@@ -229,14 +238,19 @@ mod tests {
 
     #[test]
     fn substitution_deduplicates_records_in_encounter_order() {
-        let plan = SubstitutionPlan::new(vec![
-            "vt://0abc + vt://mac/1def + vt://0abc".into(),
-            "prefix vt://0abcxyz suffix vt://0abc".into(),
-        ]);
+        let plan = SubstitutionPlan::new(
+            vec![
+                "vt://0abc + vt://mac/1def + vt://0abc".into(),
+                "prefix vt://0abcxyz suffix vt://0abc".into(),
+            ],
+            &["ARGV".into(), "FILE".into()],
+        );
         assert_eq!(
             plan.encrypted,
             ["vt://0abc", "vt://mac/1def", "vt://0abcxyz"]
         );
+        // A record's label is the first input it appeared in.
+        assert_eq!(plan.names, ["ARGV", "ARGV", "FILE"]);
         assert_eq!(
             plan.apply(vec![success("short"), success("code"), success("long")])
                 .unwrap(),
@@ -246,7 +260,7 @@ mod tests {
 
     #[test]
     fn substitution_never_rescans_inserted_plaintext() {
-        let plan = SubstitutionPlan::new(vec!["前 vt://0abc / vt://0abcdef 后".into()]);
+        let plan = SubstitutionPlan::new(vec!["前 vt://0abc / vt://0abcdef 后".into()], &[]);
         assert_eq!(
             plan.apply(vec![success("literal vt://0abcdef"), success("value")])
                 .unwrap(),
@@ -256,7 +270,7 @@ mod tests {
 
     #[test]
     fn substitution_rejects_entire_mixed_batch_without_plaintext_output() {
-        let plan = SubstitutionPlan::new(vec!["vt://0abc vt://0def".into()]);
+        let plan = SubstitutionPlan::new(vec!["vt://0abc vt://0def".into()], &[]);
         let err = plan
             .apply(vec![
                 success("decrypted-value"),
@@ -270,15 +284,15 @@ mod tests {
 
     #[test]
     fn substitution_checks_response_count_and_preserves_plain_inputs() {
-        assert!(SubstitutionPlan::new(vec!["vt://0abc".into()])
+        assert!(SubstitutionPlan::new(vec!["vt://0abc".into()], &[])
             .apply(vec![])
             .is_err());
-        assert!(SubstitutionPlan::new(vec![])
+        assert!(SubstitutionPlan::new(vec![], &[])
             .apply(vec![success("unexpected")])
             .is_err());
         let originals = vec![String::new(), "no record, just vt://".into()];
         assert_eq!(
-            SubstitutionPlan::new(originals.clone())
+            SubstitutionPlan::new(originals.clone(), &[])
                 .apply(vec![])
                 .unwrap(),
             originals

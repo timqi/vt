@@ -9,6 +9,9 @@ struct V2Record {
     t: SecretType,
     salt: [u8; SALT_LEN],
     inner_ct: Vec<u8>,
+    /// Where the caller read this record from (env var name, file basename);
+    /// `""` when unknown. Display suggestion for the Worker only.
+    name: String,
 }
 
 impl V2Record {
@@ -29,11 +32,18 @@ pub(super) struct DecryptBatch {
 }
 
 impl DecryptBatch {
-    pub(super) fn parse(urls: &[String]) -> Self {
+    /// `names[i]` labels `urls[i]`; a shorter or empty `names` means unknown.
+    pub(super) fn parse(urls: &[String], names: &[String]) -> Self {
         let records = urls
             .iter()
-            .map(|url| match VtUrl::parse(url) {
-                Ok(VtUrl::V2 { t, salt, inner_ct }) => Record::V2(V2Record { t, salt, inner_ct }),
+            .enumerate()
+            .map(|(i, url)| match VtUrl::parse(url) {
+                Ok(VtUrl::V2 { t, salt, inner_ct }) => Record::V2(V2Record {
+                    t,
+                    salt,
+                    inner_ct,
+                    name: names.get(i).cloned().unwrap_or_default(),
+                }),
                 Err(error) => Record::Invalid(error.into()),
             })
             .collect();
@@ -58,6 +68,13 @@ impl DecryptBatch {
 
     pub(super) fn salts(&self) -> Vec<[u8; SALT_LEN]> {
         self.v2_records().map(|record| record.salt).collect()
+    }
+
+    /// Aligned with `salts()`: one suggestion per v2 record, `""` when unknown.
+    pub(super) fn names(&self) -> Vec<String> {
+        self.v2_records()
+            .map(|record| record.name.clone())
+            .collect()
     }
 
     /// Pair each v2 record with the next of `count` transport results.
@@ -136,7 +153,7 @@ mod tests {
     #[test]
     fn v2_duplicates_keep_wire_and_result_order_on_both_transports() {
         let urls = [v2(2), v2(1), v2(2)];
-        let batch = DecryptBatch::parse(&urls);
+        let batch = DecryptBatch::parse(&urls, &[]);
         assert_eq!(batch.salts(), [[2; SALT_LEN], [1; SALT_LEN], [2; SALT_LEN]]);
         for (item, n) in batch.agent_items().iter().zip([2, 1, 2]) {
             assert!(
@@ -151,7 +168,7 @@ mod tests {
             Zeroizing::new([1; 32]),
             Zeroizing::new([2; 32]),
         ];
-        let cf = DecryptBatch::parse(&urls).finish_cf(&keys).unwrap();
+        let cf = DecryptBatch::parse(&urls, &[]).finish_cf(&keys).unwrap();
         let expected = vec![Ok("c".into()), Ok("b".into()), Ok("c".into())];
         assert_eq!(values(agent), expected);
         assert_eq!(values(cf), expected);
@@ -168,7 +185,7 @@ mod tests {
             v2(2),
             v2(1),
         ];
-        let batch = DecryptBatch::parse(&urls);
+        let batch = DecryptBatch::parse(&urls, &[]);
         let wire = batch.agent_items();
         assert_eq!(wire.len(), 3);
         assert_eq!(batch.salts(), [[1; SALT_LEN], [2; SALT_LEN], [1; SALT_LEN]]);
@@ -194,15 +211,25 @@ mod tests {
             Zeroizing::new([2; 32]),
             Zeroizing::new([1; 32]),
         ];
-        let cf = values(DecryptBatch::parse(&urls).finish_cf(&keys).unwrap());
+        let cf = values(DecryptBatch::parse(&urls, &[]).finish_cf(&keys).unwrap());
         assert_eq!(cf, results);
+    }
+
+    #[test]
+    fn names_align_with_v2_records_and_default_to_unknown() {
+        let urls = [v2(1), "bad".into(), v2(2), v2(3)];
+        let names = ["A_TOKEN".to_string(), "skipped".into(), ".env".into()];
+        let batch = DecryptBatch::parse(&urls, &names);
+        assert_eq!(batch.salts().len(), 3);
+        assert_eq!(batch.names(), ["A_TOKEN", ".env", ""]);
+        assert_eq!(DecryptBatch::parse(&urls, &[]).names(), ["", "", ""]);
     }
 
     #[test]
     fn response_count_mismatches_are_rejected() {
         let urls = [v2(1), "vt://mac/0YWJj".into()];
         for count in [0, 2, 3] {
-            let error = DecryptBatch::parse(&urls)
+            let error = DecryptBatch::parse(&urls, &[])
                 .finish_agent((0..count).map(|_| agent_key(1)).collect())
                 .unwrap_err();
             assert_eq!(
@@ -212,7 +239,9 @@ mod tests {
             let keys = (0..count)
                 .map(|_| Zeroizing::new([1; 32]))
                 .collect::<Vec<_>>();
-            let error = DecryptBatch::parse(&urls).finish_cf(&keys).unwrap_err();
+            let error = DecryptBatch::parse(&urls, &[])
+                .finish_cf(&keys)
+                .unwrap_err();
             assert_eq!(
                 error.to_string(),
                 format!("worker returned {count} results for 1 records")
@@ -224,7 +253,7 @@ mod tests {
     fn remote_item_errors_and_local_aead_errors_stay_per_item() {
         let urls = [v2(1), "bad".into(), v2(2), v2(1)];
         let results = values(
-            DecryptBatch::parse(&urls)
+            DecryptBatch::parse(&urls, &[])
                 .finish_agent(vec![
                     DecryptResItem::V2 {
                         dek: [1; 32],
@@ -240,7 +269,7 @@ mod tests {
         assert!(results[2].is_err());
         assert_eq!(results[3], Ok("b".into()));
         let cf = values(
-            DecryptBatch::parse(&urls)
+            DecryptBatch::parse(&urls, &[])
                 .finish_cf(&[
                     Zeroizing::new([1; 32]),
                     Zeroizing::new([9; 32]),
@@ -256,19 +285,22 @@ mod tests {
 
     #[test]
     fn empty_and_all_invalid_batches_send_nothing_and_consume_nothing() {
-        let empty = DecryptBatch::parse(&[]);
+        let empty = DecryptBatch::parse(&[], &[]);
         assert!(empty.agent_items().is_empty());
         assert!(empty.salts().is_empty());
         assert!(empty.finish_agent(vec![]).unwrap().is_empty());
-        assert!(DecryptBatch::parse(&[]).finish_cf(&[]).unwrap().is_empty());
+        assert!(DecryptBatch::parse(&[], &[])
+            .finish_cf(&[])
+            .unwrap()
+            .is_empty());
         let urls = ["vt://mac/0YWJj".into(), "bad".into()];
-        let batch = DecryptBatch::parse(&urls);
+        let batch = DecryptBatch::parse(&urls, &[]);
         assert!(batch.salts().is_empty());
         assert!(batch.agent_items().is_empty());
         let results = batch.finish_agent(vec![]).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(Result::is_err));
-        assert!(DecryptBatch::parse(&urls)
+        assert!(DecryptBatch::parse(&urls, &[])
             .finish_cf(&[])
             .unwrap()
             .iter()

@@ -173,7 +173,31 @@ pub struct ChallengeMeta {
     pub project: String,
     pub ppid_cmd: String,
     pub reason: String,
+    /// One suggested display name per entry of `salts_b64u`, same order, `""`
+    /// when unknown (the env var name or file basename `inject` read the
+    /// record from). A suggestion only: the Worker shows it as 自报 and stores
+    /// nothing until the approver adopts it (docs/dek-cache.md).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
 }
+
+/// A record-name suggestion within the Worker's cap: control chars stripped,
+/// at most 40 UTF-16 units (what the Worker's `.length` check counts), so a
+/// long basename is shortened here instead of failing the whole ceremony.
+pub fn record_name(s: &str) -> String {
+    let clean = sanitize_for_display_uncapped(s);
+    if clean.encode_utf16().count() <= RECORD_NAME_MAX {
+        return clean;
+    }
+    let mut out: String = clean.chars().take(RECORD_NAME_MAX - 1).collect();
+    while out.encode_utf16().count() > RECORD_NAME_MAX - 1 {
+        out.pop();
+    }
+    out.push('…');
+    out
+}
+
+const RECORD_NAME_MAX: usize = 40;
 
 /// Build a `ChallengeMeta` by collecting local context from the running
 /// process: cwd, project root, and the parent process command line. The caller
@@ -190,6 +214,7 @@ pub fn collect_meta(op_kind: &str, command: &str, reason: &str) -> ChallengeMeta
         project,
         ppid_cmd: client.ppid_cmd,
         reason: sanitize(reason, 200),
+        names: Vec::new(),
     }
 }
 
@@ -1156,6 +1181,27 @@ mod tests {
             assert_eq!(project_dir(&wt.display().to_string()), common);
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Record-name suggestions ride in `meta.names`, one per salt, and stay
+    /// within the Worker's 40-unit cap; an empty list is absent from the wire.
+    #[test]
+    fn challenge_meta_names_are_capped_and_optional() {
+        let mut meta = collect_meta("decrypt", "", "");
+        assert!(serde_json::to_value(&meta).unwrap().get("names").is_none());
+        meta.names = vec![
+            record_name("GH_\x07TOKEN"),
+            String::new(),
+            record_name(&"é".repeat(50)),
+        ];
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["names"][0], "GH_TOKEN");
+        assert_eq!(json["names"][1], "");
+        let long = json["names"][2].as_str().unwrap();
+        assert_eq!(long.encode_utf16().count(), 40);
+        assert!(long.ends_with('…'));
+        assert_eq!(record_name(&"😀".repeat(20)).encode_utf16().count(), 40);
+        assert_eq!(record_name(&"😀".repeat(21)).encode_utf16().count(), 39);
     }
 
     /// Agent audit rows still name the session host: non-empty host/user

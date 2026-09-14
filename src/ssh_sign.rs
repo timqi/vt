@@ -754,7 +754,12 @@ impl ssh_agent_lib::agent::Session for SignerSession {
                 let inner = &self.inner;
                 let res = inner
                     .client
-                    .decrypt(&inner.host, &inner.command, std::slice::from_ref(&vt_url))
+                    .decrypt(
+                        &inner.host,
+                        &inner.command,
+                        std::slice::from_ref(&vt_url),
+                        &[],
+                    )
                     .await
                     .map_err(|e| sign_err(e.to_string()))?;
                 let value = match res.first() {

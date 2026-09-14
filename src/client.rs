@@ -417,11 +417,14 @@ impl VTClient {
     /// URLs send only their salt to the agent (which returns a per-record
     /// DEK after Touch ID), and the inner ciphertext is decrypted client-side
     /// here. Unparseable URLs fail per item and never reach a transport.
+    /// `names[i]` is a display suggestion for `urls[i]` (env var name, file
+    /// basename); it reaches only the Worker meta, never the agent wire.
     pub async fn decrypt(
         &self,
         host: &str,
         command: &str,
         urls: &[String],
+        names: &[String],
     ) -> Result<Vec<ItemResult>> {
         // Don't bother the user for an empty batch — the agent would still
         // prompt Touch ID for "0 items" otherwise.
@@ -430,7 +433,7 @@ impl VTClient {
         }
         #[cfg(unix)]
         {
-            let batch = DecryptBatch::parse(urls);
+            let batch = DecryptBatch::parse(urls, names);
             let items = batch.agent_items();
             // Nothing decryptable: no prompt, every record reports its own
             // parse error.
@@ -453,7 +456,7 @@ impl VTClient {
         }
         #[cfg(not(unix))]
         {
-            let _ = (host, command, urls);
+            let _ = (host, command, urls, names);
             Err(anyhow::anyhow!(
                 "vt decrypt requires Unix (SSH agent socket)"
             ))
@@ -550,7 +553,8 @@ impl VTClient {
         // so a cache HIT is audited with the same context as a ceremony decrypt.
         // On any miss / cache disabled / transport hiccup, fall through to the
         // full phone ceremony.
-        let meta = cf::collect_meta("decrypt", command, "");
+        let mut meta = cf::collect_meta("decrypt", command, "");
+        meta.names = batch.names();
         let deks = match cf::try_cache(&config, &salts, &meta).await? {
             Some(d) => d,
             None => cf::get_deks(&config, &salts, meta).await?,
@@ -849,14 +853,14 @@ mod tests {
             ))
             .unwrap();
             assert!(client
-                .decrypt("host", "test", &[])
+                .decrypt("host", "test", &[], &[])
                 .await
                 .unwrap()
                 .is_empty());
             // Unparseable records, including retired `vt://mac/` ones, fail
             // in place without contacting a phone or agent.
             let urls = ["vt://mac/0YWJj".into(), "bad".into()];
-            let results = client.decrypt("host", "test", &urls).await.unwrap();
+            let results = client.decrypt("host", "test", &urls, &[]).await.unwrap();
             assert_eq!(results.len(), 2);
             assert!(results.iter().all(Result::is_err));
             let urls = [crate::core::client_encrypt_v2(
@@ -866,7 +870,10 @@ mod tests {
                 b"fixture",
             )
             .unwrap()];
-            let error = client.decrypt("host", "test", &urls).await.unwrap_err();
+            let error = client
+                .decrypt("host", "test", &urls, &[])
+                .await
+                .unwrap_err();
             assert!(format!("{error:#}").contains("relative URL without a base"));
         }
     }

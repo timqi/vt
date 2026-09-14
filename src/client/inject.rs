@@ -124,20 +124,34 @@ pub async fn inject(
     // Keep the original (ciphertext) bytes for the backup; the same bytes we
     // just read and are about to decrypt. Cheap clone (empty when no -r file).
     let orig_file_bytes = replace_file_content.clone().into_bytes();
+    // Record-name suggestions for the approval page, one per input below: argv
+    // records stay unnamed, the file's records take its basename, an env var's
+    // its name (docs/dek-cache.md). Never a trust boundary, only a label.
+    let mut names: Vec<String> = vec![String::new(); args.len()];
+    names.push(
+        replace_file
+            .as_deref()
+            .and_then(|f| std::path::Path::new(f).file_name())
+            .map(|n| crate::cf::record_name(&n.to_string_lossy()))
+            .unwrap_or_default(),
+    );
     args.push(replace_file_content);
 
     // Scan env vars locally for vt:// patterns — only those values enter the
-    // decrypt pipeline. Env var names and non-vt values never leave this process.
+    // decrypt pipeline; only their names leave this process (as record-name
+    // suggestions), never other names or non-vt values.
     // When `--only-env` is given, restrict decryption to exactly those names
     // instead of every vt:// var in the environment.
     let env_vt_vars: Vec<(String, String)> = env::vars()
         .filter(|(k, v)| env_var_in_scope(k, v, only_env.as_deref()))
         .collect();
-    for (_, value) in &env_vt_vars {
+    for (key, value) in &env_vt_vars {
         args.push(value.clone());
+        names.push(crate::cf::record_name(key));
     }
 
-    let mut decrypted_args = decrypt_from_multi_str(vt_client, args, original_command).await?;
+    let mut decrypted_args =
+        decrypt_from_multi_str(vt_client, args, &names, original_command).await?;
 
     // Pop decrypted env var values (in reverse push order) and set only those.
     // decrypt_from_multi_str preserves length 1:1, so these pops always

@@ -100,8 +100,10 @@ impl AgentAuditEntry {
             host: host.to_string(),
             user: client_meta.user.clone(),
             pwd: client_meta.pwd.clone(),
+            project: String::new(),
             ppid_cmd: client_meta.ppid_cmd.clone(),
             reason: reason.to_string(),
+            names: Vec::new(),
         };
         AgentAuditEntry {
             op_kind: op_kind.to_string(),
