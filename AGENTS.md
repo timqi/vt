@@ -179,9 +179,11 @@ Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
   only inside `opApprove` → `commitEnroll`; never store the secret. On the token
   path `meta.host`/`user` come from the record, never the body. Every request
   carries a host token; never add a token-less branch. See [docs/host-token.md](docs/host-token.md).
-- Worker-derived IP is the hard cache boundary; client `pwd` is advisory.
-  Apply `cacheScopePwd` only inside `cacheCtx` for both reads and writes; retain
-  literal `meta.pwd` and show `cache_scope_pwd` beside approval duration controls.
+- The host `token_id` is the hard cache boundary; client `project` (common git
+  dir, else cwd) is advisory and Worker-derived IP is audit metadata. Derive the
+  key only inside `cacheCtx` for both reads and writes; it refuses a missing
+  `token_id`. Retain literal `meta.pwd` and show `metadata.project` beside
+  approval duration controls.
 - Caching is opt-in and requires `CACHE_SECKEY`. A hit is not a phone approval:
   always audit it. `CACHE_HIT_NOTIFY` independently enables best-effort hit pushes
   and is off by default. Group IDs and creation stamps are immutable.

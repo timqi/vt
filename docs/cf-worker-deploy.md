@@ -146,7 +146,7 @@ openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | wrangler secret put VT_AU
 wrangler secret put CREDENTIALS_JSON
 
 # Optional — enables the opt-in DEK cache (approve-time TTL → approval-free
-# decrypt within same IP+pwd). Empty/absent → caching disabled. Rotate to
+# decrypt for the same host token + project). Empty/absent → caching disabled. Rotate to
 # instantly invalidate all cached DEKs. See docs/dek-cache.md.
 openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | wrangler secret put CACHE_SECKEY
 

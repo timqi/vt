@@ -35,30 +35,30 @@ TTL, a caller can decrypt the approved records without another phone tap.
 - Caching is enabled only when the Worker secret `CACHE_SECKEY` is configured.
   There is no `VT_DEK_CACHE` environment variable and no separate client-side
   no-cache flag.
-- A cache key binds the Worker-derived source IP and the client-reported
-  working directory `pwd`, **normalized** (see below). IP is the hard boundary;
-  the `pwd` scope is an advisory same-host blast-radius reducer. `ppid` is
-  forensic metadata only.
-- The `pwd` half is normalized by `cacheScopePwd` in
-  [`cf-worker/src/cache_policy.ts`](../cf-worker/src/cache_policy.ts): each path
-  segment loses its final `.suffix`, so
-  `/home/me/code/pier.stable/skills` keys as `/home/me/code/pier/skills`. This
-  exists for the git-worktree layout (`<repo>.<branch>` siblings, as `wt`
-  generates them), which otherwise costs one phone approval per branch. A
-  leading dot is a hidden directory, not an extension (`.config`, `.git` are
-  kept whole), and `.`/`..` are left alone. The consequence is deliberate:
-  `pier.stable`, `pier.dev` and `pier` are ONE cache scope, and so are
-  incidental neighbours such as `node-v20.11` / `node-v20.12`. Only the storage
-  key is normalized — `meta.pwd` keeps the literal directory in the approval
-  page, notifications, audit rows, and the admin listing. Because the scope can
-  be wider than the directory the request came from, the approval page states it
-  (`缓存范围`, from `ApprovePageData.cache_scope_pwd`) directly above the duration
+- A cache key is `dek:{token_id}:{project_h}:{salt_b64u}`. `token_id` is the
+  host token the edge verified on the request ([host-token.md](host-token.md))
+  and the **hard boundary**: a grant serves only the host that earned it, from
+  any egress IP. `project_h = b64u(SHA-256("vt-dek-ctx-v5" ‖ project)[0..16])`,
+  where `project` is client-reported and **advisory**: a same-host blast-radius
+  reducer, never a trust boundary. The Worker-derived IP, `pwd`, and `ppid_cmd`
+  are audit metadata only.
+- `project` is what the CLI sends in `ChallengeMeta` ([`src/cf.rs`](../src/cf.rs)
+  `project_dir`): `git rev-parse --git-common-dir`, resolved to an absolute
+  path, when the cwd is inside a repository; otherwise the cwd. Git absent or
+  failing falls back to the cwd silently. Every worktree of one repository
+  therefore shares one cache scope, and two unrelated trees on one host do not.
+  `meta.pwd` keeps the literal directory in the approval page, notifications,
+  audit rows, and the admin listing; the approval page states the scope it would
+  arm (`缓存范围（项目）`, from `metadata.project`) directly above the duration
   radios, next to the literal `目录` row.
-- Normalization is applied inside `cacheCtx`, never at a call site, so a write
-  and a read can never key on different halves of the rule. The ctx tag is
-  `vt-dek-ctx-v4`; a change to the derivation bumps it, so entries under an
-  older tag are unreachable and simply lapse or can be cleared from the admin
-  tab.
+- The key is derived inside `cacheCtx`
+  ([`cf-worker/src/account_cache.ts`](../cf-worker/src/account_cache.ts)), never
+  at a call site, so a write and a read can never key on different rules, and
+  it refuses a missing or malformed `token_id` (the DO ops already reject such
+  bodies; the seam fails closed on its own). The ctx tag is `vt-dek-ctx-v5`; a
+  change to the derivation bumps it, so entries under an older tag (v4:
+  `dek:{ctx}:{salt}`, ctx = IP + normalized `pwd`) are unreachable and simply
+  lapse or are cleared from the admin tab. There is no dual-read.
 - Reads are all-or-nothing for a batch of salts. A partial or expired batch is
   a miss and falls back to the normal phone ceremony. Opened DEK buffers are wiped
   on full hits, partial misses, and failure exits; this minimizes their lifetime,
@@ -72,7 +72,7 @@ TTL, a caller can decrypt the approved records without another phone tap.
   only storage batches whose writes succeeded. A failed later batch leaves
   earlier successful extensions recorded, without claiming the failed batch.
 - Each write mints one `cache_group_id` (all entries from one approval under one
-  binding ctx) and stamps an immutable `created_ms`. The group id is the handle
+  key prefix) and stamps an immutable `created_ms`. The group id is the handle
   the admin surface lists, clears, and extends by.
 - A hit sends a best-effort notification through configured Pushover, Slack
   App, or Feishu channels. Notifications never block DEK
@@ -83,11 +83,11 @@ TTL, a caller can decrypt the approved records without another phone tap.
 ```text
 phone approval with TTL > 0
   PWA seals each DEK to the Worker cache public key
-  Worker validates and stores dek:{ctx}:{salt}
+  Worker validates and stores dek:{token_id}:{project_h}:{salt}
 
 later vt read/inject
   CLI POSTs /api/dek-cache with salts + meta + ephemeral public key
-  Worker derives ctx(IP + cacheScopePwd(pwd)), loads the whole batch, checks expiry
+  Worker keys on (token_id, sha256(project)), loads the whole batch, checks expiry
     miss  -> CLI starts the normal /api/challenge phone ceremony
     hit   -> Worker opens, concatenates, and re-seals DEKs to the CLI key
              CLI verifies source=cache and decrypts locally
@@ -124,9 +124,9 @@ It is the only view of the real entry set — the audit tab can merely
 show which approvals *armed* a cache, which is an inference, not an inventory.
 
 The listing deliberately carries no secret material: no sealed DEK, no salts, and
-**no binding ctx digest**. The ctx is `SHA-256(tag ‖ ip ‖ cacheScopePwd(pwd))`, so publishing it
-next to an already-visible IP would turn the page into an offline oracle for the
-client-reported `pwd`. Entries scanned per request are capped; the response
+**no storage key**. The key holds `SHA-256(tag ‖ project)`, so publishing it
+would turn the page into an offline oracle for the client-reported `project`
+path. Entries scanned per request are capped; the response
 reports `truncated` and the UI says so rather than implying a complete view.
 
 Two classes of action, with deliberately different gates:
@@ -214,26 +214,24 @@ session — the Passkey requirement is decisive.
 `CACHE_SECKEY` is present in the Worker process and protects cached entries if
 Durable Object storage is copied without the running Worker. It does not
 protect against a compromised Worker. `VT_PASSKEY_TOKEN` is the request
-credential; when a cache entry is live, possession of that token from the same
-egress IP and a `pwd` in the same normalized scope is sufficient to obtain the
-cached DEK. Since tokens are per host ([host-token.md](host-token.md)), the
-cache is not bound to the token: a different enrolled host on the same egress
-IP and scope hits it too (the IP boundary was always the hard one). Revoking a
-host's token stops its probes at authentication, before the cache is consulted.
+credential and the cache key's hard half; when a cache entry is live,
+possession of that token and the same reported `project` is sufficient to
+obtain the cached DEK, from any egress IP. Since tokens are per host
+([host-token.md](host-token.md)), another enrolled host never hits a grant it
+did not earn, whatever its IP. Revoking a host's token stops its probes at
+authentication, before the cache is consulted, and orphans its entries.
 
 Keep the default TTL at `0` for high-assurance or unattended workloads. Use
 short TTLs for automation that needs repeated decrypts. The multi-day extension
 rungs (`1d`/`2d`/`1w`) are for long-running attended or CI sessions, and since
 renewal is unbounded in total, a cache can in principle be kept alive for as long
 as someone keeps approving it: for each window, possession of `VT_PASSKEY_TOKEN`
-from the same egress IP and a `pwd` in the same normalized scope decrypts with no
-phone tap. Every hop takes an
+and the same reported `project` decrypts with no phone tap. Every hop takes an
 explicit request plus a Passkey approval whose page states the new expiry, and the
 audit table records each one — treat a long chain of `缓存已延长` rows on one
 record as a signal worth reviewing. `8h` is a
 workday-session choice for an attended desktop only: for its whole window,
-possession of `VT_PASSKEY_TOKEN` from the same egress IP and a `pwd` in the same
-normalized scope decrypts the
+possession of `VT_PASSKEY_TOKEN` and the same reported `project` decrypts the
 approved records with no phone tap, so do not select it on shared, unattended,
 or CI hosts. Rotate
 `CACHE_SECKEY` or use the admin clear-cache action for emergency invalidation.
@@ -249,7 +247,7 @@ The cache does not re-key existing `vt://` records.
 | Audit persistence and notification lifecycle | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts` |
 | Sealed-box cache crypto | `cf-worker/src/cache_crypto.ts` |
 | PWA TTL selection and sealing | `cf-worker/pwa/approve.js` |
-| CLI cache request and source check | `src/cf.rs`, `src/client.rs` |
+| CLI cache request, `project` collection, and source check | `src/cf.rs`, `src/client.rs` |
 | Admin cache inventory / clear / extend UI | `cf-worker/src/index.ts`, `cf-worker/pwa/admin/cache.js` |
 | Admin audit cache column + per-row clear | `cf-worker/pwa/admin/audit.js` |
 | Deployment secret and rotation | [`cf-worker-deploy.md`](cf-worker-deploy.md) |
@@ -258,8 +256,9 @@ The cache does not re-key existing `vt://` records.
 
 1. Deploy a Worker with `CACHE_SECKEY` configured.
 2. Read a `vt://` record and select `20m` on the approval page.
-3. Read the same record again from the same egress IP and working directory;
-   the second read should not open a phone ceremony.
+3. Read the same record again from the same host inside the same repository
+   (any worktree, any egress IP); the second read should not open a phone
+   ceremony.
 4. Check the admin audit page for the cache grant and hit.
 5. Open the admin `DEK 缓存` tab: the entry group appears with its remaining time.
 6. With `CACHE_ADMIN_EXTEND = "1"`, select the group and press 延长. First pick a
