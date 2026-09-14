@@ -23,20 +23,11 @@ with its approve/extend ladders and admin.
 Rule: a compatibility branch is removed, never widened, and its test moves to
 a "rejected input" test.
 
-## 2. Delete the AI-agent hook and the FIDO2 fallback
+## 2. Landed
 
-`src/hook.rs`, `docs/hook.md`, `agent.example.toml`, `VT_AGENT_CONFIG`,
-`VT_HOOK_BIN`, `vt hook {claude,check,exec,install-shims}`, README and
-`docs/README.md` rows, hook rows in `config.example.toml`. `inject --only-env`
-stays: it is a user flag, not hook plumbing.
-
-FIDO2 fallback: `src/server_macos/fido2.rs`, `fido2_cli.rs`, `vt fido2 *`
-verbs, `AuthMethod::Fido2`, the `ctap-hid-fido2` dependency (the only C
-build in the tree and the reason `cargo check --target aarch64-apple-darwin`
-fails on Linux), README/app-bundle/engine doc rows. Worker-side WebAuthn
-security-key handling (`uv_policy.ts`) is a different feature and stays.
-Operator step: none; an enrolled key simply stops being offered. Re-adding it
-later is a new row, not a revert.
+The AI-agent hook and the FIDO2 fallback are gone. `cargo check --target
+aarch64-apple-darwin` on Linux still stops at `ring`'s C build (rustls via
+`reqwest`/`tokio-tungstenite`); macOS-only code is validated on macOS CI.
 
 ## 3. Cache key v5
 
