@@ -4,7 +4,7 @@ Status: shipped. `src/core/wire.rs` owns the envelope schema and error taxonomy;
 `src/client.rs` parses responses and classifies fallback; `src/main.rs` maps
 propagated errors to process exit codes.
 
-This reference covers the VT_AUTH-encrypted SSH-agent extensions. Structured
+This reference covers the SSH-agent `*@vt` extensions. Structured
 errors distinguish rejection, unavailable authentication, and request failures
 without changing the SSH-agent transport. The Cloudflare Worker has a separate
 protocol; switching to it is backend fallback, not wire compatibility.
@@ -12,7 +12,7 @@ protocol; switching to it is backend fallback, not wire compatibility.
 ## Wire format
 
 The dispatcher in `src/server_macos/ssh_agent.rs` wraps these success payloads
-in an envelope before encrypting the response details with the auth cipher:
+in an envelope carried as plain JSON in the extension reply details:
 
 | Extension | `data` type |
 |-----------|-------------|
@@ -41,7 +41,7 @@ wire shape. For example:
 - Unknown extra fields are ignored. Unknown `kind` values are accepted as
   `ErrKind::Unknown`; a missing `kind` on an error is a parse failure.
 - `session-bind@openssh.com` and the token-gated `ui-status@vt` channel are
-  plaintext exceptions dispatched before the lock/auth-cipher path. Neither
+  dispatched before the lock check and the Keychain path. Neither
   uses this envelope. Standard SSH signing also retains SSH-agent wire errors.
 
 Production success serialization uses `wrap_ok_envelope` around raw inner JSON,
@@ -75,7 +75,7 @@ original agent error's code.
 | `AuthRejected`       | user actively rejected Touch ID / password                   | 10        |
 | `SessionLocked`      | screen locked or off-console (`UnavailableReason::NotInteractive`) | 11    |
 | `NoGuiSession`       | no GUI session at all (LaunchDaemon-style context)           | 12        |
-| `NotInitialized`     | handler cannot validate or load master-key material after auth-cipher derivation | 13 |
+| `NotInitialized`     | handler cannot validate or load master-key material after the wrap cipher is derived | 13 |
 | `AgentLocked`        | reserved; `ssh-add -x` currently causes an unstructured failure | 14 |
 | `BadRequest`         | malformed request, unknown v2 decrypt type, size/empty-batch checks, or run allowlist refusal | 20 |
 | `LegacyDisabled`     | reserved; was "legacy URL under `--no-legacy-decrypt`", never emitted since legacy records were removed | 21 |
@@ -119,17 +119,15 @@ Not every failure can use the envelope:
 
 1. **Agent lock (`ssh-add -x`)** returns `AgentError::Failure` before
    `KeychainStore::load` or cipher derivation. Keeping this ordering avoids
-   keychain I/O just to report that a locked agent is locked. `AgentLocked`
-   remains a reserved envelope kind, not the current lock response.
-2. **Initial store load or `derive_passcode_ciphers` failure** is unstructured:
-   there is no response cipher yet. A missing/unreadable store therefore does
-   not necessarily yield `NotInitialized`; that kind is emitted by handlers
-   only after cipher setup succeeds.
-3. **Incoming auth-cipher decryption failure** (for example, wrong `VT_AUTH`)
-   returns `AgentError::Failure`. The request is not authenticated; do not
-   introduce a plaintext diagnostic/presence oracle for unauthenticated peers.
-4. **Dispatcher error-envelope serialization or response-encryption failure**
-   also propagates as an unstructured agent error.
+   keychain I/O just to report that a locked agent is locked, and a locked
+   agent answers exactly like a non-vt agent. `AgentLocked` remains a reserved
+   envelope kind, not the current lock response.
+2. **Initial store load or `derive_passcode_cipher` failure** is unstructured:
+   it precedes dispatch, so no handler has chosen a kind. A missing/unreadable
+   store therefore does not necessarily yield `NotInitialized`; that kind is
+   emitted by handlers only after cipher setup succeeds.
+3. **Dispatcher error-envelope serialization failure** also propagates as an
+   unstructured agent error.
 
 The client represents SSH-wire failures as `VtClientError::Transport`, **not**
 `Agent(Generic, ...)`. Both exit `1` if propagated. The transport path does
@@ -139,8 +137,8 @@ operator remedy is `ssh-add -X`.
 ### `auth@vt` and forwarded sockets
 
 `auth@vt` is used over forwarded sockets for remote sudo/PAM; it is not the
-only forwarded extension. Response details stay encrypted end-to-end under
-`VT_AUTH`, so the forwarding transport does not need that token.
+only forwarded extension. The forwarding transport (`--forward-real-agent`)
+relays request and response details unparsed.
 
 Error `detail` must be **server-controlled static text, never PII or reflected
 request data**: no host, command, reason, key fingerprint, or filesystem path.
@@ -225,8 +223,8 @@ dispatcher owns response encryption and permit commitment:
    still-valid grant. A shorter policy cannot reuse a wider grant and replaces
    it only after a fresh successful approval.
 
-4. **Lock state**: agent lock is checked before deriving the auth cipher or
-   showing a prompt, so it remains an unstructured SSH-agent failure and can
+4. **Lock state**: agent lock is checked before any Keychain read or
+   prompt, so it remains an unstructured SSH-agent failure and can
    neither consume nor create a grant. A `validate_live` failure and an
    authenticator returning `AuthOutcome::Unavailable` are separate paths that
    both revoke existing grants; an ordinary user rejection adds none but does
@@ -319,7 +317,7 @@ without backend fallback masking it.
 | Lock with `ssh-add -x`, then call the agent | Unstructured SSH failure, client `Transport`, exit `1`; unlock afterward with `ssh-add -X`. No automatic hint is guaranteed. |
 | Send an unknown v2 decrypt type | `BadRequest`, exit `20`, before prompting; requires a crafted authenticated request, not an ordinary CLI URL. |
 | Call `auth@vt` while screen-locked/off-console or without a GUI session | `SessionLocked`/`NoGuiSession`, exits `11`/`12`; pure classifier tests do not establish native behavior. |
-| Wrong `VT_AUTH` or initial store/cipher setup failure | Unstructured failure, exit `1`; no structured-detail disclosure to an unauthenticated caller. |
+| Initial store/cipher setup failure (`vt init` not run) | Unstructured failure, exit `1`; the client reports `Transport`. |
 
 Native checks are separate from the focused suites above. Existing ignored
 biometric/keychain helper tests are not end-to-end error-contract tests and

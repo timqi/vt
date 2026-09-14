@@ -70,9 +70,9 @@ connection its own remote socket and automatic cleanup.
 
 The upstream path is captured at startup from `SSH_AUTH_SOCK`, otherwise
 `~/.ssh/vt.sock`. Each relayed request opens a fresh upstream connection.
-`route_extension` filters the cleartext extension name; the relay does not use
-VT_AUTH to decrypt payloads and forwards request/response payloads unchanged.
-The remote CLI needs the shared VT_AUTH and an agent-enabled route.
+`route_extension` filters on the extension name; the relay never parses
+payloads and forwards request/response payloads unchanged. The remote CLI
+needs only an agent-enabled route (`VT_BACKEND` not `passkey`).
 
 | Extension | Action |
 |---|---|
@@ -85,8 +85,9 @@ classification, configured backend, and available portable record.
 
 Security boundaries:
 
-- The relay cannot filter encrypted `sign@vt` payloads by key. An authenticated
-  remote can request any upstream key, not just the advertised git identity.
+- The relay does not parse `sign@vt` payloads to filter by key. Any remote
+  process on the forwarded socket can request any upstream key, not just the
+  advertised git identity.
   The agent authorizes the operation and shows its own key label and relay origin.
 - Relay/SSH-carried VT grants remain connection-confined; they cannot reuse
   local workspace grants. Relay detection uses kernel-derived argv and scopes

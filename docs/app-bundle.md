@@ -81,10 +81,15 @@ first tries the store's recorded wrap: the fixed label for v2, or
 The old binary need not exist; the exact resolved path string is sufficient.
 On success it writes v2 and tells the operator to restart a running agent.
 
-Only `encrypted_passphrase` and `wrap_v` change. Passcode/auth token (`VT_AUTH`),
-and encrypted SSH keys are preserved byte-for-byte.
-The rewrap mutator must not call `create_and_save_passcode_passphrase`, which
-mints fresh passcode/auth-token material and would rotate client credentials.
+Only `encrypted_passphrase` and `wrap_v` change. The 64-byte
+`passcode_and_auth_token` blob and encrypted SSH keys are preserved
+byte-for-byte. The rewrap mutator must not call
+`create_and_save_passcode_passphrase`, which mints a fresh passcode.
+
+The blob's second 32 bytes were the `VT_AUTH` token; nothing reads them now and
+new stores fill them with random bytes, so no Keychain migration or `rebind`
+follows that removal. Operator step after upgrading: unset `VT_AUTH` in shells
+and `config.toml`; nothing else.
 
 Remove obsolete `vt` binaries after migration. An older binary can parse a v2
 store but cannot unwrap it. Its full-store writers (`init`, `import`,
@@ -166,9 +171,9 @@ existing grants. There is no hot reload or policy-write action on the UI channel
 
 ## 5. `ui-status@vt`: token-gated status and revoke
 
-`diag@vt` requires the VT_AUTH cipher and exposes caller-scoped counts, so it
-cannot serve a shell that holds no VT_AUTH. `ui-status@vt` is the one deliberate
-whole-store visibility channel, protected by a per-spawn token:
+`diag@vt` exposes only caller-scoped counts, so it cannot serve a shell that
+needs the whole store. `ui-status@vt` is the one deliberate whole-store
+visibility channel, protected by a per-spawn token:
 
 - The shell generates 32 random bytes, pipes them to the child's inherited
   stdin, and launches `vt ssh agent --ui-token-fd 0`. The agent reads exactly

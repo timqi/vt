@@ -8,7 +8,7 @@ password stack.
 
 | Path | Host setup | Approval |
 |---|---|---|
-| Forwarded agent | `VT_AUTH` and a forwarded `vt ssh agent` socket | Touch ID on the Mac |
+| Forwarded agent | A forwarded `vt ssh agent` socket (`ssh -A`) | Touch ID on the Mac |
 | Phone Passkey | `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN` | WebAuthn approval on the phone |
 
 With the default `VT_BACKEND=auto`, VT tries the agent first, then the Worker

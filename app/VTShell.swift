@@ -9,7 +9,7 @@
 //    UNUserNotificationCenter notification carrying the bundle identity,
 //    used by the Rust agent's notify path, then exits.
 //
-// Security stance: this UI holds no VT_AUTH and can only read status or
+// Security stance: this UI speaks only ui-status@vt and can only read status or
 // reduce authority (revoke). It never approves anything — Touch ID sheets
 // remain the only approval surface. A CLI-started agent (no token) yields a
 // degraded read-only view.

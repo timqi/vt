@@ -74,12 +74,7 @@ binary at another path.
    vt ssh agent
    ```
 
-3. Export the auth token (shown during `vt init`):
-   ```bash
-   export VT_AUTH=<your_auth_token>
-   ```
-
-4. Create and read secrets:
+3. Create and read secrets:
    ```bash
    # Create an encrypted secret (prompts for type, then the value without echo)
    vt create
@@ -289,7 +284,7 @@ route permits it, `sign@vt` signs with a key held by the Mac agent without
 exporting the private key. Eligible failures fall back to decrypt-then-sign only
 if a portable record is available; this places the seed in the caller's memory
 for the connect process lifetime. Explicit rejection does not trigger fallback.
-A forwarded agent requires VT_AUTH; backend pins remain authoritative. See
+A forwarded agent needs only its socket; backend pins remain authoritative. See
 [the signing contract](docs/sign-vt-design.md) for discovery, routing, and
 [the relay reference](docs/ssh-vt-design.md) for `--forward-real-agent`.
 
@@ -320,7 +315,6 @@ base64-encoded plaintext.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `VT_AUTH` | SSH-agent authentication token (from `vt init`) | unset |
 | `VT_PASSKEY_URL` | Cloudflare Worker base URL for phone approval | unset |
 | `VT_PASSKEY_TOKEN` | This host's Worker token (`vt1.…`, written by `vt enroll`; nothing else is accepted) | unset |
 | `VT_PASSKEY_UV` | Requested WebAuthn user-verification level for phone approval (`discouraged`/`preferred`/`required`); same as `--uv`, raise-only — the Worker's policy decides the floor | unset |
@@ -332,8 +326,8 @@ base64-encoded plaintext.
 
 ## Secret Management
 
-VT's macOS store is one Keychain item, `rusty.vault.store`, containing passcode
-and auth-token material plus the encrypted master passphrase and SSH keys.
+VT's macOS store is one Keychain item, `rusty.vault.store`, containing the
+passcode blob plus the encrypted master passphrase and SSH keys.
 Run the agent as the user who initialized it.
 
 New stores use wrap v2, derived from passcode, `$USER`, and a fixed label, not
@@ -347,14 +341,15 @@ Keychain approval; packaging and migration details belong to
 ## Architecture
 
 One Rust binary contains the cross-platform client and macOS-only vault/agent.
-The client uses VT_AUTH-encrypted SSH-agent extensions or the Worker's phone
-WebAuthn/PRF ceremony. Portable SSH keygen/connect are cross-platform; local
+The client uses SSH-agent extensions (plain JSON over the kernel-owned socket)
+or the Worker's phone WebAuthn/PRF ceremony. Portable SSH keygen/connect are cross-platform; local
 Keychain and agent management are macOS-only.
 
 Environment variables override `~/.config/vt/config.toml`; `VT_CONFIG` selects
-another file. Keep it mode 600. In `auto`, nonempty VT_AUTH enables agent-first
-routing with Worker fallback only on recoverable errors. `VT_BACKEND=agent`
-and `VT_BACKEND=passkey` pin the transport. See
+another file. Keep it mode 600. In `auto`, the agent socket is tried when it
+exists, with Worker fallback only on recoverable errors (a missing socket or a
+non-vt agent included). `VT_BACKEND=agent` and `VT_BACKEND=passkey` pin the
+transport. See
 [config.example.toml](config.example.toml) for configuration and
 [structured-errors.md](docs/structured-errors.md) for fallback classification.
 

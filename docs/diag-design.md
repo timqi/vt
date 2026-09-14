@@ -31,11 +31,11 @@ HMAC-validating `/api/health` is deferred); auditing/pushing diag events.
 
 ## 3. New agent extension: `diag@vt`
 
-Read-only. Same envelope discipline as the other five extensions: payload is
-AES-GCM encrypted under the VT_AUTH-derived `auth_cipher`, so only VT_AUTH
-holders can query, and a non-vt agent answers `SSH_AGENT_FAILURE`. **No Touch
-ID prompt** (it discloses no secret and mints no DEK), **never cached, not
-audit-pushed** (no human decision to record).
+Read-only. Same envelope discipline as the other five extensions: plain JSON
+request and `ExtResponse` reply over the kernel-owned agent socket; a non-vt
+agent answers `SSH_AGENT_FAILURE`. **No Touch ID prompt** (it discloses no
+secret and mints no DEK), **never cached, not audit-pushed** (no human
+decision to record).
 
 ### Wire (src/core.rs)
 
@@ -132,8 +132,8 @@ additionally warns when `agent_version` differs from the client's own version
 remote "why doesn't my cache hit" is the primary use case. Note the relayed
 report describes the **relay's** connection to the upstream agent (that IS the
 context relayed requests ride), so it is the right answer for the remote
-caller. Disclosure to the remote = cache config + live counts; a remote holding
-VT_AUTH can already exercise decrypts, so this adds no new capability.
+caller. Disclosure to the remote = cache config + live counts; a remote on the
+forwarded socket can already exercise decrypts, so this adds no new capability.
 
 ### 3.4 Information-disclosure notes (accepted tradeoffs)
 
@@ -158,9 +158,9 @@ VT_AUTH can already exercise decrypts, so this adds no new capability.
 
 Sections, in order; never hard-fails — reports and lints:
 
-1. **Config** — each `VT_*` knob: effective value (bearer secrets redacted to
-   `set (len N)`), source `env` / `config.toml` / `unset`. After hydration and
-   clap's auth precedence, `ResolvedConfig` captures the effective settings,
+1. **Config** — each `VT_*` knob: effective value (the host token redacted to
+   its public id), source `env` / `config.toml` / `unset`. After hydration and
+   clap parsing, `ResolvedConfig` captures the effective settings,
    socket path, and the list of file-populated keys. Doctor and client
    transports use that snapshot; anything set but not in the source list is
    `env`. Re-lint config file permissions on demand.
@@ -179,8 +179,7 @@ Sections, in order; never hard-fails — reports and lints:
      ignored the unknown name) → "vt agent too old for diag@vt (or a non-vt
      agent that ignores unknown extensions)";
    - `Err` from the extension call (`SSH_AGENT_FAILURE`) → "agent refused:
-     non-vt agent, wrong VT_AUTH, or agent locked";
-   - `VT_AUTH` empty → "agent path disabled (VT_AUTH unset)".
+     non-vt agent or agent locked".
 4. **Worker** — `VT_PASSKEY_URL` reachability (GET base URL, status only;
    no token validation in v1), token present/absent.
 

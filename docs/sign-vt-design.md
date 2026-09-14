@@ -19,8 +19,8 @@ It supports two paths:
   signs locally. The decrypt operation uses the configured agent/Worker route.
 
 Standard SSH `SIGN_REQUEST` remains supported alongside `sign@vt`. The same
-Keychain key is reachable through it without VT_AUTH or client-supplied VT
-context, subject to the agent's authorization engine. Rich VT context is
+Keychain key is reachable through it without client-supplied VT context,
+subject to the agent's authorization engine. Rich VT context is
 best-effort, not a property enforced on every use of that key.
 
 Keychain-backed and portable identities can be provisioned separately per host
@@ -49,8 +49,8 @@ discovered identities. A private-record environment value without a public key
 produces a warning before discovery; a record alone is not an identity source.
 Malformed explicit public keys are errors, not a reason to discover other keys.
 
-Agent-enabled means the resolved route uses the agent and has VT_AUTH; a
-`VT_BACKEND=passkey` pin skips discovery and `sign@vt`, even with VT_AUTH set.
+Agent-enabled means the resolved route uses the agent (`VT_BACKEND` is `auto`
+or `agent`); a `VT_BACKEND=passkey` pin skips discovery and `sign@vt`.
 See `ResolvedConfig` in `src/config/client.rs` for transport selection.
 The upstream socket is `SSH_AUTH_SOCK` when set, otherwise `~/.ssh/vt.sock`.
 
@@ -67,18 +67,17 @@ With `--forward-real-agent`, a leading `-o ForwardAgent=<ephemeral socket>`
 also pins which socket is forwarded. The extension relay permits exactly
 `encrypt@vt`, `decrypt@vt`, `auth@vt`, `sign@vt`, and read-only `diag@vt`;
 it refuses `run@vt`, `ui-status@vt`, `session-bind@openssh.com`, and unknown
-extensions. It routes opaque authenticated payloads without using VT_AUTH to
-decrypt them. Without the flag it refuses all extensions. This filter does not
-hide unadvertised upstream keys from an authenticated `sign@vt` request: its
-encrypted payload can name any upstream key, and the upstream agent authorizes
-that request. See [authorization-scopes-v2.md](authorization-scopes-v2.md) for
+extensions. It routes payloads without parsing them. Without the flag it
+refuses all extensions. This filter does not hide unadvertised upstream keys
+from a relayed `sign@vt` request: its payload can name any upstream key, and
+the upstream agent authorizes that request. See [authorization-scopes-v2.md](authorization-scopes-v2.md) for
 connection confinement and [approval-transparency.md](approval-transparency.md)
 for relay/key disclosure in prompts.
 
 ## 3. Wire and agent authorization
 
 `SignReq` / `SignRes` in `src/core.rs` are cross-platform JSON types carried
-inside the standard VT_AUTH-encrypted extension protocol:
+inside the standard extension envelope protocol:
 
 | Type | Fields |
 |---|---|
@@ -94,7 +93,7 @@ success with the current `ssh-key` dependency; the RSA regression tests
 explicitly cover SHA-2.
 
 The dispatcher recognizes `EXT_SIGN` both in its extension allowlist and its
-handler match. After the lock/Keychain/VT_AUTH checks, `handle_sign_vt`:
+handler match. After the lock/Keychain checks, `handle_sign_vt`:
 
 1. Parses JSON, enforces `PROMPT_DISPLAY_MAX_BYTES` on command text, decodes
    the public key, and computes `fingerprint_str` with the same function used
@@ -177,7 +176,7 @@ git config --global core.sshCommand "vt ssh connect"
 **macOS, Keychain-backed identity:** `vt ssh add -f <file>` imports an OpenSSH
 private key into VT's encrypted `rusty.vault.store` Keychain item. It is not
 the SSH credential facility configured by `ssh-add --apple-use-keychain`.
-With the agent initialized/running and VT_AUTH configured:
+With the agent initialized and running:
 
 ```bash
 ssh-keygen -t ed25519 -f /tmp/vt-git -C "git@$(hostname -s)" -N ""

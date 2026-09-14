@@ -64,11 +64,10 @@ protection within this model; V2 spends the same budget on intent-matching.
 
 OpenSSH ≥ 8.9 clients send `session-bind@openssh.com` on every agent
 connection before requesting signatures: `(host_key, session_id, signature,
-is_forwarding)`, plain SSH-wire encoded. **It is not a vt extension and is
-never VT_AUTH-encrypted.** `Session::extension()` currently early-returns
-for non-vt names and only decrypts `details` with the auth cipher for vt
-names; session-bind must be intercepted **before** the keychain load /
-auth-cipher path:
+is_forwarding)`, plain SSH-wire encoded. **It is not a vt extension and
+carries no JSON envelope.** `Session::extension()` early-returns for non-vt
+names and loads the Keychain store only for vt names; session-bind must be
+intercepted **before** the keychain load:
 
 ```text
 extension():
@@ -79,7 +78,7 @@ extension():
       -> Ok(None) on success (plain SSH_AGENT_SUCCESS),
          Err(AgentError::Failure) on any invalid bind
   other non-vt names -> Ok(None) (unchanged)
-  vt names -> keychain, auth cipher, envelope dispatch (unchanged)
+  vt names -> keychain, envelope dispatch (unchanged)
 ```
 
 `ssh-agent-lib` 0.5 ships the `SessionBind` message type and
@@ -438,7 +437,7 @@ Engine tests are untouched. New/changed coverage:
    destination-cacheable, >16 ids ⇒ Tainted, Tainted is sticky.
 2. **`Session::extension()` integration test with a real plaintext
    `session-bind@openssh.com` payload** — asserting it is parsed before the
-   auth-cipher path, answers plain success, and flips the connection state
+   keychain path, answers plain success, and flips the connection state
    (the seam most likely to be implemented wrong).
 3. Scope derivation: bound ⇒ destination digest over wire KeyData bytes;
    forwarding/tainted/unbound-ssh ⇒ Fresh; unbound-non-ssh ⇒ workspace;
@@ -459,7 +458,7 @@ Engine tests are untouched. New/changed coverage:
 
 1. Add `proc_info::get_cwd` + fd-based workspace resolution + tests.
 2. Add bind state machine + plaintext `session-bind` interception in
-   `extension()` **before** the keychain/auth-cipher path + tests (§3.1).
+   `extension()` **before** the keychain path + tests (§3.1).
 3. Add new `GrantScope` constructors with domain-separated digests.
 4. Rewire handlers (raw sign, sign@vt, decrypt) to the new scopes.
 5. Re-semanticize the two duration flags (0 = Fresh default); delete the

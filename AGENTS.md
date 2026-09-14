@@ -82,9 +82,10 @@ overages.
 ## Configuration and data handling
 
 - Environment variables override `~/.config/vt/config.toml`; `VT_CONFIG` selects
-  that file, which may contain secrets and should be mode 600. In `auto` mode,
-  nonempty `VT_AUTH` enables agent-first routing with Worker fallback on
-  recoverable errors; `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN` enable the Worker.
+  that file, which may contain secrets and should be mode 600. `VT_BACKEND` is
+  the only routing input: `auto` probes the agent socket when it exists and
+  falls back to the Worker on recoverable errors (socket missing, non-vt
+  agent); `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN` enable the Worker.
   `VT_BACKEND=agent` and `VT_BACKEND=passkey` pin the transport. Never silently
   broaden fallback. See [config.example.toml](config.example.toml).
 - `inject --only-env` restricts env-var decryption to the named variables; a
@@ -134,7 +135,7 @@ in [src/client/inject.rs](src/client/inject.rs). Keep these implementation bound
   envelope is a `BadRequest`, never a fresh-prompt batch. Duration `0` means
   `Fresh`, never `StrictTtl(0)`. Reusable grants remain
   operation/subject/resource-scoped. Commit the non-cloneable permit only after
-  operation success AND extension response encryption; failure drops without a
+  operation success AND envelope serialization; failure drops without a
   grant. A live permit blocks revocation: no unbounded-latency work while held.
   See [docs/unified-authorization-engine.md](docs/unified-authorization-engine.md).
 - Lock, idle timeout, observed screen lock, and detected wake advance the epoch
@@ -146,27 +147,29 @@ in [src/client/inject.rs](src/client/inject.rs). Keep these implementation bound
   kernel-derived workspace, exact cwd, then parent app for broad shared cwds.
   Forwarding-capable/tainted raw signs never cache; relay/SSH-carried vt extensions
   stay per-connection and cannot reuse local scopes. `session-bind@openssh.com`
-  is plaintext, before lock/cipher checks, and never resets idle activity.
+  is SSH-wire (not a vt envelope), before the lock check, and never resets idle activity.
   See [docs/authorization-scopes-v2.md](docs/authorization-scopes-v2.md).
 - Prompts must state reusable scope; agent-derived truth lines precede every
   client-reported line. See [docs/approval-transparency.md](docs/approval-transparency.md).
 - `run@vt` is agent-only, allowlist-gated, and returns no child output/exit code.
   Never expose it through the Worker or `--forward-real-agent`. That opt-in relay
-  holds no `VT_AUTH` and forwards only encrypt/decrypt/auth/sign/diag extensions;
+  forwards only encrypt/decrypt/auth/sign/diag extensions, payloads unparsed;
   refuse run, ui-status, session-bind, and unknown extensions.
   See [src/ssh_sign.rs](src/ssh_sign.rs) (`route_extension`).
-- `diag@vt` is VT_AUTH-encrypted, read-only, prompt-free, not audit-pushed, and
+- `diag@vt` is plaintext, read-only, prompt-free, not audit-pushed, and
   never resets idle. `live_entries` counts only grants this caller could reuse;
   never-cache callers report 0. See [docs/diag-design.md](docs/diag-design.md).
-- `ui-status@vt` alone exposes the whole grant store: plaintext before lock/cipher
-  checks, gated by constant-time comparison of the 32-byte spawn token piped to
-  `--ui-token-fd` (never env/argv/file; absent/wrong token fails unstructured).
+- `ui-status@vt` alone exposes the whole grant store: dispatched before the lock
+  check and any Keychain read, gated by constant-time comparison of the 32-byte
+  spawn token piped to `--ui-token-fd` (never env/argv/file; absent/wrong token
+  fails unstructured).
   Only `status` and authority-reducing `revoke_all`: never grant/extend/approve,
   reset idle, or audit-push. Grant display labels are memory-only.
   See [docs/app-bundle.md](docs/app-bundle.md).
-- Keychain rewrap must preserve `VT_AUTH`: new stores use wrap v2; upgrades use
-  the flock-guarded mutator changing only `encrypted_passphrase` + `wrap_v`, never
-  `create_and_save_passcode_passphrase`. Manual migration is `vt secret rebind`.
+- Keychain rewrap changes only `encrypted_passphrase` + `wrap_v`: new stores use
+  wrap v2; upgrades use the flock-guarded mutator, never
+  `create_and_save_passcode_passphrase`. The 64-byte `passcode_and_auth_token`
+  blob keeps its width (second half unread). Manual migration is `vt secret rebind`.
   See [docs/app-bundle.md](docs/app-bundle.md).
 
 ## Worker cache and admin
