@@ -19,7 +19,7 @@ import { notifyApproval } from './notify';
 import { parsePushoverConfig } from './pushover';
 import { parseSlackAppConfig } from './slack_app';
 import { parseFeishuConfig } from './feishu';
-import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, EnrollRequest, DoEnrollCreateOp, MasterKeyGen } from './types';
+import { ApprovePageData, ChallengeRequest, ChallengeResponse, Challenge, ChallengeMeta, ApproveRequest, RejectRequest, DekCacheRequest, AgentAuditIngestRequest, DoAuditIngestOp, EnrollRequest, DoEnrollCreateOp } from './types';
 import { deriveHostTokenSecret, isTokenId } from './host_token';
 import { log, logErr, tokenPrefix } from './log';
 import { requireAccess, type AccessVars } from './access';
@@ -60,7 +60,7 @@ const ADMIN_SEG = 'kestrel';
 // while admin.css stays stale, which desyncs markup from styles. The .html
 // page shells need no token — the Worker reads them server-side per request.)
 // Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
-const ASSET_VER = '20260913-ab4bb67';
+const ASSET_VER = '20260914-e7f8038';
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
@@ -356,7 +356,7 @@ app.post('/api/challenge', async (c) => {
   // 1. HMAC auth
   const authed = await readAuthenticatedDaemonBody(c);
   if (authed instanceof Response) return authed;
-  const { body: rawBody, tokenId, keyGen } = authed;
+  const { body: rawBody, tokenId } = authed;
 
   // 2. Parse body
   let body: ChallengeRequest;
@@ -419,7 +419,7 @@ app.post('/api/challenge', async (c) => {
   const doResp = await accountStub(c).fetch('https://account.do/op/create', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ challenge: ch, token_id: tokenId, key_gen: keyGen }),
+    body: JSON.stringify({ challenge: ch, token_id: tokenId }),
   });
   if (doResp.status === 401) return new Response(doResp.body, doResp);
   if (!doResp.ok) return c.text(`do create: ${await doResp.text()}`, 500);
@@ -477,7 +477,7 @@ app.get('/api/dek', async (c) => {
 app.post('/api/dek-cache', async (c) => {
   const authed = await readAuthenticatedDaemonBody(c);
   if (authed instanceof Response) return authed;
-  const { body: rawBody, tokenId, keyGen } = authed;
+  const { body: rawBody, tokenId } = authed;
 
   let body: DekCacheRequest;
   try { body = JSON.parse(new TextDecoder().decode(rawBody)); }
@@ -497,7 +497,6 @@ app.post('/api/dek-cache', async (c) => {
       salts_b64u: body.salts_b64u,
       meta,
       token_id: tokenId,
-      key_gen: keyGen,
     }),
   });
 });
@@ -594,20 +593,11 @@ app.post('/api/audit-ingest', async (c) => {
   if (body.agent_id.startsWith('t:')) {
     const id = body.agent_id.slice(2);
     if (!isTokenId(id)) return c.text('bad agent token id', 401);
-    // Same rolling-rotation fallback as the daemon path: try the current
-    // master, then the previous generation when one is configured.
-    const cur = await hmacSha256(await deriveHostTokenSecret(c.env.VT_AUTH_CF, id), rawBody);
-    if (!ctEq(providedHmac, cur)) {
-      const prevMaster = c.env.VT_AUTH_CF_PREV ?? '';
-      if (!prevMaster) return c.text('hmac mismatch', 401);
-      const prev = await hmacSha256(await deriveHostTokenSecret(prevMaster, id), rawBody);
-      if (!ctEq(providedHmac, prev)) return c.text('hmac mismatch', 401);
-      log('auth.prev_master', { path: '/api/audit-ingest', token: id });
-    }
+    const expected = await hmacSha256(await deriveHostTokenSecret(c.env.VT_AUTH_CF, id), rawBody);
+    if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
     tokenIdHost = id;
   } else {
-    // Legacy hostname-salted subkey: no previous-generation fallback. It is
-    // being deleted, not widened.
+    // Legacy hostname-salted subkey. It is being deleted, not widened.
     const key = await hkdfSha256(
       enc.encode(c.env.VT_AUTH_CF), enc.encode(body.agent_id), enc.encode('vt-agent-audit-v1'), 32);
     const expected = await hmacSha256(key, rawBody);
@@ -711,13 +701,11 @@ async function readCappedBody(c: Context, maxBytes = CEREMONY_POST_MAX_BYTES): P
 // `VT-Token-Id` header. Stateless here; the DO checks the token is alive and
 // slides its expiry (`tokenId` is returned so the route can forward it). A
 // request without the header gets the same structured 401 as a dead token:
-// the remedy is `vt enroll` either way. If that fails and VT_AUTH_CF_PREV is
-// set, the same check runs once more under the previous master, so a master
-// rotation is rolling rather than a fleet-wide flag day (`keyGen` says which
-// one verified; the DO records it for the admin tab).
+// the remedy is `vt enroll` either way. One master, one derivation: rotating
+// VT_AUTH_CF invalidates every token, and every host re-enrolls.
 async function readAuthenticatedDaemonBody(
   c: Context<{ Bindings: Env; Variables: AccessVars }>,
-): Promise<{ body: Uint8Array; tokenId: string; keyGen: MasterKeyGen } | Response> {
+): Promise<{ body: Uint8Array; tokenId: string } | Response> {
   const auth = c.req.header('Authorization') ?? '';
   const prefix = 'VT-HMAC ';
   if (!auth.startsWith(prefix)) return c.text('missing auth', 401);
@@ -730,17 +718,9 @@ async function readAuthenticatedDaemonBody(
 
   const rawBody = await readCappedBody(c);
   if (!rawBody) return c.text('body too large', 413);
-  const cur = await hmacSha256(await deriveHostTokenSecret(c.env.VT_AUTH_CF, tokenHeader), rawBody);
-  if (ctEq(providedHmac, cur)) return { body: rawBody, tokenId: tokenHeader, keyGen: 'cur' };
-  const prevMaster = c.env.VT_AUTH_CF_PREV ?? '';
-  if (prevMaster) {
-    const prev = await hmacSha256(await deriveHostTokenSecret(prevMaster, tokenHeader), rawBody);
-    if (ctEq(providedHmac, prev)) {
-      log('auth.prev_master', { path: new URL(c.req.url).pathname, token: tokenHeader });
-      return { body: rawBody, tokenId: tokenHeader, keyGen: 'prev' };
-    }
-  }
-  return c.text('hmac mismatch', 401);
+  const expected = await hmacSha256(await deriveHostTokenSecret(c.env.VT_AUTH_CF, tokenHeader), rawBody);
+  if (!ctEq(providedHmac, expected)) return c.text('hmac mismatch', 401);
+  return { body: rawBody, tokenId: tokenHeader };
 }
 
 // POST /api/approve — PWA submits sealed DEKs after WebAuthn

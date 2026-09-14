@@ -8,13 +8,6 @@ export interface Env {
   /** Worker master. Host tokens are HKDF-derived from it (host_token.ts) and
    *  the agent audit key too; it is never accepted directly as a daemon key. */
   VT_AUTH_CF: string;
-  /** PREVIOUS-generation Worker master, accepted as a fallback so rotating
-   *  VT_AUTH_CF is rolling instead of a fleet-wide flag day: a host token whose
-   *  secret was derived from the old master keeps verifying until that host
-   *  re-enrolls. Empty/absent → no previous generation (the default, and
-   *  the state to return to once every host shows `cur` on the tokens tab). A
-   *  secret: Wrangler secret storage, never inlined in wrangler.toml. */
-  VT_AUTH_CF_PREV?: string;
   /** Workers Rate Limiting binding guarding the UNAUTHENTICATED POST /api/enroll
    *  (per connecting IP). Absent → enrollment is refused (fail closed): an
    *  endpoint that can page the operator's phone must never run unthrottled. */
@@ -275,15 +268,7 @@ export interface HostTokenRow {
   last_used_ms: number;
   last_ip: string;
   revoked_ms: number | null;
-  /** Which master generation the last authenticated use verified under
-   *  (`cur` = VT_AUTH_CF, `prev` = VT_AUTH_CF_PREV). NULL on rows that have
-   *  not been used since the column existed. `prev` is the operator's signal
-   *  that this host still needs `vt enroll` before VT_AUTH_CF_PREV is cleared. */
-  last_key_gen: MasterKeyGen | null;
 }
-
-/** Which Worker master verified a request's HMAC. */
-export type MasterKeyGen = 'cur' | 'prev';
 
 export interface HostTokenListResponse {
   tokens: HostTokenRow[];
@@ -656,9 +641,6 @@ export interface DoCreateOp {
    *  edge). The DO checks liveness, slides expiry, and overwrites
    *  `challenge.meta.host` / `user` from the record. */
   token_id: string;
-  /** Master generation that verified the HMAC; recorded on the token row so the
-   *  admin tab can show who is still on the previous one. */
-  key_gen: MasterKeyGen;
 }
 
 export interface DoApproveOp {
@@ -683,8 +665,6 @@ export interface DoDekCacheOp {
   meta: ChallengeMeta;
   /** See DoCreateOp.token_id. */
   token_id: string;
-  /** See DoCreateOp.key_gen. */
-  key_gen: MasterKeyGen;
 }
 
 /** Internal DO op for POST /{ADMIN_SEG}/api/cache-extend-request. The Worker has

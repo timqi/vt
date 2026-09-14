@@ -247,15 +247,6 @@ describe('authenticating with a host token', () => {
     expect(await inDO(h => h.state.storage.get(`ch:${ch.approve_token}`))).toBeUndefined();
   });
 
-  it('records the master generation that verified the use', async () => {
-    const { tokenId } = await enrollApproved();
-    // Minted from the current master, so the row starts there.
-    expect((await tokenRow(tokenId))!.last_key_gen).toBe('cur');
-    const body = challengeBody();
-    expect((await post('/api/challenge', body, await tokenHeaders(tokenId, body))).status).toBe(200);
-    expect((await tokenRow(tokenId))!.last_key_gen).toBe('cur');
-  });
-
   it('drops tty / ppid / ssh_client from the stored meta', async () => {
     const { tokenId } = await enrollApproved();
     const body = challengeBody({ meta: { ...makeMeta(), tty: '/dev/pts/1', ppid: 7, ssh_client: '10.0.0.1 1 22' } });
@@ -265,61 +256,34 @@ describe('authenticating with a host token', () => {
   });
 });
 
-// Rolling master rotation: VT_AUTH_CF_PREV holds the OLD master so tokens
-// derived from it keep working until their host re-enrolls. Host-token paths
-// only — the legacy bare-master branches must not gain the fallback.
-describe('previous-generation master (VT_AUTH_CF_PREV)', () => {
+// Rotating VT_AUTH_CF is a flag day: every token was derived from the old
+// master and none of them verifies afterwards. There is no second accepted
+// generation — a stray VT_AUTH_CF_PREV binding changes nothing.
+describe('master rotation', () => {
   const NEW_MASTER = 'throwaway-rotated-master';
-  /** Router env after a rotation: current = new, previous = the one the
-   *  already-enrolled tokens were derived from. `null` leaves the binding
-   *  absent entirely (an explicit `undefined` would hit the default). */
-  const rotatedEnv = (prev: string | null = MASTER): Env =>
-    ({ ...routerEnv(), VT_AUTH_CF: NEW_MASTER, ...(prev === null ? {} : { VT_AUTH_CF_PREV: prev }) });
+  const rotatedEnv = (extra: Record<string, unknown> = {}): Env =>
+    ({ ...routerEnv(), VT_AUTH_CF: NEW_MASTER, ...extra });
 
-  it('accepts a token derived from the previous master and records it as prev', async () => {
+  it('refuses every token derived from the previous master, PREV binding or not', async () => {
     const { tokenId } = await enrollApproved('oldhost', 'qiqi');
-    expect((await tokenRow(tokenId))!.last_key_gen).toBe('cur');
     const body = challengeBody();
-    const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body, MASTER), rotatedEnv());
-    expect(res.status).toBe(200);
-    // Still a fully verified host: the record, not the body, names it.
-    const ch = await inDO(h => h.state.storage.get<Challenge>(`ch:${res.json.approve_token}`));
-    expect(ch!.meta.host).toBe('oldhost');
-    expect((await tokenRow(tokenId))!.last_key_gen).toBe('prev');
-    // Re-enrolling under the new master moves it back to `cur`.
-    const after = await post('/api/challenge', body, await tokenHeaders(tokenId, body, NEW_MASTER), rotatedEnv());
-    expect(after.status).toBe(200);
-    expect((await tokenRow(tokenId))!.last_key_gen).toBe('cur');
-  });
-
-  it('refuses a token matching neither generation', async () => {
-    const { tokenId } = await enrollApproved();
-    const body = challengeBody();
-    const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body, 'third-master'), rotatedEnv());
-    expect(res.status).toBe(401);
-    expect(res.text).toBe('hmac mismatch');
-  });
-
-  it('behaves exactly as before when PREV is absent or empty', async () => {
-    const { tokenId } = await enrollApproved();
-    const body = challengeBody();
-    for (const prev of [null, '']) {
-      const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body, MASTER), rotatedEnv(prev));
+    for (const e of [rotatedEnv(), rotatedEnv({ VT_AUTH_CF_PREV: MASTER })]) {
+      const res = await post('/api/challenge', body, await tokenHeaders(tokenId, body, MASTER), e);
       expect(res.status).toBe(401);
       expect(res.text).toBe('hmac mismatch');
+      const probe = { ...challengeBody(), salts_b64u: [b64uEnc(new Uint8Array(16).fill(5))] };
+      const miss = await post('/api/dek-cache', probe, await tokenHeaders(tokenId, probe, MASTER), e);
+      expect(miss.status).toBe(401);
+      expect(miss.text).toBe('hmac mismatch');
     }
-    // And a current-master token is unaffected by PREV being configured.
+    // The refusals were not uses: the row is exactly as enrollment left it.
+    const row = (await tokenRow(tokenId))!;
+    expect(row.last_used_ms).toBe(row.created_ms);
+    expect(row).not.toHaveProperty('last_key_gen');
+    // The same row verifies under the new master once the host re-enrolls
+    // (here: the secret re-derived from it).
     const ok = await post('/api/challenge', body, await tokenHeaders(tokenId, body, NEW_MASTER), rotatedEnv());
     expect(ok.status).toBe(200);
-  });
-
-  it('slides the dek-cache probe under the previous master too', async () => {
-    const { tokenId } = await enrollApproved();
-    const body = { ...challengeBody(), salts_b64u: [b64uEnc(new Uint8Array(16).fill(5))] };
-    const res = await post('/api/dek-cache', body, await tokenHeaders(tokenId, body, MASTER), rotatedEnv());
-    expect(res.status).toBe(200);
-    expect(res.json).toEqual({ miss: true });
-    expect((await tokenRow(tokenId))!.last_key_gen).toBe('prev');
   });
 
   it('refuses the bare master under either generation', async () => {
@@ -333,7 +297,7 @@ describe('previous-generation master (VT_AUTH_CF_PREV)', () => {
     }
   });
 
-  it('accepts an audit push under the previous master, but not on the legacy agent key', async () => {
+  it('refuses an audit push signed under the previous master on either agent key', async () => {
     const { tokenId } = await enrollApproved('mac', 'qiqi');
     const body = {
       timestamp_ms: Date.now(), agent_id: `t:${tokenId}`, hostname: 'mac',
@@ -343,14 +307,12 @@ describe('previous-generation master (VT_AUTH_CF_PREV)', () => {
     const raw = new TextEncoder().encode(JSON.stringify(body));
     const sign = async (key: Uint8Array) => ({ Authorization: `VT-HMAC ${b64uEnc(await hmacSha256(key, raw))}` });
     const oldKey = await deriveHostTokenSecret(MASTER, tokenId);
-    expect((await post('/api/audit-ingest', body, await sign(oldKey), rotatedEnv())).status).toBe(200);
-    // Without PREV the same push is refused, as today.
-    expect((await post('/api/audit-ingest', body, await sign(oldKey), rotatedEnv(null))).status).toBe(401);
-    // A background push is not a use: it neither slides expiry nor restamps
-    // the generation (the row still reads `cur` from enrollment).
-    expect((await tokenRow(tokenId))!.last_key_gen).toBe('cur');
+    for (const e of [rotatedEnv(), rotatedEnv({ VT_AUTH_CF_PREV: MASTER })]) {
+      expect((await post('/api/audit-ingest', body, await sign(oldKey), e)).status).toBe(401);
+    }
+    expect((await post('/api/audit-ingest', body, await sign(await deriveHostTokenSecret(NEW_MASTER, tokenId)), rotatedEnv())).status).toBe(200);
 
-    // Legacy hostname-salted agent key: no PREV fallback there either.
+    // Legacy hostname-salted agent key: same flag day.
     const legacyBody = { ...body, agent_id: 'mac' };
     const legacyRaw = new TextEncoder().encode(JSON.stringify(legacyBody));
     const legacyKey = await hkdfSha256(
@@ -358,7 +320,7 @@ describe('previous-generation master (VT_AUTH_CF_PREV)', () => {
       new TextEncoder().encode('vt-agent-audit-v1'), 32);
     const legacyMac = await hmacSha256(legacyKey, legacyRaw);
     const refused = await post('/api/audit-ingest', legacyBody,
-      { Authorization: `VT-HMAC ${b64uEnc(legacyMac)}` }, rotatedEnv());
+      { Authorization: `VT-HMAC ${b64uEnc(legacyMac)}` }, rotatedEnv({ VT_AUTH_CF_PREV: MASTER }));
     expect(refused.status).toBe(401);
     expect(refused.text).toBe('hmac mismatch');
   });

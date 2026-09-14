@@ -31,19 +31,13 @@ secret     = HKDF-SHA256(ikm = VT_AUTH_CF, salt = token_id,
   structured `401 {error: token_missing}` a dead token gets: the master is
   never accepted as a daemon key, and the DO likewise fails closed (400) on an
   op body without a `token_id`.
-- **Two master generations, so rotation rolls.** When `VT_AUTH_CF_PREV` is
-  non-empty and the HMAC does not verify under `VT_AUTH_CF`, the same
-  constant-time check runs once more against a secret derived from the previous
-  master. Host-token paths only (`/api/challenge`, `/api/dek-cache`, and the
-  `t:<token_id>` form of `/api/audit-ingest`): the legacy hostname-salted
-  audit branch never falls back, it is being deleted. The
-  ordering is unchanged — syntactic `token_id` check before any KDF, body cap
-  before crypto. A `prev` verification is logged `auth.prev_master` (path +
-  token_id, never key material) and stamped on the row as `last_key_gen`, which
-  is what the admin tab reads. See §7.
+- **One master, one derivation.** There is no previous-generation fallback:
+  rotating `VT_AUTH_CF` invalidates every token at once (§7). Ordering:
+  syntactic `token_id` check before any KDF, body cap before crypto, one
+  constant-time comparison.
 - **Stateful liveness in the DO.** `host_token` (SQLite,
   `account_tokens.ts`) records `host, user, enroll_ip, origin, created_ms,
-  expires_ms, last_used_ms, last_ip, revoked_ms, last_key_gen`. Every authenticated
+  expires_ms, last_used_ms, last_ip, revoked_ms`. Every authenticated
   `/api/challenge` and `/api/dek-cache` calls `AccountTokens.touch`: unknown /
   revoked / expired → structured `401 {error: token_unknown|token_revoked|
   token_expired}` (the CLI prints "run `vt enroll`"); otherwise
@@ -82,8 +76,7 @@ secret     = HKDF-SHA256(ikm = VT_AUTH_CF, salt = token_id,
 ## 4. Admin
 
 `/<ADMIN_SEG>/tokens` lists every token (no secret material) with host, user,
-issue IP · origin, last use / IP (plus a 旧主密钥 marker when `last_key_gen`
-is `prev`, counted in the status line), remaining window, and a 吊销 button.
+issue IP · origin, last use / IP, remaining window, and a 吊销 button.
 Revocation is authority-reducing, so Cloudflare Access alone suffices (same
 rule as cache clears); it is immediate and idempotent. Revoked/lapsed rows stay
 listed for 30 days, then the alarm sweep drops them.
@@ -116,30 +109,19 @@ read NULL for new rows. Decision record: [approval-transparency.md §2b](approva
    token written by `vt enroll`; the hostname-keyed audit derivation is the
    one legacy branch left.
 
-### Rotating the master (rolling, no flag day)
+### Rotating the master (flag day)
 
 Every host token secret is `HKDF(VT_AUTH_CF, token_id)`, so replacing the master
-invalidates them all at once. `VT_AUTH_CF_PREV` makes that a rolling change
-instead: the old master keeps verifying while hosts re-enroll one at a time.
+invalidates them all at once; there is deliberately no second accepted
+generation (two masters is a wider surface, and a host that never re-enrolls
+would keep an old credential alive).
 
-1. `wrangler secret put VT_AUTH_CF_PREV` — the value is the **current** master.
-2. `wrangler secret put VT_AUTH_CF` — the new master. Deploy is not required;
-   secrets take effect on their own. From here a host verifies under either
-   generation, and each authenticated use stamps `last_key_gen`.
-3. Re-enroll each host (`vt enroll`, phone approval, pairing code) and switch
-   any `vt ssh agent --audit-key` to the token it writes. The admin 主机令牌 tab
-   marks every host still verifying under the old master 旧主密钥 · 需重新 enroll
-   and counts them in the status line; `auth.prev_master` in Workers Logs is the
-   same signal.
-4. **Set a deadline** and hold to it — two accepted masters is a wider surface
-   than one, and a host that never re-enrolls silently keeps an old credential
-   alive. At the deadline: `wrangler secret delete VT_AUTH_CF_PREV`. Anything
-   still on `prev` breaks immediately and must `vt enroll`; revoke the row on
-   the tokens tab if the host is gone. A token minted during the window is
-   always derived from the current master, so it starts at `cur`.
-
-The fast path is unchanged when `VT_AUTH_CF_PREV` is empty or absent (the
-default): one derivation, one comparison, no fallback.
+1. `wrangler secret put VT_AUTH_CF` — the new master. Deploy is not required;
+   secrets take effect on their own. From here every existing token fails with
+   `hmac mismatch` and the agent audit push is refused the same way.
+2. The same day, on each host: `vt enroll` (phone approval, pairing code) and
+   switch any `vt ssh agent --audit-key` to the token it writes. Revoke the
+   rows of hosts that are gone on the tokens tab; the rest lapse in 7 days.
 
 ## 8. Tests
 
@@ -147,10 +129,9 @@ default): one derivation, one comparison, no fallback.
   pairing code), `test/do_account.host_token.test.ts` (enroll → approve →
   token; challenge/dek-cache auth with sliding expiry and structured refusals;
   bare master and token-less DO bodies refused; meta trim; audit ingest with
-  `t:`; admin list/revoke; limiter
-  absent → 503; pending cap → 429; the `VT_AUTH_CF_PREV` rotation window —
-  cur/prev/neither, PREV absent or empty, `last_key_gen`, and both legacy
-  branches refusing the fallback).
+  `t:`; admin list/revoke; limiter absent → 503; pending cap → 429; master
+  rotation refusing old-master tokens on every route, with or without a stray
+  `VT_AUTH_CF_PREV` binding).
 - Rust: `cf::tests::worker_auth_parses_host_token_and_legacy_master`,
   `http_post_sends_token_id_header_only_when_given`,
   `config::tests::upsert_*`, `audit::tests::host_token_audit_key_only_for_host_tokens`.

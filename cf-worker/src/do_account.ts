@@ -431,7 +431,7 @@ export class AccountDO extends DurableObject<Env> {
     if (typeof parsed.token_id !== 'string') return badRequest('missing token_id');
     // Refuse a dead token BEFORE anything is stored or pushed, and let the
     // record — not the body — say which host/user this is.
-    const t = this.tokens.touch(parsed.token_id, challenge.meta?.ip ?? '', Date.now(), parsed.key_gen);
+    const t = this.tokens.touch(parsed.token_id, challenge.meta?.ip ?? '', Date.now());
     if (!t.ok) return tokenRefused(t.reason);
     challenge.meta = { ...challenge.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
     challenge.token_id = parsed.token_id;
@@ -808,7 +808,7 @@ export class AccountDO extends DurableObject<Env> {
     // a ceremony, and the hit audit row names the token's host/user. Same
     // fail-closed rule as opCreate for a body without a token.
     if (typeof body.token_id !== 'string') return badRequest('missing token_id');
-    const t = this.tokens.touch(body.token_id, ip, Date.now(), body.key_gen);
+    const t = this.tokens.touch(body.token_id, ip, Date.now());
     if (!t.ok) return tokenRefused(t.reason);
     const meta = { ...body.meta, host: t.host, user: t.user, ip_prev: t.prev_ip };
     const salts = body.salts_b64u;
