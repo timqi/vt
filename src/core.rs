@@ -129,12 +129,6 @@ pub struct AuthRes {
     pub approved: bool,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct CryptoResItem {
-    pub result: String,
-    pub err_message: String,
-}
-
 // Variant names ARE the wire tokens: `SecretType` is serde-serialized inside
 // `EncryptReq`/`DecryptInput::V2` on the agent protocol, so renaming them to
 // `Raw`/`Totp`/`Unknown` would break every older client/agent pair.

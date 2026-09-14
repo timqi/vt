@@ -455,14 +455,6 @@ pub fn authenticate(reason: &str) -> AuthOutcome {
     }
 }
 
-pub fn touch_id_authentication(reason: &str) -> bool {
-    la::can_evaluate(la::Policy::WithBiometrics)
-        && matches!(
-            la::evaluate(la::Policy::WithBiometrics, reason),
-            EvalOutcome::Success
-        )
-}
-
 pub fn local_authentication(reason: &str) -> bool {
     authenticate(reason).is_success()
 }
