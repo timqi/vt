@@ -509,6 +509,10 @@ pub fn load_agent_config() -> HookConfig {
 mod tests {
     use super::*;
 
+    /// `VT_CONFIG` is process-global; the tests that set it run in parallel,
+    /// so they take this lock for the whole set/remove span.
+    static VT_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn backend_parse() {
         assert_eq!(Backend::parse("auto"), Ok(Backend::Auto));
@@ -556,7 +560,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("vt-cfg-test-{}", std::process::id()));
         let path = dir.join("config.toml");
-        // VT_CONFIG is process-global; tests in this crate don't otherwise set it.
+        let _guard = VT_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("VT_CONFIG", &path);
         let written = upsert_config_values(&[("VT_PASSKEY_URL", "https://w")]).unwrap();
         assert_eq!(written, path);
@@ -671,6 +675,7 @@ GH_TOKEN = "vt://0projA"
         .unwrap();
         drop(f);
 
+        let _guard = VT_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("VT_HYDRATE_TEST_KEY");
         std::env::set_var("VT_CONFIG", &path);
         hydrate_env_from_file();
