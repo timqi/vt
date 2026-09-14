@@ -68,7 +68,7 @@ pub struct SshKeyEntry {
 
 /// Decode the SSH-keys blob from a loaded store. Returns an empty vec when
 /// the store has no SSH keys yet.
-pub fn decode_ssh_keys(store: &KeychainStore, cipher: &AesGcmCrypto) -> Result<Vec<SshKeyEntry>> {
+fn decode_ssh_keys(store: &KeychainStore, cipher: &AesGcmCrypto) -> Result<Vec<SshKeyEntry>> {
     let Some(encrypted) = store.encrypted_ssh_keys_bytes()? else {
         return Ok(Vec::new());
     };
@@ -79,7 +79,7 @@ pub fn decode_ssh_keys(store: &KeychainStore, cipher: &AesGcmCrypto) -> Result<V
 
 /// Re-encrypt SSH key entries and stash them on the in-memory store. Caller
 /// is responsible for `store.save()` (or going through `KeychainStore::modify`).
-pub fn encode_ssh_keys_into(
+fn encode_ssh_keys_into(
     store: &mut KeychainStore,
     cipher: &AesGcmCrypto,
     entries: &[SshKeyEntry],
@@ -88,6 +88,59 @@ pub fn encode_ssh_keys_into(
     let encrypted = cipher.encrypt(&json)?;
     store.set_encrypted_ssh_keys(&encrypted);
     Ok(())
+}
+
+/// The cipher over the SSH-keys blob: the master key unwrapped through the
+/// store's own passcode. Callers drop it as soon as the blob is handled.
+fn ssh_keys_cipher(store: &KeychainStore) -> Result<AesGcmCrypto> {
+    let (mac_cipher, _mac_key) = load_mac_cipher(store, &derive_passcode_cipher(store)?)?;
+    Ok(mac_cipher)
+}
+
+/// Decrypt the SSH keys of a loaded store; empty when none were stored.
+pub fn load_ssh_keys(store: &KeychainStore) -> Result<Vec<SshKeyEntry>> {
+    decode_ssh_keys(store, &ssh_keys_cipher(store)?)
+}
+
+/// Pure read-modify-write over an in-memory store: decode, let `f` mutate,
+/// re-encode when it reports a change. A blob this binary cannot decrypt or
+/// parse aborts before `f` runs, so an unreadable blob is never overwritten
+/// by an empty or partial one.
+fn modify_ssh_keys(
+    store: &mut KeychainStore,
+    f: impl FnOnce(&mut Vec<SshKeyEntry>) -> Result<bool>,
+) -> Result<()> {
+    let mac_cipher = ssh_keys_cipher(store)?;
+    let mut entries = decode_ssh_keys(store, &mac_cipher)?;
+    if f(&mut entries)? {
+        encode_ssh_keys_into(store, &mac_cipher, &entries)?;
+    }
+    Ok(())
+}
+
+/// The one write path for the SSH key store: `modify_ssh_keys` under the
+/// cross-process flock. Authorization (Touch ID in `ssh_cli`) happens before
+/// this call, never inside it.
+pub fn with_ssh_keys(f: impl FnOnce(&mut Vec<SshKeyEntry>) -> Result<bool>) -> Result<()> {
+    KeychainStore::modify(|store| modify_ssh_keys(store, f))
+}
+
+/// `with_ssh_keys` off the runtime, mapped to an SSH-wire failure. Agent
+/// callers touch their in-memory keys only after this returns Ok, so the
+/// Keychain and the agent never disagree about what is stored.
+async fn persist_ssh_keys(
+    f: impl FnOnce(&mut Vec<SshKeyEntry>) -> Result<bool> + Send + 'static,
+) -> Result<(), AgentError> {
+    tokio::task::spawn_blocking(move || with_ssh_keys(f))
+        .await
+        .map_err(|e| {
+            tracing::warn!("ssh key store task failed: {e}");
+            AgentError::Failure
+        })?
+        .map_err(|e| {
+            tracing::warn!("ssh key store update failed: {e}");
+            AgentError::Failure
+        })
 }
 
 // --- Reuse policy -----------------------------------------------------------
@@ -384,10 +437,7 @@ pub struct AuthCacheTtls {
 /// derived ciphers are dropped after this returns so the master key does not
 /// linger in memory.
 fn load_all_keys() -> Result<HashMap<String, PrivateKey>> {
-    let store = KeychainStore::load()?;
-    let passphrase_cipher = derive_passcode_cipher(&store)?;
-    let (mac_cipher, _mac_key) = load_mac_cipher(&store, &passphrase_cipher)?;
-    let entries = decode_ssh_keys(&store, &mac_cipher)?;
+    let entries = load_ssh_keys(&KeychainStore::load()?)?;
     let mut keys = HashMap::new();
     for entry in &entries {
         match PrivateKey::from_openssh(entry.key_data.as_bytes()) {
@@ -1323,26 +1373,19 @@ impl Session for VtSshSession {
                 let fp_for_modify = fp_str.clone();
                 let comment_for_modify = comment.clone();
                 let key_openssh_str = key_openssh.to_string();
-                tokio::task::spawn_blocking(move || {
-                    KeychainStore::modify(|store| {
-                        let passphrase_cipher = derive_passcode_cipher(store)?;
-                        let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
-                        let mut entries = decode_ssh_keys(store, &mac_cipher).unwrap_or_default();
-                        if !entries.iter().any(|e| e.fingerprint == fp_for_modify) {
-                            entries.push(SshKeyEntry {
-                                fingerprint: fp_for_modify.clone(),
-                                algorithm,
-                                comment: comment_for_modify,
-                                key_data: key_openssh_str,
-                            });
-                            encode_ssh_keys_into(store, &mac_cipher, &entries)?;
-                        }
-                        Ok(())
-                    })
+                persist_ssh_keys(move |entries| {
+                    if entries.iter().any(|e| e.fingerprint == fp_for_modify) {
+                        return Ok(false);
+                    }
+                    entries.push(SshKeyEntry {
+                        fingerprint: fp_for_modify,
+                        algorithm,
+                        comment: comment_for_modify,
+                        key_data: key_openssh_str,
+                    });
+                    Ok(true)
                 })
-                .await
-                .map_err(|e| agent_err(anyhow::anyhow!("join error: {e}")))?
-                .map_err(agent_err)?;
+                .await?;
 
                 let mut keys = self.keys.write().await;
                 keys.insert(fp_str.clone(), private_key);
@@ -1359,22 +1402,11 @@ impl Session for VtSshSession {
         let fp_str = fingerprint_str(&identity.pubkey);
 
         let fp_for_modify = fp_str.clone();
-        match tokio::task::spawn_blocking(move || {
-            KeychainStore::modify(|store| {
-                let passphrase_cipher = derive_passcode_cipher(store)?;
-                let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
-                let mut entries = decode_ssh_keys(store, &mac_cipher).unwrap_or_default();
-                entries.retain(|e| e.fingerprint != fp_for_modify);
-                encode_ssh_keys_into(store, &mac_cipher, &entries)?;
-                Ok(())
-            })
+        persist_ssh_keys(move |entries| {
+            entries.retain(|e| e.fingerprint != fp_for_modify);
+            Ok(true)
         })
-        .await
-        {
-            Err(e) => tracing::warn!("remove_identity join error: {}", e),
-            Ok(Err(e)) => tracing::warn!("remove_identity keychain update failed: {}", e),
-            Ok(Ok(())) => {}
-        }
+        .await?;
 
         let mut keys = self.keys.write().await;
         keys.remove(&fp_str);
@@ -1384,20 +1416,11 @@ impl Session for VtSshSession {
     }
 
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
-        match tokio::task::spawn_blocking(|| {
-            KeychainStore::modify(|store| {
-                let passphrase_cipher = derive_passcode_cipher(store)?;
-                let (mac_cipher, _mac_key) = load_mac_cipher(store, &passphrase_cipher)?;
-                encode_ssh_keys_into(store, &mac_cipher, &[])?;
-                Ok(())
-            })
+        persist_ssh_keys(|entries| {
+            entries.clear();
+            Ok(true)
         })
-        .await
-        {
-            Err(e) => tracing::warn!("remove_all_identities join error: {}", e),
-            Ok(Err(e)) => tracing::warn!("remove_all_identities keychain update failed: {}", e),
-            Ok(Ok(())) => {}
-        }
+        .await?;
 
         let mut keys = self.keys.write().await;
         keys.clear();
@@ -1947,6 +1970,69 @@ d0EI4yKGPuCZ5YkAAAAWdnQtcnNhLXJlZ3Jlc3Npb24tdGVzdAECAwQF
         let cipher = AesGcmCrypto::new(&key).unwrap();
         let entries = decode_ssh_keys(&store, &cipher).unwrap();
         assert!(entries.is_empty());
+    }
+
+    /// In-memory store whose master key unwraps under its own passcode, so
+    /// `ssh_keys_cipher` works without the keychain.
+    fn test_store() -> KeychainStore {
+        use super::super::store::WRAP_V2;
+        let mut tokens = Vec::new();
+        tokens.extend_from_slice(&AesGcmCrypto::generate_key());
+        tokens.extend_from_slice(&AesGcmCrypto::generate_key());
+        let mut store = KeychainStore::new(&tokens, &[0u8; 60]);
+        let wrapped = derive_passcode_cipher(&store)
+            .unwrap()
+            .encrypt(&AesGcmCrypto::generate_key())
+            .unwrap();
+        store.set_encrypted_passphrase(&wrapped, WRAP_V2);
+        store
+    }
+
+    fn test_entry(fp: &str) -> SshKeyEntry {
+        SshKeyEntry {
+            fingerprint: fp.to_string(),
+            algorithm: "ssh-ed25519".to_string(),
+            comment: "test".to_string(),
+            key_data: "fake".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_modify_ssh_keys_roundtrip_and_unchanged_skips_write() {
+        let mut store = test_store();
+        modify_ssh_keys(&mut store, |entries| {
+            entries.push(test_entry("SHA256:a"));
+            Ok(true)
+        })
+        .unwrap();
+        let blob = store.encrypted_ssh_keys.clone();
+        assert!(blob.is_some());
+        assert_eq!(load_ssh_keys(&store).unwrap()[0].fingerprint, "SHA256:a");
+
+        modify_ssh_keys(&mut store, |entries| {
+            entries.clear();
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(store.encrypted_ssh_keys, blob, "no change, no re-encrypt");
+    }
+
+    /// A blob this binary cannot decrypt must fail before the mutation runs
+    /// and leave the stored bytes as they were, never re-encoded as empty.
+    #[test]
+    fn test_modify_ssh_keys_refuses_corrupt_blob() {
+        let mut store = test_store();
+        store.set_encrypted_ssh_keys(b"not-a-ciphertext");
+        let before = store.encrypted_ssh_keys.clone();
+        let mut ran = false;
+        let err = modify_ssh_keys(&mut store, |_| {
+            ran = true;
+            Ok(true)
+        });
+        assert!(err.is_err());
+        assert!(!ran, "mutation must not run on an unreadable blob");
+        assert_eq!(store.encrypted_ssh_keys, before);
+        assert!(load_ssh_keys(&store).is_err());
     }
 
     // --- Activity-scope classification tests (V2) ---
