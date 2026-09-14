@@ -1,54 +1,13 @@
 //! macOS kernel process queries used only for peer attribution and scope discovery.
 
-const PROC_PIDTBSDINFO: libc::c_int = 3;
-const MAXPATHLEN: u32 = 1024;
-const MAXCOMLEN: usize = 16;
-
-#[repr(C)]
-struct ProcBsdInfo {
-    pbi_flags: u32,
-    pbi_status: u32,
-    pbi_xstatus: u32,
-    pbi_pid: u32,
-    pbi_ppid: u32,
-    pbi_uid: u32,
-    pbi_gid: u32,
-    pbi_ruid: u32,
-    pbi_rgid: u32,
-    pbi_svuid: u32,
-    pbi_svgid: u32,
-    rfu_1: u32,
-    pbi_comm: [u8; MAXCOMLEN],
-    pbi_name: [u8; 2 * MAXCOMLEN],
-    pbi_nfiles: u32,
-    pbi_pgid: u32,
-    pbi_pjobc: u32,
-    e_tdev: u32,
-    e_tpgid: u32,
-    pbi_nice: i32,
-    pbi_start_tvsec: u64,
-    pbi_start_tvusec: u64,
-}
-
-extern "C" {
-    fn proc_pidinfo(
-        pid: libc::c_int,
-        flavor: libc::c_int,
-        arg: u64,
-        buffer: *mut libc::c_void,
-        buffersize: libc::c_int,
-    ) -> libc::c_int;
-    fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_void, buffersize: u32) -> libc::c_int;
-}
-
 /// Get process BSD info: returns (ppid, tdev, start_tvsec) or None.
 pub(super) fn get_proc_bsdinfo(pid: i32) -> Option<(u32, u32, u64)> {
-    let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<ProcBsdInfo>() as libc::c_int;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     let ret = unsafe {
-        proc_pidinfo(
+        libc::proc_pidinfo(
             pid,
-            PROC_PIDTBSDINFO,
+            libc::PROC_PIDTBSDINFO,
             0,
             &mut info as *mut _ as *mut libc::c_void,
             size,
@@ -63,8 +22,14 @@ pub(super) fn get_proc_bsdinfo(pid: i32) -> Option<(u32, u32, u64)> {
 
 /// Get process executable path.
 pub(super) fn get_proc_path(pid: i32) -> Option<String> {
-    let mut buf = vec![0u8; MAXPATHLEN as usize];
-    let ret = unsafe { proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, MAXPATHLEN) };
+    let mut buf = vec![0u8; libc::MAXPATHLEN as usize];
+    let ret = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            libc::MAXPATHLEN as u32,
+        )
+    };
     if ret > 0 {
         buf.truncate(ret as usize);
         String::from_utf8(buf).ok()
@@ -85,23 +50,6 @@ pub(super) fn get_tty_dev(pid: i32) -> Option<u32> {
     }
 }
 
-const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
-
-/// Layout mirror of `struct vnode_info_path` from `<sys/proc_info.h>`:
-/// `struct vnode_info` (a 136-byte `vinfo_stat` + type/pad/fsid = 152
-/// bytes, opaque here) followed by a MAXPATHLEN path buffer.
-#[repr(C)]
-struct VnodeInfoPath {
-    vip_vi: [u8; 152],
-    vip_path: [u8; MAXPATHLEN as usize],
-}
-
-#[repr(C)]
-struct ProcVnodePathInfo {
-    pvi_cdir: VnodeInfoPath,
-    pvi_rdir: VnodeInfoPath,
-}
-
 /// NUL-terminated kernel path buffer → PathBuf. `None` on a missing
 /// NUL, an empty path, or non-UTF-8 bytes (callers degrade to Fresh).
 pub(super) fn nul_terminated_path(buf: &[u8]) -> Option<std::path::PathBuf> {
@@ -119,13 +67,12 @@ pub(super) fn nul_terminated_path(buf: &[u8]) -> Option<std::path::PathBuf> {
 /// `ret == size` check makes a layout mismatch fail closed instead of
 /// reading a truncated struct.
 pub(super) fn get_cwd(pid: i32) -> Option<std::path::PathBuf> {
-    const _: () = assert!(std::mem::size_of::<ProcVnodePathInfo>() == 2 * (152 + 1024));
-    let mut info: ProcVnodePathInfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<ProcVnodePathInfo>() as libc::c_int;
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
     let ret = unsafe {
-        proc_pidinfo(
+        libc::proc_pidinfo(
             pid,
-            PROC_PIDVNODEPATHINFO,
+            libc::PROC_PIDVNODEPATHINFO,
             0,
             &mut info as *mut _ as *mut libc::c_void,
             size,
@@ -134,7 +81,16 @@ pub(super) fn get_cwd(pid: i32) -> Option<std::path::PathBuf> {
     if ret != size {
         return None;
     }
-    nul_terminated_path(&info.pvi_cdir.vip_path)
+    // libc declares the MAXPATHLEN `char` buffer as `[[c_char; 32]; 32]`;
+    // flatten it and reinterpret the (signed) chars as bytes.
+    let path: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .as_flattened()
+        .iter()
+        .map(|&c| c as u8)
+        .collect();
+    nul_terminated_path(&path)
 }
 
 /// Get the process start time (seconds since epoch).
