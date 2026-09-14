@@ -4,6 +4,69 @@ This is the canonical agent guide; `CLAUDE.md` is a relative symlink to it.
 VT is one Rust binary with a macOS SSH-agent transport (Touch ID, Keychain,
 optional FIDO2) and a Cloudflare Worker transport (Passkey/WebAuthn).
 
+## Principles
+
+1. **Less code is the feature.** Every line is a liability; a security tool
+   is audited by the line. If the OS, OpenSSH, or the Worker platform already
+   does it, we don't.
+2. **Two custodies, one engine each.** Keychain + Touch ID locally, PRF passkey
+   via the Worker. Every local authorization passes the unified engine; every
+   Worker authorization passes `opApprove`. No third custody, no side door.
+3. **Hard boundaries come from the kernel or the token, never the client.**
+   Locally the verified caller (pid/uid, `session-bind`); on the Worker the
+   host `token_id`. Everything a client reports (cwd, project, app name) is
+   advisory: display and scope narrowing only, never a trust boundary.
+4. **Three seams.** `core/` is platform-blind (no Keychain, no HTTP, no
+   `cfg(target_os)`); `server_macos/` is the only macOS tree; `client/` speaks
+   to the agent socket and to `cf.rs` and nothing else. The Worker mirrors it:
+   `do_account.ts` owns state, `index.ts` owns routes, nothing else touches
+   storage.
+5. **Compatibility is removed, never widened.** A migration branch ships for
+   one release with its operator step named, then goes; its test becomes a
+   rejected-input test. See [docs/refactor.md](docs/refactor.md).
+6. **No speculative generality.** The third repeat earns an abstraction. No
+   knobs, traits, or config keys for a caller that does not exist.
+7. **Fail closed, fail loudly.** An unavailable check denies; an error reaches
+   the operator as a stable structured code. A silent fallback is a bug even
+   when it works.
+8. **Minimal dependencies.** Std first, then audited crypto staples and the
+   platform SDKs. A new runtime dep names in its commit what code it deletes.
+   `Cargo.lock` / `package-lock.json` diffs are reviewed on upgrade.
+
+## Budgets
+
+The target is disordered growth and duplication; line counts are a proxy, so
+the rules fail on the thing, not on the number.
+
+1. **Growth is a claim.** A change that adds net lines to an area names, in
+   the commit, what the feature could not have been without them.
+2. **Splitting is not a reduction.** A module splits when it has two reasons
+   to exist; a header that needs "and" is the tripwire.
+3. **The third copy is a bug.** Same logic in three places is fixed or deleted;
+   a copy-paste pair past ~30 lines is reported at two.
+4. **Never traded for a number.** Tests, failure paths, fresh-approval
+   semantics, lock/epoch invalidation, structured error codes, type and seam
+   declarations.
+5. **Ceilings are a prompt with a deadline.** `just size` prints the table
+   below with live numbers. Crossing a ceiling asks "what is in there?"; if the
+   answer is "the right things", raise it with that sentence. A ceiling exceeded
+   for more than one release without a raise or a deletion is the failure this
+   section exists to catch.
+
+| Area | Ceiling | What the size is |
+| --- | --- | --- |
+| `src/core/` | 1.1k | record format, crypto, wire envelopes, authorization engine and session model — platform-blind |
+| `src/client/` | 1.4k | CLI verbs, `inject` with its recovery supervisor, `doctor`, record parsing |
+| `src/server_macos/` | 4.5k | SSH agent, scopes, Keychain, FIDO2, socket owner check, audit push, UI status; step 4 of refactor.md decides the scopes share |
+| root `src/*.rs` | 2.5k | entry, config, `cf.rs` Worker client, `ssh_sign.rs` relay routing, caller metadata, audit |
+| `cf-worker/src/` | 3.5k | one DO owning state, routes, host tokens, DEK cache policy, WebAuthn, notifications, admin page |
+| one module | 750 | rule 2 before splitting; `core/authorization.rs`, `server_macos/ssh_agent.rs`, `client/inject.rs` are the open tripwires |
+
+Non-blank, non-comment lines, `#[cfg(test)]` and `*.test.ts` excluded. No
+repo-wide number. Ceilings are the post-slim targets: steps 1–2 of
+[docs/refactor.md](docs/refactor.md) close the current `core`, root and
+`cf-worker` overages.
+
 ## Start here
 
 - [docs/README.md](docs/README.md) owns the feature/source map, change routing,

@@ -95,6 +95,32 @@ check:
     cargo check
     cargo check --target x86_64-unknown-linux-gnu
 
+# Print the AGENTS.md budget table with live line counts
+size:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Non-blank, non-comment lines; a Rust file is cut at its first `#[cfg(test)]`.
+    count() {
+        local total=0 n
+        for f in "$@"; do
+            n=$(awk '/^#\[cfg\(test\)\]/{exit} !/^[[:space:]]*(\/\/|$)/{c++} END{print c+0}' "$f")
+            total=$((total + n))
+        done
+        echo "$total"
+    }
+    row() { printf '%-22s %6s %6s\n' "$1" "$2" "$3"; }
+    row Area Lines Ceiling
+    row 'src/core/'          "$(count src/core/*.rs)"            1100
+    row 'src/client/'        "$(count src/client/*.rs)"          1400
+    row 'src/server_macos/'  "$(count src/server_macos/*.rs src/server_macos/ssh_agent/*.rs)" 4500
+    row 'root src/*.rs'      "$(count src/*.rs)"                 2500
+    row 'cf-worker/src/'     "$(count cf-worker/src/*.ts)"       3500
+    echo
+    echo 'Modules over 750:'
+    for f in $(fd -e rs -e ts . src cf-worker/src); do
+        n=$(count "$f"); [ "$n" -gt 750 ] && row "  $f" "$n" 750 || true
+    done
+
 # Run the Rust unit + integration tests
 test:
     cargo test --all-targets
