@@ -42,19 +42,6 @@ flag day.
 
 ## 4. Decide, then do or drop
 
-- **`VT_AUTH` (decided: delete).** A bearer secret every process that can
-  reach the agent socket can also read (env or config), locally and on a
-  forwarded host; the boundary is the kernel (socket owner, `session-bind`),
-  never the client. Leaves: the `auth_cipher` layer on extension payloads
-  (`client.rs`, `ssh_agent/handlers.rs`, `ssh_agent.rs`), `VT_AUTH` in
-  `config.rs`/`config/client.rs`/`doctor.rs`/`inject.rs`, the `export
-  VT_AUTH=` line of `vt init`, the auth-token half of the Keychain
-  `passcode_and_auth_token` blob (bytes stay, ignored — no Keychain
-  migration), `diag@vt` becomes plaintext read-only, `setup-pam.sh` and
-  `config.example.toml` rows, AGENTS.md red lines that name it. Routing is
-  `VT_BACKEND` only: `auto` tries the socket when it exists; a non-vt agent's
-  `SSH_AGENT_FAILURE` is a recoverable fallback. Operator step: unset
-  `VT_AUTH` everywhere; nothing else. macOS native test required.
 - **Agent grant scopes.** `src/core/authorization.rs` + `ssh_agent/scopes.rs`
   are 4k lines for four scope families. Candidate shape: two scopes only —
   `local` (kernel-verified same-user caller) and `destination` (the
