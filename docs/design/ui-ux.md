@@ -16,59 +16,81 @@ wins over a convention; a changed convention updates this file.
 - Hierarchy by spacing, size, placement and contrast — not opacity.
 - Light and dark coherent; visible focus; status conveyed beyond color.
 
-## Materials `ported`
+## Materials `vt` (Liquid Glass, macOS/iOS 26)
 
-- **Solid**: request fields, tables, cards, the detail dialog, the hovercard.
-- **Glass + hairline + shadow**: the tab strip only. One token set — canvas
-  one step darker than the panel, neutral translucent hairline (light in dark
-  mode), top-edge highlight, two-part shadow (wide ambient + tight contact).
-- Corner radii coordinate with nesting: 12px cards and dialog, 10px table
-  frame and bars, 8px controls, 999px badges.
-- One palette, the `admin.css` variables: `--bg --panel --panel-2 --fg --muted
-  --accent --ok --err --warn --border --mono`. Light default, dark only on
-  `prefers-color-scheme: dark`; `color-scheme: light dark` on both shells.
+- Three layers, no fourth: **canvas** (`--bg`, solid), **content** (cards,
+  tables, dialog, sheet — solid `--panel`), **chrome** (glass: the tab bar, the
+  approve action bar, segmented controls, floating buttons). Content is never
+  glass; readability wins.
+- Glass token, one class `.glass`: `backdrop-filter: blur(20px) saturate(180%)`
+  over a translucent `--panel` tint, 1px translucent hairline, top-edge
+  specular highlight (`inset 0 1px 0 rgba(255,255,255,.35)`, weaker in dark),
+  two-part shadow (wide ambient + tight contact). Under
+  `prefers-reduced-transparency` or without `backdrop-filter` support it is
+  solid `--panel` with the same hairline.
+- Concentric radii: a nested radius equals the container's minus the padding.
+  Cards and sheets 20px, bars and segmented controls 16px, controls 12px,
+  badges 999px. Chrome that floats keeps a full-height pill shape.
+- Colors via `light-dark()` and `color-mix()`; one palette, the `admin.css`
+  variables `--bg --panel --panel-2 --fg --muted --accent --ok --err --warn
+  --border --mono`; `color-scheme: light dark` on both shells. Accent tints
+  glass (`color-mix(in oklab, var(--accent) 12%, var(--panel))`) only on the
+  selected segment and the primary action.
 - Canvas: `--bg` is the page edge and the `theme-color` meta in both themes,
   including startup of the installed app.
-- Type: system sans with `PingFang SC`; `--mono` for identifiers, paths and
-  commands only.
-- One shared stylesheet; `.vt-ap-*` and every control below exist once. No
-  page-specific styles `vt`.
+- Type: `-apple-system, system-ui` with `PingFang SC`; sizes from the iOS
+  scale (34/28/22 titles, 17 body, 15 secondary, 13 caption); `--mono` for
+  identifiers, paths and commands only.
+- One shared stylesheet; `.vt-ap-*`, `.glass` and every control below exist
+  once. No page-specific styles.
 
-## Layout
+## Layout `vt`
 
-- **Page head** `ported`: the tab strip is a slim 8px-inset rounded glass
-  strip floating over the content, which pads its top by what covers it. On a
-  phone it hides the title and wraps the tabs.
-- **Tables** `vt`: a tab's `.table-wrap` owns horizontal scrolling; a long value
-  truncates (`.trunc`, `.cell-main`/`.cell-sub`) and lives whole in the detail
-  dialog or hovercard, never only in a `title`. Two lines per cell before a
-  seventh column.
-- **Detail dialog** `vt`: `#detail-card` in `#detail-backdrop`, solid, 680px
-  max, `role="dialog" aria-modal="true"`, labeled close control, Escape and
-  backdrop tap close without activating what is beneath, focus returns on
-  dismissal. Below 640px the `dt`/`dd` grid stacks.
-- Phone breakpoint 640px; the approve shell is one 420px column at every width.
+- **Phone first** (< 768px): the admin tab bar is a bottom glass pill inset
+  by 12px and `env(safe-area-inset-bottom)`, five items, label under mark;
+  it shrinks to marks only while the content scrolls down and restores on
+  scroll up or stop. The page head is the tab's title only. On desktop
+  (≥ 768px) the same strip floats at the top, 8px inset, title at its left.
+- **Rows, not tables, on a phone**: each list renders as `.row` items — first
+  line the identity (host, record name), second line the secondary facts
+  (`.cell-sub`), trailing status badge or remaining time. Tables (`.table-wrap`,
+  `.trunc`, `.cell-main`/`.cell-sub`) appear at ≥ 768px only. Both render from
+  the same data and the same click handler; a long value lives whole in the
+  detail sheet, never only in a `title`.
+- **Detail sheet** (`vt.dialog`): native `<dialog>`; on a phone a bottom sheet
+  with a grab handle, rounded top 20px, max 92vh, scrolls inside, dismissed by
+  the close control, Escape, backdrop tap or swipe down; on desktop a centered
+  680px solid card. `aria-modal`, labeled close, focus returns on dismissal.
+  The `dt`/`dd` grid stacks below 640px.
+- Content pads for what floats over it (bottom bar height + safe area on a
+  phone, strip height on desktop); nothing hides under chrome.
 
 ## Approve shell `vt`
 
 Used on a phone, one hand, under time pressure. Field set and order come from
 [approval-transparency.md](../approval-transparency.md) §C; this adds presentation.
 
+- One solid card, 420px column at every width. The decision line is first and
+  largest (22px): the operation and the record names; then `主机（已验证）@用户`
+  and 命令. Everything else sits in a closed `<details>` 详情 (目录, 项目,
+  父进程, IP with 上次, 原因).
 - Agent-derived truth lines precede every client-reported line; trust is in
   the label (`主机（已验证）`, `IP（已验证）`) and the footnote under the fields
   names what is client-reported, so a hostile caller pads only its own region.
 - The pairing code (`.vt-ap-pair`) is the largest element on an enroll
   approval; nothing else on the page is bold monospace.
 - The cache scope sentence (`缓存范围（项目）`) sits directly above the duration
-  control; the first option is `不缓存` and is checked by default.
-- `同意` is the primary fill at 2fr, `拒绝` the muted fill at 1fr, never below
-  44px; both disable while a ceremony runs.
+  control, a glass segmented control; the first option is `不缓存` and is
+  selected by default.
+- `同意` and `拒绝` live in a bottom glass action bar above the safe area:
+  `同意` primary fill at 2fr, `拒绝` muted at 1fr, 50px tall; both disable
+  while a ceremony runs. The card pads its bottom by the bar.
 - One status line (`role="status" aria-live="polite"`) carries progress,
   success and error; errors name the cause in Chinese and never echo client data.
 - Every await before `navigator.credentials.get` is resolved at load; iOS
   Safari drops the user gesture at the first real async boundary.
 - A settled decision stays visible ≥ 800ms before the tab or dialog closes.
-- The same `vt.mountApprove` renders inline in the audit dialog with
+- The same `vt.mountApprove` renders inline in the audit sheet with
   `showMeta: false`; no second ceremony DOM.
 
 ## Audit rows `changed`
@@ -97,18 +119,19 @@ Used on a phone, one hand, under time pressure. Field set and order come from
   appear only once something is selected `vt`.
 - Secrets never round-trip through the page: configured state is a badge, not the value `vt`.
 
-## Motion `ported`
+## Motion `vt`
 
-- Brief, restrained, interruptible; explains feedback and spatial relations.
-  No global suppression. Reuse existing easing and browser primitives.
+- One easing `cubic-bezier(.2,.8,.2,1)`, 200ms (sheet 280ms); only
+  `transform` and `opacity` animate — never `backdrop-filter`, size or layout.
+- Brief, restrained, interruptible; explains feedback and spatial relations:
+  the sheet rises from the bottom, the tab bar shrinks in place, a selected
+  segment slides. Nothing animates on stream pushes, refreshes or restored rows.
 - Logical state changes immediately even while a visual exit continues:
   closing controls stop accepting input; cleanup never leaves an invisible
   blocking layer; rapid reversals continue from the visible state.
-- Animate deliberate changes, not stream pushes, refreshes or restored rows.
-  Preserve the reader's position.
-- Reduced motion: short fades, less movement. Reduced transparency / increased
-  contrast: solid surfaces. Unsupported features fall back to instant changes
-  keeping content, semantics and keyboard access.
+- Reduced motion: opacity fades ≤ 120ms, no movement. Reduced transparency /
+  increased contrast: solid surfaces. Unsupported features fall back to
+  instant changes keeping content, semantics and keyboard access.
 
 ## Foundations
 
@@ -116,8 +139,9 @@ Used on a phone, one hand, under time pressure. Field set and order come from
   presentation records.
 - Native controls and semantics, readable contrast, visible focus
   (`:focus-visible` outline in `--accent`), 44px touch targets `ported`.
-- Icons `changed`: no icon set, no build step. A Unicode mark (`✓ ● ⚠️`)
-  accompanies text and never replaces it; a control keeps its text or `aria-label`.
+- Icons `vt`: no icon set, no build step. Tab marks are single Unicode
+  glyphs (text, `currentColor`); elsewhere a mark (`✓ ● ⚠️`) accompanies text
+  and never replaces it; a control keeps its text or `aria-label`.
 - CSP `vt`: `script-src 'self'; style-src 'self'` — no inline scripts, styles
   or handlers; DOM is built with `createElement`/`textContent`, positioning
   through CSSOM; page data enters only through the `#vt-data` JSON block.
@@ -138,9 +162,9 @@ Used on a phone, one hand, under time pressure. Field set and order come from
   **login** — one primary button `使用 Passkey 登录` and the status line;
   **console** — the tab strip 审计 · DEK 缓存 · 主机令牌 · Passkey · 设置, tab
   in the URL hash (`/admin#audit`), first tab default.
-- 审计: filter bar, table, `加载更多`, live indicator, detail dialog with
-  inline approval. DEK 缓存: filter bar, bulk bar, table, extend dialog.
-  主机令牌: filter bar, table with per-row `吊销`. Passkey: current list,
+- 审计: filter bar, list/table, `加载更多`, live indicator, detail sheet with
+  inline approval. DEK 缓存: filter bar, bulk bar, list/table, extend sheet.
+  主机令牌: filter bar, list/table with per-row `吊销`. Passkey: current list,
   segmented `新增 / 吊销`, `自检`. 设置: session (`退出登录`, `退出所有会话`),
   caching and hit-notify switches, UV policy JSON, push subscriptions
   (`开启推送`, per-row test/remove).
@@ -151,13 +175,13 @@ Used on a phone, one hand, under time pressure. Field set and order come from
 
 | Control | Where |
 | --- | --- |
-| Tab strip, page head | `admin.js` |
+| Tab bar (bottom pill / top strip), page head | `admin.js` |
 | `.hint`, `.warn`, `.card`/`.card-head`, `.field` | `admin.css` |
 | Buttons: primary, `.ghost`, `.danger`, `.small` | `admin.css` |
 | `.badge`, `.badge-*`, `.reason-badge` | `admin.css` |
-| `.switch`, segmented `#modes` | `admin.css` |
-| Filter bar, `#bulkbar`, table + `.trunc`/`.cell-*` | `admin.css` |
-| Detail dialog (`vt.dialog`), hovercard (`vt.hovercard`), `vt.commandSummary`, `vt.api` | `admin.js` |
+| `.glass`, `.switch`, segmented control (`.seg`) | `admin.css` |
+| Filter bar, `#bulkbar`, `.row` list + table + `.trunc`/`.cell-*` | `admin.css` |
+| Detail sheet (`vt.dialog`), hovercard (`vt.hovercard`), `vt.commandSummary`, `vt.api` | `admin.js` |
 | Status line: `vt.statusLine(el)` returns the tab's `setStatus` | `common.js` |
 | `fmtTime`, `fmtRemaining`, `ttlLabel`, `el` | `common.js` (`vt.*`) |
 | Passkey ceremony | `approve.js` (`vt.mountApprove`) |
@@ -168,7 +192,8 @@ A second copy of any row is a bug (AGENTS.md Budgets rule 3).
 
 - Exercise normal use, failure, cancellation, expiry (`410`), loading,
   reconnection; keyboard, pointer, touch; 375px and 1000px; light and dark;
-  reduced motion and transparency. Check rapid interaction and real hit
+  reduced motion and transparency; installed (standalone) and in-browser on
+  iOS — the bottom bar, safe areas and the sheet's swipe differ. Check rapid interaction and real hit
   targets — screenshots alone do not establish correctness.
 - Isolated mock data only; never a real approval, host token or production Worker.
 - Report actual browser coverage (glass, dialogs, WebAuthn, native controls).
