@@ -142,11 +142,10 @@ pub fn hydrate_env_from_file() -> Vec<String> {
 // Writing top-level keys (`vt enroll` persists VT_PASSKEY_URL / VT_PASSKEY_TOKEN)
 
 /// Set top-level `KEY = "value"` entries in the config file, creating it (mode
-/// 600) when absent. Line-based on purpose: the file is hand-edited and full of
-/// comments, and a parse→serialize round trip would drop them. An existing
-/// uncommented top-level line for the key is replaced in place (first match);
-/// otherwise the key is inserted before the first `[section]` header so it
-/// stays top-level. Only `is_allowed_key` names are accepted.
+/// 600) when absent. Goes through `toml_edit` (the parser `toml` already
+/// uses) so the hand-edited file keeps its comments and layout: an existing
+/// top-level key is replaced in place, a new one lands in the top-level region
+/// before the first `[section]`. Only `is_allowed_key` names are accepted.
 pub fn upsert_config_values(pairs: &[(&str, &str)]) -> anyhow::Result<PathBuf> {
     use anyhow::Context;
     let path = config_path()
@@ -156,7 +155,8 @@ pub fn upsert_config_values(pairs: &[(&str, &str)]) -> anyhow::Result<PathBuf> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let updated = upsert_toml_lines(&existing, pairs)?;
+    let updated =
+        upsert_toml(&existing, pairs).with_context(|| format!("update {}", path.display()))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
@@ -189,72 +189,20 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     result
 }
 
-fn toml_basic_string(v: &str) -> String {
-    let mut out = String::with_capacity(v.len() + 2);
-    out.push('"');
-    for ch in v.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                out.push_str(&format!("\\u{:04X}", c as u32))
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// True when `line` is an uncommented assignment of `key` (`KEY = …`).
-fn line_assigns(line: &str, key: &str) -> bool {
-    let t = line.trim_start();
-    t.strip_prefix(key)
-        .map(|rest| rest.trim_start().starts_with('='))
-        .unwrap_or(false)
-}
-
-fn upsert_toml_lines(existing: &str, pairs: &[(&str, &str)]) -> anyhow::Result<String> {
+/// A file that does not parse is refused rather than overwritten: the operator
+/// fixes it by hand, `vt enroll` never guesses at its contents.
+fn upsert_toml(existing: &str, pairs: &[(&str, &str)]) -> anyhow::Result<String> {
     for (key, _) in pairs {
         anyhow::ensure!(
             is_allowed_key(key),
             "refusing to write non-VT config key {key}"
         );
     }
-    let mut lines: Vec<String> = existing.lines().map(str::to_owned).collect();
-    // Top-level region ends at the first table header.
-    let first_section = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with('['))
-        .unwrap_or(lines.len());
-    // New keys go after the last non-blank top-level line, so the blank line(s)
-    // that visually separate the first section stay where they were.
-    let mut insert_at = lines[..first_section]
-        .iter()
-        .rposition(|l| !l.trim().is_empty())
-        .map_or(0, |i| i + 1);
+    let mut doc: toml_edit::DocumentMut = existing.parse()?;
     for (key, value) in pairs {
-        let rendered = format!("{key} = {}", toml_basic_string(value));
-        match lines[..first_section]
-            .iter()
-            .position(|l| line_assigns(l, key))
-        {
-            Some(i) => lines[i] = rendered,
-            None => {
-                lines.insert(insert_at, rendered);
-                insert_at += 1;
-            }
-        }
+        doc[key] = toml_edit::value(*value);
     }
-    let mut out = lines.join("\n");
-    out.push('\n');
-    // Prove the result still parses before it replaces the user's file.
-    out.parse::<toml::Table>()
-        .map_err(|e| anyhow::anyhow!("refusing to write config that no longer parses: {e}"))?;
-    Ok(out)
+    Ok(doc.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +263,7 @@ mod tests {
     #[test]
     fn upsert_replaces_top_level_key_and_keeps_comments_and_sections() {
         let existing = "# header\n# VT_PASSKEY_TOKEN = \"old-commented\"\nVT_PASSKEY_URL = \"https://a\"\nVT_PASSKEY_TOKEN = \"old\"\n\n[agent]\ntimeout = 60\n";
-        let out = upsert_toml_lines(
+        let out = upsert_toml(
             existing,
             &[("VT_PASSKEY_TOKEN", "vt1.x.y"), ("VT_BACKEND", "auto")],
         )
@@ -326,17 +274,26 @@ mod tests {
         );
         // A key that only exists under a section is NOT the top-level key.
         let sectioned = "[agent]\nVT_PASSKEY_TOKEN = \"inner\"\n";
-        let out = upsert_toml_lines(sectioned, &[("VT_PASSKEY_TOKEN", "t")]).unwrap();
+        let out = upsert_toml(sectioned, &[("VT_PASSKEY_TOKEN", "t")]).unwrap();
         assert_eq!(
             out,
             "VT_PASSKEY_TOKEN = \"t\"\n[agent]\nVT_PASSKEY_TOKEN = \"inner\"\n"
         );
-        // Empty file, value needing escapes, non-VT key refused.
-        assert_eq!(
-            upsert_toml_lines("", &[("VT_X", "a\"b\\c")]).unwrap(),
-            "VT_X = \"a\\\"b\\\\c\"\n"
-        );
-        assert!(upsert_toml_lines("", &[("PATH", "x")]).is_err());
+        // Non-VT key and a file that no longer parses are both refused.
+        assert!(upsert_toml("", &[("PATH", "x")]).is_err());
+        assert!(upsert_toml("VT_A = \"unterminated\n", &[("VT_B", "x")]).is_err());
+    }
+
+    #[test]
+    fn upsert_round_trips_through_a_real_toml_parse() {
+        // Escaping is the serializer's job; the proof is that a real parser
+        // reads back exactly what was written, whatever the value contains.
+        let hard = "a\"b\\c\n\t\u{1}\u{7f}#not-a-comment 'q' \"\"\"";
+        let out = upsert_toml("VT_KEEP = \"k\"\n", &[("VT_X", hard), ("VT_KEEP", "k2")]).unwrap();
+        let table: toml::Table = out.parse().unwrap();
+        assert_eq!(table["VT_X"].as_str(), Some(hard));
+        assert_eq!(table["VT_KEEP"].as_str(), Some("k2"));
+        assert_eq!(table.len(), 2);
     }
 
     #[test]
