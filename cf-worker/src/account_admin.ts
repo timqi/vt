@@ -30,6 +30,7 @@ const PUSH_MAX = 10;
 const LOGIN_TTL_MS = 120_000;
 const LOGIN_PENDING_MAX = 5;
 const LOGIN_FAIL_LOG_THROTTLE_MS = 5000;
+const ASSERTION_FIELDS = ['challenge_id', 'credential_id_b64u', 'client_data_json_b64u', 'authenticator_data_b64u', 'signature_b64u'];
 
 export interface Config {
   v: 1;
@@ -258,8 +259,8 @@ export class AccountAdmin {
 
   // ── Sessions ─────────────────────────────────────────────────────────
 
-  private async cookieFor(cur: Loaded): Promise<string> {
-    return sessionSetCookie((await mintSession(cur.ksess, cur.cfg.epoch, Date.now())).value);
+  private async cookieFor(cur: Loaded, epoch = cur.cfg.epoch): Promise<string> {
+    return sessionSetCookie((await mintSession(cur.ksess, epoch, Date.now())).value);
   }
 
   /** `exp_s` of the caller's session, or the refusal. Every non-GET request
@@ -348,17 +349,33 @@ export class AccountAdmin {
     let body: Record<string, unknown>;
     try { body = (await request.json()) as Record<string, unknown>; }
     catch { return new Response('invalid json', { status: 400 }); }
-    for (const f of ['challenge_id', 'credential_id_b64u', 'client_data_json_b64u', 'authenticator_data_b64u', 'signature_b64u']) {
+    const verified = await this.assertPasskey(cur, body, fail);
+    if (verified instanceof Response) return verified;
+    log('admin.login', { label: verified.entry.l, ip });
+    return new Response(null, { status: 204, headers: { 'Set-Cookie': await this.cookieFor(cur, verified.epoch) } });
+  }
+
+  /** Consume the login challenge `body` names and verify the assertion over it
+   *  by a registered credential. Epoch and membership are read before the
+   *  verification await and again after it: a credential revoked mid-ceremony
+   *  authorizes nothing, and a session minted from the result carries the epoch
+   *  the assertion was checked under. Malformed fields are a 400; every other
+   *  refusal is `fail(reason)`. */
+  private async assertPasskey(
+    cur: Loaded, body: Record<string, unknown>, fail: (reason: string) => Response,
+  ): Promise<{ entry: CredentialEntry; epoch: number } | Response> {
+    for (const f of ASSERTION_FIELDS) {
       if (!isB64uString(body[f]) || (body[f] as string).length > 8192) return new Response(`bad ${f}`, { status: 400 });
     }
     // challenge_id becomes a storage key (2048-byte limit): an over-long one
     // must be a 400, not a thrown 500. Minted ids are 16 chars.
     if ((body.challenge_id as string).length > 32) return new Response('bad challenge_id', { status: 400 });
-    // Read and delete in one step: a challenge answers exactly one login.
+    // Read and delete in one step: a challenge answers exactly one assertion.
     const key = `login:${body.challenge_id as string}`;
     const stored = await this.storage.get<LoginChallenge>(key);
     if (stored) await this.storage.delete(key);
     if (!stored || Date.now() - stored.t >= LOGIN_TTL_MS) return fail('challenge');
+    const epoch = cur.cfg.epoch;
     const entry = await lookupByCredentialId(cur.cfg.credentials, b64uDec(body.credential_id_b64u as string));
     if (!entry) return fail('unknown_credential');
     try {
@@ -375,8 +392,9 @@ export class AccountAdmin {
     } catch {
       return fail('assertion');
     }
-    log('admin.login', { label: entry.l, ip });
-    return new Response(null, { status: 204, headers: { 'Set-Cookie': await this.cookieFor(cur) } });
+    // `cur.cfg` is the live copy every write replaces (see `write`).
+    if (cur.cfg.epoch !== epoch || !cur.cfg.credentials.some(c => c.h === entry.h)) return fail('revoked');
+    return { entry, epoch };
   }
 
   // ── Rotation: R stays, a second wrap is appended ────────────────────

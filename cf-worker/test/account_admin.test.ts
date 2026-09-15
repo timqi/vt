@@ -6,7 +6,12 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { AccountAdmin } from '../src/account_admin';
 import { AccountNotifications } from '../src/account_notifications';
 import { b64uEnc } from '../src/crypto';
+import { verifyAssertion } from '../src/webauthn';
 import type { Challenge } from '../src/types';
+
+// The race tests below need a verification that yields mid-ceremony; the
+// signature math itself is covered by test/do_account.admin_auth.test.ts.
+vi.mock('../src/webauthn', () => ({ verifyAssertion: vi.fn(async () => {}) }));
 
 const SECRET = 'synthetic-test-kek';
 const ORIGIN = 'https://vt.test.invalid';
@@ -48,6 +53,42 @@ async function browserSub(n: number, label = `dev${n}`) {
 
 const post = (body: unknown) => new Request('https://account.do/op/x', { method: 'POST', body: JSON.stringify(body) });
 const get = () => new Request('https://account.do/op/x');
+
+/** A login-challenge answer for ENTRY's credential id; the mocked verifier
+ *  never reads the assertion bytes. */
+async function assertionFor(admin: AccountAdmin, extra: Record<string, unknown> = {}) {
+  const ch = await admin.loginChallenge();
+  expect(ch.status).toBe(200);
+  const { challenge_id } = (await ch.json()) as { challenge_id: string };
+  return {
+    challenge_id, credential_id_b64u: 'dnQtdGVzdC1jcmVkZW50aWFs',
+    client_data_json_b64u: 'AAAA', authenticator_data_b64u: 'AAAA', signature_b64u: 'AAAA', ...extra,
+  };
+}
+
+describe('passkey assertion races', () => {
+  afterEach(() => vi.mocked(verifyAssertion).mockReset());
+
+  it('W-1: a login whose credential set or epoch changed during verification is refused', async () => {
+    const admin = await configured();
+    const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+    // The revocation lands while the signature is being checked.
+    vi.mocked(verifyAssertion).mockImplementationOnce(async () => {
+      expect((await admin.adminOp('sessions-revoke', post({}))).status).toBe(204);
+    });
+    const raced = await admin.login(post(await assertionFor(admin)));
+    expect(raced.status).toBe(401);
+    expect(await raced.json()).toEqual({ error: 'login_failed' });
+    expect(raced.headers.get('Set-Cookie')).toBeNull();
+    expect(logs.mock.calls.map(c => JSON.parse(String(c[0])) as { event: string; reason?: string }))
+      .toContainEqual({ event: 'admin.login_failed', reason: 'revoked', ip: '' });
+    // Undisturbed, the cookie carries the epoch the assertion was verified under.
+    const ok = await admin.login(post(await assertionFor(admin)));
+    expect(ok.status).toBe(204);
+    expect(ok.headers.get('Set-Cookie')).toMatch(/^__Host-vt_admin=1\.\d+\.2\./);
+    logs.mockRestore();
+  });
+});
 
 async function listed(admin: AccountAdmin): Promise<Array<{ endpoint: string; label: string }>> {
   const r = await admin.pushOp('vapid', get());
