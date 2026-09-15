@@ -88,6 +88,26 @@ describe('passkey assertion races', () => {
     expect(ok.headers.get('Set-Cookie')).toMatch(/^__Host-vt_admin=1\.\d+\.2\./);
     logs.mockRestore();
   });
+
+  it('W-5: concurrent revocations of the two remaining credentials leave one', async () => {
+    const admin = await configured();
+    const second = { ...ENTRY, h: 'C'.repeat(43), i: 'c2Vjb25k', l: 'second' };
+    expect((await admin.adminOp('credentials-add', post({ entry: second, ...(await assertionFor(admin)) }))).status).toBe(200);
+    const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const [a, b] = await Promise.all([
+      admin.adminOp('credentials-revoke', post({ h: ENTRY.h, ...(await assertionFor(admin)) })),
+      admin.adminOp('credentials-revoke', post({ h: second.h, ...(await assertionFor(admin)) })),
+    ]);
+    logs.mockRestore();
+    expect([a.status, b.status].sort()).toEqual([204, 409]);
+    expect(await (a.status === 409 ? a : b).json()).toEqual({ error: 'last_credential' });
+    expect(admin.current.credentials).toHaveLength(1);
+    expect(admin.current.epoch).toBe(2);
+    // Reloaded from storage, the same one credential is there.
+    const again = new AccountAdmin(admin['storage'], SECRET);
+    await again.load();
+    expect(again.current.credentials.map(c => c.h)).toEqual(admin.current.credentials.map(c => c.h));
+  });
 });
 
 async function listed(admin: AccountAdmin): Promise<Array<{ endpoint: string; label: string }>> {

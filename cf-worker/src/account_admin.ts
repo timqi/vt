@@ -440,8 +440,20 @@ export class AccountAdmin {
 
   // ── Session ops (the DO verified the cookie) ─────────────────────────
 
-  private async bumpEpoch(mutate?: (cfg: Config) => void): Promise<Response> {
-    await this.write(cfg => { cfg.epoch += 1; mutate?.(cfg); });
+  /** Advance the epoch (every session ends) with an optional change judged
+   *  against the config as it is at write time, not the caller's snapshot: a
+   *  Response returned by `mutate` refuses and leaves the config untouched. */
+  private async bumpEpoch(mutate?: (cfg: Config) => Response | void): Promise<Response> {
+    try {
+      await this.write(cfg => {
+        const refused = mutate?.(cfg);
+        if (refused) throw refused;
+        cfg.epoch += 1;
+      });
+    } catch (e) {
+      if (e instanceof Response) return e;
+      throw e;
+    }
     return new Response(null, { status: 204, headers: { 'Set-Cookie': sessionSetCookie(null) } });
   }
 
@@ -506,10 +518,12 @@ export class AccountAdmin {
         if (typeof h !== 'string') return new Response('bad h', { status: 400 });
         const by = await this.assertPasskey(cur, body, denied);
         if (by instanceof Response) return by;
-        if (!cfg.credentials.some(c => c.h === h)) return new Response('unknown credential', { status: 404 });
-        if (cfg.credentials.length <= 1) return json({ error: 'last_credential' }, 409);
-        log('admin.credential_revoked', { h, by: by.entry.l });
-        return this.bumpEpoch(c => { c.credentials = c.credentials.filter(e => e.h !== h); });
+        return this.bumpEpoch(c => {
+          if (!c.credentials.some(e => e.h === h)) return new Response('unknown credential', { status: 404 });
+          if (c.credentials.length <= 1) return json({ error: 'last_credential' }, 409);
+          c.credentials = c.credentials.filter(e => e.h !== h);
+          log('admin.credential_revoked', { h, by: by.entry.l });
+        });
       }
       default:
         return new Response('unknown op', { status: 400 });
