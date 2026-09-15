@@ -147,38 +147,11 @@ table and loses prior rows. Audit history is not a backup.
   require phone approval again, or end all admin sessions to invalidate cookies.
   These actions do not erase material already released to a caller.
 
-## Current upgrade steps
+## Upgrading from a pre-v2.3 Worker
 
-**Source:** `v20260911-a312763`, or an older deployment using Access/master-derived
-host tokens and libsodium sealed boxes.
-
-**Target:** the first release containing both the root-key configuration change
-`0309690` and sealed-box-v1 CLI support `b9b1d89`; this release is not yet tagged.
-Record its tag here when releasing. The steps below apply only across this
-boundary, not to ordinary updates or KEK rotation.
-
-**Removal:** delete this section in the release immediately following that target
-release. Afterward, operators crossing from the old formats must first use the
-target release's runbook. Do not retain these instructions as a permanent appendix.
-
-**Sealed-box format:** install matching CLI and Worker/PWA builds in the same
-window and clear all DEK cache entries on the cache tab. Old/new key-delivery
-formats are not interchangeable; mismatches can fail with `sealed_box open
-failed`. Persistent `vt://` records do not change. See
-[sealed-box-v1.md](sealed-box-v1.md).
-
-**Pre-Passkey-admin/Access deployment:** remove the Access application and all
-`[vars]`, use the current Wrangler example's `LIMITER` binding, set a fresh
-`SECRET`, and remove retired secrets:
-
-```bash
-wrangler secret delete VT_AUTH_CF
-wrangler secret delete CREDENTIALS_JSON
-wrangler secret delete CACHE_SECKEY
-```
-
-Deploy and bootstrap, re-enroll every host, replace each agent's audit token,
-and restore settings/push subscriptions. Old master-derived tokens are refused.
+Deployments using Cloudflare Access, master-derived host tokens, or libsodium
+sealed boxes cannot be updated in place; follow
+[worker-redeploy.md](worker-redeploy.md).
 
 ## Local development
 

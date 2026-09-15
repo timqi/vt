@@ -31,6 +31,20 @@ Release bundles are ad-hoc signed; upgrades may require renewed Keychain
 permission. For Gatekeeper, an existing agent installation, or a pre-v2 vault,
 follow the [macOS installation and upgrade guide](docs/app-bundle.md).
 
+## Upgrading to v2.3: breaking change for phone approval
+
+v2.3 replaces the Worker's trust model: Passkey-only admin instead of Cloudflare
+Access, per-host tokens issued by `vt enroll` instead of a shared
+`VT_AUTH_CF`, and a new sealed-box format for cached keys. A Worker deployed
+before v2.3 cannot be updated in place, and a v2.3 CLI cannot talk to it.
+
+Deploy a new Worker and re-enroll every host by following
+[worker-redeploy.md](docs/worker-redeploy.md): export the vault, delete the old
+Worker and its Access application, deploy, bootstrap with a Passkey, then
+`vt enroll` each host and re-run `setup-pam.sh` on sudo hosts. Stored `vt://`
+records are unaffected. Local Touch ID use without a Worker needs only the new
+VT.app.
+
 ## Quick Start
 
 | Approval path | Setup |
