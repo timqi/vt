@@ -60,6 +60,14 @@ pub fn sanitize_for_display(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// `sanitize_for_display` that refuses instead of truncating: `None` when the
+/// text would not fit in `max_chars`. For prompts where the user must approve
+/// exactly what is shown (`run@vt` argv), never a visible prefix of it.
+pub fn sanitize_for_display_exact(s: &str, max_chars: usize) -> Option<String> {
+    let out = sanitize_for_display(s, max_chars);
+    (out.chars().count() <= max_chars).then_some(out)
+}
+
 /// Like `sanitize_for_display_multiline` but WITHOUT length / line-count caps:
 /// strips control chars and preserves `\n` only, never truncates or appends an
 /// ellipsis. Used for the `command` field so a long command is shown in full on
@@ -804,6 +812,19 @@ mod tests {
         let s = "short\n".to_string() + &"x".repeat(200);
         let out = sanitize_for_display_multiline(&s, 10, 10);
         assert_eq!(out, "short\nxxxxxxxxxx…");
+    }
+
+    #[test]
+    fn sanitize_exact_refuses_instead_of_truncating() {
+        assert_eq!(sanitize_for_display_exact("a\tb", 3).as_deref(), Some("ab"));
+        assert_eq!(
+            sanitize_for_display_exact(&"x".repeat(400), 400).as_deref(),
+            Some("x".repeat(400).as_str())
+        );
+        // One char over the cap is refused outright, not shown with `…`.
+        assert_eq!(sanitize_for_display_exact(&"x".repeat(401), 400), None);
+        // Control chars do not count: they are stripped, not displayed.
+        assert!(sanitize_for_display_exact(&"\n".repeat(500), 1).is_some());
     }
 
     #[test]

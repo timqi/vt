@@ -230,6 +230,7 @@ async fn clear_keys_for_reload(
 // Defense-in-depth re-sanitization before surfacing wire meta to the Touch ID
 // prompt — forwarded SSH agent sockets could be rewritten by a hostile hop.
 use crate::core::sanitize_for_display as sanitize_prompt;
+use crate::core::sanitize_for_display_exact as sanitize_prompt_exact;
 use crate::core::sanitize_for_display_multiline as sanitize_prompt_multiline;
 
 /// Per-line cap and total-line cap for the multi-line `command` body the CLI
@@ -376,7 +377,8 @@ fn resolve_in_path(name: &str, path_env: &str) -> Option<PathBuf> {
 }
 
 /// Cap on the total characters of joined argv shown in the Touch ID prompt.
-/// Beyond this the prompt is truncated; argv itself is still passed in full.
+/// A request whose argv would not fit is refused (`BadRequest`), never shown
+/// truncated: the user approves exactly the argv line displayed.
 const RUN_PROMPT_ARGV_MAX: usize = 400;
 
 /// Cap on the total bytes of argv strings the agent will accept. Avoids
@@ -862,6 +864,7 @@ const DETAIL_INTERNAL_SERIALIZE: &str = "agent failed to serialize response";
 const DETAIL_RUN_DISABLED: &str = "run@vt disabled (--run-allow not set on agent)";
 const DETAIL_RUN_ARGV_EMPTY: &str = "run@vt argv is empty";
 const DETAIL_RUN_ARGV_TOO_LARGE: &str = "run@vt argv exceeds size cap";
+const DETAIL_RUN_ARGV_UNDISPLAYABLE: &str = "run@vt argv does not fit the approval prompt";
 const DETAIL_DISPLAY_FIELD_TOO_LARGE: &str = "display field exceeds size cap";
 const DETAIL_BATCH_TOO_LARGE: &str = "batch exceeds the per-request item cap";
 const DETAIL_BATCH_EMPTY: &str = "batch contains no items";

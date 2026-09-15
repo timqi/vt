@@ -15,15 +15,15 @@ use super::super::store::KeychainStore;
 use super::scopes::append_reuse_line;
 use super::{
     agent_err, authorization_failure_wire, cache_hit_note_for, fingerprint_str, sanitize_prompt,
-    sanitize_prompt_multiline, sign_data_with_privkey, spawn_detached, HandlerSuccess,
-    VtSshSession, WireFailure, DETAIL_BAD_REQUEST_JSON, DETAIL_BATCH_EMPTY, DETAIL_BATCH_TOO_LARGE,
-    DETAIL_DISPLAY_FIELD_TOO_LARGE, DETAIL_INTERNAL_SERIALIZE, DETAIL_NOT_INITIALIZED,
-    DETAIL_RUN_ARGV_EMPTY, DETAIL_RUN_ARGV_TOO_LARGE, DETAIL_RUN_DISABLED,
-    DETAIL_RUN_NOT_ALLOWLISTED, DETAIL_RUN_SPAWN_FAILED, DETAIL_SIGN_BAD_PUBKEY,
-    DETAIL_SIGN_FAILED, DETAIL_SIGN_KEYS_LOAD, DETAIL_SIGN_KEY_NOT_IN_AGENT,
-    DETAIL_UNKNOWN_SECRET_TYPE, MAX_CRYPTO_BATCH, PROMPT_COMMAND_MAX_LINES,
-    PROMPT_COMMAND_MAX_LINE_LEN, PROMPT_DISPLAY_MAX_BYTES, RUN_PROMPT_ARGV_MAX,
-    RUN_REQ_ARGV_MAX_BYTES,
+    sanitize_prompt_exact, sanitize_prompt_multiline, sign_data_with_privkey, spawn_detached,
+    HandlerSuccess, VtSshSession, WireFailure, DETAIL_BAD_REQUEST_JSON, DETAIL_BATCH_EMPTY,
+    DETAIL_BATCH_TOO_LARGE, DETAIL_DISPLAY_FIELD_TOO_LARGE, DETAIL_INTERNAL_SERIALIZE,
+    DETAIL_NOT_INITIALIZED, DETAIL_RUN_ARGV_EMPTY, DETAIL_RUN_ARGV_TOO_LARGE,
+    DETAIL_RUN_ARGV_UNDISPLAYABLE, DETAIL_RUN_DISABLED, DETAIL_RUN_NOT_ALLOWLISTED,
+    DETAIL_RUN_SPAWN_FAILED, DETAIL_SIGN_BAD_PUBKEY, DETAIL_SIGN_FAILED, DETAIL_SIGN_KEYS_LOAD,
+    DETAIL_SIGN_KEY_NOT_IN_AGENT, DETAIL_UNKNOWN_SECRET_TYPE, MAX_CRYPTO_BATCH,
+    PROMPT_COMMAND_MAX_LINES, PROMPT_COMMAND_MAX_LINE_LEN, PROMPT_DISPLAY_MAX_BYTES,
+    RUN_PROMPT_ARGV_MAX, RUN_REQ_ARGV_MAX_BYTES,
 };
 use crate::core::authorization::{AuthorizationRequest, GrantScope, Operation, ReusePolicy};
 use crate::core::crypto::{derive_dek, AesGcmCrypto};
@@ -501,6 +501,10 @@ impl VtSshSession {
         if req.argv.iter().any(|s| s.contains('\0')) {
             return Err((ErrKind::BadRequest, Some(DETAIL_RUN_ARGV_EMPTY)));
         }
+        // The user approves exactly the argv line they see: refuse rather than
+        // truncate, so no tail can hide past the prompt's display cap.
+        let argv_for_prompt = sanitize_prompt_exact(&req.argv.join(" "), RUN_PROMPT_ARGV_MAX)
+            .ok_or((ErrKind::BadRequest, Some(DETAIL_RUN_ARGV_UNDISPLAYABLE)))?;
 
         let resolved = self.run_allow.resolve(&req.argv[0]).map_err(|why| {
             tracing::warn!("run@vt rejected: {} (argv0={:?})", why, &req.argv[0]);
@@ -511,13 +515,6 @@ impl VtSshSession {
         // its own line so the user is approving the *resolved* program, not
         // the (potentially confusing) raw argv[0] from a remote peer.
         let who = who_at_host(&req.meta.user, &req.host);
-        let argv_joined: String = req
-            .argv
-            .iter()
-            .map(|a| sanitize_prompt(a, 80))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let argv_for_prompt = sanitize_prompt(&argv_joined, RUN_PROMPT_ARGV_MAX);
         let exe_display = sanitize_prompt(&resolved.display().to_string(), 160);
         let mut auth_message = header_with_who("run on this Mac", "from", &who);
         // The vt relay refuses run@vt, so the relay marker is a dead path

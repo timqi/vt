@@ -26,7 +26,7 @@ containing forwarded requests and preventing accidental reuse across activities.
 | Raw SSH signing / `sign@vt` | Sign TTL, when the caller has a reusable scope |
 | `decrypt@vt` | Decrypt TTL, when the caller has a reusable scope |
 | `auth@vt` | Always fresh: attest human presence now |
-| `run@vt` | Always fresh, after executable allowlist validation |
+| `run@vt` | Always fresh, after executable allowlist validation; argv that would not fit the prompt is refused, never truncated |
 
 Both reuse durations default to zero, meaning fresh approval. Sign and decrypt
 have separate policies because a signature answers one challenge while a
