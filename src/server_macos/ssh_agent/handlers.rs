@@ -56,7 +56,9 @@ fn header_with_who(verb: &str, prep: &str, who: &str) -> String {
 }
 
 /// Render `user@host`, omitting either side when empty so the prompt
-/// degrades gracefully for old clients that don't send `meta.user`.
+/// degrades gracefully for old clients that don't send `meta.user`. A host
+/// that is already a `user@host` SSH destination (`vt ssh connect`) is shown
+/// as-is rather than as `qiqi@git@github.com`.
 fn who_at_host(user: &str, host: &str) -> String {
     let u = sanitize_prompt(user, 40);
     let h = sanitize_prompt(host, 60);
@@ -64,14 +66,30 @@ fn who_at_host(user: &str, host: &str) -> String {
         (true, true) => String::new(),
         (true, false) => h,
         (false, true) => u,
+        (false, false) if h.contains('@') => h,
         (false, false) => format!("{}@{}", u, h),
     }
+}
+
+/// Drop a trailing ` -> {who}` from the client command label when the header
+/// already names `who` (`ssh-sign: fetch -> git@github.com` under a
+/// `… on git@github.com` header). Display only; the scope is unchanged.
+fn strip_repeated_destination(body: &str, who: &str) -> String {
+    if who.is_empty() {
+        return body.to_string();
+    }
+    body.strip_suffix(who)
+        .and_then(|rest| rest.strip_suffix(" -> "))
+        .unwrap_or(body)
+        .to_string()
 }
 
 /// Append the extra context lines (pwd, parent process, ssh-from) to the
 /// Touch ID prompt body. Each is on its own line — `LAContext`'s
 /// `localizedReason` renders multi-line strings. Empty fields are skipped so
-/// the prompt stays compact for old clients.
+/// the prompt stays compact for old clients. All three are client claims:
+/// `via:` is cut short (the header already names the operation) and `ssh:`
+/// keeps only the peer address (`SSH_CLIENT` also carries two port numbers).
 fn append_meta_lines(message: &mut String, meta: &crate::core::ClientMeta) {
     if !meta.pwd.is_empty() {
         message.push_str("\npwd: ");
@@ -79,11 +97,11 @@ fn append_meta_lines(message: &mut String, meta: &crate::core::ClientMeta) {
     }
     if !meta.ppid_cmd.is_empty() {
         message.push_str("\nvia: ");
-        message.push_str(&sanitize_prompt(&meta.ppid_cmd, 100));
+        message.push_str(&sanitize_prompt(&meta.ppid_cmd, 40));
     }
-    if !meta.ssh_client.is_empty() {
+    if let Some(addr) = meta.ssh_client.split_whitespace().next() {
         message.push_str("\nssh: ");
-        message.push_str(&sanitize_prompt(&meta.ssh_client, 80));
+        message.push_str(&sanitize_prompt(addr, 80));
     }
 }
 
@@ -228,7 +246,7 @@ impl VtSshSession {
             self.cache_ttls.decrypt_secs,
         );
         let body = sanitize_prompt_multiline(
-            &req.command,
+            &strip_repeated_destination(&req.command, &who),
             PROMPT_COMMAND_MAX_LINE_LEN,
             PROMPT_COMMAND_MAX_LINES,
         );
@@ -692,7 +710,7 @@ impl VtSshSession {
             ctx
         };
         let body = sanitize_prompt_multiline(
-            &req.command,
+            &strip_repeated_destination(&req.command, &who),
             PROMPT_COMMAND_MAX_LINE_LEN,
             PROMPT_COMMAND_MAX_LINES,
         );
@@ -794,6 +812,26 @@ mod tests {
     }
 
     #[test]
+    fn who_at_host_keeps_ssh_destination_unprefixed() {
+        assert_eq!(who_at_host("qiqi", "git@github.com"), "git@github.com");
+    }
+
+    #[test]
+    fn strip_repeated_destination_only_drops_exact_header_match() {
+        let who = "git@github.com";
+        assert_eq!(
+            strip_repeated_destination("ssh-sign: fetch -> git@github.com", who),
+            "ssh-sign: fetch"
+        );
+        assert_eq!(
+            strip_repeated_destination("ssh-sign: fetch -> other.host", who),
+            "ssh-sign: fetch -> other.host"
+        );
+        assert_eq!(strip_repeated_destination("[read]", who), "[read]");
+        assert_eq!(strip_repeated_destination("x -> ", ""), "x -> ");
+    }
+
+    #[test]
     fn who_at_host_degrades_gracefully_for_old_clients() {
         // Old client doesn't send meta.user — fall back to bare host so the
         // prompt still reads naturally.
@@ -839,7 +877,7 @@ mod tests {
         assert_eq!(lines[0], "decrypt 1: [read] on qiqi@alpha");
         assert_eq!(lines[1], "pwd: /tmp");
         assert_eq!(lines[2], "via: zsh -i");
-        assert_eq!(lines[3], "ssh: 10.0.0.5 5234 22");
+        assert_eq!(lines[3], "ssh: 10.0.0.5", "ports carry no decision value");
         assert_eq!(lines.len(), 4, "tty must not be rendered on prompt");
     }
 
@@ -1029,7 +1067,7 @@ mod tests {
         };
         let mut msg = String::new();
         append_meta_lines(&mut msg, &meta);
-        // pwd:100, via:100, ssh:80 — plus the labels and newlines.
+        // pwd:100, via:40, ssh:80 — plus the labels and newlines.
         // Conservative upper bound: each line under 120 chars (label + 100 + …).
         for line in msg.split('\n').filter(|l| !l.is_empty()) {
             assert!(
