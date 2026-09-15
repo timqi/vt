@@ -13,7 +13,7 @@
 // and must still be all-or-nothing across chunk boundaries), not a reproduction
 // of the production throw.
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { b64uEnc } from '../src/crypto';
 import {
   inDO, configure, doPost, doGet, approve, makeChallenge, makeMeta, makeEntry, FAKE_CTX,
@@ -175,6 +175,24 @@ describe('opDekCache — batched reads', () => {
     expect((listing.json as { entries: unknown[] }).entries).toHaveLength(1);
     expect((await doPost('clear-cache', {})).json).toEqual({ cleared: 1 });
   });
+});
+
+// W-11: a salt of the wrong length is a uniform miss decided before any
+// storage read — an over-long one would otherwise become an oversize storage
+// key and surface as a 500.
+it('misses on a malformed or over-long salt without touching storage', async () => {
+  const salts = await armCache(1);
+  const get = await inDO(({ state }) => vi.spyOn(state.storage, 'get'));
+  try {
+    for (const bad of ['A'.repeat(21), 'A'.repeat(23), 'A'.repeat(3000), 'not/b64u!']) {
+      const res = await read([...salts, bad]);
+      expect(res.status).toBe(200);
+      expect(res.json).toEqual({ miss: true });
+    }
+    expect(get.mock.calls.filter(([k]) => Array.isArray(k) && k.some(x => String(x).startsWith('dek:')))).toHaveLength(0);
+  } finally {
+    get.mockRestore();
+  }
 });
 
 describe('opDekCache / writeCache — token_id is the hard half', () => {

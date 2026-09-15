@@ -672,7 +672,7 @@ app.get('/a/:approve_token', async (c) => {
 app.get('/api/page/:approve_token', async (c) => {
   const res = await fetchApprovePageData(c, c.req.param('approve_token'));
   if (!res.ok) return c.json({ error: res.status === 410 ? 'gone' : res.status === 503 ? 'not_configured' : 'not_found' }, res.status);
-  return c.json(res.data);
+  return c.json(res.data, 200, { 'Cache-Control': 'no-store' });
 });
 
 // ── Page shells (static assets + placeholder substitution) ────────────────
@@ -704,7 +704,8 @@ async function fetchShell(c: Context<{ Bindings: Env }>, path: string): Promise<
 // Serve a page shell with the substituted values and the page security headers.
 // A fresh Response is built (ASSETS responses have immutable headers), and the
 // global middleware then rebuilds it again to add HSTS / nosniff /
-// Referrer-Policy — so every page carries the full set.
+// Referrer-Policy — so every page carries the full set. `no-store`: the
+// rendered shell carries per-request data (ceremony material, session state).
 async function servePage(
   c: Context<{ Bindings: Env }>,
   path: string,
@@ -715,6 +716,7 @@ async function servePage(
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
       'Content-Security-Policy': STRICT_CSP,
+      'Cache-Control': 'no-store',
     },
   });
 }

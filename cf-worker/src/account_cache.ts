@@ -213,7 +213,9 @@ export class AccountCache {
   async read(tokenId: string, meta: ChallengeMeta, salts: string[], daemonPk: Uint8Array): Promise<string | null> {
     if (salts.length === 0 || salts.length > 256) return null;
     const sk = this.seckey();
-    for (const s of salts) { if (!isB64uString(s)) return null; }
+    // 16-byte salts, so 22 b64u chars: anything else is a miss, never a
+    // storage-key error surfacing as a 500.
+    for (const s of salts) { if (!isB64uString(s) || s.length !== 22) return null; }
 
     const ctx = await cacheCtx(tokenId, meta.project ?? '');
     // Batch the lookups (M2): the whole key set is read before anything is

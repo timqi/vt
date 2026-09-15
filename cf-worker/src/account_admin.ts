@@ -351,6 +351,9 @@ export class AccountAdmin {
     for (const f of ['challenge_id', 'credential_id_b64u', 'client_data_json_b64u', 'authenticator_data_b64u', 'signature_b64u']) {
       if (!isB64uString(body[f]) || (body[f] as string).length > 8192) return new Response(`bad ${f}`, { status: 400 });
     }
+    // challenge_id becomes a storage key (2048-byte limit): an over-long one
+    // must be a 400, not a thrown 500. Minted ids are 16 chars.
+    if ((body.challenge_id as string).length > 32) return new Response('bad challenge_id', { status: 400 });
     // Read and delete in one step: a challenge answers exactly one login.
     const key = `login:${body.challenge_id as string}`;
     const stored = await this.storage.get<LoginChallenge>(key);

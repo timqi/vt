@@ -106,6 +106,11 @@ describe('login', () => {
     const late = await signChallenge(b64uDec(stale.challenge_b64u), 0x05);
     expect((await viaRouter('/api/admin/login', { method: 'POST', body: JSON.stringify({ challenge_id: stale.challenge_id, ...late }) })).status).toBe(401);
 
+    // W-11: an over-long challenge_id is refused before it becomes a storage key.
+    const long = await viaRouter('/api/admin/login', { method: 'POST', body: JSON.stringify({ challenge_id: 'A'.repeat(3000), ...late }) });
+    expect(long.status).toBe(400);
+    expect(long.text).toBe('bad challenge_id');
+
     for (let i = 0; i < 5; i++) expect((await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' })).status).toBe(200);
     expect((await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' })).status).toBe(429);
     const e = { ...(env as unknown as Env) };

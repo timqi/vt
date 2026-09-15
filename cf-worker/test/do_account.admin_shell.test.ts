@@ -7,7 +7,7 @@
 //     session the DO verifies.
 import { describe, it, expect } from 'vitest';
 import { SELF } from 'cloudflare:test';
-import { adminHeaders, bootstrap } from './do_helpers';
+import { adminHeaders, bootstrap, inDO, makeChallenge } from './do_helpers';
 
 const ORIGIN = 'https://vt.test.invalid';
 
@@ -49,6 +49,24 @@ describe('admin shell', () => {
     const page = await SELF.fetch(`${ORIGIN}/a/sometoken12345`);
     expect(page.status).toBe(503);
     await page.text();
+  });
+
+  // W-11: ceremony data is never cacheable, as HTML or as JSON.
+  it('serves the approval page and its JSON twin with no-store', async () => {
+    await bootstrap();
+    const ch = makeChallenge();
+    await inDO(({ state }) => state.storage.put(`ch:${ch.approve_token}`, ch));
+    const page = await SELF.fetch(`${ORIGIN}/a/${ch.approve_token}`);
+    expect(page.status).toBe(200);
+    expect(page.headers.get('Cache-Control')).toBe('no-store');
+    await page.text();
+    const json = await SELF.fetch(`${ORIGIN}/api/page/${ch.approve_token}`);
+    expect(json.status).toBe(200);
+    expect(json.headers.get('Cache-Control')).toBe('no-store');
+    await json.text();
+    const shell = await SELF.fetch(`${ORIGIN}/admin`);
+    expect(shell.headers.get('Cache-Control')).toBe('no-store');
+    await shell.text();
   });
 
   it('points the manifest at the shell', async () => {
