@@ -31,12 +31,13 @@ Release bundles are ad-hoc signed; upgrades may require renewed Keychain
 permission. For Gatekeeper, an existing agent installation, or a pre-v2 vault,
 follow the [macOS installation and upgrade guide](docs/app-bundle.md).
 
-## Upgrading to v2.3: breaking change for phone approval
+## Upgrading to v20260915: breaking change for phone approval
 
-v2.3 replaces the Worker's trust model: Passkey-only admin instead of Cloudflare
-Access, per-host tokens issued by `vt enroll` instead of a shared
+Release `v20260915-b2f3a0e` replaces the Worker's trust model: Passkey-only
+admin instead of Cloudflare Access, per-host tokens issued by `vt enroll` instead of a shared
 `VT_AUTH_CF`, and a new sealed-box format for cached keys. A Worker deployed
-before v2.3 cannot be updated in place, and a v2.3 CLI cannot talk to it.
+before `v20260915` cannot be updated in place, and a `v20260915` or later CLI
+cannot talk to it.
 
 Deploy a new Worker and re-enroll every host by following
 [worker-redeploy.md](docs/worker-redeploy.md): export the vault, delete the old

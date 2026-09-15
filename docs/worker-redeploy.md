@@ -1,15 +1,15 @@
-# Worker redeploy: upgrading across the v2.3 boundary
+# Worker redeploy: upgrading across the v20260915 boundary
 
-Operator runbook for replacing a Worker deployed before v2.3 (Cloudflare
-Access admin, master-derived host tokens, libsodium sealed boxes) with the
+Operator runbook for replacing a Worker deployed before `v20260915-b2f3a0e`
+(Cloudflare Access admin, master-derived host tokens, libsodium sealed boxes) with the
 current Passkey-admin Worker. Everyday updates, KEK rotation, and factory reset
 stay in [cf-worker-deploy.md](cf-worker-deploy.md).
 
 **Applies to:** any Worker deployed from `v20260911-a312763` or earlier.
-**Target:** v2.3 (`v20260915-*` and later), which requires the root-key
+**Target:** `v20260915-b2f3a0e` and later, which requires the root-key
 configuration `0309690` and sealed-box-v1 CLI support `b9b1d89`.
-**Removal:** delete this document in the release after the first tagged v2.3
-release; later operators upgrade through that release first.
+**Removal:** delete this document in the release after `v20260915-b2f3a0e`;
+later operators upgrade through that release first.
 
 The old and new formats are not interchangeable: old host tokens are refused,
 old DEK-cache entries fail with `sealed_box open failed`, and the admin page no

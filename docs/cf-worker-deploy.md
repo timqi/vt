@@ -147,7 +147,7 @@ table and loses prior rows. Audit history is not a backup.
   require phone approval again, or end all admin sessions to invalidate cookies.
   These actions do not erase material already released to a caller.
 
-## Upgrading from a pre-v2.3 Worker
+## Upgrading from a pre-v20260915 Worker
 
 Deployments using Cloudflare Access, master-derived host tokens, or libsodium
 sealed boxes cannot be updated in place; follow
