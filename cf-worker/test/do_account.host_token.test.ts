@@ -6,7 +6,7 @@
 // rate-limit / pending-cap guards on the public enroll route are covered here
 // too — they are what makes the unauthenticated route safe.
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { env } from 'cloudflare:test';
 import app from '../src/index';
 import { b64uEnc, hmacSha256 } from '../src/crypto';
@@ -14,7 +14,7 @@ import { HOST_TOKEN_TTL_MS } from '../src/host_token';
 import type { Challenge, HostTokenRow } from '../src/types';
 import { AccountAdmin } from '../src/account_admin';
 import {
-  inDO, configure, doPost, doGet, approve, reject, makeMeta, auditRow, bootstrap, hostSecret,
+  inDO, accountStub, configure, doPost, doGet, approve, reject, makeMeta, auditRow, bootstrap, hostSecret,
   redeployWithSecret, TEST_ORIGIN, TEST_CREDENTIAL_ENTRY,
 } from './do_helpers';
 
@@ -137,6 +137,34 @@ describe('enrollment', () => {
       expect((await post('/api/enroll', { host: `h${i}`, user: 'u', timestamp_ms: Date.now() })).status).toBe(200);
     }
     expect((await post('/api/enroll', { host: 'h6', user: 'u', timestamp_ms: Date.now() })).status).toBe(429);
+  });
+
+  // W-7: the count and the reservation share one input-gate window, so a burst
+  // of concurrent requests cannot all pass the cap before any of them is stored.
+  // The ceremony build is slowed with a real timer (the gate opens on any
+  // non-storage await, as it would on thread-pooled WebCrypto in production).
+  it('holds the pending cap under concurrent requests', async () => {
+    await inDO(({ inst }) => {
+      const build = inst.buildAdminCeremony.bind(inst);
+      vi.spyOn(inst, 'buildAdminCeremony').mockImplementation(async (...args: unknown[]) => {
+        const ch = await build(...args);
+        await new Promise(r => setTimeout(r, 10));
+        return ch;
+      });
+    });
+    const enrollCreate = (i: number) => accountStub().fetch('https://account.do/op/enroll-create', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host: `burst${i}`, user: 'u', ip: `203.0.113.${i}`, origin: '' }),
+    });
+    const results = await Promise.all(Array.from({ length: 12 }, (_, i) => enrollCreate(i)));
+    await Promise.all(results.map(r => r.text()));
+    await inDO(({ inst }) => inst.buildAdminCeremony.mockRestore());
+    const statuses = results.map(r => r.status);
+    expect(statuses.filter(s => s === 200)).toHaveLength(5);
+    expect(statuses.filter(s => s === 429)).toHaveLength(7);
+    const pending = await inDO(async h => [...(await h.state.storage.list<Challenge>({ prefix: 'ch:' })).values()]
+      .filter(c => c.enroll && c.status === 'pending').length);
+    expect(pending).toBe(5);
   });
 });
 

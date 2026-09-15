@@ -720,16 +720,6 @@ export class AccountDO extends DurableObject<Env> {
     if (typeof op.host !== 'string' || !op.host) return badRequest('host required');
 
     const now = Date.now();
-    let pending = 0;
-    for await (const page of listPrefixPages<Challenge>(this.ctx.storage, 'ch:')) {
-      for (const [, ch] of page) {
-        if (ch.enroll && ch.status === 'pending' && !isPendingExpired(ch, now)) pending++;
-      }
-    }
-    if (pending >= ENROLL_PENDING_MAX) {
-      return new Response('too many pending enrollments', { status: 429 });
-    }
-
     const intent: EnrollIntent = {
       host: op.host,
       user: typeof op.user === 'string' ? op.user : '',
@@ -738,10 +728,24 @@ export class AccountDO extends DurableObject<Env> {
       pair_code: mintPairCode(),
     };
     // This approval hands out a credential: biometric UV regardless of policy.
-    const ch = await this.mintAdminCeremony(now, {
+    const ch = await this.buildAdminCeremony(now, {
       op_kind: 'enroll', command: enrollSummary(intent), host: intent.host, user: intent.user,
       pwd: '', project: '', ppid_cmd: '', ip: intent.ip, reason: '',
     }, { enroll: intent });
+    // Count AFTER the crypto above and immediately before the put: from here to
+    // storeAndAnnounce's first put only storage awaits occur, so the DO input
+    // gate keeps the count and the reservation atomic against concurrent
+    // requests (a crypto await in between would let N requests all pass).
+    let pending = 0;
+    for await (const page of listPrefixPages<Challenge>(this.ctx.storage, 'ch:')) {
+      for (const [, c] of page) {
+        if (c.enroll && c.status === 'pending' && !isPendingExpired(c, now)) pending++;
+      }
+    }
+    if (pending >= ENROLL_PENDING_MAX) {
+      return new Response('too many pending enrollments', { status: 429 });
+    }
+    await this.storeAndAnnounce(ch);
     return Response.json({
       approve_token: ch.approve_token,
       poll_token: ch.poll_token,
@@ -757,7 +761,8 @@ export class AccountDO extends DurableObject<Env> {
   // placeholder seal is undecryptable by anyone rather than merely ignored.
   // Always `required`: each of these GRANTS authority, so it keeps the
   // biometric step whatever `uv_policy` does to the hot decrypt path.
-  private async mintAdminCeremony(now: number, meta: ChallengeMeta, intent: Pick<Challenge, 'enroll' | 'extend'>): Promise<Challenge> {
+  // Built only; the caller stores it (storeAndAnnounce) once its own gate passes.
+  private async buildAdminCeremony(now: number, meta: ChallengeMeta, intent: Pick<Challenge, 'enroll' | 'extend'>): Promise<Challenge> {
     const workerNonce = randomBytes(16);
     const daemonPk = await discardedBoxPublicKey();
     const ch: Challenge = {
@@ -775,7 +780,6 @@ export class AccountDO extends DurableObject<Env> {
       created_ms: now,
       ...intent,
     };
-    await this.storeAndAnnounce(ch);
     return ch;
   }
 
@@ -1022,10 +1026,11 @@ export class AccountDO extends DurableObject<Env> {
       expires_ms: latest,
     };
     const summary = extendSummary(intent);
-    const ch = await this.mintAdminCeremony(now, {
+    const ch = await this.buildAdminCeremony(now, {
       op_kind: 'cache-extend', command: summary, host: 'admin', user: '', pwd: '', project, ppid_cmd: '',
       ip: request.headers.get('CF-Connecting-IP') ?? '', reason: 'extend the expiry of granted DEK caches',
     }, { extend: intent });
+    await this.storeAndAnnounce(ch);
     log('cache.extend_requested', { at: tokenPrefix(ch.approve_token), ttl_s: ttlS, entries: targets.length });
     const resp: CacheExtendCreateResponse = {
       approve_token: ch.approve_token,
