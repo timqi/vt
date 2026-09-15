@@ -55,7 +55,8 @@ is open only while unconfigured; the first successful registration owns the
 account, so operators must bootstrap promptly on the canonical hostname.
 
 Bootstrap and login-challenge requests are rate-limited; an absent limiter
-fails with 503. Login consumes a single-use challenge. Unconfigured state
+fails with 503. Pending login challenges are capped per client IP, so one
+client cannot lock the operator out. Login consumes a single-use challenge. Unconfigured state
 allows only the admin shell, bootstrap, and public assets; protected operations
 must not fall back to permissive defaults.
 

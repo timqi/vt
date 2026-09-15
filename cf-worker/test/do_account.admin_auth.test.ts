@@ -92,7 +92,7 @@ describe('bootstrap', () => {
 describe('login', () => {
   beforeEach(bootstrap);
 
-  it('consumes its challenge once, within 120 s, and caps pending challenges', async () => {
+  it('consumes its challenge once, within 120 s, and caps pending challenges per IP', async () => {
     const ch = (await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' })).json as { challenge_id: string; challenge_b64u: string };
     const assertion = await signChallenge(b64uDec(ch.challenge_b64u), 0x05);
     const body = JSON.stringify({ challenge_id: ch.challenge_id, ...assertion });
@@ -113,6 +113,14 @@ describe('login', () => {
 
     for (let i = 0; i < 5; i++) expect((await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' })).status).toBe(200);
     expect((await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' })).status).toBe(429);
+    // One saturated client does not lock the operator out from elsewhere.
+    const elsewhere = { 'CF-Connecting-IP': '198.51.100.7' };
+    expect((await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}', headers: elsewhere })).status).toBe(200);
+    await inDO(async h => {
+      const rows = [...(await h.state.storage.list<{ ip: string }>({ prefix: 'login:' })).values()];
+      expect(rows.filter(r => r.ip === IP)).toHaveLength(5);
+      expect(rows.filter(r => r.ip === elsewhere['CF-Connecting-IP'])).toHaveLength(1);
+    });
     const e = { ...(env as unknown as Env) };
     delete e.LIMITER;
     expect((await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' }, e)).status).toBe(503);

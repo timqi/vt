@@ -219,7 +219,7 @@ export class AccountDO extends DurableObject<Env> {
     switch (op) {
       case 'admin-state':           return this.admin.state(request);
       case 'admin-bootstrap':       return this.admin.bootstrap(request);
-      case 'admin-login-challenge': return this.admin.loginChallenge();
+      case 'admin-login-challenge': return this.admin.loginChallenge(request);
       case 'admin-login':           return this.admin.login(request);
     }
     // Unconfigured (docs/worker-slim.md#bootstrap): only the open ops above answer.

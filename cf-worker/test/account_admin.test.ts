@@ -57,7 +57,7 @@ const get = () => new Request('https://account.do/op/x');
 /** A login-challenge answer for ENTRY's credential id; the mocked verifier
  *  never reads the assertion bytes. */
 async function assertionFor(admin: AccountAdmin, extra: Record<string, unknown> = {}) {
-  const ch = await admin.loginChallenge();
+  const ch = await admin.loginChallenge(get());
   expect(ch.status).toBe(200);
   const { challenge_id } = (await ch.json()) as { challenge_id: string };
   return {

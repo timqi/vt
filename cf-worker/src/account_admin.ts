@@ -28,7 +28,10 @@ const CFG_AAD = new TextEncoder().encode('vt-config-v1');
 // rows are the dead ones; the cap bounds fan-out, not devices.
 const PUSH_MAX = 10;
 const LOGIN_TTL_MS = 120_000;
+// Per IP, so one client cannot fill the table and lock the operator out; the
+// global ceiling only bounds storage and the list scan.
 const LOGIN_PENDING_MAX = 5;
+const LOGIN_PENDING_GLOBAL_MAX = 256;
 const LOGIN_FAIL_LOG_THROTTLE_MS = 5000;
 const ASSERTION_FIELDS = ['challenge_id', 'credential_id_b64u', 'client_data_json_b64u', 'authenticator_data_b64u', 'signature_b64u'];
 
@@ -50,7 +53,7 @@ export interface Config {
 
 interface Sealed { n: string; c: string }
 interface RootRecord { wraps: Sealed[] }
-interface LoginChallenge { c: string; t: number }
+interface LoginChallenge { c: string; t: number; ip: string }
 
 interface Loaded {
   root: Uint8Array;
@@ -320,17 +323,21 @@ export class AccountAdmin {
     return run;
   }
 
-  async loginChallenge(): Promise<Response> {
+  async loginChallenge(request: Request): Promise<Response> {
     const cur = await this.load();
     if (!cur) return notConfigured();
     const now = Date.now();
+    const ip = request.headers.get('CF-Connecting-IP') ?? '';
     const pending = await this.storage.list<LoginChallenge>({ prefix: 'login:' });
     const stale = [...pending].filter(([, v]) => now - v.t >= LOGIN_TTL_MS).map(([k]) => k);
     if (stale.length) await this.storage.delete(stale);
-    if (pending.size - stale.length >= LOGIN_PENDING_MAX) return new Response('too many pending logins', { status: 429 });
+    const live = [...pending.values()].filter(v => now - v.t < LOGIN_TTL_MS);
+    if (live.length >= LOGIN_PENDING_GLOBAL_MAX || live.filter(v => v.ip === ip).length >= LOGIN_PENDING_MAX) {
+      return new Response('too many pending logins', { status: 429 });
+    }
     const id = b64uEnc(randomBytes(12));
     const challenge = b64uEnc(randomBytes(32));
-    await this.storage.put(`login:${id}`, { c: challenge, t: now } satisfies LoginChallenge);
+    await this.storage.put(`login:${id}`, { c: challenge, t: now, ip } satisfies LoginChallenge);
     return json({ challenge_id: id, challenge_b64u: challenge, rp_id: new URL(cur.cfg.origin).hostname });
   }
 
