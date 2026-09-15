@@ -85,9 +85,11 @@ pub enum SessionState {
 }
 
 /// Three flags carrying interactive-session evidence. All optional —
-/// `None` means "no info", which the classifier treats as not blocking.
-/// Platform adapters fill these in from whatever signals they have. The
-/// macOS adapter reads them out of `CGSessionCopyCurrentDictionary`.
+/// `None` means "no info". Console and login are positive evidence the
+/// classifier requires; only the lock flag may be absent, because macOS
+/// omits `CGSSessionScreenIsLocked` while unlocked. Platform adapters fill
+/// these in from whatever signals they have. The macOS adapter reads them
+/// out of `CGSessionCopyCurrentDictionary`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionFlags {
     pub is_locked: Option<bool>,
@@ -95,13 +97,14 @@ pub struct SessionFlags {
     pub is_login_done: Option<bool>,
 }
 
-/// Pure classifier. `None` flags = no session evidence available.
+/// Pure classifier. `None` flags = no session evidence available. Fails
+/// closed: `Interactive` needs console and login affirmed, not merely
+/// un-denied, so a missing or mistyped key denies instead of caching.
 pub fn classify_session(flags: Option<SessionFlags>) -> SessionState {
     let Some(f) = flags else {
         return SessionState::NoSession;
     };
-    if f.is_locked == Some(true) || f.is_on_console == Some(false) || f.is_login_done == Some(false)
-    {
+    if f.is_locked == Some(true) || f.is_on_console != Some(true) || f.is_login_done != Some(true) {
         return SessionState::NotInteractive;
     }
     SessionState::Interactive
@@ -195,13 +198,27 @@ mod tests {
     }
 
     #[test]
-    fn classify_missing_keys_default_interactive() {
-        // None for every flag = "no info" → not blocking. Defaults to Interactive
-        // so an Apple key rename doesn't fail-close.
+    fn classify_missing_keys_is_not_interactive() {
+        // None for every flag = "no info" → deny. An Apple key rename or a
+        // mistyped value fails closed rather than unlocking grant reuse.
         assert_eq!(
             classify_session(Some(SessionFlags::default())),
-            SessionState::Interactive
+            SessionState::NotInteractive
         );
+        for f in [
+            SessionFlags {
+                is_locked: Some(false),
+                is_on_console: None,
+                is_login_done: Some(true),
+            },
+            SessionFlags {
+                is_locked: Some(false),
+                is_on_console: Some(true),
+                is_login_done: None,
+            },
+        ] {
+            assert_eq!(classify_session(Some(f)), SessionState::NotInteractive);
+        }
     }
 
     #[test]

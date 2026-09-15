@@ -71,7 +71,8 @@ mod cgsession {
 
     /// Returns `None` if the dict is NULL (no GUI session). Otherwise reads
     /// the three flags we care about; missing/wrong-type keys yield `None`
-    /// for that specific flag (treated as "no info" by `classify_session`).
+    /// for that specific flag (`classify_session` denies on a missing
+    /// console/login flag; the lock key is absent while unlocked).
     pub(super) fn fetch_flags() -> Option<SessionFlags> {
         // SAFETY: CGSessionCopyCurrentDictionary is a *Copy* CF function — it
         // returns either NULL or a +1 retained dict. CFRetained::from_raw
