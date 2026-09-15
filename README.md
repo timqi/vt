@@ -1,6 +1,6 @@
-# VT (Vault)
+# vt (Vault)
 
-VT keeps secrets encrypted and releases them through macOS Keychain / Touch ID
+vt keeps secrets encrypted and releases them through macOS Keychain / Touch ID
 or phone Passkey approval. It supports raw secrets, TOTP, transient injection,
 Ed25519 SSH identities, and remote sudo approval.
 
@@ -84,7 +84,7 @@ vt enroll --url https://vt.example.com
 ```
 
 Open the approval URL on your phone and compare the pairing code before
-approving. Enrollment saves the host's credentials in the VT config file;
+approving. Enrollment saves the host's credentials in the vt config file;
 keep it private. Host revocation and token renewal are covered by the
 [Worker guide](docs/cf-worker-deploy.md#enroll-hosts).
 

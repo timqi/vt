@@ -1,7 +1,7 @@
-# VT coding-agent guide
+# vt coding-agent guide
 
 This is the canonical agent guide; `CLAUDE.md` is a relative symlink to it.
-VT is one Rust binary with a macOS SSH-agent transport (Touch ID, Keychain)
+vt is one Rust binary with a macOS SSH-agent transport (Touch ID, Keychain)
 and a Cloudflare Worker transport (Passkey/WebAuthn).
 
 ## Start here

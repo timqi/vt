@@ -1,6 +1,6 @@
 # SSH identity and forwarding
 
-This document defines how VT supplies SSH identities without requiring every
+This document defines how vt supplies SSH identities without requiring every
 host to retain a plaintext private key. System SSH owns connection setup,
 `known_hosts`, SSH configuration, and exit status.
 
@@ -17,7 +17,7 @@ These may be separate identities; distributing a portable copy is an explicit
 choice to permit private-key decryption outside the agent.
 
 An agent-held key is ordinary decrypted memory, not a Secure Enclave
-non-exportable key. Standard SSH signing can also use it; client-supplied VT
+non-exportable key. Standard SSH signing can also use it; client-supplied vt
 context is not mandatory provenance for every use of the key.
 
 ## Identity selection
@@ -93,7 +93,7 @@ backend pin and available portable record.
 - A process that can open the forwarded socket can request any upstream key,
   including keys the ephemeral signer did not advertise; the upstream agent
   still authorizes each request.
-- Forwarded VT grants remain connection-confined; raw forwarding-capable signs
+- Forwarded vt grants remain connection-confined; raw forwarding-capable signs
   never cache. Neither can reuse local activity grants.
 - `auth@vt` is always fresh; diagnostics are read-only; encryption needs no
   operation approval. Direct `ssh -A` of the real agent exposes a broader surface.

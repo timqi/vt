@@ -17,7 +17,7 @@ Build inputs and bundle layout are defined in [justfile](../justfile).
 
 Release bundles are ad-hoc signed and not notarized. A new build can require
 renewed Keychain permission; a stable `VT_CODESIGN_ID` reduces repeated prompts.
-Keychain permission is separate from VT operation approval. For a trusted
+Keychain permission is separate from vt operation approval. For a trusted
 bundle blocked solely by quarantine:
 
 ```bash
@@ -31,7 +31,7 @@ code. VT.app has no automatic updater.
 ## Master-key wrap v2
 
 The local store accepts wrap v2 only. Its binding is independent of binary
-path; moving VT must not change the key used to unwrap the master. Non-v2
+path; moving vt must not change the key used to unwrap the master. Non-v2
 markers fail before unwrap; there is no in-binary upgrade or rebind command.
 
 Before upgrading a v1 store, run `vt secret rebind` with the previous release,
@@ -42,7 +42,7 @@ wrap definitions belong to [store.rs](../src/server_macos/store.rs) and
 
 ## Notifications
 
-VT-branded notifications require the bundled helper; a bare CLI drops them.
+vt-branded notifications require the bundled helper; a bare CLI drops them.
 Delivery failure never blocks or fails signing/decryption and has no alternate
 notification transport.
 
@@ -125,7 +125,7 @@ security validation must reject unsafe use independently of the watcher.
 
 Automatic reload checks interactivity before Keychain I/O and before installing
 keys, including current agent lock. Unsafe state leaves the key map empty.
-Reload adds no VT approval prompt, though Keychain permission may still appear;
+Reload adds no vt approval prompt, though Keychain permission may still appear;
 explicit `ssh-add -X` unlock is a separate path.
 
 Idle is a backstop for an unlocked, unattended session, separate from grant TTL.

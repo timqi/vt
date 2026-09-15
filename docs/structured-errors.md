@@ -6,7 +6,7 @@ The Worker has a separate wire protocol.
 
 ## Envelope contract
 
-SSH-agent VT extensions use a versioned, plaintext JSON `ExtResponse` envelope.
+SSH-agent vt extensions use a versioned, plaintext JSON `ExtResponse` envelope.
 [src/core/wire.rs](../src/core/wire.rs) is the schema and error declaration;
 do not maintain a second type definition here.
 

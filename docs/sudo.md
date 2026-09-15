@@ -1,6 +1,6 @@
 # Linux sudo approval
 
-VT provides an optional PAM factor: successful human approval satisfies sudo;
+vt provides an optional PAM factor: successful human approval satisfies sudo;
 failure or timeout falls through to the normal password stack.
 
 ## Install
@@ -13,7 +13,7 @@ Run the installer on the Linux host:
 sudo ./setup-pam.sh
 ```
 
-The installer reads the invoking user's VT config and asks which binary to
+The installer reads the invoking user's vt config and asks which binary to
 install when needed. Pin either input explicitly:
 
 ```bash
@@ -22,7 +22,7 @@ sudo VT_CONFIG=/path/to/config.toml VT_BIN=/path/to/vt ./setup-pam.sh
 
 It installs a root-owned binary copy and a root-only helper, then adds the PAM
 factor to `/etc/pam.d/sudo`. Re-running refreshes the copy and helper without
-adding another PAM entry. After upgrading VT, run the installer again.
+adding another PAM entry. After upgrading vt, run the installer again.
 
 ## Verify
 
@@ -56,7 +56,7 @@ Subscribe the phone to Web Push if PAM does not reliably display the approval UR
 
 ## Remove
 
-Delete the VT `pam_exec.so` entry from each PAM file you configured, then remove
+Delete the vt `pam_exec.so` entry from each PAM file you configured, then remove
 `/usr/local/bin/vt-sudo-auth.sh`. Remove the `/usr/local/bin/vt` copy only when
 nothing else uses it.
 

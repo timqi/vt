@@ -45,7 +45,7 @@ a sign grant never authorizes decryption or another signing key.
 | Local `sign@vt`, decrypt, or unbound non-SSH signer in a repository | Kernel-derived workspace and requested key/record |
 | Local caller outside a repository | Exact kernel-derived cwd, in a separate grant family |
 | Caller in a broad shared cwd | Immediate parent application instance and requested key/record |
-| VT extension carried by SSH or the filtering relay | Connection-confined; never a local activity grant |
+| vt extension carried by SSH or the filtering relay | Connection-confined; never a local activity grant |
 | Forwarding-capable or tainted raw sign; unbound SSH client | Fresh only |
 
 - Workspace detection uses the nearest `.git` entry; submodules and worktrees
