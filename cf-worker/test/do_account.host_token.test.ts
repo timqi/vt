@@ -471,4 +471,22 @@ describe('admin token inventory', () => {
     expect((await doPost('tokens-revoke', { token_id: tokenId })).json).toEqual({ revoked: false });
     expect((await doPost('tokens-revoke', { token_id: '' })).status).toBe(400);
   });
+
+  // W-9: a storage failure is a structured 5xx, never `revoked: false` (which
+  // the console reads as "already inactive").
+  it('reports a failed revoke as an error while the token stays live', async () => {
+    const { tokenId } = await enrollApproved('devbox', 'qiqi');
+    await inDO(({ state }) => {
+      vi.spyOn(state.storage.sql, 'exec').mockImplementation(() => { throw new Error('synthetic SQL failure'); });
+    });
+    try {
+      const res = await doPost('tokens-revoke', { token_id: tokenId });
+      expect(res.status).toBe(500);
+      expect(res.json).toEqual({ error: 'token.revoke_failed' });
+    } finally {
+      await inDO(({ state }) => (state.storage.sql.exec as unknown as { mockRestore(): void }).mockRestore());
+    }
+    expect((await tokenRow(tokenId))!.revoked_ms).toBeNull();
+    expect((await doPost('tokens-revoke', { token_id: tokenId })).json).toEqual({ revoked: true });
+  });
 });

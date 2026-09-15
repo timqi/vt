@@ -103,18 +103,15 @@ export class AccountTokens {
   }
 
   /** Authority-reducing: stamps revoked_ms, idempotent. Returns whether a live
-   *  token was actually revoked (false: unknown or already revoked). */
+   *  token was actually revoked; `false` only means a CONFIRMED no-op (unknown
+   *  or already revoked). A SQL failure propagates: the caller must not report
+   *  a token that is still live as inactive. */
   revoke(tokenId: string, now: number): boolean {
-    try {
-      const cursor = this.sql.exec(
-        `UPDATE host_token SET revoked_ms = ? WHERE token_id = ? AND revoked_ms IS NULL RETURNING token_id`,
-        now, tokenId,
-      );
-      return cursor.toArray().length > 0;
-    } catch (e) {
-      logErr('token.revoke_failed', e);
-      return false;
-    }
+    const cursor = this.sql.exec(
+      `UPDATE host_token SET revoked_ms = ? WHERE token_id = ? AND revoked_ms IS NULL RETURNING token_id`,
+      now, tokenId,
+    );
+    return cursor.toArray().length > 0;
   }
 
   /** Storage bounding only: a revoked or lapsed token stays listed for 30 days

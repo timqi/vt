@@ -83,8 +83,14 @@ vt.tabs.tokens = function (panel) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token_id: t.token_id }),
       });
-      if (!resp.ok) { setStatus('Revoke failed: HTTP ' + resp.status, 'error'); btn.disabled = false; return; }
-      var json = await resp.json();
+      var json = await resp.json().catch(function () { return null; });
+      if (!resp.ok) {
+        // A structured code means the token may still be live: say so, never "inactive".
+        var code = json && json.error ? json.error : 'HTTP ' + resp.status;
+        setStatus('Revoke failed: ' + code + ' — token may still be live', 'error');
+        btn.disabled = false;
+        return;
+      }
       setStatus(json.revoked ? 'Revoked ' + (t.host || t.token_id) : 'Token was already inactive', json.revoked ? 'ok' : '');
       await load();
     } catch (e) {

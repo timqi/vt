@@ -821,7 +821,14 @@ export class AccountDO extends DurableObject<Env> {
   private async opTokensRevoke(request: Request): Promise<Response> {
     const tokenId = await AccountDO.tokenIdBody(request);
     if (tokenId instanceof Response) return tokenId;
-    const revoked = this.tokens.revoke(tokenId, Date.now());
+    let revoked: boolean;
+    try { revoked = this.tokens.revoke(tokenId, Date.now()); }
+    catch (e) {
+      // Structured 5xx: the token may still be live, which the console must
+      // not report as "already inactive".
+      logErr('token.revoke_failed', e, { token: tokenId });
+      return Response.json({ error: 'token.revoke_failed' }, { status: 500 });
+    }
     log('token.revoked', { token: tokenId, revoked });
     return Response.json({ revoked });
   }

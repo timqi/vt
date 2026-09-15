@@ -132,8 +132,9 @@ The token secret is derived when needed, never stored in the token record.
   never the request body. This authenticates a credential, not the physical host.
 - Token possession can request approvals and retrieve that token's live cached
   DEKs; theft therefore exposes those cache windows without another phone tap.
-- Admin revocation immediately blocks further token use. A new root invalidates
-  every token; rotating only the KEK does not.
+- Admin revocation immediately blocks further token use; a revoke that fails
+  to write answers `token.revoke_failed` (500), never a no-op. A new root
+  invalidates every token; rotating only the KEK does not.
 
 Token lifecycle and tests: [account_tokens.ts](../cf-worker/src/account_tokens.ts)
 and [host_token.ts](../cf-worker/src/host_token.ts). Enrollment and reset
