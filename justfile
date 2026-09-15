@@ -141,7 +141,7 @@ size:
     row 'src/core/'          "$(count src/core.rs $(files src/core))"   1700
     row 'src/client/'        "$(count src/client.rs $(files src/client))" 1800
     row 'src/server_macos/'  "$(count $(files src/server_macos))" 4500
-    row 'root src/*.rs'      "$(count $(ls src/*.rs | grep -v -e /core.rs -e /client.rs) $(files src/config))" 2000
+    row 'root src/*.rs'      "$(count $(ls src/*.rs | grep -v -e /core.rs -e /client.rs) $(files src/config))" 2700
     row 'cf-worker/src/'     "$(count $(files cf-worker/src))"       4100
     echo
     echo 'Modules over 750:'

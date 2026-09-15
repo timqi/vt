@@ -11,6 +11,7 @@ pub const CLIENT_CONFIG_KEYS: &[&str] = &[
     "VT_PASSKEY_TOKEN",
     "VT_GIT_SSH_PRIVATE_KEY",
     "VT_GIT_SSH_PUB",
+    "VT_AGENT_CONFIG",
     "VT_PASSKEY_UV",
 ];
 

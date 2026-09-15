@@ -1,0 +1,986 @@
+//! `vt hook` — PATH shims that hand a tool exactly the vt:// secrets its rule
+//! names, so nothing has to be exported in plaintext.
+//!
+//! `vt hook install-shims` writes one symlink-to-vt per `[[rules]]` command in
+//! the dedicated, syncable `~/.config/vt/agent.toml`. When a shim is invoked
+//! (`argv[0] = "gh"`), vt dispatches to the exec-gateway for that command:
+//! it consults the rules and either execs the real tool unchanged, refuses it,
+//! or execs it under `vt inject --only-env <vars>` so the child sees plaintext.
+//! Values may come from the process environment OR be supplied centrally in the
+//! same file (`[env.default]` / per-PWD `[env.dirs."…"]`).
+//!
+//! Three outcomes per command:
+//!   * **accept** — exec unchanged. The default for any command not matched.
+//!   * **block**  — refuse (rule has `block = true`), exit 126.
+//!   * **inject** — exec under `vt inject` (rule matched AND ≥1 of its
+//!     `env_vars` resolves to a `vt://` value).
+//!
+//! ## Security notes
+//! * **Scoped injection.** `--only-env` lists *only* the rule's vt:// vars, so a
+//!   matched command never gets handed unrelated secrets from the environment
+//!   (confused-deputy guard).
+//! * **Recursion guards.** A bare `vt` execs unchanged; `resolve_real` skips any
+//!   PATH candidate that canonicalizes back to vt; `VT_HOOK_DEPTH` caps exec
+//!   chains instead of looping.
+//! * **Matching is by argv[0] basename** plus positional / contains-any arg
+//!   tokens — no globs, no substrings, no regex. A program named inside
+//!   `bash -c "…"` is invisible to the rules (documented limitation).
+
+use anyhow::{Context, Result};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use crate::config::{self, HookConfig, HookRule};
+use crate::HookCommands;
+
+/// Multi-call entry: vt was invoked via a `vt hook install-shims` symlink named
+/// `<invoked>` (e.g. `gh`). Behaves exactly like `vt hook exec -- <invoked>
+/// <args>`. Called from `main()` before clap, since `argv[0]` isn't `vt`.
+/// Returns an exit code (the success paths `exec()` and never return).
+pub fn shim_main(invoked: &str, args: &[std::ffi::OsString]) -> i32 {
+    let cfg = config::load_agent_config();
+    let vt_bin = vt_binary();
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(invoked.to_string());
+    argv.extend(args.iter().map(|s| s.to_string_lossy().into_owned()));
+    match run_exec(&cfg, &vt_bin, &argv) {
+        Ok(()) => 0, // unreachable on success (run_exec exec()s), guard anyway
+        Err(e) => {
+            eprintln!("{e:#}");
+            1
+        }
+    }
+}
+
+/// Entry point for the `vt hook` subcommand. Synchronous: the gateway only
+/// decides and execs — the actual decryption happens in the `vt inject` process
+/// it execs into.
+pub fn run(cmd: &HookCommands) -> Result<()> {
+    let cfg = config::load_agent_config();
+    let vt_bin = vt_binary();
+    match cmd {
+        HookCommands::Exec { argv } => run_exec(&cfg, &vt_bin, argv),
+        HookCommands::InstallShims { dir } => install_shims(&cfg, &vt_bin, dir.as_deref()),
+    }
+}
+
+/// Default env reader used in production.
+fn env_lookup(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// This process's working directory as a string (empty on failure).
+fn current_dir() -> String {
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// What to do for a matched command. Two distinct sets:
+///   * `set_vars` — config-sourced (name, value) pairs (BOTH plaintext and
+///     vt:// ciphertext) that the caller hasn't exported, so the hook supplies
+///     them. Process-env-sourced values are omitted (already in the env).
+///   * `only_env` — the subset of vars whose value is vt:// ciphertext, passed
+///     to `vt inject --only-env` to be decrypted. Empty ⇒ nothing to decrypt,
+///     so the command just runs with `set_vars` applied (no `vt inject`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct InjectPlan {
+    pub set_vars: Vec<(String, String)>,
+    pub only_env: Vec<String>,
+    /// `--reason` recorded in the vt audit row.
+    pub reason: String,
+}
+
+impl InjectPlan {
+    /// True when at least one var resolves to vt:// ciphertext (so we must run
+    /// `vt inject`); false ⇒ only plaintext values to set.
+    fn needs_inject(&self) -> bool {
+        !self.only_env.is_empty()
+    }
+}
+
+/// Structured decision for one invocation. The `vt` recursion guard is applied
+/// by the caller.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Deny(String),
+    Inject(InjectPlan),
+}
+
+/// Pure decision core — `get_env` and `cwd` are injected so the logic is
+/// unit-testable without touching the real environment. `cwd` is the working
+/// directory of the command (used to pick per-directory env-value overrides).
+///
+/// Precedence for each named var: `[env.dirs."<cwd-prefix>"]` (longest
+/// prefix) > `[env.default]` > the process environment (agent config wins;
+/// a stray ambient env var can't override a carefully-configured per-project
+/// value). Block rules win over inject rules.
+pub fn decide(
+    prog: &str,
+    args: &[String],
+    cwd: &str,
+    cfg: &HookConfig,
+    get_env: &impl Fn(&str) -> Option<String>,
+) -> Decision {
+    // Block takes precedence over inject, regardless of rule order: a more
+    // specific deny (e.g. `gh auth token`) must win over a broad inject rule
+    // for the same program (e.g. all of `gh`). So scan deny rules first.
+    if let Some(rule) = cfg
+        .rules
+        .iter()
+        .find(|r| r.block && rule_matches(r, prog, args))
+    {
+        return Decision::Deny(
+            rule.reason
+                .clone()
+                .unwrap_or_else(|| format!("command '{prog}' is blocked by policy")),
+        );
+    }
+
+    let rule = match cfg
+        .rules
+        .iter()
+        .find(|r| !r.block && rule_matches(r, prog, args))
+    {
+        Some(r) => r,
+        None => return Decision::Allow, // default policy: accept
+    };
+
+    let dir_vars = dir_override(&cfg.env.dirs, cwd);
+    let mut plan = InjectPlan {
+        set_vars: Vec::new(),
+        only_env: Vec::new(),
+        reason: rule
+            .reason
+            .clone()
+            .unwrap_or_else(|| format!("vt hook: {prog}")),
+    };
+    for name in &rule.env_vars {
+        // Precedence: the agent config WINS over the process env — dirs
+        // (longest cwd-prefix) > default > process env. A carefully-configured
+        // per-project value is authoritative; a stray ambient env var can't
+        // silently override it. Tradeoff (accepted): nested shims no longer
+        // compose without double-injecting — once an outer layer decrypts a var
+        // to plaintext in the env, an inner layer still re-reads the config
+        // vt:// value and decrypts it a second time (a silent DEK-cache hit when
+        // caching is on, an extra approval otherwise).
+        let (val, from_config) = match dir_vars
+            .and_then(|m| m.get(name))
+            .or_else(|| cfg.env.default.get(name))
+        {
+            Some(v) => (v.clone(), true),
+            None => match get_env(name) {
+                Some(v) => (v, false),
+                None => continue,
+            },
+        };
+        // Same detector `vt inject --only-env` uses, so the hook and inject
+        // agree on what counts as a secret (value *containing* a vt:// URL).
+        let is_secret = crate::core::has_vt_url(&val);
+        // Config-sourced values (plaintext OR vt://) are supplied by the hook;
+        // process-env values are already present, so nothing to set.
+        if from_config {
+            plan.set_vars.push((name.clone(), val));
+        }
+        if is_secret {
+            plan.only_env.push(name.clone());
+        }
+    }
+
+    if plan.set_vars.is_empty() && plan.only_env.is_empty() {
+        Decision::Allow // nothing to supply or decrypt → run unchanged
+    } else {
+        Decision::Inject(plan)
+    }
+}
+
+/// Exec-gateway: evaluate a clean argv and exec the result. No shell quoting is
+/// involved — `vt inject` execs argv directly, and we already have a real argv.
+/// The command is resolved to an absolute path (skipping the shim dir) so
+/// re-execing can never re-enter a PATH shim.
+fn run_exec(cfg: &HookConfig, vt_bin: &str, argv: &[String]) -> Result<()> {
+    let arg0 = argv.first().context("vt hook exec: missing command")?;
+    let rest = &argv[1..];
+
+    // Loop breaker: exec chains inherit VT_HOOK_DEPTH. A shim that resolves back
+    // to itself (misconfigured PATH) would exec forever; bail with a clear error
+    // instead of hanging. Legit nesting (mise shim → vt hook exec → real mise)
+    // is depth 1–2; the cap is well above that.
+    const MAX_DEPTH: u32 = 10;
+    let depth: u32 = std::env::var("VT_HOOK_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if depth >= MAX_DEPTH {
+        anyhow::bail!(
+            "vt hook exec: recursion limit ({MAX_DEPTH}) hit for `{arg0}` — a shim is \
+             resolving to itself. Check that the shim dir on PATH matches its real \
+             path and re-run `vt hook install-shims`."
+        );
+    }
+    std::env::set_var("VT_HOOK_DEPTH", (depth + 1).to_string());
+
+    // Match on the program basename; the original argv is still what gets exec'd.
+    let prog = basename(arg0);
+
+    // Recursion guard: a bare `vt …` (or renamed VT_HOOK_BIN) runs as-is.
+    if prog == "vt" || prog == basename(vt_bin) {
+        return exec_real(arg0, rest);
+    }
+
+    let cwd = current_dir();
+    match decide(&prog, rest, &cwd, cfg, &env_lookup) {
+        Decision::Allow => {
+            let real = resolve_real(arg0)?;
+            exec_real(&real, rest)
+        }
+        Decision::Deny(reason) => {
+            eprintln!("vt hook: {reason}");
+            std::process::exit(126);
+        }
+        Decision::Inject(plan) => {
+            // Config-sourced values (plaintext + vt://) aren't exported by the
+            // caller — set them so the child (and the `vt inject` scan) finds
+            // them. exec inherits this modified env.
+            for (k, v) in &plan.set_vars {
+                std::env::set_var(k, v);
+            }
+            let real = resolve_real(arg0)?;
+            if !plan.needs_inject() {
+                // Only plaintext values to supply — exec the command directly.
+                return exec_real(&real, rest);
+            }
+            let mut vt_args = vec![
+                "inject".to_string(),
+                "--only-env".to_string(),
+                plan.only_env.join(","),
+                "--reason".to_string(),
+                plan.reason,
+                "--".to_string(),
+                real,
+            ];
+            vt_args.extend(rest.iter().cloned());
+            exec_real(vt_bin, &vt_args)
+        }
+    }
+}
+
+/// `execvp()` the given program with `argv[0] = prog` (never returns on
+/// success).
+fn exec_real(prog: &str, args: &[String]) -> Result<()> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(prog.to_string());
+    argv.extend(args.iter().cloned());
+    let c_args: Vec<std::ffi::CString> = argv
+        .iter()
+        .map(|a| std::ffi::CString::new(a.as_bytes()))
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("vt hook exec: {prog} argv contains a NUL byte"))?;
+    let mut ptrs: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    // SAFETY: `ptrs` is NUL-terminated and every entry points into a CString in
+    // `c_args`, alive for the call; execvp only reads through them.
+    unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };
+    Err(anyhow::anyhow!(
+        "vt hook exec: failed to run {}: {}",
+        prog,
+        std::io::Error::last_os_error()
+    ))
+}
+
+/// Resolve a bare command name to an absolute path via `$PATH`, skipping any
+/// candidate that is our own binary (a `vt hook install-shims` symlink points
+/// back at `vt`). This is how re-execing never re-enters a shim — and it is
+/// robust to symlinked PATH entries (`/home/me` → `/essd/me`) because it
+/// compares the *resolved target*, not the directory string. A name already
+/// containing `/` is returned unchanged.
+///
+/// When every PATH candidate IS a vt shim, this is a hard error: exec'ing the
+/// bare name would go through execvp's own PATH search, land on the shim
+/// again, and loop to the depth limit — the confusing failure mode this
+/// replaces. A name with no candidates at all is returned as-is (let `exec`
+/// fail with ENOENT).
+fn resolve_real(arg0: &str) -> Result<String> {
+    if arg0.contains('/') {
+        return Ok(arg0.to_string());
+    }
+    let self_exe = canonical_self_exe();
+    let paths: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    match resolve_in_paths(arg0, &paths, self_exe.as_deref()) {
+        Resolved::Real(p) => Ok(p),
+        Resolved::OnlyShims => anyhow::bail!(
+            "vt hook exec: no real `{arg0}` on PATH — every candidate is a vt shim. \
+             Install `{arg0}` (or put its real location on PATH), or remove the shim."
+        ),
+        Resolved::NotFound => Ok(arg0.to_string()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Resolved {
+    /// First executable PATH candidate that is not a vt shim.
+    Real(String),
+    /// Executable candidates exist, but every one canonicalizes to vt itself.
+    OnlyShims,
+    /// No executable candidate at all.
+    NotFound,
+}
+
+/// First `dir/arg0` on `paths` that is executable and is NOT `self_exe` (our own
+/// binary, i.e. a vt shim symlink). Canonicalizing the candidate resolves the
+/// symlink to the real vt binary, so shims are detected regardless of path form.
+fn resolve_in_paths(arg0: &str, paths: &[PathBuf], self_exe: Option<&Path>) -> Resolved {
+    let mut skipped_shim = false;
+    for dir in paths {
+        let cand = dir.join(arg0);
+        if !is_executable(&cand) {
+            continue;
+        }
+        let is_self = match self_exe {
+            Some(me) => std::fs::canonicalize(&cand)
+                .map(|c| c == me)
+                .unwrap_or(false),
+            None => false,
+        };
+        if is_self {
+            skipped_shim = true;
+            continue; // this candidate is a vt shim → skip past it
+        }
+        return Resolved::Real(cand.to_string_lossy().into_owned());
+    }
+    if skipped_shim {
+        Resolved::OnlyShims
+    } else {
+        Resolved::NotFound
+    }
+}
+
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// The set of command basenames to shim: every rule's `command`. `vt` is never
+/// shimmed.
+fn shim_names(cfg: &HookConfig) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = cfg.rules.iter().map(|r| basename(&r.command)).collect();
+    names.remove("vt");
+    names
+}
+
+/// Generate one PATH shim per name from `shim_names`. Each shim is a **symlink
+/// to the vt binary** (busybox-style multi-call): when invoked as `gh`, vt sees
+/// `argv[0] = "gh"` and dispatches to the exec-gateway for that command. No
+/// shell wrapper, no baked paths — and `resolve_real` skips any candidate that
+/// canonicalizes back to vt, so shims never resolve to themselves.
+fn install_shims(cfg: &HookConfig, vt_bin: &str, dir: Option<&str>) -> Result<()> {
+    let dir = match dir {
+        Some(d) => PathBuf::from(d),
+        None => std::env::home_dir()
+            .context("no home directory")?
+            .join(".local")
+            .join("share")
+            .join("vt")
+            .join("shims"),
+    };
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating shim dir {}", dir.display()))?;
+    let dir_abs = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+    // Absolute target so the symlink resolves regardless of CWD.
+    let target = std::fs::canonicalize(vt_bin).unwrap_or_else(|_| PathBuf::from(vt_bin));
+
+    let names = shim_names(cfg);
+    if names.is_empty() {
+        println!("no commands in agent config — nothing to shim");
+        return Ok(());
+    }
+
+    for name in &names {
+        let path = dir.join(name);
+        // Replace any existing shim (script or symlink) idempotently.
+        let _ = std::fs::remove_file(&path);
+        std::os::unix::fs::symlink(&target, &path)
+            .with_context(|| format!("linking {} -> {}", path.display(), target.display()))?;
+    }
+
+    println!(
+        "installed {} shim(s) in {} (symlinks to {}): {}",
+        names.len(),
+        dir_abs.display(),
+        target.display(),
+        names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "add to the FRONT of your PATH (e.g. in ~/.zshrc):\n  export PATH=\"{}:$PATH\"",
+        dir_abs.display()
+    );
+    Ok(())
+}
+
+/// Expand a leading `~` / `~/` in a config dir key to the user's home directory.
+/// Only a bare `~` prefix is handled (not `~user`); everything else is returned
+/// verbatim. Trailing slashes are left intact — callers trim them.
+fn expand_tilde(key: &str) -> std::borrow::Cow<'_, str> {
+    let rest = if key == "~" {
+        Some("")
+    } else {
+        key.strip_prefix("~/")
+    };
+    match (rest, std::env::home_dir()) {
+        (Some(rest), Some(home)) => {
+            let home = home.to_string_lossy();
+            let home = home.trim_end_matches('/');
+            std::borrow::Cow::Owned(if rest.is_empty() {
+                home.to_string()
+            } else {
+                format!("{home}/{rest}")
+            })
+        }
+        _ => std::borrow::Cow::Borrowed(key),
+    }
+}
+
+/// Pick the per-directory override map whose path key is the longest prefix of
+/// `cwd` (exact match or a parent directory). Trailing slashes are ignored, and a
+/// leading `~` in the config key is expanded to the user's home directory.
+fn dir_override<'a>(
+    dirs: &'a std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    cwd: &str,
+) -> Option<&'a std::collections::BTreeMap<String, String>> {
+    let cwd_n = cwd.trim_end_matches('/');
+    dirs.iter()
+        .filter_map(|(d, m)| {
+            let dn = expand_tilde(d);
+            let dn = dn.trim_end_matches('/');
+            // exact dir, or cwd is `<dn>/<something>` (a real subdirectory).
+            let hit = cwd_n == dn
+                || (cwd_n.len() > dn.len()
+                    && cwd_n.starts_with(dn)
+                    && cwd_n.as_bytes()[dn.len()] == b'/');
+            hit.then_some((dn.len(), m))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, m)| m)
+}
+
+/// A rule matches when ALL of these hold:
+///   * its `command` basename equals the command's program basename,
+///   * its `args` are a positional prefix of the command's arguments, and
+///   * if `args_any` is non-empty, the command's args contain at least one of
+///     those tokens (anywhere).
+///
+/// So `command = "gh"` (no args) matches every `gh …`; `args = ["auth","token"]`
+/// matches only `gh auth token …`; adding `args_any = ["-t","--show-token"]`
+/// further narrows to invocations carrying one of those flags. Exact, case-
+/// sensitive, basename-only on the program.
+fn rule_matches(rule: &HookRule, prog: &str, args: &[String]) -> bool {
+    basename(&rule.command) == prog
+        && args_prefix_matches(&rule.args, args)
+        && (rule.args_any.is_empty() || rule.args_any.iter().any(|a| args.iter().any(|g| g == a)))
+}
+
+/// True when `rule_args` is a positional prefix of `inv_args`. Empty rule args
+/// match anything.
+fn args_prefix_matches(rule_args: &[String], inv_args: &[String]) -> bool {
+    rule_args.len() <= inv_args.len()
+        && rule_args
+            .iter()
+            .zip(inv_args)
+            .all(|(want, got)| want == got)
+}
+
+/// This process's executable, canonicalized.
+///
+/// Canonicalization is load-bearing: when running as a shim (a symlink to vt
+/// named after the shimmed tool), macOS's `current_exe()` returns the symlink
+/// path as invoked (`_NSGetExecutablePath` does not resolve links, unlike
+/// Linux's `/proc/self/exe`). Un-canonicalized, `basename(vt_bin)` would
+/// equal the tool name itself, so run_exec's "bare vt runs as-is" recursion
+/// guard would match EVERY shimmed command and exec the bare name — which
+/// execvp resolves right back to the shim, looping to the depth limit; inject
+/// rewrites would similarly re-enter the shim instead of `vt inject`. The
+/// same resolved identity is what `resolve_in_paths` compares candidates
+/// against to skip shims.
+fn canonical_self_exe() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+}
+
+/// The vt binary to exec for injection. Prefer `$VT_HOOK_BIN`, then this
+/// process's own canonicalized path (guarantees the same binary — see
+/// `canonical_self_exe` for why the raw `current_exe` path is NOT usable
+/// here), else bare `vt`.
+fn vt_binary() -> String {
+    if let Ok(p) = std::env::var("VT_HOOK_BIN") {
+        if !p.trim().is_empty() {
+            return p;
+        }
+    }
+    canonical_self_exe()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "vt".to_string())
+}
+
+/// Basename: the segment after the final '/'. Surrounding quotes are stripped.
+fn basename(s: &str) -> String {
+    let s = s.trim_matches(|c| c == '\'' || c == '"');
+    match s.rsplit('/').next() {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EnvConfig;
+    use std::collections::BTreeMap;
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+    fn cfg(rules: Vec<HookRule>) -> HookConfig {
+        HookConfig {
+            rules,
+            ..Default::default()
+        }
+    }
+    fn cfg_env(rules: Vec<HookRule>, env: EnvConfig) -> HookConfig {
+        HookConfig { rules, env }
+    }
+    fn rule(command: &str, env_vars: &[&str], block: bool) -> HookRule {
+        HookRule {
+            command: command.to_string(),
+            env_vars: strs(env_vars),
+            block,
+            ..Default::default()
+        }
+    }
+    fn rule_args(command: &str, args: &[&str], block: bool) -> HookRule {
+        HookRule {
+            command: command.to_string(),
+            args: strs(args),
+            block,
+            ..Default::default()
+        }
+    }
+    fn rule_args_any(command: &str, args: &[&str], args_any: &[&str]) -> HookRule {
+        HookRule {
+            command: command.to_string(),
+            args: strs(args),
+            args_any: strs(args_any),
+            block: true,
+            ..Default::default()
+        }
+    }
+    fn argv(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+    fn env_default(pairs: &[(&str, &str)]) -> EnvConfig {
+        EnvConfig {
+            default: map(pairs),
+            dirs: BTreeMap::new(),
+        }
+    }
+    /// The plan of an expected-inject decision (panics otherwise).
+    fn plan_of(d: Decision) -> InjectPlan {
+        match d {
+            Decision::Inject(p) => p,
+            other => panic!("expected inject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unmatched_command_is_accepted() {
+        let c = cfg(vec![rule("gh", &["GH_TOKEN"], false)]);
+        assert_eq!(decide("ls", &argv("-la"), "", &c, &no_env), Decision::Allow);
+    }
+
+    #[test]
+    fn block_rule_denies() {
+        let c = cfg(vec![rule("rm", &[], true)]);
+        assert!(matches!(
+            decide("rm", &argv("-rf /"), "", &c, &no_env),
+            Decision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn matched_without_vt_env_is_accepted() {
+        // gh is whitelisted but GH_TOKEN is plain (not vt://) → nothing to do.
+        let c = cfg(vec![rule("gh", &["GH_TOKEN"], false)]);
+        let env = |_: &str| Some("ghp_plaintext".to_string());
+        assert_eq!(
+            decide("gh", &argv("pr list"), "", &c, &env),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn matched_with_vt_env_is_scoped_to_the_rules_vars() {
+        let c = cfg(vec![rule("gh", &["GH_TOKEN", "GITHUB_TOKEN"], false)]);
+        // Only GH_TOKEN is vt://; GITHUB_TOKEN is absent.
+        let env = |name: &str| match name {
+            "GH_TOKEN" => Some("vt://0abc".to_string()),
+            _ => None,
+        };
+        let plan = plan_of(decide("gh", &argv("pr create"), "", &c, &env));
+        assert_eq!(plan.only_env, vec!["GH_TOKEN".to_string()]);
+        assert!(plan.needs_inject());
+    }
+
+    #[test]
+    fn rule_matches_by_basename() {
+        let r = rule("/usr/bin/python", &["K"], false);
+        assert!(rule_matches(&r, "python", &[]));
+        assert!(!rule_matches(&r, "python3", &[]));
+    }
+
+    #[test]
+    fn args_prefix_matching() {
+        let r = rule_args("gh", &["auth", "token"], true);
+        assert!(rule_matches(&r, "gh", &argv("auth token")));
+        assert!(rule_matches(&r, "gh", &argv("auth token --hostname x"))); // prefix
+        assert!(!rule_matches(&r, "gh", &argv("auth status")));
+        assert!(!rule_matches(&r, "gh", &argv("pr list")));
+        assert!(!rule_matches(&r, "gh", &[])); // too short
+    }
+
+    #[test]
+    fn shim_names_include_rule_commands_never_vt() {
+        let c = cfg(vec![
+            rule("gh", &["GH_TOKEN"], false),
+            rule("glab", &["GITLAB_TOKEN"], false),
+            rule("vt", &["X"], false),
+        ]);
+        let names = shim_names(&c);
+        assert!(names.contains("gh"));
+        assert!(names.contains("glab"));
+        assert!(!names.contains("vt")); // vt is never shimmed
+    }
+
+    #[test]
+    fn resolve_in_paths_skips_vt_shim_symlink() {
+        // The shim is a symlink to the vt binary; resolve_real must skip any
+        // candidate that canonicalizes to vt (self), and return the real tool.
+        // This is robust even when the shim dir is on PATH via a symlink, since
+        // we compare the resolved target, not the directory path.
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("vt-hook-rt-{}", std::process::id()));
+        let bindir = base.join("bin");
+        let shim = base.join("shim");
+        let real = base.join("real");
+        for d in [&bindir, &shim, &real] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // fake vt binary
+        let vt = bindir.join("vt");
+        std::fs::write(&vt, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&vt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let vt_canon = std::fs::canonicalize(&vt).unwrap();
+        // shim/gh -> vt (a vt shim); real/gh = a distinct real tool
+        std::os::unix::fs::symlink(&vt, shim.join("gh")).unwrap();
+        let real_gh = real.join("gh");
+        std::fs::write(&real_gh, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // shim dir on PATH via a symlink; self = vt binary.
+        let link = std::env::temp_dir().join(format!("vt-hook-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        let paths = vec![link.join("shim"), real.clone()];
+
+        // With self set → the shim (symlink to vt) is skipped, real gh wins.
+        let got = resolve_in_paths("gh", &paths, Some(&vt_canon));
+        assert_eq!(
+            got,
+            Resolved::Real(real_gh.to_string_lossy().into_owned()),
+            "vt shim symlink must be skipped"
+        );
+        // Without self → first candidate wins (the shim), proving self is the guard.
+        let got2 = resolve_in_paths("gh", &paths, None);
+        assert_eq!(
+            got2,
+            Resolved::Real(link.join("shim").join("gh").to_string_lossy().into_owned())
+        );
+        // Missing command → NotFound.
+        assert_eq!(
+            resolve_in_paths("nope", &paths, Some(&vt_canon)),
+            Resolved::NotFound
+        );
+        // Shim is the ONLY candidate → OnlyShims (a hard error upstream): exec'ing
+        // the bare name would execvp straight back into the shim and loop.
+        let shim_only = vec![link.join("shim")];
+        assert_eq!(
+            resolve_in_paths("gh", &shim_only, Some(&vt_canon)),
+            Resolved::OnlyShims
+        );
+
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // (The macOS current_exe-returns-the-symlink regression is guarded by
+    // canonical_self_exe's doc + the OnlyShims coverage above; a unit test
+    // here could only re-assert stdlib canonicalize semantics.)
+
+    #[test]
+    fn decide_returns_structured_inject_plan() {
+        let c = cfg_env(
+            vec![rule("gh", &["GH_TOKEN"], false)],
+            env_default(&[("GH_TOKEN", "vt://0cfg")]),
+        );
+        let plan = plan_of(decide("gh", &argv("pr list"), "/x", &c, &no_env));
+        assert_eq!(plan.only_env, vec!["GH_TOKEN".to_string()]);
+        assert_eq!(
+            plan.set_vars,
+            vec![("GH_TOKEN".to_string(), "vt://0cfg".to_string())]
+        );
+        assert!(plan.needs_inject());
+        // block rule -> Deny
+        let cb = cfg(vec![rule_args("gh", &["auth", "token"], true)]);
+        assert!(matches!(
+            decide("gh", &argv("auth token"), "/x", &cb, &no_env),
+            Decision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn mixed_plaintext_and_secret_config_values_all_set() {
+        // logcli-style: two vt:// + two plaintext values from config.
+        let c = cfg_env(
+            vec![rule(
+                "logcli",
+                &["LOKI_ADDR", "LOKI_ORG_ID", "LOKI_USERNAME", "LOKI_PASSWORD"],
+                false,
+            )],
+            env_default(&[
+                ("LOKI_ADDR", "vt://0addr"),
+                ("LOKI_PASSWORD", "vt://0pw"),
+                ("LOKI_ORG_ID", "org"),
+                ("LOKI_USERNAME", "loki-readonly"),
+            ]),
+        );
+        let plan = plan_of(decide("logcli", &argv("query x"), "/x", &c, &no_env));
+        // all four supplied to the child
+        assert_eq!(plan.set_vars.len(), 4, "{:?}", plan.set_vars);
+        // only the two vt:// ones decrypted
+        assert_eq!(
+            plan.only_env,
+            vec!["LOKI_ADDR".to_string(), "LOKI_PASSWORD".to_string()]
+        );
+    }
+
+    #[test]
+    fn plaintext_only_config_runs_without_vt_inject() {
+        let c = cfg_env(
+            vec![rule("logcli", &["LOKI_ORG_ID"], false)],
+            env_default(&[("LOKI_ORG_ID", "org")]),
+        );
+        let plan = plan_of(decide("logcli", &argv("query x"), "/x", &c, &no_env));
+        assert_eq!(
+            plan.set_vars,
+            vec![("LOKI_ORG_ID".to_string(), "org".to_string())]
+        );
+        assert!(
+            !plan.needs_inject(),
+            "no vt:// value → no vt inject: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn args_any_matches_flag_anywhere() {
+        // Block `glab auth status` only when -t/--show-token is present.
+        let r = rule_args_any("glab", &["auth", "status"], &["-t", "--show-token"]);
+        assert!(rule_matches(&r, "glab", &argv("auth status -t")));
+        assert!(rule_matches(&r, "glab", &argv("auth status --show-token")));
+        assert!(rule_matches(
+            &r,
+            "glab",
+            &argv("auth status --hostname x -t") // flag not adjacent
+        ));
+        assert!(!rule_matches(&r, "glab", &argv("auth status"))); // no token flag
+        assert!(!rule_matches(&r, "glab", &argv("auth login -t"))); // wrong subcommand
+    }
+
+    #[test]
+    fn glab_show_token_blocked_but_plain_status_injected() {
+        let c = cfg(vec![
+            rule("glab", &["GITLAB_TOKEN"], false),
+            rule_args_any("glab", &["auth", "status"], &["-t", "--show-token"]),
+        ]);
+        let env = |_: &str| Some("vt://0tok".to_string());
+        assert!(matches!(
+            decide("glab", &argv("auth status --show-token"), "", &c, &env),
+            Decision::Deny(_)
+        ));
+        let plan = plan_of(decide("glab", &argv("auth status"), "", &c, &env));
+        assert_eq!(plan.only_env, vec!["GITLAB_TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn block_subcommand_wins_over_inject_regardless_of_order() {
+        // inject rule for all of `gh`, plus a deny for `gh auth token`.
+        let c = cfg(vec![
+            rule("gh", &["GH_TOKEN"], false),
+            rule_args("gh", &["auth", "token"], true),
+        ]);
+        let env = |_: &str| Some("vt://0abc".to_string());
+        // subcommand is blocked even though the inject rule also matches gh
+        assert!(matches!(
+            decide("gh", &argv("auth token"), "", &c, &env),
+            Decision::Deny(_)
+        ));
+        // a different gh subcommand still gets injected
+        let plan = plan_of(decide("gh", &argv("pr create"), "", &c, &env));
+        assert_eq!(plan.only_env, vec!["GH_TOKEN".to_string()]);
+    }
+
+    // --- env-value config (defaults + per-PWD overrides) -------------------
+
+    #[test]
+    fn dir_override_picks_longest_prefix() {
+        let mut dirs = BTreeMap::new();
+        dirs.insert("/home/me/work".to_string(), map(&[("K", "broad")]));
+        dirs.insert("/home/me/work/projA".to_string(), map(&[("K", "specific")]));
+        assert_eq!(
+            dir_override(&dirs, "/home/me/work/projA/sub")
+                .unwrap()
+                .get("K"),
+            Some(&"specific".to_string())
+        );
+        assert_eq!(
+            dir_override(&dirs, "/home/me/work/other").unwrap().get("K"),
+            Some(&"broad".to_string())
+        );
+        assert!(dir_override(&dirs, "/tmp").is_none());
+        // exact match with trailing slash normalizes
+        assert!(dir_override(&dirs, "/home/me/work/").is_some());
+    }
+
+    #[test]
+    fn dir_override_expands_tilde() {
+        let Some(home) = std::env::home_dir() else {
+            return;
+        };
+        let home = home.to_string_lossy().trim_end_matches('/').to_string();
+        let mut dirs = BTreeMap::new();
+        dirs.insert("~/work/projA".to_string(), map(&[("K", "tilde")]));
+        // a real cwd under $HOME/work/projA hits the tilde key
+        assert_eq!(
+            dir_override(&dirs, &format!("{home}/work/projA/sub"))
+                .unwrap()
+                .get("K"),
+            Some(&"tilde".to_string())
+        );
+        // exact match on the expanded home dir
+        assert!(dir_override(&dirs, &format!("{home}/work/projA")).is_some());
+        // bare "~" expands to $HOME itself
+        let mut only_home = BTreeMap::new();
+        only_home.insert("~".to_string(), map(&[("K", "h")]));
+        assert!(dir_override(&only_home, &home).is_some());
+        // a literal "~/..." cwd (no expansion on the cwd side) must NOT match
+        assert!(dir_override(&dirs, "/elsewhere").is_none());
+    }
+
+    #[test]
+    fn default_value_is_supplied_in_all_pwds() {
+        // No process env at all — the value comes purely from config.
+        let c = cfg_env(
+            vec![rule("gh", &["GH_TOKEN"], false)],
+            env_default(&[("GH_TOKEN", "vt://0def")]),
+        );
+        let plan = plan_of(decide("gh", &argv("pr list"), "/anywhere", &c, &no_env));
+        assert_eq!(
+            plan.set_vars,
+            vec![("GH_TOKEN".to_string(), "vt://0def".to_string())]
+        );
+        assert_eq!(plan.only_env, vec!["GH_TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn dir_value_overrides_default_by_pwd() {
+        let mut dirs = BTreeMap::new();
+        dirs.insert("/work/projA".to_string(), map(&[("GH_TOKEN", "vt://0A")]));
+        let env = EnvConfig {
+            default: map(&[("GH_TOKEN", "vt://0def")]),
+            dirs,
+        };
+        let c = cfg_env(vec![rule("gh", &["GH_TOKEN"], false)], env);
+        // inside projA -> projA value
+        let inside = plan_of(decide(
+            "gh",
+            &argv("pr list"),
+            "/work/projA/src",
+            &c,
+            &no_env,
+        ));
+        assert_eq!(inside.set_vars[0].1, "vt://0A");
+        // elsewhere -> default value
+        let outside = plan_of(decide("gh", &argv("pr list"), "/work/projB", &c, &no_env));
+        assert_eq!(outside.set_vars[0].1, "vt://0def");
+    }
+
+    #[test]
+    fn config_wins_over_process_env_and_is_supplied() {
+        // config-first: the config default takes precedence over an exported
+        // vt:// value, and (being config-sourced) is set for the child.
+        let c = cfg_env(
+            vec![rule("gh", &["GH_TOKEN"], false)],
+            env_default(&[("GH_TOKEN", "vt://0cfg")]),
+        );
+        let proc_env = |_: &str| Some("vt://0env".to_string());
+        let plan = plan_of(decide("gh", &argv("pr list"), "/x", &c, &proc_env));
+        assert_eq!(
+            plan.set_vars,
+            vec![("GH_TOKEN".to_string(), "vt://0cfg".to_string())],
+            "config should win"
+        );
+        assert_eq!(plan.only_env, vec!["GH_TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn config_reinjects_over_plaintext_env() {
+        // Accepted tradeoff of config-first: even when a var is already
+        // plaintext in the env (e.g. an outer inject decrypted it), a config
+        // vt:// value wins and is re-injected (double-decrypt in compose).
+        let c = cfg_env(
+            vec![rule("gh", &["GH_TOKEN"], false)],
+            env_default(&[("GH_TOKEN", "vt://0cfg")]),
+        );
+        let proc_env = |_: &str| Some("ghp_plaintext".to_string());
+        let plan = plan_of(decide("gh", &argv("pr list"), "/x", &c, &proc_env));
+        assert_eq!(plan.set_vars[0].1, "vt://0cfg", "config should win");
+        assert_eq!(plan.only_env, vec!["GH_TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn env_sourced_value_is_not_set_again() {
+        // Var only in the process env (not config) → used but not re-set (it is
+        // already in the environment vt inject will scan).
+        let c = cfg(vec![rule("gh", &["GH_TOKEN"], false)]);
+        let proc_env = |_: &str| Some("vt://0env".to_string());
+        let plan = plan_of(decide("gh", &argv("pr list"), "/x", &c, &proc_env));
+        assert!(plan.set_vars.is_empty(), "{:?}", plan.set_vars);
+        assert_eq!(plan.only_env, vec!["GH_TOKEN".to_string()]);
+    }
+}

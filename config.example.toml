@@ -51,6 +51,14 @@
 # VT_GIT_SSH_PRIVATE_KEY = "vt://0..."
 # VT_GIT_SSH_PUB = "ssh-ed25519 AAAA... vt-dev"
 
+# --- Command shims (`vt hook`) ----------------------------------------------
+# Shim rules do NOT live here. They contain no plaintext and are meant to be
+# synced, so they live in a separate file:
+#
+#     ~/.config/vt/agent.toml          (override with $VT_AGENT_CONFIG)
+#
+# See agent.example.toml for the template and docs/hook.md for the design.
+
 # --- SSH agent defaults ([agent] section, optional) --------------------------
 # Startup defaults for `vt ssh agent`, so a supervisor (the VT.app menu-bar
 # shell) can spawn the agent without hardcoding your flags. Explicit CLI flags

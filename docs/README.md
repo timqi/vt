@@ -8,6 +8,7 @@ Find the document that owns the task; implementation history stays in Git.
 |---|---|
 | Install, use the CLI, inject secrets, diagnose routing | [Project README](../README.md) |
 | Configure client routing and agent defaults | [Config template](../config.example.toml) |
+| Give a command its secrets through a PATH shim | [Command shims](hook.md) |
 | Deploy, bootstrap, update, or reset phone approval | [Worker deployment](cf-worker-deploy.md) |
 | Replace a pre-v20260915 Worker (breaking upgrade) | [Worker redeploy](worker-redeploy.md) |
 | Operate the macOS menu app and agent | [VT.app](app-bundle.md) |

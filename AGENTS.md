@@ -87,7 +87,7 @@ Line counts are a proxy for growth and duplication, not a reason to weaken code.
 | `src/core/` | 1.7k | `core.rs` + `core/` |
 | `src/client/` | 1.8k | `client.rs` + `client/` |
 | `src/server_macos/` | 4.5k | macOS server tree |
-| root `src/*.rs` | 2.0k | root modules excluding `core.rs` / `client.rs`, plus `config/` |
+| root `src/*.rs` | 2.7k | root modules excluding `core.rs` / `client.rs`, plus `config/` (includes `hook.rs`, the shim exec-gateway) |
 | `cf-worker/src/` | 4.1k | Worker TypeScript |
 | one module | 750 | consider responsibilities before splitting |
 
@@ -104,6 +104,10 @@ Errors and fallback classes: [docs/structured-errors.md](docs/structured-errors.
   falls back only on recoverable errors; `agent` / `passkey` pin the transport.
   Never silently broaden fallback.
 - Wrappers use `inject --only-env` to limit environment-variable decryption.
+  Shim rules are separate: `~/.config/vt/agent.toml`, overridden by
+  `VT_AGENT_CONFIG`. Preserve default-accept, inject only when a configured rule
+  names a resolved `vt://` variable, and keep the self-resolution guards. The
+  shims are not a sandbox. See [docs/hook.md](docs/hook.md).
   Plaintext secrets and private seeds never enter logs, examples, or test output.
   Do not add disk/argv exposure beyond explicit product flows such as injection.
 - Preserve structured extension envelopes and stable exit codes; error details

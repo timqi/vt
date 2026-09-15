@@ -140,6 +140,24 @@ vt inject --recover
 Recovery requires no approval and can run from a login/boot hook. Failed
 restoration preserves recovery state for a retry.
 
+## Command Shims
+
+To make a tool receive its secret without any wrapper in your muscle memory,
+name the command and its variables in `~/.config/vt/agent.toml`, then install
+the shims:
+
+```bash
+vt hook install-shims                 # ~/.local/share/vt/shims/{gh,glab,…}
+export PATH="$HOME/.local/share/vt/shims:$PATH"
+```
+
+Each shim is a symlink to `vt`; invoked as `gh` it execs the real tool under
+`vt inject --only-env`, so only that rule's variables are decrypted. A rule can
+also refuse a command (`gh auth token` printing the token it was just handed).
+The rules file carries no plaintext and can be synced.
+[`hook.md`](docs/hook.md) owns the schema, precedence, and limits;
+[`agent.example.toml`](agent.example.toml) is the template.
+
 ## SSH
 
 With the Mac agent running, import an existing Ed25519 key and use its socket:
@@ -184,7 +202,8 @@ vt --help
 vt inject --help
 ```
 
-Use `vt <command> --help` for the full command and option reference. Linux sudo
+Use `vt <command> --help` for the full command and option reference. Shim rules
+live in their own file (`VT_AGENT_CONFIG`) — see [hook.md](docs/hook.md). Linux sudo
 setup and removal are in [sudo.md](docs/sudo.md); other tasks are indexed in the
 [documentation map](docs/README.md).
 

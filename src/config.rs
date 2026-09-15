@@ -135,7 +135,8 @@ pub fn hydrate_env_from_file() -> Vec<String> {
     for (key, value) in &table {
         // Structured sections (TOML tables / arrays) are not env-var
         // candidates — skip them silently so a future section can never
-        // produce warning spam on every `vt` invocation.
+        // produce warning spam on every `vt` invocation. (Shim rules live in
+        // their own file; see `load_agent_config`.)
         if value.is_table() || value.is_array() {
             continue;
         }
@@ -275,6 +276,142 @@ pub fn load_agent_file_config() -> AgentFileConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shim rules (dedicated file: ~/.config/vt/agent.toml)
+// ---------------------------------------------------------------------------
+//
+// Consumed by the `vt hook` PATH shims (see `src/hook.rs`). Kept in its OWN
+// file, separate from the secret-bearing config.toml (whose `[agent]` section
+// is unrelated agent policy), so the rules + env-var values can be synced to a
+// repo while plaintext secrets never leave the host. Top-level `[[rules]]`
+// (+ optional `[env]`):
+//
+//     [[rules]]
+//     command  = "gh"                       # matched against argv[0] basename
+//     env_vars = ["GH_TOKEN", "GITHUB_TOKEN"]
+//
+//     [[rules]]
+//     command = "gh"
+//     args    = ["auth", "token"]           # subcommand-level deny
+//     block   = true
+
+/// One whitelist entry. A command is matched by the *basename* of its leading
+/// program token (so `python`, `/usr/bin/python`, and `./python` all match a
+/// rule whose `command = "python"`).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct HookRule {
+    /// Program to match (matched by basename against the command's argv[0]).
+    pub command: String,
+    /// Optional leading-argument prefix that must match (the tokens right after
+    /// the program) for this rule to apply. Empty = match any invocation of
+    /// `command`. Lets a rule target a subcommand, e.g.
+    /// `command = "gh"`, `args = ["auth", "token"]` matches `gh auth token …`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional "contains any" guard: when non-empty, the invocation's args
+    /// must include at least one of these tokens (anywhere) for the rule to
+    /// apply. Use it to match a flag that has no fixed position or has short/
+    /// long aliases, e.g. `command = "glab"`, `args = ["auth","status"]`,
+    /// `args_any = ["-t","--show-token"]` blocks `glab auth status --show-token`
+    /// but leaves a plain `glab auth status` untouched.
+    #[serde(default)]
+    pub args_any: Vec<String>,
+    /// Env-var names that should be decrypted via `vt inject` when this command
+    /// runs AND the var's value contains a `vt://` record. Empty → nothing to
+    /// inject (the rule becomes a no-op unless `block` is set).
+    #[serde(default)]
+    pub env_vars: Vec<String>,
+    /// When true, the command is denied outright (no execution).
+    #[serde(default)]
+    pub block: bool,
+    /// Optional human reason surfaced to the caller (deny) or recorded in the
+    /// vt audit row (inject). Defaults are synthesized when absent.
+    pub reason: Option<String>,
+}
+
+/// Centrally-managed env-var VALUES the shim can supply to matched commands, so
+/// nothing has to be exported. Values are normally `vt://` ciphertext
+/// (decrypted on use). `default` applies in every working directory; `dirs`
+/// overrides per directory (longest path prefix of the command's CWD wins).
+/// TOML:
+///
+///     [env.default]
+///     GH_TOKEN = "vt://0default…"
+///
+///     [env.dirs."/home/me/work/projA"]
+///     GH_TOKEN = "vt://0projA…"
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct EnvConfig {
+    /// Values applied in all PWDs.
+    #[serde(default)]
+    pub default: std::collections::BTreeMap<String, String>,
+    /// Per-directory overrides, keyed by absolute path (a leading `~` is
+    /// expanded). The longest key that is a prefix of the command's CWD wins.
+    #[serde(default)]
+    pub dirs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+/// The shim-rules file: a top-level array of `[[rules]]` plus an optional
+/// `[env]` section supplying values for the vars those rules name.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct HookConfig {
+    #[serde(default)]
+    pub rules: Vec<HookRule>,
+    #[serde(default)]
+    pub env: EnvConfig,
+}
+
+/// Resolve the shim-rules file path: `$VT_AGENT_CONFIG` if set and non-empty,
+/// otherwise `~/.config/vt/agent.toml`.
+///
+/// This is a SEPARATE file from `config.toml` (the `VT_*` secret store) on
+/// purpose: `config.toml` holds secrets and must never be synced to a repo,
+/// whereas the command rules + env-var values carry no plaintext secrets and
+/// are meant to be shared/synced (symlink `agent.toml` into a dotfiles repo, or
+/// point `$VT_AGENT_CONFIG` at a checked-in file).
+pub fn agent_config_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("VT_AGENT_CONFIG") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    Some(
+        std::env::home_dir()?
+            .join(".config")
+            .join("vt")
+            .join("agent.toml"),
+    )
+}
+
+/// Load the shim rules (command rules + env-var values) from the dedicated
+/// file. Absent file → empty config (every command then defaults to *accept*).
+/// Malformed file → warn + empty config so a typo can never wedge a shimmed
+/// tool.
+pub fn load_agent_config() -> HookConfig {
+    let Some(path) = agent_config_path() else {
+        return HookConfig::default();
+    };
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HookConfig::default(),
+        Err(e) => {
+            tracing::warn!("vt hook: could not read {}: {}", path.display(), e);
+            return HookConfig::default();
+        }
+    };
+    match toml::from_str::<HookConfig>(&contents) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(
+                "vt hook: ignoring malformed shim rules {}: {}",
+                path.display(),
+                describe_toml_error(&contents, &e)
+            );
+            HookConfig::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +499,79 @@ mod tests {
         assert!(!is_allowed_key("vt_backend")); // lowercase
         assert!(!is_allowed_key("VT_backend")); // mixed
         assert!(!is_allowed_key("VTBACKEND")); // missing underscore prefix shape
+    }
+
+    // The shim-rules schema is deserialized by serde; a field/shape mismatch
+    // would silently fail-open to "no rules". These lock the wiring.
+    #[test]
+    fn agent_config_deserializes_full_schema() {
+        let toml = r#"
+[[rules]]
+command  = "gh"
+env_vars = ["GH_TOKEN"]
+
+[[rules]]
+command  = "gh"
+args     = ["auth", "token"]
+block    = true
+reason   = "no token reveal"
+
+[[rules]]
+command  = "glab"
+args     = ["auth", "status"]
+args_any = ["-t", "--show-token"]
+block    = true
+
+[env.default]
+GH_TOKEN = "vt://0default"
+
+[env.dirs."/work/projA"]
+GH_TOKEN = "vt://0projA"
+"#;
+        let cfg: HookConfig = toml::from_str(toml).expect("valid shim rules parse");
+        assert_eq!(cfg.rules.len(), 3);
+        // rule 0: inject
+        assert_eq!(cfg.rules[0].command, "gh");
+        assert_eq!(cfg.rules[0].env_vars, vec!["GH_TOKEN"]);
+        assert!(!cfg.rules[0].block);
+        // rule 1: subcommand block with reason
+        assert_eq!(cfg.rules[1].args, vec!["auth", "token"]);
+        assert!(cfg.rules[1].block);
+        assert_eq!(cfg.rules[1].reason.as_deref(), Some("no token reveal"));
+        // rule 2: args_any flag guard
+        assert_eq!(cfg.rules[2].args_any, vec!["-t", "--show-token"]);
+        // env values
+        assert_eq!(
+            cfg.env.default.get("GH_TOKEN").map(String::as_str),
+            Some("vt://0default")
+        );
+        assert_eq!(
+            cfg.env
+                .dirs
+                .get("/work/projA")
+                .and_then(|m| m.get("GH_TOKEN"))
+                .map(String::as_str),
+            Some("vt://0projA")
+        );
+    }
+
+    #[test]
+    fn empty_and_minimal_configs_default_cleanly() {
+        let empty: HookConfig = toml::from_str("").unwrap();
+        assert!(empty.rules.is_empty() && empty.env.default.is_empty());
+        // a rule with only `command` uses defaults for the rest
+        let min: HookConfig = toml::from_str("[[rules]]\ncommand = \"gh\"\n").unwrap();
+        assert_eq!(min.rules.len(), 1);
+        assert!(
+            min.rules[0].args.is_empty() && !min.rules[0].block && min.rules[0].reason.is_none()
+        );
+    }
+
+    #[test]
+    fn unquoted_value_is_a_parse_error() {
+        // Documents the footgun: a shell-style unquoted value breaks the file.
+        // `load_agent_config` catches this and returns default (fail-open).
+        assert!(toml::from_str::<HookConfig>("[env.default]\nGH_TOKEN=vt://x\n").is_err());
     }
 
     #[test]
