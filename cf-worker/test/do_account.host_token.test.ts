@@ -14,7 +14,7 @@ import { HOST_TOKEN_TTL_MS } from '../src/host_token';
 import type { Challenge, HostTokenRow } from '../src/types';
 import { AccountAdmin } from '../src/account_admin';
 import {
-  inDO, accountStub, configure, doPost, doGet, approve, reject, makeMeta, auditRow, bootstrap, hostSecret,
+  inDO, accountStub, configure, doPost, doGet, approve, reject, makeMeta, auditRow, bootstrap, hostSecret, loginAssertion,
   redeployWithSecret, TEST_ORIGIN, TEST_CREDENTIAL_ENTRY,
 } from './do_helpers';
 
@@ -319,7 +319,7 @@ describe('SECRET rotation and reset', () => {
 
   it('keeps every host token across a console rotation and retires the old wrap on first use', async () => {
     const { tokenId } = await enrollApproved('devbox', 'qiqi');
-    const rotated = await doPost('admin-rotate-secret', {});
+    const rotated = await doPost('admin-rotate-secret', await loginAssertion());
     expect(rotated.status).toBe(200);
     const fresh = rotated.json.secret as string;
     expect(fresh).toMatch(/^[A-Za-z0-9_-]{43}$/);
@@ -338,8 +338,8 @@ describe('SECRET rotation and reset', () => {
     const body = challengeBody();
     expect((await post('/api/challenge', body, await tokenHeaders(tokenId, body))).status).toBe(200);
     // A second rotation before deploying replaces the pending wrap: never three.
-    await doPost('admin-rotate-secret', {});
-    await doPost('admin-rotate-secret', {});
+    await doPost('admin-rotate-secret', await loginAssertion());
+    await doPost('admin-rotate-secret', await loginAssertion());
     expect(await wraps()).toBe(2);
   });
 

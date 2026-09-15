@@ -33,6 +33,8 @@ const LOGIN_TTL_MS = 120_000;
 const LOGIN_PENDING_MAX = 5;
 const LOGIN_PENDING_GLOBAL_MAX = 256;
 const LOGIN_FAIL_LOG_THROTTLE_MS = 5000;
+// A rotation the new SECRET has not been deployed under by then is void.
+const ROTATION_TTL_MS = 24 * 3600_000;
 const ASSERTION_FIELDS = ['challenge_id', 'credential_id_b64u', 'client_data_json_b64u', 'authenticator_data_b64u', 'signature_b64u'];
 
 export interface Config {
@@ -52,7 +54,8 @@ export interface Config {
 }
 
 interface Sealed { n: string; c: string }
-interface RootRecord { wraps: Sealed[] }
+/** `pending_ms`: when `wraps[1]` was appended by a rotation. */
+interface RootRecord { wraps: Sealed[]; pending_ms?: number }
 interface LoginChallenge { c: string; t: number; ip: string }
 
 interface Loaded {
@@ -222,6 +225,11 @@ export class AccountAdmin {
   private async loadFromStorage(): Promise<Loaded | null> {
     const rootRec = await this.storage.get<RootRecord>(ROOT_KEY);
     if (!rootRec) return null;
+    if (rootRec.wraps.length > 1 && rootRec.pending_ms !== undefined && Date.now() - rootRec.pending_ms >= ROTATION_TTL_MS) {
+      await this.storage.put(ROOT_KEY, { wraps: [rootRec.wraps[0]!] } satisfies RootRecord);
+      rootRec.wraps = [rootRec.wraps[0]!];
+      log('admin.rotation_expired', {});
+    }
     const kek = await this.kek();
     let root: Uint8Array | null = null;
     let at = -1;
@@ -418,8 +426,8 @@ export class AccountAdmin {
    *  the value once for `wrangler secret put SECRET`. The first successful
    *  load under the new SECRET drops the old wrap (loadFromStorage); a second
    *  rotation before that replaces the pending wrap, so there are never more
-   *  than two. */
-  private rotateSecret(): Promise<Response> {
+   *  than two, and a pending wrap older than ROTATION_TTL_MS is dropped at load. */
+  private rotateSecret(by: string): Promise<Response> {
     const run = this.queue.then(async (): Promise<Response> => {
       const cur = await this.load();
       if (!cur) return notConfigured();
@@ -430,8 +438,8 @@ export class AccountAdmin {
       const rec = await this.storage.get<RootRecord>(ROOT_KEY);
       if (!rec?.wraps[0]) return new Response('root missing', { status: 500 });
       // wraps[0] is the wrap the current SECRET opened (load collapses to it).
-      await this.storage.put(ROOT_KEY, { wraps: [rec.wraps[0], fresh] } satisfies RootRecord);
-      log('admin.secret_rotated', {});
+      await this.storage.put(ROOT_KEY, { wraps: [rec.wraps[0], fresh], pending_ms: Date.now() } satisfies RootRecord);
+      log('admin.secret_rotated', { by });
       return json({ secret });
     });
     this.queue = run.catch(() => {});
@@ -462,8 +470,8 @@ export class AccountAdmin {
     const cur = await this.load();
     if (!cur) return notConfigured();
     const cfg = cur.cfg;
-    // Credential changes need more than the cookie: a fresh assertion by a
-    // registered Passkey, carried in the same body (docs/worker-slim.md#sessions).
+    // Credential changes and SECRET rotation need more than the cookie: a fresh
+    // assertion by a registered Passkey in the same body (docs/worker-slim.md#sessions).
     const denied = (reason: string): Response => {
       log('admin.assertion_failed', { op, reason });
       return json({ error: 'assertion_failed' }, 403);
@@ -496,8 +504,13 @@ export class AccountAdmin {
         log('admin.config', { cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy !== null });
         return json({ cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy });
       }
-      case 'rotate-secret':
-        return this.rotateSecret();
+      case 'rotate-secret': {
+        const body = await jsonObject(request);
+        if (body instanceof Response) return body;
+        const by = await this.assertPasskey(cur, body, denied);
+        if (by instanceof Response) return by;
+        return this.rotateSecret(by.entry.l);
+      }
       case 'credentials-add': {
         const body = await jsonObject(request);
         if (body instanceof Response) return body;

@@ -374,6 +374,16 @@ export async function signChallenge(expectedChallenge: Uint8Array, flags: number
   };
 }
 
+/** A fresh login challenge answered by the test authenticator: what login
+ *  and the assertion-gated admin ops (credentials-add / -revoke,
+ *  rotate-secret) read from the request body. */
+export async function loginAssertion(flags = FLAGS_UP_UV, ip = '203.0.113.9'): Promise<Record<string, string>> {
+  const ch = await doPost('admin-login-challenge', {}, { 'CF-Connecting-IP': ip });
+  if (ch.status !== 200) throw new Error(`login-challenge: ${ch.status}`);
+  const c = ch.json as { challenge_id: string; challenge_b64u: string };
+  return { challenge_id: c.challenge_id, ...(await signChallenge(b64uDec(c.challenge_b64u), flags)) };
+}
+
 /** Build the assertion the Worker expects for `approve`:
  *  challenge = SHA-256(approve_challenge_hash || pwa_pk). */
 export async function signApproval(

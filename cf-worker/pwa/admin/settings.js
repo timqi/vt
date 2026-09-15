@@ -53,14 +53,18 @@ vt.tabs.settings = function (panel, data) {
   // ── SECRET rotation ───────────────────────────────────────────────────────
   var rotateStatus = vt.statusLine($('#rotate-status'));
   $('#rotate-secret').addEventListener('click', async function () {
-    if (!confirm('Generate a new SECRET? You must then run wrangler secret put SECRET.')) return;
+    if (!confirm('Generate a new SECRET? You must then run wrangler secret put SECRET within 24 hours.')) return;
     var btn = this; btn.disabled = true;
     try {
-      var resp = await vt.postJson('rotate-secret');
+      rotateStatus('Confirm with a Passkey…');
+      var resp = await vt.postJson('rotate-secret', await vt.discoverAssertion());
+      if (resp.status === 403) { rotateStatus('The Passkey was not accepted; try again', 'error'); return; }
       if (!resp.ok) { rotateStatus('Rotation failed: HTTP ' + resp.status, 'error'); return; }
       $('#rotate-value').value = (await resp.json()).secret;
       $('#rotate-output').hidden = false;
       rotateStatus('Generated; deploy it now', 'ok');
+    } catch (e) {
+      rotateStatus(vtPasskeyError(e, 'No matching Passkey, or the prompt was cancelled'), 'error');
     } finally { btn.disabled = false; }
   });
   $('#rotate-copy').addEventListener('click', function () {

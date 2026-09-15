@@ -11,7 +11,7 @@ import app from '../src/index';
 import { b64uDec, b64uEnc } from '../src/crypto';
 import { SESSION_COOKIE, sessionCookieValue } from '../src/admin_auth';
 import {
-  accountStub, inDO, doGet, doPost, bootstrap, adminHeaders, signChallenge,
+  accountStub, inDO, doGet, doPost, bootstrap, adminHeaders, signChallenge, loginAssertion,
   TEST_ORIGIN, TEST_CREDENTIAL_ENTRY,
 } from './do_helpers';
 
@@ -31,14 +31,7 @@ async function viaRouter(path: string, init: RequestInit & { headers?: Record<st
 
 const cookieHeader = (value: string) => ({ Cookie: `${SESSION_COOKIE}=${value}`, Origin: TEST_ORIGIN });
 
-/** A fresh login challenge answered by the test authenticator: what the
- *  assertion-gated admin ops carry beside their own fields. */
-async function assertion(flags = 0x05) {
-  const ch = await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' });
-  expect(ch.status).toBe(200);
-  const c = ch.json as { challenge_id: string; challenge_b64u: string };
-  return { challenge_id: c.challenge_id, ...(await signChallenge(b64uDec(c.challenge_b64u), flags)) };
-}
+const assertion = loginAssertion;
 
 /** A full login: challenge, assertion by the test authenticator, cookie. */
 async function login(headers: Record<string, string> = {}) {
@@ -207,7 +200,9 @@ describe('session verification in the DO', () => {
     await bad.text();
     const got = await SELF.fetch(`${TEST_ORIGIN}/api/admin/config`, { headers: adminHeaders() });
     expect(await got.json()).toMatchObject({ cache_hit_notify: true, origin: TEST_ORIGIN, epoch: 1 });
-    const rotate = await SELF.fetch(`${TEST_ORIGIN}/api/admin/rotate-secret`, { method: 'POST', headers: adminHeaders() });
+    const rotate = await SELF.fetch(`${TEST_ORIGIN}/api/admin/rotate-secret`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...adminHeaders() }, body: JSON.stringify(await loginAssertion()),
+    });
     expect(rotate.status).toBe(200);
     const { secret } = await rotate.json() as { secret: string };
     expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
@@ -215,6 +210,19 @@ describe('session verification in the DO', () => {
     await inDO(async ({ state }) => {
       expect(JSON.stringify([await state.storage.get('root:v1'), await state.storage.get('cfg:v1')])).not.toContain(secret);
     });
+  });
+
+  it('W-10: rotate-secret needs a verified Passkey assertion, not just the session', async () => {
+    const wraps = () => inDO(h => h.state.storage.get<{ wraps: unknown[] }>('root:v1').then(r => r!.wraps.length));
+    expect((await doPost('admin-rotate-secret', {})).status).toBe(400);
+    const upOnly = await doPost('admin-rotate-secret', await loginAssertion(0x01));
+    expect(upOnly.status).toBe(403);
+    expect(upOnly.json).toEqual({ error: 'assertion_failed' });
+    expect((await doPost('admin-rotate-secret', await loginAssertion(), {})).status).toBe(401);
+    expect(await wraps()).toBe(1);
+    const ok = await doPost('admin-rotate-secret', await loginAssertion());
+    expect(ok.status).toBe(200);
+    expect(await wraps()).toBe(2);
   });
 
   it('forwards the cookie through the router and no-stores every admin payload', async () => {

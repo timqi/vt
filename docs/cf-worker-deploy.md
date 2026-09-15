@@ -134,8 +134,9 @@ table and loses prior rows. Audit history is not a backup.
 
 - **Code update:** run `just deploy-worker`. After any PWA change, first run
   `just bump-assets` so browsers fetch the updated assets.
-- **Rotate the KEK:** choose Rotate SECRET in Settings, then install the returned
-  value with `wrangler secret put SECRET`. The value is shown once. Existing
+- **Rotate the KEK:** choose Rotate SECRET in Settings, confirm with a Passkey,
+  then install the returned value with `wrangler secret put SECRET` within 24
+  hours (after that the new value is void; rotate again). The value is shown once. Existing
   Passkeys, tokens, configuration, subscriptions, and cached entries survive.
   Do not replace it with a separately generated secret.
 - **Factory reset:** set a fresh `SECRET` without console rotation, then bootstrap

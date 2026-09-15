@@ -22,8 +22,10 @@ These keys do not by themselves unwrap the phone's PRF-protected master or
 produce a verified Passkey assertion. A compromised service that can alter the
 approval page is outside that key-only limit; the browser trusts delivered code.
 
-- Rotating `SECRET` preserves `R` and existing authority. At most two wraps may
-  coexist while the operator installs the new secret.
+- Rotating `SECRET` requires a verified Passkey assertion and preserves `R` and
+  existing authority. At most two wraps may coexist while the operator installs
+  the new secret; a pending wrap not loaded under its secret within 24 hours is
+  dropped at the next load, and the rotation must be repeated.
 - Factory reset replaces `R`, invalidating derived credentials and orphaning
   cached material. An unreadable root/config fails closed as unconfigured.
 - Real secrets never belong in TOML examples, browser assets, or logs.
@@ -46,8 +48,8 @@ broadcast.
 
 A session permits configuration, record renaming, listing, and
 authority-reducing revocation. It cannot approve a protected ceremony, extend
-a cache entry, or add or revoke a Passkey without a verified Passkey assertion:
-credential changes answer a single-use login challenge with a
+a cache entry, add or revoke a Passkey, or rotate `SECRET` without a verified
+Passkey assertion: these ops answer a single-use login challenge with a
 user-verified assertion by a currently registered Passkey, carried in the
 same request body; the session alone is refused with `assertion_failed`.
 

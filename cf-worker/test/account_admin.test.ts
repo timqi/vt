@@ -108,6 +108,32 @@ describe('passkey assertion races', () => {
     await again.load();
     expect(again.current.credentials.map(c => c.h)).toEqual(admin.current.credentials.map(c => c.h));
   });
+
+  it('W-10: a pending SECRET wrap not adopted within 24 h is dropped at the next load', async () => {
+    const storage = fakeStorage();
+    const admin = await configured(storage);
+    const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const rotated = await admin.adminOp('rotate-secret', post(await assertionFor(admin)));
+    expect(rotated.status).toBe(200);
+    const { secret } = (await rotated.json()) as { secret: string };
+    const root = () => storage.map.get('root:v1') as { wraps: unknown[]; pending_ms?: number };
+    expect(root().wraps).toHaveLength(2);
+    expect(Math.abs(root().pending_ms! - Date.now())).toBeLessThan(60_000);
+    // Within the window the new value opens R and the collapse happens on that load.
+    const copy = fakeStorage(new Map(storage.map));
+    expect(await new AccountAdmin(copy, secret).load()).not.toBeNull();
+    expect((copy.map.get('root:v1') as { wraps: unknown[] }).wraps).toHaveLength(1);
+    // Past it the pending wrap is deleted before any unwrap: the new SECRET is void.
+    storage.map.set('root:v1', { ...root(), pending_ms: Date.now() - 24 * 3600_000 });
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await new AccountAdmin(storage, secret).load()).toBeNull();
+    expect(root().wraps).toHaveLength(1);
+    expect(root().pending_ms).toBeUndefined();
+    expect(await new AccountAdmin(storage, SECRET).load()).not.toBeNull();
+    expect(logs.mock.calls.map(c => (JSON.parse(String(c[0])) as { event: string }).event)).toContain('admin.rotation_expired');
+    err.mockRestore();
+    logs.mockRestore();
+  });
 });
 
 async function listed(admin: AccountAdmin): Promise<Array<{ endpoint: string; label: string }>> {
