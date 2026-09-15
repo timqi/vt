@@ -24,8 +24,9 @@ bundle blocked solely by quarantine:
 xattr -dr com.apple.quarantine /Applications/VT.app
 ```
 
-Installation does not replace running code; restart the managed agent to use
-the new build. VT.app has no automatic updater.
+`just install-app` restarts a running VT.app and its managed agent, dropping
+current grants; an agent started outside the bundle is left running the old
+code. VT.app has no automatic updater.
 
 ## Master-key wrap v2
 

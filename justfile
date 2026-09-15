@@ -82,12 +82,28 @@ app:
 install-app: app
     #!/usr/bin/env bash
     set -euo pipefail
+    # A running VT.app and its managed agent are stopped before the copy and
+    # reopened after it, so the new build serves immediately (grants drop).
+    # An agent started outside the bundle is left alone.
+    AGENT='/Applications/VT.app/Contents/MacOS/vt ssh agent'
+    RUNNING=0
+    if pgrep -xq VTApp || pgrep -fq "$AGENT"; then
+      RUNNING=1
+      osascript -e 'quit app id "dev.rustyvault.vt"' >/dev/null 2>&1 || true
+      pkill -f "$AGENT" || true
+      for _ in $(seq 50); do pgrep -fq "$AGENT" || break; sleep 0.1; done
+      if pgrep -fq "$AGENT"; then echo "error: old agent did not exit" >&2; exit 1; fi
+    fi
     rm -rf /Applications/VT.app
     cp -R build/VT.app /Applications/VT.app
     mkdir -p ~/.local/bin
     rm -f ~/.local/bin/vt
     ln -s /Applications/VT.app/Contents/MacOS/vt ~/.local/bin/vt
     echo "installed: /Applications/VT.app; CLI: ~/.local/bin/vt -> bundle"
+    if [ "$RUNNING" = 1 ]; then
+      open -a /Applications/VT.app
+      echo "restarted: VT.app and managed agent"
+    fi
 
 # Type-check for host + linux-gnu targets
 check:
