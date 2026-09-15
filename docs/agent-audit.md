@@ -22,6 +22,10 @@ Each Mac signs events with its own enrolled host token. The DO verifies the MAC
 and token liveness; background push does not renew token expiry. No Worker root
 or KEK is distributed to the agent.
 
+An accepted row is attributed to the signing token: its `token_id` must start
+with `a_t:<token_id>_` and `host`/`user` are taken from the token record, never
+from the pushed body.
+
 A compromised host can forge its own audit rows and use its live cached DEKs.
 Audit is therefore an operational record, not independent proof that Touch ID
 occurred. Revoking the token blocks further accepted events and cache reads.

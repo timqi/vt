@@ -80,10 +80,13 @@ export class AccountTokens {
   }
 
   /** Liveness WITHOUT sliding — for the agent audit push, which is a
-   *  background side-effect, not a use the operator would count. */
-  isLive(tokenId: string, now: number): boolean {
+   *  background side-effect, not a use the operator would count. Still names
+   *  the record's host/user: the row written must be attributed to the token,
+   *  not to whatever the body claims. */
+  isLive(tokenId: string, now: number): { host: string; user: string } | null {
     const row = this.get(tokenId);
-    return !!row && row.revoked_ms == null && row.expires_ms > now;
+    if (!row || row.revoked_ms != null || row.expires_ms <= now) return null;
+    return { host: row.host, user: row.user };
   }
 
   get(tokenId: string): HostTokenRow | undefined {

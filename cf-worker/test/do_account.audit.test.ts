@@ -71,7 +71,7 @@ describe('AccountAudit persistence and projection', () => {
     const auth = await daemonAuth(tokenId);
     await inDO(async ({ inst, state }) => {
       const ch = makeChallenge();
-      const op = { ...agentOp(), outcome: 'approved', auth };
+      const op = { ...agentOp(), token_id: `a_t:${tokenId}_${nextToken('r')}`, outcome: 'approved', auth };
       const broadcast = vi.spyOn(inst.audit, 'broadcastRow');
       try {
         for (let i = 0; i < 2; i++) {

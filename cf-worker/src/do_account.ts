@@ -451,8 +451,8 @@ export class AccountDO extends DurableObject<Env> {
     }
     const now = Date.now();
     if (!touch) {
-      return this.tokens.isLive(auth.token_id, now)
-        ? { token_id: auth.token_id, host: '', user: '' } : tokenRefused('token_unknown');
+      const live = this.tokens.isLive(auth.token_id, now);
+      return live ? { token_id: auth.token_id, ...live } : tokenRefused('token_unknown');
     }
     const t = this.tokens.touch(auth.token_id, ip, now);
     if (!t.ok) return tokenRefused(t.reason);
@@ -857,6 +857,11 @@ export class AccountDO extends DurableObject<Env> {
     // sliding here: a background push is not a use the operator would count.
     const t = await this.authenticateDaemon(op.auth, '', false);
     if (t instanceof Response) return t;
+    // A host may only write rows attributed to itself: the row key carries the
+    // signing token (`a_t:<token_id>_<rnd>`, audit.rs mint_token_id) and the
+    // host/user labels come from the token record, never the body.
+    if (!op.token_id.startsWith(`a_t:${t.token_id}_`)) return badRequest('token_id not owned by signer');
+    op.meta = { ...op.meta, host: t.host, user: t.user };
     this.audit.agent(op);
     // An agent cache hit (sign / decrypt@vt served from the Touch ID auth
     // cache) had no human in the loop, so surface it like the Worker DEK-cache

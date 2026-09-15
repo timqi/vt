@@ -351,7 +351,7 @@ describe('SECRET rotation and reset', () => {
     const body = {
       timestamp_ms: Date.now(), agent_id: `t:${tokenId}`, hostname: 'mac',
       entry: { op_kind: 'sign', outcome: 'approved', salts: 0, latency_ms: 1, ts_ms: Date.now(),
-               token_id: `a_prev_${Math.random()}`, meta: { op_kind: 'sign', host: 'mac', user: 'qiqi' } },
+               token_id: `a_t:${tokenId}_${Math.random()}`, meta: { op_kind: 'sign', host: 'mac', user: 'qiqi' } },
     };
     const raw = new TextEncoder().encode(JSON.stringify(body));
     const sign = async (key: Uint8Array) => ({ Authorization: `VT-HMAC ${b64uEnc(await hmacSha256(key, raw))}` });
@@ -370,11 +370,12 @@ describe('SECRET rotation and reset', () => {
 });
 
 describe('audit ingest keyed on a host token', () => {
-  async function ingest(agentId: string, key: Uint8Array) {
+  async function ingest(agentId: string, key: Uint8Array, entryOver: Record<string, unknown> = {}) {
     const body = {
       timestamp_ms: Date.now(), agent_id: agentId, hostname: 'mac',
       entry: { op_kind: 'sign', outcome: 'approved', salts: 0, latency_ms: 1, ts_ms: Date.now(),
-               token_id: `a_${agentId}_${Math.random()}`, meta: { op_kind: 'sign', host: 'mac', user: 'qiqi' } },
+               token_id: `a_${agentId}_${Math.random()}`, meta: { op_kind: 'sign', host: 'mac', user: 'qiqi' },
+               ...entryOver },
     };
     const raw = new TextEncoder().encode(JSON.stringify(body));
     const mac = await hmacSha256(key, raw);
@@ -391,6 +392,25 @@ describe('audit ingest keyed on a host token', () => {
     await inDO(h => h.inst.tokens.revoke(tokenId, Date.now()));
     expect((await ingest(`t:${tokenId}`, key)).status).toBe(401);
     expect((await ingest('t:short', key)).status).toBe(401);
+  });
+
+  // W-2: a host writes only rows attributed to itself. The row key must carry
+  // the signing token and host/user come from the token record.
+  it('refuses a row keyed on another token and relabels host/user from the record', async () => {
+    const { tokenId } = await enrollApproved('mac', 'qiqi');
+    const { tokenId: other } = await enrollApproved('prod', 'root');
+    const key = await hostSecret(tokenId);
+    const forged = await ingest(`t:${tokenId}`, key, { token_id: `a_t:${other}_x` });
+    expect(forged.status).toBe(400);
+    expect((await ingest(`t:${tokenId}`, key, { token_id: `a_t:${tokenId}` })).status).toBe(400);
+    expect((await ingest(`t:${tokenId}`, key, { token_id: `prefix_a_t:${tokenId}_x` })).status).toBe(400);
+    const own = await ingest(`t:${tokenId}`, key, { meta: { op_kind: 'sign', host: 'prod', user: 'root' } });
+    expect(own.status).toBe(200);
+    const rows = await inDO(h => h.state.storage.sql
+      .exec(`SELECT token_id, host, user FROM audit WHERE source = 'agent'`).toArray());
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ host: 'mac', user: 'qiqi' });
+    expect(String(rows[0]!.token_id).startsWith(`a_t:${tokenId}_`)).toBe(true);
   });
 });
 
