@@ -133,10 +133,27 @@ describe('enrollment', () => {
     const e = routerEnv();
     delete e.LIMITER;
     expect((await post('/api/enroll', { host: 'h', user: 'u', timestamp_ms: Date.now() }, {}, e)).status).toBe(503);
-    for (let i = 0; i < 5; i++) {
+    // W-6: the cap one IP hits is per IP; another IP still enrolls, and an
+    // approval frees the slot.
+    for (let i = 0; i < 2; i++) {
       expect((await post('/api/enroll', { host: `h${i}`, user: 'u', timestamp_ms: Date.now() })).status).toBe(200);
     }
     expect((await post('/api/enroll', { host: 'h6', user: 'u', timestamp_ms: Date.now() })).status).toBe(429);
+    const other = { 'CF-Connecting-IP': '198.51.100.7' };
+    expect((await post('/api/enroll', { host: 'h7', user: 'u', timestamp_ms: Date.now() }, other)).status).toBe(200);
+    expect((await post('/api/enroll', { host: 'h8', user: 'u', timestamp_ms: Date.now() }, other)).status).toBe(200);
+    expect((await post('/api/enroll', { host: 'h9', user: 'u', timestamp_ms: Date.now() }, other)).status).toBe(429);
+    const h0 = await inDO(async h => [...(await h.state.storage.list<Challenge>({ prefix: 'ch:' })).values()].find(c => c.enroll?.host === 'h0')!);
+    expect((await approve(h0)).status).toBe(200);
+    expect((await post('/api/enroll', { host: 'h10', user: 'u', timestamp_ms: Date.now() })).status).toBe(200);
+  });
+
+  it('bounds pending enrollments globally across IPs', async () => {
+    for (let i = 0; i < 32; i++) {
+      const res = await post('/api/enroll', { host: `g${i}`, user: 'u', timestamp_ms: Date.now() }, { 'CF-Connecting-IP': `198.51.${i}.1` });
+      expect(res.status).toBe(200);
+    }
+    expect((await post('/api/enroll', { host: 'g32', user: 'u', timestamp_ms: Date.now() }, { 'CF-Connecting-IP': '198.51.200.1' })).status).toBe(429);
   });
 
   // W-7: the count and the reservation share one input-gate window, so a burst
@@ -154,17 +171,17 @@ describe('enrollment', () => {
     });
     const enrollCreate = (i: number) => accountStub().fetch('https://account.do/op/enroll-create', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ host: `burst${i}`, user: 'u', ip: `203.0.113.${i}`, origin: '' }),
+      body: JSON.stringify({ host: `burst${i}`, user: 'u', ip: IP, origin: '' }),
     });
     const results = await Promise.all(Array.from({ length: 12 }, (_, i) => enrollCreate(i)));
     await Promise.all(results.map(r => r.text()));
     await inDO(({ inst }) => inst.buildAdminCeremony.mockRestore());
     const statuses = results.map(r => r.status);
-    expect(statuses.filter(s => s === 200)).toHaveLength(5);
-    expect(statuses.filter(s => s === 429)).toHaveLength(7);
+    expect(statuses.filter(s => s === 200)).toHaveLength(2);
+    expect(statuses.filter(s => s === 429)).toHaveLength(10);
     const pending = await inDO(async h => [...(await h.state.storage.list<Challenge>({ prefix: 'ch:' })).values()]
       .filter(c => c.enroll && c.status === 'pending').length);
-    expect(pending).toBe(5);
+    expect(pending).toBe(2);
   });
 });
 

@@ -52,11 +52,14 @@ const CACHE_CLEAR_MAX_ENTRIES = 512;
 // operator, so this is generous.
 const MAX_ADMIN_SOCKETS = 8;
 
-// Cap on enrollment ceremonies pending at once. /api/enroll is unauthenticated,
-// so beyond the per-IP rate limit this bounds how many approval pushes a
-// distributed nuisance can raise before the operator revokes nothing at all —
-// pending ceremonies expire on their own after TTL_MS.
-const ENROLL_PENDING_MAX = 5;
+// Caps on enrollment ceremonies pending at once. /api/enroll is unauthenticated,
+// so beyond the edge rate limit these bound how many approval pushes a nuisance
+// can raise — pending ceremonies expire on their own after TTL_MS. The per-IP
+// cap is the one a single source hits; the global cap only bounds a distributed
+// source, and sits high enough that one or two IPs cannot lock enrollment for
+// everyone else.
+const ENROLL_PENDING_PER_IP = 2;
+const ENROLL_PENDING_MAX = 32;
 
 function badRequest(msg: string): Response {
   return new Response(msg, { status: 400 });
@@ -736,13 +739,15 @@ export class AccountDO extends DurableObject<Env> {
     // storeAndAnnounce's first put only storage awaits occur, so the DO input
     // gate keeps the count and the reservation atomic against concurrent
     // requests (a crypto await in between would let N requests all pass).
-    let pending = 0;
+    let pending = 0, fromIp = 0;
     for await (const page of listPrefixPages<Challenge>(this.ctx.storage, 'ch:')) {
       for (const [, c] of page) {
-        if (c.enroll && c.status === 'pending' && !isPendingExpired(c, now)) pending++;
+        if (!c.enroll || c.status !== 'pending' || isPendingExpired(c, now)) continue;
+        pending++;
+        if (c.enroll.ip === intent.ip) fromIp++;
       }
     }
-    if (pending >= ENROLL_PENDING_MAX) {
+    if (fromIp >= ENROLL_PENDING_PER_IP || pending >= ENROLL_PENDING_MAX) {
       return new Response('too many pending enrollments', { status: 429 });
     }
     await this.storeAndAnnounce(ch);

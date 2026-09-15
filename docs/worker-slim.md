@@ -119,7 +119,8 @@ original bytes and checks token liveness before protected state is accessed.
 The token secret is derived when needed, never stored in the token record.
 
 - Enrollment is unauthenticated and can page a phone, so it requires per-IP rate
-  limiting, a bounded pending set, and a short-lived ceremony; no limiter means 503.
+  limiting, a pending set bounded per IP and globally, and a short-lived ceremony;
+  no limiter means 503.
 - Compare the terminal and phone pairing codes before approval. Host/user are
   self-reported at enrollment and become the approved record's labels afterward.
 - Issue a token only through verified Passkey approval; reconnecting may recover

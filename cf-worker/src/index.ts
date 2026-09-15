@@ -419,7 +419,7 @@ app.post('/api/dek-cache', async (c) => {
 // design (a fresh host has nothing to sign with), which makes it the one public
 // route that can page the operator's phone. Three independent bounds:
 //   • per-IP Workers Rate Limiting (`enroll:<ip>`; absent → refuse outright),
-//   • the DO's cap on concurrently pending enrollments (ENROLL_PENDING_MAX),
+//   • the DO's caps on concurrently pending enrollments (per IP and global),
 //   • the usual 5-minute ceremony TTL.
 // Nothing is issued here: the response is a pending Passkey ceremony plus the
 // pairing code the approver compares against the requesting terminal.
