@@ -14,7 +14,8 @@
 # (or delete it) to leave that variable unset.
 
 # --- CF passkey ceremony (Linux servers + macOS fallback) -------------------
-# Worker base URL for the phone-approval ceremony.
+# Worker base URL for the phone-approval ceremony. Must be https:// (plain
+# http:// only to localhost / 127.x for a local Worker dev server).
 # VT_PASSKEY_URL = "https://vt.example.com"
 
 # This host's own Worker token, written here by `vt enroll` (vt1.<id>.<secret>;

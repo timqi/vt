@@ -214,6 +214,9 @@ impl ResolvedConfig {
         if worker_auth.trim().is_empty() {
             bail!("VT_PASSKEY_TOKEN is empty");
         }
+        if !worker_url_is_secure(worker_url) {
+            bail!("VT_PASSKEY_URL must be https:// (got {worker_url})");
+        }
         Ok(crate::cf::CfConfig {
             worker_url,
             worker_auth,
@@ -237,6 +240,23 @@ impl ResolvedConfig {
                 .ok_or_else(|| anyhow::anyhow!("Cannot determine home dir")),
         }
     }
+}
+
+/// The host token rides on every Worker request, so the transport must be
+/// TLS. Plain `http://` is allowed only to loopback (local Worker dev); the
+/// host is compared whole so `localhost.example` does not pass.
+pub(crate) fn worker_url_is_secure(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest.split(['/', ':', '?', '#']).next().unwrap_or_default();
+    host == "localhost"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 #[cfg(test)]
@@ -302,6 +322,26 @@ mod tests {
                     );
                 }
             }
+        }
+        // Plaintext transport is refused even with a token: the URL would
+        // downgrade the challenge and WebSocket carrying the host token.
+        for url in [
+            "http://worker.invalid",
+            "http://localhost.evil.invalid/",
+            "http://127.evil.invalid",
+            "ftp://worker.invalid",
+        ] {
+            let cfg = config(&[("VT_PASSKEY_URL", url), ("VT_PASSKEY_TOKEN", "token")]);
+            let err = cfg.passkey_config().err().map(|e| e.to_string());
+            assert!(
+                err.as_deref()
+                    .is_some_and(|e| e.contains("must be https://")),
+                "{url}: {err:?}"
+            );
+        }
+        for url in ["http://localhost:8787", "http://127.0.0.1:8787/"] {
+            let cfg = config(&[("VT_PASSKEY_URL", url), ("VT_PASSKEY_TOKEN", "token")]);
+            assert!(cfg.passkey_config().is_ok(), "{url}");
         }
         // A retired VT_AUTH value is inert: it neither routes nor is captured.
         let cfg = config(&[("VT_AUTH", "stale"), ("VT_BACKEND", "auto")]);

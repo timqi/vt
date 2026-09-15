@@ -802,7 +802,10 @@ mod tests {
                 .decrypt("host", "test", &urls, &[])
                 .await
                 .unwrap_err();
-            assert!(format!("{error:#}").contains("relative URL without a base"));
+            assert!(
+                format!("{error:#}").contains("must be https://"),
+                "{error:#}"
+            );
         }
     }
 

@@ -73,9 +73,7 @@ pub async fn enroll(config: &crate::config::ResolvedConfig, url: Option<&str>) -
             .ok_or_else(|| anyhow::anyhow!("no Worker URL: pass --url or set VT_PASSKEY_URL"))?,
     };
     ensure!(
-        url.starts_with("https://")
-            || url.starts_with("http://localhost")
-            || url.starts_with("http://127."),
+        crate::config::worker_url_is_secure(&url),
         "Worker URL must be https:// (got {url})"
     );
     let url = url.trim_end_matches('/').to_owned();

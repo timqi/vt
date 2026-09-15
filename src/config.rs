@@ -15,7 +15,10 @@
 //! cannot inject arbitrary unrelated environment variables.
 
 mod client;
-pub use client::{ClientRoute, PasskeyState, ResolvedConfig, RoutingError, CLIENT_CONFIG_KEYS};
+pub(crate) use client::{
+    worker_url_is_secure, ClientRoute, PasskeyState, ResolvedConfig, RoutingError,
+    CLIENT_CONFIG_KEYS,
+};
 
 use std::path::{Path, PathBuf};
 
