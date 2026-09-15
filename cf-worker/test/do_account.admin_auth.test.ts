@@ -31,6 +31,15 @@ async function viaRouter(path: string, init: RequestInit & { headers?: Record<st
 
 const cookieHeader = (value: string) => ({ Cookie: `${SESSION_COOKIE}=${value}`, Origin: TEST_ORIGIN });
 
+/** A fresh login challenge answered by the test authenticator: what the
+ *  assertion-gated admin ops carry beside their own fields. */
+async function assertion(flags = 0x05) {
+  const ch = await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' });
+  expect(ch.status).toBe(200);
+  const c = ch.json as { challenge_id: string; challenge_b64u: string };
+  return { challenge_id: c.challenge_id, ...(await signChallenge(b64uDec(c.challenge_b64u), flags)) };
+}
+
 /** A full login: challenge, assertion by the test authenticator, cookie. */
 async function login(headers: Record<string, string> = {}) {
   const ch = await viaRouter('/api/admin/login-challenge', { method: 'POST', body: '{}' });
@@ -223,31 +232,56 @@ describe('credentials and sessions', () => {
 
   it('adds a credential without ending sessions, refuses a duplicate and the {v,c} envelope', async () => {
     const second = { ...TEST_CREDENTIAL_ENTRY, h: 'C'.repeat(43), i: 'c2Vjb25k', l: 'second' };
-    expect((await doPost('admin-credentials-add', { entry: second })).status).toBe(200);
-    expect((await doPost('admin-credentials-add', { entry: second })).status).toBe(409);
-    expect((await doPost('admin-credentials-add', { entry: { v: 1, c: [second] } })).status).toBe(400);
-    expect((await doPost('admin-credentials-add', { v: 1, c: [second] })).status).toBe(400);
+    expect((await doPost('admin-credentials-add', { entry: second, ...(await assertion()) })).status).toBe(200);
+    expect((await doPost('admin-credentials-add', { entry: second, ...(await assertion()) })).status).toBe(409);
+    expect((await doPost('admin-credentials-add', { entry: { v: 1, c: [second] }, ...(await assertion()) })).status).toBe(400);
+    expect((await doPost('admin-credentials-add', { v: 1, c: [second], ...(await assertion()) })).status).toBe(400);
     const creds = await doGet('admin-credentials');
     expect(creds.json.credentials.map((c: { l: string }) => c.l)).toEqual(['test-passkey', 'second']);
     expect(creds.json.epoch).toBe(1);
   });
 
+  it('W-3: the session alone cannot add or revoke a credential; the assertion must verify', async () => {
+    const second = { ...TEST_CREDENTIAL_ENTRY, h: 'C'.repeat(43), i: 'c2Vjb25k', l: 'second' };
+    const none = await doPost('admin-credentials-add', { entry: second });
+    expect(none.status).toBe(400);
+    const tampered = await assertion();
+    for (const bad of [
+      { ...tampered, signature_b64u: tampered.signature_b64u.replace(/^./, c => (c === 'A' ? 'B' : 'A')) },
+      await assertion(0x01),                                            // presence only
+      { ...(await assertion()), credential_id_b64u: b64uEnc(new Uint8Array(16).fill(3)) },
+      { ...(await assertion()), challenge_id: 'bm9wZQ' },              // unknown challenge
+    ]) {
+      const res = await doPost('admin-credentials-add', { entry: second, ...bad });
+      expect(res.status).toBe(403);
+      expect(res.json).toEqual({ error: 'assertion_failed' });
+    }
+    // A consumed challenge does not answer twice.
+    const a = await assertion();
+    expect((await doPost('admin-credentials-add', { entry: second, ...a })).status).toBe(200);
+    expect((await doPost('admin-credentials-revoke', { h: second.h, ...a })).status).toBe(403);
+    expect((await doPost('admin-credentials-revoke', { h: second.h })).status).toBe(400);
+    const creds = await doGet('admin-credentials');
+    expect(creds.json.credentials).toHaveLength(2);
+    expect(creds.json.epoch).toBe(1);
+  });
+
   it('revoke bumps the epoch (all sessions end) and refuses the last credential', async () => {
     const second = { ...TEST_CREDENTIAL_ENTRY, h: 'C'.repeat(43), i: 'c2Vjb25k', l: 'second' };
-    await doPost('admin-credentials-add', { entry: second });
+    await doPost('admin-credentials-add', { entry: second, ...(await assertion()) });
     const before = adminHeaders();
-    const revoked = await doPost('admin-credentials-revoke', { h: second.h });
+    const revoked = await doPost('admin-credentials-revoke', { h: second.h, ...(await assertion()) });
     expect(revoked.status).toBe(204);
     expect((await doGet('tokens-list', before)).status).toBe(401);
-    expect((await doPost('admin-credentials-revoke', { h: 'zzz' }, before)).status).toBe(401);
+    expect((await doPost('admin-credentials-revoke', { h: 'zzz', ...(await assertion()) }, before)).status).toBe(401);
 
     const fresh = await login();
     expect(fresh.status).toBe(204);
     const h = cookieHeader(sessionCookieValue(fresh.cookie)!);
-    const last = await doPost('admin-credentials-revoke', { h: TEST_CREDENTIAL_ENTRY.h }, h);
+    const last = await doPost('admin-credentials-revoke', { h: TEST_CREDENTIAL_ENTRY.h, ...(await assertion()) }, h);
     expect(last.status).toBe(409);
     expect(last.json).toEqual({ error: 'last_credential' });
-    expect((await doPost('admin-credentials-revoke', { h: 'unknown' }, h)).status).toBe(404);
+    expect((await doPost('admin-credentials-revoke', { h: 'unknown', ...(await assertion()) }, h)).status).toBe(404);
     expect((await doGet('admin-credentials', h)).json.epoch).toBe(2);
   });
 

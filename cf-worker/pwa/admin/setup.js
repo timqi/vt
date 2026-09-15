@@ -3,7 +3,8 @@
 // Passkey ceremonies of the admin shell: the setup view (bootstrap, the first
 // credential) and the Settings tab's Passkeys block (add / revoke / self-check).
 // The master never leaves this page: only a credential entry — wrapped master, public key, ids,
-// label — is POSTed, to /api/admin/bootstrap or /api/admin/credentials-add.
+// label — is POSTed, to /api/admin/bootstrap or /api/admin/credentials-add;
+// add and revoke also carry a fresh assertion by an existing Passkey.
 //
 // Byte formats MUST match cf-worker/pwa/approve.js + src/webauthn.ts:
 //   PRF input = SHA-256("vt-passkey-prf-v1")            (common.js)
@@ -64,11 +65,13 @@ function vtPasskeyCeremony(RP_ID) {
   }
 
   // Run an assertion with the PRF extension over the given credential ids.
-  async function assertPrf(allowIds) {
+  // `challenge` is the Worker's login challenge when the assertion is also
+  // posted (credentials-add / -revoke); a local PRF read uses a random one.
+  async function assertPrf(allowIds, challenge) {
     var PRF_INPUT = await prfInputReady;
     var assertion = await navigator.credentials.get({
       publicKey: {
-        challenge: randomBytes(32),
+        challenge: challenge || randomBytes(32),
         rpId: RP_ID,
         allowCredentials: allowIds.map(function (id) { return { type: 'public-key', id: id }; }),
         userVerification: 'required',
@@ -79,7 +82,7 @@ function vtPasskeyCeremony(RP_ID) {
     var ext = assertion.getClientExtensionResults && assertion.getClientExtensionResults();
     var prf = ext && ext.prf && ext.prf.results && ext.prf.results.first;
     if (!prf) throw new Error('This Passkey lacks the PRF extension; use 1Password / YubiKey / a newer OS');
-    return { rawId: new Uint8Array(assertion.rawId), K: new Uint8Array(prf) };
+    return { rawId: new Uint8Array(assertion.rawId), K: new Uint8Array(prf), assertion: assertion };
   }
 
   // ── master_key wrap / unwrap (byte-exact with approve.js) ──────────────────
@@ -252,29 +255,40 @@ vt.tabs.setup = function (panel, data) {
     populateRevoke();
   }
 
-  // Unwrap the master with one of the existing passkeys, register the new one,
-  // wrap for it and post only the entry.
+  // One prompt on an existing Passkey answers the Worker's login challenge and
+  // (add only) yields the PRF that unlocks the master. The challenge lives 120 s,
+  // so it is fetched right before the prompt whose assertion is posted.
+  async function existingAssertion() {
+    var ch = await vt.loginChallenge();
+    var a = await pk.assertPrf(entries.map(function (e) { return vt.b64uDec(e.i); }), vt.b64uDec(ch.challenge_b64u));
+    return { a: a, fields: vt.assertionFields(ch.challenge_id, a.assertion) };
+  }
+
+  // Register the new passkey, then in one prompt prove an existing one to the
+  // Worker and unwrap the master with it; wrap for the new key and post only
+  // the entry plus that assertion.
   async function runAdd(label) {
     if (!entries.length) throw new Error('No existing Passkey');
-    var masterKey = null;
+    var masterKey = null, pr = null;
     try {
-      setStatus('① Unlocking master_key with an existing Passkey…');
-      var a = await pk.assertPrf(entries.map(function (e) { return vt.b64uDec(e.i); }));
-      var used = vt.b64uEnc(a.rawId);
-      var old = entries.filter(function (e) { return e.i === used; })[0];
-      if (!old) { vt.zeroize(a.K); throw new Error('The Passkey used is not in the current list'); }
-      masterKey = await pk.unwrapMasterKey(a.K, a.rawId, old.k);
-      vt.zeroize(a.K);
-      setStatus('② Registering the new Passkey… (complete the biometric prompt)');
+      setStatus('① Registering the new Passkey… (complete the biometric prompt)');
       var c = await pk.createPasskey(label);
-      setStatus('③ Reading the new Passkey\'s PRF… (complete the prompt again)');
-      var pr = await pk.assertPrf([c.credId]);
+      setStatus('② Reading the new Passkey\'s PRF… (complete the prompt again)');
+      pr = await pk.assertPrf([c.credId]);
+      setStatus('③ Unlocking master_key with an existing Passkey…');
+      var ex = await existingAssertion();
+      var used = vt.b64uEnc(ex.a.rawId);
+      var old = entries.filter(function (e) { return e.i === used; })[0];
+      if (!old) { vt.zeroize(ex.a.K); throw new Error('The Passkey used is not in the current list'); }
+      masterKey = await pk.unwrapMasterKey(ex.a.K, ex.a.rawId, old.k);
+      vt.zeroize(ex.a.K);
       var w = await pk.wrapMasterKey(pr.K, c.credId, masterKey);
-      vt.zeroize(pr.K);
-      var resp = await vt.postJson('credentials-add', { entry: pk.buildEntry(c.credId, c.cose, w.k, w.h, label) });
+      var body = Object.assign({ entry: pk.buildEntry(c.credId, c.cose, w.k, w.h, label) }, ex.fields);
+      var resp = await vt.postJson('credentials-add', body);
       if (resp.status === 409) throw new Error('This Passkey is already registered');
+      if (resp.status === 403) throw new Error('The existing Passkey was not accepted; try again');
       if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()));
-    } finally { if (masterKey) vt.zeroize(masterKey); }
+    } finally { if (masterKey) vt.zeroize(masterKey); if (pr) vt.zeroize(pr.K); }
   }
 
   async function runRevoke() {
@@ -282,8 +296,12 @@ vt.tabs.setup = function (panel, data) {
     var e = entries.filter(function (x) { return x.h === h; })[0];
     if (!e) throw new Error('Pick a Passkey to revoke');
     if (!confirm('Revoke "' + (e.l || e.i.slice(0, 12)) + '"? Every session, including this one, ends immediately.')) return false;
-    var resp = await vt.postJson('credentials-revoke', { h: h });
+    setStatus('Confirm with any current Passkey…');
+    var ex = await existingAssertion();
+    vt.zeroize(ex.a.K);
+    var resp = await vt.postJson('credentials-revoke', Object.assign({ h: h }, ex.fields));
     if (resp.status === 409) throw new Error('This is the last Passkey; it cannot be revoked');
+    if (resp.status === 403) throw new Error('The Passkey was not accepted; try again');
     if (resp.status !== 204) throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()));
     return true;
   }

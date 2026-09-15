@@ -119,6 +119,15 @@ function parseSubscription(body: unknown, now: number): PushSubscription | Respo
   };
 }
 
+/** The request body as a JSON object, else the 400 to return. */
+async function jsonObject(request: Request): Promise<Record<string, unknown> | Response> {
+  let body: unknown;
+  try { body = await request.json(); }
+  catch { return new Response('invalid json', { status: 400 }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return new Response('not an object', { status: 400 });
+  return body as Record<string, unknown>;
+}
+
 /** A well-formed https origin from an `Origin` header, else null. */
 function parseOrigin(v: string | null): string | null {
   if (!v) return null;
@@ -353,9 +362,8 @@ export class AccountAdmin {
       }
       return json({ error: 'login_failed' }, 401);
     };
-    let body: Record<string, unknown>;
-    try { body = (await request.json()) as Record<string, unknown>; }
-    catch { return new Response('invalid json', { status: 400 }); }
+    const body = await jsonObject(request);
+    if (body instanceof Response) return body;
     const verified = await this.assertPasskey(cur, body, fail);
     if (verified instanceof Response) return verified;
     log('admin.login', { label: verified.entry.l, ip });
@@ -439,8 +447,15 @@ export class AccountAdmin {
 
   // `op` is the DO path's `admin-` suffix.
   async adminOp(op: string, request: Request): Promise<Response> {
-    await this.load();
-    const cfg = this.current;
+    const cur = await this.load();
+    if (!cur) return notConfigured();
+    const cfg = cur.cfg;
+    // Credential changes need more than the cookie: a fresh assertion by a
+    // registered Passkey, carried in the same body (docs/worker-slim.md#sessions).
+    const denied = (reason: string): Response => {
+      log('admin.assertion_failed', { op, reason });
+      return json({ error: 'assertion_failed' }, 403);
+    };
     switch (op) {
       case 'logout':
         return new Response(null, { status: 204, headers: { 'Set-Cookie': sessionSetCookie(null) } });
@@ -452,10 +467,8 @@ export class AccountAdmin {
       case 'config': {
         const { origin, epoch, cache_hit_notify, uv_policy } = cfg;
         if (request.method !== 'PUT') return json({ origin, epoch, cache_hit_notify, uv_policy });
-        let body: Record<string, unknown>;
-        try { body = (await request.json()) as Record<string, unknown>; }
-        catch { return new Response('invalid json', { status: 400 }); }
-        if (!body || typeof body !== 'object' || Array.isArray(body)) return new Response('not an object', { status: 400 });
+        const body = await jsonObject(request);
+        if (body instanceof Response) return body;
         for (const k of Object.keys(body)) {
           if (!['cache_hit_notify', 'uv_policy'].includes(k)) return new Response(`unknown key ${k}`, { status: 400 });
         }
@@ -474,21 +487,28 @@ export class AccountAdmin {
       case 'rotate-secret':
         return this.rotateSecret();
       case 'credentials-add': {
+        const body = await jsonObject(request);
+        if (body instanceof Response) return body;
         let entry: CredentialEntry;
-        try { entry = parseCredentialEntry(((await request.json()) as { entry?: unknown }).entry); }
+        try { entry = parseCredentialEntry(body.entry); }
         catch (e) { return new Response(`bad request: ${(e as Error).message}`, { status: 400 }); }
+        const by = await this.assertPasskey(cur, body, denied);
+        if (by instanceof Response) return by;
         if (cfg.credentials.some(c => c.h === entry.h)) return json({ error: 'duplicate' }, 409);
         await this.write(c => { c.credentials.push(entry); });
-        log('admin.credential_added', { label: entry.l });
+        log('admin.credential_added', { label: entry.l, by: by.entry.l });
         return json({ ok: true });
       }
       case 'credentials-revoke': {
-        let h: unknown;
-        try { h = ((await request.json()) as { h?: unknown }).h; }
-        catch { return new Response('invalid json', { status: 400 }); }
+        const body = await jsonObject(request);
+        if (body instanceof Response) return body;
+        const h = body.h;
+        if (typeof h !== 'string') return new Response('bad h', { status: 400 });
+        const by = await this.assertPasskey(cur, body, denied);
+        if (by instanceof Response) return by;
         if (!cfg.credentials.some(c => c.h === h)) return new Response('unknown credential', { status: 404 });
         if (cfg.credentials.length <= 1) return json({ error: 'last_credential' }, 409);
-        log('admin.credential_revoked', { h });
+        log('admin.credential_revoked', { h, by: by.entry.l });
         return this.bumpEpoch(c => { c.credentials = c.credentials.filter(e => e.h !== h); });
       }
       default:

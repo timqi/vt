@@ -32,6 +32,36 @@
     });
   };
 
+  // ── Passkey assertion ─────────────────────────────────────────────────────
+  // Login and the assertion-gated ops (credentials-add / -revoke, rotate-secret)
+  // answer a single-use login challenge with a verified assertion; the Worker
+  // reads these fields from the request body.
+  vt.loginChallenge = async function () {
+    var ch = await vt.postJson('login-challenge');
+    if (!ch.ok) throw new Error(ch.status === 429 ? 'Too many login attempts, try again later' : 'HTTP ' + ch.status);
+    return ch.json();
+  };
+  vt.assertionFields = function (challengeId, a) {
+    var r = a.response;
+    return {
+      challenge_id: challengeId,
+      credential_id_b64u: vt.b64uEnc(new Uint8Array(a.rawId)),
+      client_data_json_b64u: vt.b64uEnc(new Uint8Array(r.clientDataJSON)),
+      authenticator_data_b64u: vt.b64uEnc(new Uint8Array(r.authenticatorData)),
+      signature_b64u: vt.b64uEnc(new Uint8Array(r.signature)),
+    };
+  };
+  // No allowCredentials: registration required resident keys, so the
+  // authenticator discovers the credential and the page lists nothing.
+  vt.discoverAssertion = async function () {
+    var c = await vt.loginChallenge();
+    var a = await navigator.credentials.get({ publicKey: {
+      challenge: vt.b64uDec(c.challenge_b64u), rpId: c.rp_id, userVerification: 'required',
+    } });
+    if (!a) throw new Error('Verification cancelled');
+    return vt.assertionFields(c.challenge_id, a);
+  };
+
   // ── Command summary (audit + cache list columns) ──────────────────────────
   // Cosmetic, FRONTEND-ONLY: if the command's leading program is an absolute
   // path (`/usr/bin/foo …`), show just its basename (`foo …`). The stored
@@ -432,24 +462,8 @@
     btn.addEventListener('click', async function () {
       btn.disabled = true;
       try {
-        var ch = await vt.postJson('login-challenge');
-        if (!ch.ok) throw new Error(ch.status === 429 ? 'Too many login attempts, try again later' : 'HTTP ' + ch.status);
-        var c = await ch.json();
         setStatus('Complete the Passkey prompt…');
-        // No allowCredentials: registration required resident keys, so the
-        // authenticator discovers the credential and the page lists nothing.
-        var a = await navigator.credentials.get({ publicKey: {
-          challenge: vt.b64uDec(c.challenge_b64u), rpId: c.rp_id, userVerification: 'required',
-        } });
-        if (!a) throw new Error('Verification cancelled');
-        var r = a.response;
-        var resp = await vt.postJson('login', {
-          challenge_id: c.challenge_id,
-          credential_id_b64u: vt.b64uEnc(new Uint8Array(a.rawId)),
-          client_data_json_b64u: vt.b64uEnc(new Uint8Array(r.clientDataJSON)),
-          authenticator_data_b64u: vt.b64uEnc(new Uint8Array(r.authenticatorData)),
-          signature_b64u: vt.b64uEnc(new Uint8Array(r.signature)),
-        });
+        var resp = await vt.postJson('login', await vt.discoverAssertion());
         if (resp.status !== 204) throw new Error(resp.status === 401 ? 'Login failed: Passkey not registered or verification failed' : 'HTTP ' + resp.status);
         setStatus('Logged in', 'ok');
         location.reload();

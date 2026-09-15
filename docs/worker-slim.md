@@ -44,9 +44,12 @@ An audit-stream socket carries the epoch and expiry of the session that opened
 it; an epoch bump closes it, and a socket past either check receives no
 broadcast.
 
-A session permits configuration, credential management, record renaming,
-listing, and authority-reducing revocation. It cannot approve a protected
-ceremony or extend a cache entry without a verified Passkey assertion.
+A session permits configuration, record renaming, listing, and
+authority-reducing revocation. It cannot approve a protected ceremony, extend
+a cache entry, or add or revoke a Passkey without a verified Passkey assertion:
+credential changes answer a single-use login challenge with a
+user-verified assertion by a currently registered Passkey, carried in the
+same request body; the session alone is refused with `assertion_failed`.
 
 ### Bootstrap
 
