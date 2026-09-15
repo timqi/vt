@@ -269,28 +269,12 @@ vt.tabs.audit = function (panel) {
     var d = vt.dialog.open({ onClose: onDialogClosed });
     var dl = d.dl;
     openDetailId = id;
+    // What the decision is about first (outcome, operation, records, command,
+    // who and where), then the authorization scope, then provenance and
+    // identifiers. addRow skips ''/null, so a row shows only what it carries.
     addRow(dl, 'Status', r.status + (r.verify_failures ? ' (' + r.verify_failures + ' verify failures)' : ''));
-    addRow(dl, 'Source', r.source || 'ceremony');
+    addRow(dl, 'Reason', r.reason);
     addRow(dl, 'Type', opKindLabel(r));
-    addRow(dl, 'Host', r.host);
-    addRow(dl, 'User', r.user);
-    addRow(dl, 'Directory', r.pwd);
-    addRow(dl, 'Project', r.project);
-    addRow(dl, 'TTY', r.tty);
-    addRow(dl, 'Parent process', r.ppid_cmd);
-    if (r.ppid != null) addRow(dl, 'Parent PID', r.ppid);
-    // Agent-authoritative fields (source='agent' rows; addRow skips ''/null,
-    // so pre-migration and non-agent rows render unchanged).
-    addRow(dl, 'Caller', r.peer_exe);
-    addRow(dl, 'Key', r.key_fp);
-    addRow(dl, 'Destination', r.dest);
-    addRow(dl, 'Reuse scope', r.scope_label);
-    addRow(dl, 'Scope family', r.scope_family);
-    if (typeof r.grant_ttl_s === 'number' && r.grant_ttl_s > 0) addRow(dl, 'Grant duration', ttlLabel(r.grant_ttl_s));
-    if (r.relayed === 1) addRow(dl, 'Relayed', 'yes');
-    addRow(dl, 'SSH client', r.ssh_client);
-    addRow(dl, 'IP', r.ip);
-    addRow(dl, 'DEKs', r.salts);
     // Records with inline rename; a saved name updates this row's cached copy so
     // the table cell and a later re-open agree without a refetch.
     if (r.records && r.records.length) {
@@ -304,13 +288,33 @@ vt.tabs.audit = function (panel) {
       }));
       dl.appendChild(dd);
     }
+    addRow(dl, 'Command', r.command, true);
+    addRow(dl, 'Host', r.host);
+    addRow(dl, 'User', r.user);
+    addRow(dl, 'Project', r.project);
+    addRow(dl, 'Directory', r.pwd);
+    addRow(dl, 'Created', fmtTime(r.created_ms));
+    // Authorization scope: agent-authoritative fields (source='agent' rows) and
+    // what this decision armed.
+    addRow(dl, 'Destination', r.dest);
+    addRow(dl, 'Key', r.key_fp);
+    addRow(dl, 'Reuse scope', r.scope_label);
+    addRow(dl, 'Scope family', r.scope_family);
+    if (typeof r.grant_ttl_s === 'number' && r.grant_ttl_s > 0) addRow(dl, 'Grant duration', ttlLabel(r.grant_ttl_s));
     if (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) addRow(dl, 'Cache TTL', ttlLabel(r.cache_ttl_s));
     // Actual expiry (updated by an approved extension); shown alongside the
     // originally-approved TTL so an extended row is self-explaining.
     if (typeof r.cache_expires_ms === 'number') addRow(dl, 'Cache expires', fmtTime(r.cache_expires_ms));
-    addRow(dl, 'Command', r.command, true);
-    addRow(dl, 'Reason', r.reason);
-    addRow(dl, 'Created', fmtTime(r.created_ms));
+    // Provenance and identifiers.
+    addRow(dl, 'DEKs', r.salts);
+    addRow(dl, 'Source', r.source || 'ceremony');
+    addRow(dl, 'IP', r.ip);
+    addRow(dl, 'SSH client', r.ssh_client);
+    if (r.relayed === 1) addRow(dl, 'Relayed', 'yes');
+    addRow(dl, 'Caller', r.peer_exe);
+    addRow(dl, 'Parent process', r.ppid_cmd);
+    if (r.ppid != null) addRow(dl, 'Parent PID', r.ppid);
+    addRow(dl, 'TTY', r.tty);
     addRow(dl, 'Finalized', fmtTime(r.finalized_ms));
     addRow(dl, 'Latency (ms)', r.latency_ms);
     addRow(dl, 'token', r.token_id);

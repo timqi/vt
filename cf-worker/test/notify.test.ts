@@ -52,17 +52,17 @@ describe('metaLines', () => {
 describe('buildApprovalMessage', () => {
   it('carries the batch size and no URL (the payload carries it separately)', () => {
     const { title, body } = buildApprovalMessage('decrypt', meta, 5);
-    expect(title).toBe('VT approval: decrypt');
+    expect(title).toBe('vt approval: decrypt');
     expect(body.startsWith('qiqi@devbox · 5 records\n')).toBe(true);
     expect(body).not.toMatch(/https?:/);
-    expect(buildApprovalMessage('', meta).title).toBe('VT approval request');
+    expect(buildApprovalMessage('', meta).title).toBe('vt approval request');
   });
 });
 
 describe('buildCacheHitMessage', () => {
   it('stays compact: who · N records · note, pwd, cmd — no via/ssh/ip/reason', () => {
     const { title, body } = buildCacheHitMessage(meta, 2);
-    expect(title).toBe('VT cache hit (no approval): decrypt');
+    expect(title).toBe('vt cache hit (no approval): decrypt');
     expect(body.split('\n')[0]).toBe('qiqi@devbox · 2 records · cache hit, no phone approval');
     expect(body).not.toMatch(/via:|ssh:|ip:|reason:/);
   });

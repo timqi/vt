@@ -1,8 +1,8 @@
 'use strict';
 
 // Passkey ceremonies of the admin shell: the setup view (bootstrap, the first
-// credential) and the Passkey tab (add / revoke / self-check). The master never
-// leaves this page: only a credential entry — wrapped master, public key, ids,
+// credential) and the Settings tab's Passkeys block (add / revoke / self-check).
+// The master never leaves this page: only a credential entry — wrapped master, public key, ids,
 // label — is POSTed, to /api/admin/bootstrap or /api/admin/credentials-add.
 //
 // Byte formats MUST match cf-worker/pwa/approve.js + src/webauthn.ts:
@@ -228,7 +228,7 @@ vt.views.setup = function (view, data) {
   });
 };
 
-// ── Passkey tab: add / revoke / self-check ─────────────────────────────────────────
+// ── Passkeys block (Settings tab): add / revoke / self-check ───────────────
 
 vt.tabs.setup = function (panel, data) {
   var $ = function (sel) { return panel.querySelector(sel); };

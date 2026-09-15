@@ -78,7 +78,7 @@ describe('AccountNotifications push contract', () => {
       expect(p.kind).toBe('approval');
       expect(p.url).toBe(`https://vt.test.invalid/a/${ch.approve_token}`);
       expect(p.tag).toBe(`a:${ch.approve_token}`);
-      expect(p.title).toBe('VT approval: decrypt');
+      expect(p.title).toBe('vt approval: decrypt');
       expect(p.body).not.toContain('https://');
       expect(p.body).toContain(`${ch.meta.user}@${ch.meta.host}`);
     });

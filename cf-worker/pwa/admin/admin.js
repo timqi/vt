@@ -367,7 +367,7 @@
   // mark on a phone, beside it on desktop.
   var TABS = [
     ['audit', 'Audit', '≣'], ['cache', 'DEK Cache', '◷'], ['tokens', 'Hosts', '⌂'],
-    ['setup', 'Passkey', '⚷'], ['settings', 'Settings', '⚙\uFE0E'],
+    ['settings', 'Settings', '⚙\uFE0E'],
   ];
   var started = {};
 
@@ -388,21 +388,7 @@
     });
     var title = TABS.filter(function (t) { return t[0] === key; })[0][1];
     document.getElementById('page-title').textContent = title;
-    document.title = 'VT — ' + title;
-  }
-
-  // Phone: the bar shrinks to marks while the content scrolls down and
-  // restores on scroll up or when scrolling stops (admin.css .compact).
-  function scrollShrink(nav) {
-    var lastY = window.scrollY, stop = null;
-    window.addEventListener('scroll', function () {
-      var y = window.scrollY;
-      if (y > lastY + 4 && y > 40) nav.classList.add('compact');
-      else if (y < lastY - 4) nav.classList.remove('compact');
-      lastY = y;
-      clearTimeout(stop);
-      stop = setTimeout(function () { nav.classList.remove('compact'); }, 400);
-    }, { passive: true });
+    document.title = 'vt — ' + title;
   }
 
   function bootConsole(data) {
@@ -420,7 +406,6 @@
     document.getElementById('page-head').hidden = false;
     document.getElementById('console').hidden = false;
     window.addEventListener('hashchange', function () { activate(data); });
-    scrollShrink(nav);
     activate(data);
   }
 

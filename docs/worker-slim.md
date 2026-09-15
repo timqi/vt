@@ -97,6 +97,16 @@ On iOS, Web Push requires an installed home-screen app. The service worker
 handles notifications without caching authenticated pages or API responses.
 Setup steps and browser requirements belong to the deployment guide.
 
+The service worker holds the approval a notification points at for three minutes
+and hands it to a page that asks on load; the page navigates itself, because an
+iOS home-screen app answers a tap by showing its start page. Approval and
+enrollment pushes hand it to an already-open window immediately; cache-hit
+notices never navigate, and a page already showing an approval is never
+navigated away — that would abort its WebAuthn prompt. A tap focuses that window, and opens one only when the
+app has none — an opened window is an auxiliary context that iOS presents as an
+in-app browser. Each hand-off fires once, and after a decision the page leaves
+for the admin console: the spent token would only render as 410.
+
 ## Host tokens
 
 Each host enrolls for its own token; there is no master daemon credential.

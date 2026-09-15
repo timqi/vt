@@ -35,6 +35,10 @@
 
 body {
   margin: 0;
+  /* Installed on iOS the status-bar strip is ours (black-translucent, the page
+     shells): pay the inset back so the strip carries the page's own canvas
+     instead of a system grey band. Zero everywhere else. */
+  padding-top: env(safe-area-inset-top);
   background: var(--bg);
   color: var(--fg);
   font: var(--body)/1.45 -apple-system, BlinkMacSystemFont, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -79,39 +83,40 @@ h2 { font-size: var(--body); margin: 18px 0 8px; }
 }
 
 /* ── Page head + tab bar (admin.js builds the items). Phone: the head is the
-   tab's title; the bar is a bottom pill that shrinks to marks while the content
-   scrolls down (.compact). Desktop: one sticky strip, title at its left. ─── */
+   tab's title, the bar a fixed bottom pill. Desktop: one sticky strip, title at
+   its left. The bar is .glass and never moves: a backdrop-filter surface
+   repaints its blur on every frame it animates, which stutters on iOS. ──── */
 .page-head { max-width: 1000px; margin: 0 auto; padding: 12px 16px 0; }
 .page-head h1 { margin: 0; }
 .tabbar {
   position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom));
   z-index: 5; display: flex; justify-content: space-around; padding: 4px;
-  border-radius: 999px; transform-origin: 50% 100%;
-  transition: transform var(--dur) var(--ease);
+  border-radius: 999px;
 }
 .tab {
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
   flex: 1 1 0; min-width: 0; min-height: 50px; padding: 4px 2px; border-radius: 999px;
   text-decoration: none; color: var(--muted); font-weight: 600; font-size: 11px;
   -webkit-tap-highlight-color: transparent;
 }
-.tab-mark { font-size: 20px; line-height: 22px; transition: transform var(--dur) var(--ease); }
-.tab-label { line-height: 14px; white-space: nowrap; transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease); }
+/* The marks are Unicode glyphs with unequal metrics: give each the same box and
+   centre the glyph in it, so the row reads as one line of icons. */
+.tab-mark {
+  display: flex; align-items: center; justify-content: center;
+  width: 24px; height: 22px; font-size: 20px; line-height: 1;
+}
+.tab-label { line-height: 14px; white-space: nowrap; }
 .tab:hover { color: var(--fg); }
 .tab.active { color: var(--accent); }
-.tabbar.compact { transform: scale(.9); }
-.tabbar.compact .tab-mark { transform: translateY(7px); }
-.tabbar.compact .tab-label { opacity: 0; transform: translateY(4px); }
 @media (min-width: 768px) {
   .page-head { position: sticky; top: 8px; z-index: 5; display: grid; padding: 0 8px; margin: 8px auto 0; }
   .page-head > * { grid-area: 1 / 1; }
   .page-head h1 { align-self: center; justify-self: start; z-index: 1; margin-left: 16px; font-size: var(--body); pointer-events: none; }
-  .tabbar { position: static; z-index: auto; justify-content: center; gap: 2px; border-radius: var(--r-bar); transform: none; }
+  .tabbar { position: static; z-index: auto; justify-content: center; gap: 2px; border-radius: var(--r-bar); }
   .tab { flex: 0 0 auto; flex-direction: row; gap: 6px; min-height: 36px; padding: 0 14px; border-radius: var(--r-ctl); font-size: 14px; }
-  .tab-mark { font-size: 16px; line-height: 1; }
+  .tab-mark { width: 18px; height: 18px; font-size: 16px; }
   .tab:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
   .tab.active { background: var(--tint); }
-  .tabbar.compact .tab-mark, .tabbar.compact .tab-label { transform: none; opacity: 1; }
 }
 /* Shell-level status (state errors); invisible while empty. */
 #shell-status { max-width: 1000px; margin: 8px auto 0; padding: 0 16px; }
@@ -238,6 +243,10 @@ tbody tr.clickable { cursor: pointer; }
   align-items: center; gap: 4px 12px; padding: 12px 16px; border-bottom: 1px solid var(--border);
 }
 .row:last-child { border-bottom: 0; }
+/* The list clips its overflow, so a row's focus ring has to sit inside the row:
+   offset outwards, its sides are cut and only two blue lines across the card
+   survive — which reads as a stray separator, not as focus. */
+.row:focus-visible, tbody tr:focus-visible { outline-offset: -2px; }
 .row.clickable { cursor: pointer; }
 .row.clickable:active { background: var(--panel-2); }
 .row-lead { grid-area: lead; }
@@ -363,8 +372,16 @@ th.col-pick input, td.col-pick input, .row-lead input { accent-color: var(--acce
 #detail-dl dd { margin: 0; font-size: var(--sec); word-break: break-word; }
 .mono { font-family: var(--mono); }
 #detail-dl dd.mono { white-space: pre-wrap; }
+/* The ceremony is the sheet's footer, not part of the scrolling body: the cache
+   duration and the action bar stay on screen while the details scroll. Tall
+   content scrolls inside it, with the bar sticky at its bottom. */
 #detail-approve:empty { display: none; }
-#detail-approve .vt-approve { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
+#detail-approve {
+  flex: none; max-height: 55vh; max-height: 55dvh; overflow: auto;
+  border-top: 1px solid var(--border);
+  padding: 12px 20px calc(12px + env(safe-area-inset-bottom));
+}
+#detail-approve .vt-ap-cache-section { margin-top: 0; }
 @media (min-width: 640px) {
   #detail-dl { grid-template-columns: max-content 1fr; gap: 6px 16px; }
   #detail-dl dt { margin-top: 0; }
@@ -375,6 +392,7 @@ th.col-pick input, td.col-pick input, .row-lead input { accent-color: var(--acce
   @starting-style { #detail[open] { transform: translateY(12px); } }
   .sheet-grab { display: none; }
   .sheet-body { padding: 20px 22px; }
+  #detail-approve { padding: 12px 22px 20px; }
 }
 
 /* ── Passkey ceremony (vt.mountApprove): standalone page and inline sheet ── */
@@ -414,12 +432,11 @@ dd.vt-ap-pair { font-size: 28px; font-weight: 700; letter-spacing: 2px; }
 }
 .chip:hover { opacity: 1; background: var(--tint); }
 .vt-ap-cache-section { margin: 18px 0 0; }
-.vt-ap-cache-section .cache-warn { margin: 0 0 8px; font-size: var(--cap); color: var(--muted); }
-.vt-ap-cache-section .cache-warn strong { color: var(--err); }
-/* The reuse scope this approval would arm — a path, so it wraps. Sits directly
-   above the duration control. */
-.vt-ap-cache-section .cache-scope { margin: 0 0 8px; font-size: var(--cap); overflow-wrap: anywhere; }
-.vt-ap-cache-section .cache-scope strong { font-family: var(--mono); }
+/* The one line above the duration control: what reuse this approval arms, and
+   the path it binds — so it wraps. */
+.vt-ap-cache-section .cache-scope { margin: 0 0 8px; font-size: var(--cap); color: var(--muted); overflow-wrap: anywhere; }
+.vt-ap-cache-section .cache-scope strong { color: var(--err); }
+.vt-ap-cache-section .cache-scope .cache-path { color: var(--fg); font-family: var(--mono); }
 /* Action bar: Approve 2fr / Reject 1fr at 50px with the status line above them.
    Standalone it floats over the card's bottom; in the sheet it sticks to the
    sheet's bottom. The card pads for it. */
@@ -441,15 +458,22 @@ pre.cmd {
   overflow-x: auto; font-family: var(--mono); font-size: var(--sec);
 }
 
+/* The approval page's own navigation (approve.html): opened from a notification
+   the page can sit in an in-app browser whose toolbar is iOS's, not ours. Small
+   and at the top, never beside Approve / Reject. */
+.approve-nav { display: flex; gap: 8px; margin: 12px 0 0; }
+.approve-nav a, .approve-nav button {
+  display: inline-flex; align-items: center; margin: 0; padding: 6px 14px; min-height: 36px;
+  background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
+  border-radius: var(--r-ctl); font-size: var(--cap); font-weight: 600; text-decoration: none;
+}
+
 .hint a, #detail-dl a { color: var(--accent); text-decoration: none; white-space: nowrap; }
 .hint a:hover, #detail-dl a:hover { text-decoration: underline; }
 
 /* ── Reduced motion: opacity only, no movement. ──────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
-  .tabbar, .tab-mark, .seg-thumb, button { transition: none; }
-  .tab-label { transition: opacity var(--dur) var(--ease); }
-  .tabbar.compact { transform: none; }
-  .tabbar.compact .tab-mark, .tabbar.compact .tab-label { transform: none; }
+  .seg-thumb, button { transition: none; }
   button:active { transform: none; }
   #detail, #detail[open] { transform: none; transition: opacity var(--dur-sheet) var(--ease), display var(--dur-sheet) allow-discrete, overlay var(--dur-sheet) allow-discrete; }
   @starting-style { #detail[open] { transform: none; } }

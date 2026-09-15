@@ -48,7 +48,7 @@ export function buildApprovalMessage(
   meta: Pick<ChallengeMeta, 'command' | 'host' | 'user' | 'pwd' | 'ppid_cmd' | 'ip' | 'reason' | 'ip_prev'>,
   salts = 0,
 ): { title: string; body: string } {
-  const title = opKind ? `VT approval: ${opKind}` : 'VT approval request';
+  const title = opKind ? `vt approval: ${opKind}` : 'vt approval request';
   return { title, body: metaLines(meta, salts).join('\n') };
 }
 
@@ -71,7 +71,7 @@ export function buildCacheHitMessage(
   note = 'cache hit, no phone approval',
   names: string[] = [],
 ): { title: string; body: string } {
-  const title = meta.op_kind ? `VT cache hit (no approval): ${meta.op_kind}` : 'VT cache hit (approval-free decrypt)';
+  const title = meta.op_kind ? `vt cache hit (no approval): ${meta.op_kind}` : 'vt cache hit (approval-free decrypt)';
   const lines = bodyLines(meta, salts, note);
   if (names.length) lines.splice(1, 0, `records: ${names.slice(0, 6).join(', ')}${names.length > 6 ? ` … ${names.length} total` : ''}`);
   return { title, body: lines.join('\n') };

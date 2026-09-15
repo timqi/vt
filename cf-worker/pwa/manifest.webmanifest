@@ -1,6 +1,6 @@
 {
-  "name": "VT",
-  "short_name": "VT",
+  "name": "vt",
+  "short_name": "vt",
   "scope": "/",
   "start_url": "/admin",
   "display": "standalone",

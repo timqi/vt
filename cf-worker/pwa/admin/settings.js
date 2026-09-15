@@ -1,12 +1,13 @@
 'use strict';
 
-// Settings tab: the session (logout / log out everywhere), the config knobs (hit
+// Settings tab: the Passkeys block (setup.js, mounted on its #tab-setup
+// sub-panel), the session (logout / log out everywhere), the config knobs (hit
 // notify, UV policy — GET/PUT /api/admin/config), SECRET rotation, and push
 // subscriptions — this device subscribes with the Worker's VAPID key and posts
 // the result; every row can be tested or removed. Rendering is textContent
 // only; the endpoint's keys never come back from the server.
 
-vt.tabs.settings = function (panel) {
+vt.tabs.settings = function (panel, data) {
   var $ = function (sel) { return panel.querySelector(sel); };
   var setStatus = vt.statusLine($('#subs').parentNode.parentNode.querySelector('.status'));
   var sessionStatus = vt.statusLine($('#session-status'));
@@ -185,4 +186,5 @@ vt.tabs.settings = function (panel) {
   vt.onLayout(render);
   loadConfig();
   init();
+  vt.tabs.setup($('#tab-setup'), data);
 };

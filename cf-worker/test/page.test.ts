@@ -40,6 +40,7 @@ describe('cache creation time rendering', () => {
     },
     addEventListener() {},
     matchMedia: () => ({ matches: false, addEventListener() {} }),   // desktop: the table branch
+    navigator: {},   // no serviceWorker: common.js skips the notification hand-off
     TextEncoder, crypto,
   };
   context.window = context; // common.js publishes `window.vt`; scripts read the global `vt`
@@ -104,6 +105,7 @@ describe('admin shell scripts against the shell markup', () => {
       location: { pathname: '/admin', hash: '' },
       document: { getElementById: () => new Element(), createElement: () => new Element(), addEventListener() {}, body: new Element() },
       addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }),
+      navigator: {},   // no serviceWorker: common.js skips the notification hand-off
       TextEncoder, crypto, console,
     };
     context.window = context;

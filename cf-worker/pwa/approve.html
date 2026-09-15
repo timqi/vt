@@ -5,7 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
-  <title>VT approval request</title>
+  <!-- Installed on iOS the system paints the status-bar strip in a grey that
+       belongs to no part of the app. Translucent hands the strip to the page,
+       which body's safe-area inset (admin.css) pays for. -->
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>vt approval request</title>
   {{FAVICON_TAGS}}
   <link rel="stylesheet" href="/pwa/admin/admin.css?v={{ASSET_VER}}">
 </head>
@@ -13,8 +17,14 @@
   <script type="application/json" id="vt-data">{{VT_DATA}}</script>
   <main class="approve">
     <header>
-      <h1>VT approval request</h1>
+      <h1>vt approval request</h1>
       <p class="hint">Confirm the operation below with a Passkey (iCloud / 1Password / YubiKey).</p>
+      <!-- The page's own way out: opened from a notification it may sit in an
+           in-app browser whose toolbar belongs to iOS, not to us. -->
+      <nav class="approve-nav">
+        <a href="/admin">Admin console</a>
+        <button id="ap-reload" type="button">Refresh</button>
+      </nav>
     </header>
     <!-- The ceremony UI (decision / details / cache selector / action bar) is
          built by approve.js's vt.mountApprove(), the single source shared with

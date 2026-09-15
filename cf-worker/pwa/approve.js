@@ -55,20 +55,11 @@
         var cacheSec = el('section', 'vt-ap-cache-section');
         cacheSec.hidden = true;
         cacheSec.appendChild(el('h2', null, 'Cache decrypt authorization'));
-        var warn = el('p', 'hint cache-warn');
-        // Cache key binds the host token (hard) + project (advisory) — see
-        // docs/dek-cache.md. The copy states each half's trust level so the
-        // promised boundary matches the implemented one. Built as nodes to keep
-        // the <strong> emphasis under CSP.
-        warn.appendChild(document.createTextNode('For the chosen duration, decrypts of these records from the '));
-        warn.appendChild(el('strong', null, 'same host token (verified) and same project (client-claimed)'));
-        warn.appendChild(document.createTextNode(' will '));
-        warn.appendChild(el('strong', null, 'skip phone approval'));
-        warn.appendChild(document.createTextNode('. Default: no cache.'));
-        cacheSec.appendChild(warn);
-        // The reuse scope this approval would arm: the client-reported project
-        // (its repository's common git dir, so every worktree shares one cache)
-        // — the approver must see that before tapping Approve.
+        // The reuse scope this approval would arm, in one line: what the cache
+        // key binds — host token (verified) + project (client-reported, its
+        // repository's common git dir, so every worktree shares one cache) — and
+        // what that buys, a decrypt with no phone approval. No cache is the
+        // duration control's own default, so it needs no sentence.
         refs.cacheScope = el('p', 'hint cache-scope');
         refs.cacheScope.hidden = true;
         cacheSec.appendChild(refs.cacheScope);
@@ -238,12 +229,14 @@
             var scope = (data.metadata && data.metadata.project) || '';
             if (scope) {
                 refs.cacheScope.innerHTML = '';
-                refs.cacheScope.appendChild(document.createTextNode('Cache scope (project): '));
-                refs.cacheScope.appendChild(el('strong', null, scope));
+                refs.cacheScope.appendChild(document.createTextNode('Skips phone approval for the '));
+                refs.cacheScope.appendChild(el('strong', null, 'same host token (verified)'));
+                refs.cacheScope.appendChild(document.createTextNode(' and project (client-reported) '));
+                refs.cacheScope.appendChild(el('strong', 'cache-path', scope));
                 var literal = (data.metadata && data.metadata.pwd) || '';
                 if (literal && literal !== scope) {
                     refs.cacheScope.appendChild(
-                        document.createTextNode(' (this directory: ' + literal + '; other directories of the project hit too)'));
+                        document.createTextNode(' — this directory: ' + literal + ', other directories of the project hit too'));
                 }
                 refs.cacheScope.hidden = false;
             }
@@ -477,7 +470,13 @@
     vt.mountApprove = mountApprove;
 
     // Standalone approval page (/a/:token): auto-mount from the embedded data,
-    // close the tab shortly after a decision. The admin shell has no such root.
+    // then land on the console shortly after a decision — the token is spent, so
+    // the page would only reload as 410. window.close() is a no-op for a window
+    // the script did not open (every notification and CLI-link arrival).
+    // The admin shell has no such root.
+    var reload = document.getElementById('ap-reload');
+    if (reload) reload.addEventListener('click', function () { location.reload(); });
+
     var root = document.getElementById('vt-approve-root');
     if (root) {
         var data = vt.bootData();
@@ -486,7 +485,7 @@
                 data: data,
                 root: root,
                 showMeta: true,
-                onSettled: function () { setTimeout(function () { window.close(); }, 800); },
+                onSettled: function () { setTimeout(function () { location.replace('/admin'); }, 800); },
             });
         }
     }

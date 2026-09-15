@@ -69,7 +69,7 @@ Open `https://vt.example.com/admin` on the canonical hostname.
 2. Paste the export and passphrase into setup, label the Passkey, and choose
    Register and log in. The browser unwraps the master locally; the Worker
    receives only the wrapped credential material.
-3. Run the Passkey tab's self-check.
+3. Run the Settings tab's Passkeys self-check.
 
 If setup reports a prior registration with an unfamiliar time/IP, use the reset
 procedure below. Add further Passkeys from the console. Revoking one ends every

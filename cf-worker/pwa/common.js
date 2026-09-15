@@ -184,5 +184,25 @@
 
     vt.zeroize = function (arr) { if (!arr) return; try { arr.fill(0); } catch (_) {} };
 
+    // Notification hand-off (sw.js): the worker holds the approval a tap should
+    // land on and hands it to the page, which navigates itself — an iOS
+    // home-screen app answers a tap by showing its start page whatever the
+    // worker navigates. Only an approval path is followed, never an arbitrary URL.
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.addEventListener('message', function (e) {
+            if (!e.data || e.data.type !== 'vt-navigate' || typeof e.data.url !== 'string') return;
+            var u = new URL(e.data.url, location.origin);
+            if (u.origin !== location.origin || u.pathname.lastIndexOf('/a/', 0) !== 0) return;
+            // An approval already on screen owns the page: navigating away mid
+            // ceremony aborts the WebAuthn prompt (it surfaces as "cancelled").
+            if (document.querySelector('.vt-approve')) return;
+            if (u.pathname !== location.pathname) location.replace(u.href);
+        });
+        navigator.serviceWorker.ready.then(function (reg) {
+            var sw = navigator.serviceWorker.controller || reg.active;
+            if (sw) sw.postMessage({ type: 'vt-pending' });
+        }).catch(function () { /* no worker registered: notifications are off anyway */ });
+    }
+
     window.vt = vt;
 })();

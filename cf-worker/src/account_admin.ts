@@ -523,7 +523,7 @@ export class AccountAdmin {
         const sub = cfg.push.find(s => s.endpoint === endpoint);
         if (!sub || !cfg.vapid) return new Response('unknown subscription', { status: 404 });
         const payload: PushPayload = {
-          v: 1, kind: 'test', title: 'VT push test', body: `${sub.label || 'This device'} is subscribed to approval notices`,
+          v: 1, kind: 'test', title: 'vt push test', body: `${sub.label || 'This device'} is subscribed to approval notices`,
           url: `${cfg.origin}${ADMIN_AUDIT_PATH}`, tag: 'test',
         };
         return Response.json(await sendPush(sub, JSON.stringify(payload), cfg.vapid, cfg.origin, 60, 'normal'));
