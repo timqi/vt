@@ -95,10 +95,30 @@ fn read_config_table() -> Option<(PathBuf, toml::Table)> {
     match contents.parse::<toml::Table>() {
         Ok(table) => Some((path, table)),
         Err(e) => {
-            tracing::warn!("ignoring malformed config {}: {}", path.display(), e);
+            tracing::warn!(
+                "ignoring malformed config {}: {}",
+                path.display(),
+                describe_toml_error(&contents, &e)
+            );
             None
         }
     }
+}
+
+/// Position + message only. The error's `Display` quotes the offending source
+/// line, which for a config file may be a token assignment; that must never
+/// reach the log.
+fn describe_toml_error(contents: &str, e: &toml::de::Error) -> String {
+    let at = match e.span() {
+        Some(span) => {
+            let before = &contents[..span.start.min(contents.len())];
+            let line = before.matches('\n').count() + 1;
+            let col = before.rsplit('\n').next().map_or(0, str::len) + 1;
+            format!("line {line} column {col}: ")
+        }
+        None => String::new(),
+    };
+    format!("{at}{}", e.message())
 }
 
 pub fn hydrate_env_from_file() -> Vec<String> {
@@ -313,6 +333,21 @@ mod tests {
         );
         std::env::remove_var("VT_CONFIG");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_config_warning_omits_source_text() {
+        // A token assignment on the offending line must not be echoed.
+        let contents = "VT_PASSKEY_TOKEN = \"vt1.secret-token-value\" trailing\nVT_B = \"x\"\n";
+        let e = contents.parse::<toml::Table>().unwrap_err();
+        assert!(
+            e.to_string().contains("vt1.secret-token-value"),
+            "precondition: Display leaks"
+        );
+        let msg = describe_toml_error(contents, &e);
+        assert!(!msg.contains("vt1.secret-token-value"), "{msg}");
+        assert!(!msg.contains("VT_PASSKEY_TOKEN"), "{msg}");
+        assert!(msg.starts_with("line 1 column "), "{msg}");
     }
 
     #[test]
