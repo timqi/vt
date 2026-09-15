@@ -40,6 +40,10 @@ epoch. Mutations and audit-stream upgrades also require the configured Origin.
 Revoking a Passkey or all sessions advances the epoch; logging out one browser
 only discards its cookie. The last Passkey cannot be revoked.
 
+An audit-stream socket carries the epoch and expiry of the session that opened
+it; an epoch bump closes it, and a socket past either check receives no
+broadcast.
+
 A session permits configuration, credential management, record renaming,
 listing, and authority-reducing revocation. It cannot approve a protected
 ceremony or extend a cache entry without a verified Passkey assertion.

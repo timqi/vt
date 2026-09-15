@@ -238,6 +238,38 @@ describe('credentials and sessions', () => {
     expect((await doGet('admin-credentials', h)).json.epoch).toBe(2);
   });
 
+  // W-4: a stream minted under an earlier epoch or past its session's exp
+  // gets nothing more — it is closed by the revocation itself, and any socket
+  // that slipped through is dropped before a broadcast reaches it.
+  it('closes admin audit streams on epoch bump and skips stale ones on broadcast', async () => {
+    const open = async () => {
+      const res = await accountStub().fetch('https://account.do/ws-admin', { headers: { Upgrade: 'websocket', ...adminHeaders() } });
+      expect(res.status).toBe(101);
+      const ws = res.webSocket!;
+      ws.accept();
+      const closed = new Promise<number>(resolve => ws.addEventListener('close', ev => resolve(ev.code)));
+      return { ws, closed };
+    };
+    const a = await open();
+    const stale = await open();
+    const expired = await open();
+    await inDO(({ inst, state }) => {
+      const [x, y] = state.getWebSockets('admin').slice(1);
+      // Attachments as an older epoch / a lapsed session would leave them.
+      x!.serializeAttachment({ exp: Math.floor(Date.now() / 1000) + 3600, epoch: inst.admin.current.epoch - 1 });
+      y!.serializeAttachment({ exp: Math.floor(Date.now() / 1000) - 1, epoch: inst.admin.current.epoch });
+    });
+    await inDO(({ inst }) => {
+      expect(inst.liveAdminSockets()).toHaveLength(1);
+      inst.audit.broadcastRow('nothing', 'update');
+    });
+    expect(await stale.closed).toBe(4001);
+    expect(await expired.closed).toBe(4001);
+    expect((await doPost('admin-sessions-revoke', {})).status).toBe(204);
+    expect(await a.closed).toBe(4001);
+    await inDO(({ inst }) => expect(inst.liveAdminSockets()).toHaveLength(0));
+  });
+
   it('logout clears only the browser copy; sessions-revoke ends every session', async () => {
     const a = adminHeaders();
     const out = await doPost('admin-logout', {});

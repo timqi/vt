@@ -183,7 +183,7 @@ export class AccountDO extends DurableObject<Env> {
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    this.audit = new AccountAudit(this.ctx.storage.sql, () => this.ctx.getWebSockets('admin'));
+    this.audit = new AccountAudit(this.ctx.storage.sql, () => this.liveAdminSockets());
     this.admin = new AccountAdmin(this.ctx.storage, this.env.SECRET);
     this.notifications = new AccountNotifications(this.ctx, this.admin);
     this.cache = new AccountCache(this.ctx.storage, () => this.admin.cacheSeckey());
@@ -225,7 +225,13 @@ export class AccountDO extends DurableObject<Env> {
       const session = await this.admin.session(request);
       if (session instanceof Response) return session;
     }
-    if (op.startsWith('admin-')) return this.admin.adminOp(op.slice(6), request);
+    if (op.startsWith('admin-')) {
+      const res = await this.admin.adminOp(op.slice(6), request);
+      // An epoch bump (Passkey / all-sessions revocation) kills every stream
+      // minted under the old epoch now, not at its next broadcast.
+      this.liveAdminSockets();
+      return res;
+    }
     if (op.startsWith('push-')) return this.admin.pushOp(op.slice(5), request);
     switch (op) {
       case 'create':              return this.opCreate(request);
@@ -277,10 +283,12 @@ export class AccountDO extends DurableObject<Env> {
   }
 
   // Admin audit stream. The session cookie is verified here like every admin
-  // op; its `exp_s` bounds the socket via serializeAttachment so a hibernating
-  // stream cannot outlive the session — the alarm() sweep closes any socket
-  // past exp. (REST polling gets a fresh 401 the moment the session ends; a
-  // long-lived socket needs this explicit re-check.)
+  // op; its `exp_s` and the config epoch it was verified against ride on the
+  // socket via serializeAttachment, and liveAdminSockets re-checks both before
+  // every broadcast, after every admin op and in the alarm sweep, so a
+  // hibernating stream cannot outlive the session or a revocation. (REST
+  // polling gets a fresh 401 the moment the session ends; a long-lived socket
+  // needs this explicit re-check.)
   private async handleAdminWsUpgrade(request: Request): Promise<Response> {
     const exp = await this.admin.session(request);
     if (exp instanceof Response) return exp;
@@ -297,11 +305,31 @@ export class AccountDO extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server, ['admin']);
-    server.serializeAttachment({ exp });
+    server.serializeAttachment({ exp, epoch: this.admin.current.epoch });
     // 'hello' → the client runs an after_seq catch-up to reconcile anything it
     // missed between its REST snapshot and this socket opening.
     server.send(JSON.stringify({ kind: 'hello' } satisfies AdminWsMessage));
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // Admin sockets whose session is still valid: same epoch as the config and
+  // not past `exp_s`. Everything else — including a missing or garbled
+  // attachment — is closed on the spot (fail closed). Synchronous, so a check
+  // and the send it guards share one DO turn.
+  private liveAdminSockets(): WebSocket[] {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const epoch = this.admin.current.epoch;
+    const live: WebSocket[] = [];
+    for (const ws of this.ctx.getWebSockets('admin')) {
+      let att: { exp?: number; epoch?: number } | null = null;
+      try { att = ws.deserializeAttachment() as { exp?: number; epoch?: number } | null; } catch {}
+      if (att?.epoch === epoch && typeof att.exp === 'number' && nowSec < att.exp) {
+        live.push(ws);
+      } else {
+        try { ws.close(4001, 'session expired'); } catch {}
+      }
+    }
+    return live;
   }
 
   webSocketMessage(ws: WebSocket, _message: string | ArrayBuffer): void {
@@ -322,6 +350,9 @@ export class AccountDO extends DurableObject<Env> {
     // once CF exhausts its automatic alarm retries.
     const now = Date.now();
     try {
+    // liveAdminSockets (every broadcast below) reads the config epoch; a cold
+    // start has not loaded it yet.
+    await this.admin.load();
 
     // 1. Challenges: expire pending past TTL_MS; delete finalized past RETENTION_MS.
     try {
@@ -361,17 +392,11 @@ export class AccountDO extends DurableObject<Env> {
     // Long-dead host tokens (revoked/lapsed > 30 d ago); live ones are never touched.
     this.tokens.sweep(now);
 
-    // 4. Admin audit-stream sockets: close any whose session `exp_s` has passed,
-    // so a hibernating stream cannot outlive the admin's authenticated session.
-    // Bounds staleness to at most one alarm period (TTL_MS) past exp. A socket
-    // with no/garbled attachment is treated as expired (fail closed).
+    // 4. Admin audit-stream sockets: close any whose session has expired or
+    // was revoked, so an idle hibernating stream is cut within one alarm
+    // period (TTL_MS) even when no broadcast happens to check it.
     try {
-      const nowSec = Math.floor(now / 1000);
-      for (const ws of this.ctx.getWebSockets('admin')) {
-        let exp = 0;
-        try { exp = (ws.deserializeAttachment() as { exp?: number } | null)?.exp ?? 0; } catch {}
-        if (nowSec >= exp) { try { ws.close(4001, 'session expired'); } catch {} }
-      }
+      this.liveAdminSockets();
     } catch (e) {
       logErr('alarm.admin_ws_sweep_failed', e);
     }
