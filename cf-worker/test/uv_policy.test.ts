@@ -63,21 +63,25 @@ describe('configured policy', () => {
     expect(effectiveUvLevel(policy, { op_kind: 'decrypt', host: 'prod-db' })).toBe('required');
   });
 
-  it('ignores unparseable entries instead of dropping the whole policy', () => {
-    const { policy: p, error } = parseUvPolicy({
-      default: 'preferred', by_op: { decrypt: 'nonsense', auth: 'required' }, by_host: 'oops',
-    });
-    expect(error).toBeNull();
-    expect(effectiveUvLevel(p, { op_kind: 'decrypt' })).toBe('preferred');
-    expect(effectiveUvLevel(p, { op_kind: 'auth' })).toBe('required');
-  });
-
+  // W-8: a rule that does not parse is not dropped — the whole policy is
+  // refused and reads strict, so a typo can never leave a host on `discouraged`.
   it('falls back to required — never to the permissive default — when malformed', () => {
-    for (const bad of ['{', [], 'required', 7, { default: 'off' }]) {
+    for (const bad of [
+      '{', [], 'required', 7, { default: 'off' },
+      { by_host: { prod: 'requird' } },
+      { default: 'preferred', by_op: { decrypt: 'nonsense', auth: 'required' } },
+      { by_host: 'oops' }, { by_op: ['required'] }, { by_op: null },
+      { default: 'constructor' }, { by_host: { prod: 'toString' } },
+      { by_hosts: { prod: 'required' } },
+    ]) {
       const { policy: p, error } = parseUvPolicy(bad);
       expect(error).toBeTruthy();
-      expect(effectiveUvLevel(p, DECRYPT)).toBe('required');
+      expect(effectiveUvLevel(p, { op_kind: 'decrypt', host: 'prod' })).toBe('required');
     }
+    // Inherited names are not levels; a stored default of that shape is strict.
+    expect(parseUvLevel('constructor')).toBeNull();
+    expect(parseUvLevel('__proto__')).toBeNull();
+    expect(parseUvPolicy({ default: 'preferred', by_op: {}, by_host: {} }).error).toBeNull();
   });
 });
 

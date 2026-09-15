@@ -33,9 +33,10 @@ const RANK: Record<UvLevel, number> = { discouraged: 0, preferred: 1, required: 
 export const DEFAULT_APPROVAL_UV: UvLevel = 'discouraged';
 
 /** Accept only the three spec levels. Anything else — absent, misspelled, a
- *  non-string from a client body — is "no opinion", never a level. */
+ *  non-string from a client body, an inherited name like `constructor` — is
+ *  "no opinion", never a level. */
 export function parseUvLevel(v: unknown): UvLevel | null {
-  return typeof v === 'string' && v in RANK ? (v as UvLevel) : null;
+  return typeof v === 'string' && Object.hasOwn(RANK, v) ? (v as UvLevel) : null;
 }
 
 /** The stricter of two levels. The single operation the whole policy is built
@@ -60,46 +61,52 @@ export function defaultUvPolicy(): UvPolicy {
   return { default: DEFAULT_APPROVAL_UV, byOp: {}, byHost: {} };
 }
 
-function levelMap(v: unknown): Record<string, UvLevel> {
+/** `{name: level}` with every entry a spec level, or the first offence. An
+ *  absent map is empty; anything else malformed is an error, never a partial
+ *  map — a rule the operator typed and we dropped is a rule they believe is
+ *  in force. */
+function levelMap(v: unknown, field: string): Record<string, UvLevel> | string {
   const out: Record<string, UvLevel> = {};
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) return out;
+  if (v === undefined) return out;
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return `${field}: not an object`;
   for (const [k, raw] of Object.entries(v as Record<string, unknown>)) {
     const level = parseUvLevel(raw);
-    if (level) out[k] = level;
+    if (!level) return `${field}: invalid level`;
+    out[k] = level;
   }
   return out;
 }
+
+const POLICY_KEYS = new Set(['default', 'by_op', 'by_host']);
 
 /** Parse the `uv_policy` object of the config blob (docs/worker-slim.md#approval-policy),
  *  the same shape the Settings tab PUTs:
  *
  *    {"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{"prod":"required"}}
  *
- *  `null`/absent → the default policy, no error. MALFORMED → `required`
- *  everywhere plus an error: the PUT refuses it, and a stored one (a bug)
- *  reads as the strict pre-policy behaviour, never as "ask for less".
- *
- *  Unknown keys and unparseable levels inside a well-formed object are dropped
- *  rather than fatal — one bad op name cannot take the whole policy strict. */
+ *  `null`/absent → the default policy, no error. MALFORMED — a non-object, an
+ *  unknown key, a non-level anywhere — → `required` everywhere plus an error:
+ *  the PUT refuses it, and a stored one (a bug) reads as the strict pre-policy
+ *  behaviour, never as "ask for less". */
 export function parseUvPolicy(obj: unknown): {
   policy: UvPolicy;
   error: string | null;
 } {
   if (obj === null || obj === undefined) return { policy: defaultUvPolicy(), error: null };
   const strict: UvPolicy = { default: 'required', byOp: {}, byHost: {} };
-  if (typeof obj !== 'object' || Array.isArray(obj)) {
-    return { policy: strict, error: 'not an object' };
-  }
+  const fail = (error: string) => ({ policy: strict, error });
+  if (typeof obj !== 'object' || Array.isArray(obj)) return fail('not an object');
   const o = obj as Record<string, unknown>;
-  if ('default' in o && parseUvLevel(o['default']) === null) {
-    return { policy: strict, error: 'invalid default level' };
+  for (const k of Object.keys(o)) {
+    if (!POLICY_KEYS.has(k)) return fail(`unknown key ${k}`);
   }
+  if ('default' in o && parseUvLevel(o['default']) === null) return fail('invalid default level');
+  const byOp = levelMap(o['by_op'], 'by_op');
+  if (typeof byOp === 'string') return fail(byOp);
+  const byHost = levelMap(o['by_host'], 'by_host');
+  if (typeof byHost === 'string') return fail(byHost);
   return {
-    policy: {
-      default: parseUvLevel(o['default']) ?? DEFAULT_APPROVAL_UV,
-      byOp: levelMap(o['by_op']),
-      byHost: levelMap(o['by_host']),
-    },
+    policy: { default: parseUvLevel(o['default']) ?? DEFAULT_APPROVAL_UV, byOp, byHost },
     error: null,
   };
 }

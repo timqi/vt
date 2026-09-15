@@ -57,12 +57,24 @@ describe('the policy is read from the config blob', () => {
     expect((await put({ uv_policy: { default: 'sometimes' } })).status).toBe(400);
     expect((await put({ uv_policy: 'required' })).status).toBe(400);
     expect((await put({ uv_policy: ['required'] })).status).toBe(400);
+    // W-8: one misspelled rule refuses the whole policy.
+    expect((await put({ uv_policy: { by_host: { prod: 'requird' } } })).status).toBe(400);
+    expect((await put({ uv_policy: { default: 'constructor' } })).status).toBe(400);
     expect((await put({ cache_hit_notify: 'yes' })).status).toBe(400);
     expect((await put({ origin: 'https://evil.test.invalid' })).status).toBe(400);
     expect((await put({ epoch: 99 })).status).toBe(400);
     const cfg = await doGet('admin-config');
     expect(cfg.json).toMatchObject({ uv_policy: null, cache_hit_notify: false, epoch: 1, origin: 'https://vt.test.invalid' });
   });
+});
+
+// W-8: a malformed policy that reached storage (a bug, or an older writer)
+// reads as `required`, never as the permissive default.
+it('serves a stored malformed policy as required', async () => {
+  await inDO(({ inst }) => inst.admin.write((c: { uv_policy: unknown }) => { c.uv_policy = { default: 'discouraged', by_host: { testbox: 'requird' } }; }));
+  const ch = makeChallenge();
+  expect((await doPost('create', { challenge: ch, uv_request: 'discouraged', auth: await daemonAuth(await liveTokenId()) })).status).toBe(200);
+  expect(await storedUv(ch)).toBe('required');
 });
 
 async function pageData(token: string) {

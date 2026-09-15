@@ -73,7 +73,8 @@ origin cannot change without reset.
 - Enrollment, admin login, and cache extension require user verification;
   ordinary approval follows the configured floor.
 - User presence remains mandatory even when UV is discouraged.
-- Malformed policy must not silently become a weaker policy.
+- A policy with any unknown key or non-level value is refused at PUT; a stored
+  one reads as `required` everywhere.
 
 WebAuthn PRF custody stays on the phone; host authentication requests approval
 but does not replace it. Cached DEKs are the deliberate exception described
