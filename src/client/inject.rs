@@ -171,7 +171,8 @@ pub async fn inject(
     //   1. Open target with O_NOFOLLOW, stat to capture mode + reject non-regular.
     //      Reserve an EMPTY tmp and retain its fd (no plaintext yet).
     //   2. Write a backup file alongside the target (ciphertext copy,
-    //      O_CREAT|O_EXCL|O_NOFOLLOW, mode = orig) at the DETERMINISTIC
+    //      O_CREAT|O_EXCL|O_NOFOLLOW, mode = orig, under the parent-directory
+    //      flock every restorer also takes) at the DETERMINISTIC
     //      per-target path `.{name}.vt-backup`. The backup doubles as the
     //      exposure lock (see `exposure_backup_path`): a second inject of the
     //      same target fails EEXIST here instead of snapshotting the exposed
@@ -582,6 +583,18 @@ fn write_inject_sidecar(path: &std::path::Path, sc: &InjectSidecar) -> Result<()
 // (see `restore_exposure` — a suspend can delay the supervisor's monotonic
 // sleep, or stop the parent short of its failure path, past the wall-clock
 // deadline, letting --recover and a new exposure run first).
+//
+// The re-check is only as good as its atomicity with the rename: a restorer
+// suspended between the two could otherwise resume after another restorer
+// consumed the verified backup and a new inject recreated the path, and
+// rename the successor's backup. So every creator and every consumer of the
+// backup path runs under [`lock_backup_dir`]: an exclusive advisory flock on
+// the target's parent directory, held only across one O_EXCL create or one
+// cancel + check + rename — never across a prompt, the exec, or the
+// supervisor's sleep. A directory fd needs no lock file to create or clean
+// up, so there is no unlink-vs-relock race of its own. Lock failure is
+// unknown state: inject refuses to arm; restorers keep backup and sidecar
+// for `--recover`, exactly as for a stat error.
 
 /// Deterministic ciphertext-backup path for `target`: `dir/.{name}.vt-backup`.
 /// Deliberately NOT randomized — see the module comment above. Restore paths
@@ -599,6 +612,28 @@ fn exposure_backup_path(target: &str) -> Result<std::path::PathBuf> {
         .to_string_lossy()
         .into_owned();
     Ok(dir.join(format!(".{}.vt-backup", file_name)))
+}
+
+/// Take the exclusive advisory lock every creator and consumer of `backup`
+/// must hold across its create or its check + rename (module comment above).
+/// Released when the returned fd drops; O_CLOEXEC, so the parent's exec never
+/// inherits it. Blocking: holders do only bounded local filesystem work.
+fn lock_backup_dir(backup: &std::path::Path) -> io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = backup
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(dir)?;
+    // SAFETY: the file owns a valid descriptor for the entire flock call.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(f)
 }
 
 /// Create the exposure-lock backup (O_CREAT|O_EXCL|O_NOFOLLOW, `mode`), fill
@@ -621,6 +656,7 @@ fn create_exposure_backup(
     mode: u32,
 ) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let _dir_lock = lock_backup_dir(backup_path)?;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -936,6 +972,8 @@ fn recover_sidecar(
     let Some(mut action) = plan_recovery(sc.deadline_ms, survives, now) else {
         return Ok(None);
     };
+    let _dir_lock = lock_backup_dir(std::path::Path::new(&sc.backup))
+        .with_context(|| format!("cannot lock directory of {}", sc.backup))?;
     cancel_publication(std::path::Path::new(&sc.tmp))
         .with_context(|| format!("cannot cancel publication at {}", sc.tmp))?;
     if action == RecoverAction::Restore {
@@ -1037,13 +1075,10 @@ fn parse_dev_ino(s: &str) -> Option<(u64, u64)> {
 /// Failure warnings go to stderr: user-visible on the parent paths, /dev/null
 /// in the supervisor.
 ///
-/// Known, accepted residuals: (a) a successor reusing our exact inode is
+/// Known, accepted residual: a successor reusing our exact inode is
 /// indistinguishable here — unlike `--recover` we know no deadline to bound
-/// mtime by; (b) the stat→rename pair is not atomic, so a window of
-/// microseconds remains in which `--recover` consuming the verified backup
-/// AND a new inject recreating the path would misdirect the rename. Both
-/// events landing inside that window is negligible; absolute closure would
-/// need every consumer to serialize on a parent-directory flock.
+/// mtime by. The stat→rename pair itself is atomic against every other
+/// creator and consumer via `lock_backup_dir`.
 fn restore_exposure(
     tmp: &std::path::Path,
     backup: &std::path::Path,
@@ -1052,6 +1087,17 @@ fn restore_exposure(
     armed_id: (u64, u64),
 ) {
     use std::os::unix::fs::MetadataExt;
+    let _dir_lock = match lock_backup_dir(backup) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "vt inject: cannot lock directory of {}: {}; leaving backup and sidecar",
+                backup.display(),
+                e
+            );
+            return;
+        }
+    };
     // Cancel publication even if the parent has not written plaintext yet.
     // A real unlink failure must never consume its only restoration source.
     if let Err(e) = cancel_publication(tmp) {
@@ -1095,8 +1141,8 @@ fn restore_exposure(
         Ok(()) => {
             let _ = std::fs::remove_file(sidecar);
         }
-        // Consumed between the check and the rename: --recover won the race
-        // and the exposure is settled — same as the gone case above.
+        // Gone under the lock cannot be another restorer; only an out-of-band
+        // move. The exposure is settled either way — same as the gone case.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let _ = std::fs::remove_file(sidecar);
         }
@@ -2098,6 +2144,83 @@ mod tests {
         assert_eq!(std::fs::read(&a.backup).unwrap(), b"ciphertext-B");
         drop(fd);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// R-3 interleaving: restorer A verifies its generation, is suspended,
+    /// restorer B consumes the backup, inject C recreates the path, A resumes
+    /// and renames C's backup. With the directory lock held by A across its
+    /// check + rename, B (both restore paths) and C block until A releases.
+    #[test]
+    fn backup_consumers_and_creators_serialize_on_the_directory_lock() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for recovery in [false, true] {
+            let (dir, a, fd, sc) = prepared_exposure(&format!("dirlock-{recovery}"));
+            std::fs::write(&a.target, b"plaintext").unwrap();
+            // A: locked, generation verified, not yet renamed.
+            let held = lock_backup_dir(&a.backup).unwrap();
+            let md = std::fs::symlink_metadata(&a.backup).unwrap();
+            assert_eq!((md.dev(), md.ino()), a.backup_id);
+
+            // B: another restorer of the same exposure must not consume.
+            let (tx, rx) = mpsc::channel();
+            let (b_a, b_sc) = (
+                ArmedExposure {
+                    target: a.target.clone(),
+                    backup: a.backup.clone(),
+                    tmp: a.tmp.clone(),
+                    sidecar: a.sidecar.clone(),
+                    backup_id: a.backup_id,
+                },
+                sc.clone(),
+            );
+            let b = std::thread::spawn(move || {
+                if recovery {
+                    // Probes Ours before blocking on the lock; once A has
+                    // renamed, the locked re-probe must see it settled.
+                    assert_eq!(
+                        recover_sidecar(&b_sc, &b_a.sidecar, b_sc.deadline_ms + RECOVER_GRACE_MS)
+                            .unwrap(),
+                        Some(RecoverAction::CleanStale)
+                    );
+                } else {
+                    restore_exposure(
+                        &b_a.tmp,
+                        &b_a.backup,
+                        std::path::Path::new(&b_a.target),
+                        &b_a.sidecar,
+                        b_a.backup_id,
+                    );
+                }
+                tx.send(()).unwrap();
+            });
+            // C: a successor inject must not take the path either.
+            let (ctx, crx) = mpsc::channel();
+            let c_backup = a.backup.clone();
+            let c = std::thread::spawn(move || {
+                let r = create_exposure_backup(&c_backup, b"ciphertext-C", 0o600);
+                ctx.send(r.map(|_| ())).unwrap();
+            });
+            assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+            assert!(crx.try_recv().is_err());
+            assert_eq!(std::fs::read(&a.backup).unwrap(), b"ciphertext");
+            assert_eq!(std::fs::read(&a.target).unwrap(), b"plaintext");
+
+            // A completes its rename and releases. In either order, B finds
+            // nothing of A's left and only drops the sidecar; C arms on the
+            // free path and its backup is never consumed by B.
+            std::fs::rename(&a.backup, &a.target).unwrap();
+            drop(held);
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            b.join().unwrap();
+            crx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            c.join().unwrap();
+            assert_eq!(std::fs::read(&a.target).unwrap(), b"ciphertext");
+            assert_eq!(std::fs::read(&a.backup).unwrap(), b"ciphertext-C");
+            drop(fd);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

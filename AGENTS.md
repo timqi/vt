@@ -126,7 +126,9 @@ Usage: [README.md](README.md#inject-command). Recovery mechanics and tests:
   Clean up a newly created backup if filling it or obtaining its generation fails;
   never remove another exposure's lock or randomize the backup name.
 - Restore by atomic `rename`, never copy+delete. Every sidecar and every parent /
-  supervisor failure path checks the armed `(dev, ino)`. Id-less records are unknown
+  supervisor failure path checks the armed `(dev, ino)`, and every backup create
+  and check+rename holds the parent-directory `flock` (`lock_backup_dir`); a lock
+  failure refuses to arm and leaves backup and record in place. Id-less records are unknown
   state: never parse, restore, or retire them. Arming retires stale sidecars for
   that backup path; recovery checks generation and mtime against the recorded
   deadline, including a re-probe after publication cancellation. Never restore a successor.
