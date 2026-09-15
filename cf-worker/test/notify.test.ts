@@ -16,9 +16,9 @@ const meta = {
 };
 
 describe('metaLines', () => {
-  it('renders who · N 条 head, then pwd/cmd/via/ip/reason in order', () => {
+  it('renders who · N records head, then pwd/cmd/via/ip/reason in order', () => {
     const lines = metaLines(meta, 3);
-    expect(lines[0]).toBe('qiqi@devbox · 3 条');
+    expect(lines[0]).toBe('qiqi@devbox · 3 records');
     expect(lines.slice(1)).toEqual([
       'pwd: /repo',
       'op: inject\nfile: .env', // self-labelled multi-line command, no cmd: prefix
@@ -30,13 +30,13 @@ describe('metaLines', () => {
 
   it('flags an IP change on the host-token path', () => {
     const lines = metaLines({ ...meta, ip_prev: '198.51.100.7' });
-    expect(lines).toContain('ip: 203.0.113.9（上次 198.51.100.7）');
+    expect(lines).toContain('ip: 203.0.113.9 (last 198.51.100.7)');
   });
 
   it('drops the batch segment at salts=0 and keeps a bare count when who is empty', () => {
     expect(metaLines(meta)[0]).toBe('qiqi@devbox');
     const anon = { ...meta, user: '', host: '' };
-    expect(metaLines(anon, 2)[0]).toBe('2 条');
+    expect(metaLines(anon, 2)[0]).toBe('2 records');
     // No head line at all when both are absent.
     expect(metaLines(anon)[0]).toBe('pwd: /repo');
   });
@@ -52,18 +52,18 @@ describe('metaLines', () => {
 describe('buildApprovalMessage', () => {
   it('carries the batch size and no URL (the payload carries it separately)', () => {
     const { title, body } = buildApprovalMessage('decrypt', meta, 5);
-    expect(title).toBe('VT 审批: decrypt');
-    expect(body.startsWith('qiqi@devbox · 5 条\n')).toBe(true);
+    expect(title).toBe('VT approval: decrypt');
+    expect(body.startsWith('qiqi@devbox · 5 records\n')).toBe(true);
     expect(body).not.toMatch(/https?:/);
-    expect(buildApprovalMessage('', meta).title).toBe('VT 审批请求');
+    expect(buildApprovalMessage('', meta).title).toBe('VT approval request');
   });
 });
 
 describe('buildCacheHitMessage', () => {
-  it('stays compact: who · N 条 · note, pwd, cmd — no via/ssh/ip/reason', () => {
+  it('stays compact: who · N records · note, pwd, cmd — no via/ssh/ip/reason', () => {
     const { title, body } = buildCacheHitMessage(meta, 2);
-    expect(title).toBe('VT 缓存命中(免审批): decrypt');
-    expect(body.split('\n')[0]).toBe('qiqi@devbox · 2 条 · 缓存命中，无手机审批');
+    expect(title).toBe('VT cache hit (no approval): decrypt');
+    expect(body.split('\n')[0]).toBe('qiqi@devbox · 2 records · cache hit, no phone approval');
     expect(body).not.toMatch(/via:|ssh:|ip:|reason:/);
   });
 });

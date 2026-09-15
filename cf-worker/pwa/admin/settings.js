@@ -1,6 +1,6 @@
 'use strict';
 
-// 设置 tab: the session (logout / 退出所有会话), the config knobs (hit
+// Settings tab: the session (logout / log out everywhere), the config knobs (hit
 // notify, UV policy — GET/PUT /api/admin/config), SECRET rotation, and push
 // subscriptions — this device subscribes with the Worker's VAPID key and posts
 // the result; every row can be tested or removed. Rendering is textContent
@@ -25,7 +25,7 @@ vt.tabs.settings = function (panel) {
 
   async function loadConfig() {
     var resp = await vt.apiFetch(vt.api('config'), { headers: { 'Accept': 'application/json' } });
-    if (!resp.ok) { cfgStatus('读取配置失败 HTTP ' + resp.status, 'error'); return; }
+    if (!resp.ok) { cfgStatus('Config load failed: HTTP ' + resp.status, 'error'); return; }
     var c = await resp.json();
     $('#cfg-hit-notify').checked = !!c.cache_hit_notify;
     $('#cfg-uv').value = c.uv_policy == null ? '' : JSON.stringify(c.uv_policy);
@@ -37,14 +37,14 @@ vt.tabs.settings = function (panel) {
       var raw = $('#cfg-uv').value.trim();
       var uv = null;
       if (raw) {
-        try { uv = JSON.parse(raw); } catch (e) { cfgStatus('UV 策略不是合法 JSON', 'error'); return; }
+        try { uv = JSON.parse(raw); } catch (e) { cfgStatus('UV policy is not valid JSON', 'error'); return; }
       }
       var resp = await vt.apiFetch(vt.api('config'), {
         method: 'PUT', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ cache_hit_notify: $('#cfg-hit-notify').checked, uv_policy: uv }),
       });
-      if (!resp.ok) { cfgStatus('保存失败：' + (await resp.text()), 'error'); return; }
-      cfgStatus('已保存', 'ok');
+      if (!resp.ok) { cfgStatus('Save failed: ' + (await resp.text()), 'error'); return; }
+      cfgStatus('Saved', 'ok');
       await loadConfig();
     } finally { btn.disabled = false; }
   });
@@ -52,64 +52,64 @@ vt.tabs.settings = function (panel) {
   // ── SECRET rotation ───────────────────────────────────────────────────────
   var rotateStatus = vt.statusLine($('#rotate-status'));
   $('#rotate-secret').addEventListener('click', async function () {
-    if (!confirm('生成新的 SECRET？需要随后执行 wrangler secret put SECRET。')) return;
+    if (!confirm('Generate a new SECRET? You must then run wrangler secret put SECRET.')) return;
     var btn = this; btn.disabled = true;
     try {
       var resp = await vt.postJson('rotate-secret');
-      if (!resp.ok) { rotateStatus('轮换失败 HTTP ' + resp.status, 'error'); return; }
+      if (!resp.ok) { rotateStatus('Rotation failed: HTTP ' + resp.status, 'error'); return; }
       $('#rotate-value').value = (await resp.json()).secret;
       $('#rotate-output').hidden = false;
-      rotateStatus('已生成，请立即部署', 'ok');
+      rotateStatus('Generated; deploy it now', 'ok');
     } finally { btn.disabled = false; }
   });
   $('#rotate-copy').addEventListener('click', function () {
     var ta = $('#rotate-value');
     ta.select();
     navigator.clipboard.writeText(ta.value).then(
-      function () { rotateStatus('已复制到剪贴板', 'ok'); },
-      function () { rotateStatus('复制失败，请手动选择文本', 'error'); }
+      function () { rotateStatus('Copied to clipboard', 'ok'); },
+      function () { rotateStatus('Copy failed; select the text manually', 'error'); }
     );
   });
 
   // ── Session ───────────────────────────────────────────────────────────────
   $('#logout').addEventListener('click', async function () {
     await vt.postJson('logout');
-    vt.showLogin('已退出登录');
+    vt.showLogin('Logged out');
   });
   $('#sessions-revoke').addEventListener('click', async function () {
-    if (!confirm('结束所有设备上的登录会话？')) return;
+    if (!confirm('End the login sessions on every device?')) return;
     var resp = await vt.postJson('sessions-revoke');
-    if (resp.status !== 204 && resp.status !== 401) { sessionStatus('失败 HTTP ' + resp.status, 'error'); return; }
-    vt.showLogin('所有会话已结束，请重新登录');
+    if (resp.status !== 204 && resp.status !== 401) { sessionStatus('Failed: HTTP ' + resp.status, 'error'); return; }
+    vt.showLogin('All sessions ended, please log in again');
   });
 
   var list = vt.list($('#subs').parentNode);   // rows on a phone, the table on desktop
 
   function renderRow(s) {
     var isMine = mine && mine.endpoint === s.endpoint;
-    var label = (s.label || '未命名') + (isMine ? '（本设备）' : '');
+    var label = (s.label || 'unnamed') + (isMine ? ' (this device)' : '');
     var host = '';
     try { host = new URL(s.endpoint).host; } catch (_) { host = '?'; }
-    var test = el('button', 'ghost small', '测试');
+    var test = el('button', 'ghost small', 'Test');
     test.type = 'button';
     test.addEventListener('click', async function () {
       test.disabled = true;
       try {
         var r = await post('test', { endpoint: s.endpoint });
-        setStatus(r.status >= 200 && r.status < 300 ? '已发送（HTTP ' + r.status + '）'
-          : '推送服务返回 ' + r.status + (r.error ? '：' + r.error : ''), r.status >= 200 && r.status < 300 ? 'ok' : 'error');
-      } catch (e) { setStatus('测试失败: ' + (e.message || e), 'error'); }
+        setStatus(r.status >= 200 && r.status < 300 ? 'Sent (HTTP ' + r.status + ')'
+          : 'Push service returned ' + r.status + (r.error ? ': ' + r.error : ''), r.status >= 200 && r.status < 300 ? 'ok' : 'error');
+      } catch (e) { setStatus('Test failed: ' + (e.message || e), 'error'); }
       test.disabled = false;
     });
-    var del = el('button', 'danger small', '删除');
+    var del = el('button', 'danger small', 'Delete');
     del.type = 'button';
     del.addEventListener('click', async function () {
-      if (!confirm('删除 ' + (s.label || host) + ' 的订阅？')) return;
+      if (!confirm('Delete the subscription of ' + (s.label || host) + '?')) return;
       try {
         await post('unsubscribe', { endpoint: s.endpoint });
         if (isMine) await mine.unsubscribe().catch(function () {});
         await load();
-      } catch (e) { setStatus('删除失败: ' + (e.message || e), 'error'); }
+      } catch (e) { setStatus('Delete failed: ' + (e.message || e), 'error'); }
     });
     return list.item({
       cells: function () {
@@ -128,12 +128,12 @@ vt.tabs.settings = function (panel) {
   function render() {
     list.clear();
     subs.forEach(function (s) { list.body().appendChild(renderRow(s)); });
-    if (!subs.length) list.empty('没有订阅');
+    if (!subs.length) list.empty('No subscriptions');
   }
 
   async function load() {
     var resp = await vt.apiFetch(vt.api('push/vapid'), { headers: { 'Accept': 'application/json' } });
-    if (!resp.ok) { setStatus('查询失败 HTTP ' + resp.status, 'error'); return null; }
+    if (!resp.ok) { setStatus('Load failed: HTTP ' + resp.status, 'error'); return null; }
     var json = await resp.json();
     subs = json.subscriptions || [];
     render();
@@ -146,7 +146,7 @@ vt.tabs.settings = function (panel) {
     try {
       var pub = await load();
       if (!pub) return;
-      if ((await Notification.requestPermission()) !== 'granted') { setStatus('未授予通知权限', 'error'); return; }
+      if ((await Notification.requestPermission()) !== 'granted') { setStatus('Notification permission not granted', 'error'); return; }
       var reg = await navigator.serviceWorker.ready;
       var sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: vt.b64uDec(pub) });
       await post('subscribe', {
@@ -156,10 +156,10 @@ vt.tabs.settings = function (panel) {
         label: $('#push-label').value.trim(),
       });
       mine = sub;
-      setStatus('已订阅', 'ok');
+      setStatus('Subscribed', 'ok');
       await load();
     } catch (e) {
-      setStatus('订阅失败: ' + (e.message || e), 'error');
+      setStatus('Subscribe failed: ' + (e.message || e), 'error');
     } finally {
       btn.disabled = false;
     }
@@ -167,7 +167,7 @@ vt.tabs.settings = function (panel) {
 
   async function init() {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-      setStatus('此浏览器不支持 Web Push（iOS 需从主屏幕图标打开）', 'error');
+      setStatus('This browser lacks Web Push (on iOS open from the Home Screen icon)', 'error');
       await load();
       return;
     }
@@ -175,7 +175,7 @@ vt.tabs.settings = function (panel) {
       var reg = await navigator.serviceWorker.register('/sw.js');
       mine = await reg.pushManager.getSubscription();
     } catch (e) {
-      setStatus('Service worker 注册失败: ' + (e.message || e), 'error');
+      setStatus('Service worker registration failed: ' + (e.message || e), 'error');
     }
     await load();
     $('#subscribe').disabled = false;

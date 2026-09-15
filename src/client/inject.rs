@@ -28,10 +28,10 @@ pub async fn inject(
     // Display body shown on the Touch ID prompt, the approval page, and the
     // notifications. No `op:` header — the `cmd:`/`file:` lines themselves say
     // "inject" (`vt read` keeps its explicit `op: read`), and the surrounding
-    // surface already names the operation (prompt header / 类型 field). The
+    // surface already names the operation (prompt header / Type field). The
     // command is shortened to basename + args and capped: a long absolute
     // argv[0] drowned the signal a human actually reads (operator feedback,
-    // docs/approval-transparency.md §C5); the executable path was
+    // docs/approval-transparency.md#what-the-approval-must-show); the executable path was
     // client-claimed display data anyway, never a verified field.
     let mut lines: Vec<String> = Vec::new();
     if let Some(p) = replace_file.as_ref() {

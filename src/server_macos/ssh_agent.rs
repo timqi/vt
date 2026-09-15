@@ -46,7 +46,7 @@ pub const EXT_AUTH: &str = "auth@vt";
 pub const EXT_RUN: &str = "run@vt";
 pub const EXT_SIGN: &str = "sign@vt";
 pub const EXT_DIAG: &str = "diag@vt";
-/// Token-gated shell status/revoke channel (docs/app-bundle.md §5).
+/// Token-gated shell status/revoke channel (docs/app-bundle.md#status-and-revoke-boundary).
 /// Dispatched before the lock check like `session-bind@openssh.com`; NOT in
 /// the vt handler match below and NOT permitted by the relay filter.
 pub const EXT_UI_STATUS: &str = "ui-status@vt";
@@ -204,7 +204,7 @@ fn watcher_should_clear(
 }
 
 /// Wipe the decrypted-key map from RAM and mark `idle_cleared` so the next
-/// interactive request silently reloads (docs/app-bundle.md §10). The single
+/// interactive request silently reloads (docs/app-bundle.md#key-wiping-and-idle-timeout). The single
 /// source of the "wipe → later silent reload" handshake, shared by the idle
 /// sweeper and the screen-lock/wake watcher so the flag can't be forgotten in
 /// one of them. Returns the number of keys cleared. NOTE: the `ssh-add -x`
@@ -517,13 +517,13 @@ pub struct VtSshAgentFactory {
     /// Disabled config = audit push is a no-op.
     audit_push: Arc<AuditPushConfig>,
     /// Fire a system notification when a grant reuse satisfies sign/decrypt
-    /// without a prompt (docs/app-bundle.md §3). Default on.
+    /// without a prompt (docs/app-bundle.md#notifications). Default on.
     notify_cache_hits: bool,
     /// 32-byte spawn token read from `--ui-token-fd` at startup; gates
     /// `ui-status@vt`. `None` (CLI-started agent) refuses every request.
     ui_token: Option<[u8; 32]>,
     /// Configured idle timeout (seconds) — reported over `ui-status@vt` so
-    /// the shell can display it (docs/app-bundle.md §10).
+    /// the shell can display it (docs/app-bundle.md#key-wiping-and-idle-timeout).
     idle_timeout_secs: u64,
 }
 
@@ -626,13 +626,13 @@ struct VtSshSession {
     /// loop, where a hung network mount would stall every client. Still
     /// once per connection (never re-resolved per request).
     workspace: std::sync::OnceLock<WorkspaceResolution>,
-    /// Destination binding driven by `session-bind@openssh.com` (§3.2 of
-    /// docs/authorization-scopes-v2.md). Mutated by `extension()`.
+    /// Destination binding driven by `session-bind@openssh.com`
+    /// (docs/unified-authorization-engine.md#scopes). Mutated by `extension()`.
     bind_state: BindState,
     /// Display label for the bound destination, computed once per bind so a
     /// sign burst does not re-read known_hosts.
     destination_label: Option<String>,
-    /// Cache-hit transparency notifications (docs/app-bundle.md §3).
+    /// Cache-hit transparency notifications (docs/app-bundle.md#notifications).
     notify_cache_hits: bool,
     /// Spawn token gating `ui-status@vt`; `None` refuses every request.
     ui_token: Option<[u8; 32]>,
@@ -676,7 +676,7 @@ impl VtSshSession {
     }
 
     /// Ensure keys are loaded. If they were cleared by the idle sweeper or by
-    /// the screen-lock/sleep watcher (docs/app-bundle.md §10), silently reload
+    /// the screen-lock/sleep watcher (docs/app-bundle.md#key-wiping-and-idle-timeout), silently reload
     /// from keychain. The unified authorization engine still gates every
     /// operation before a loaded key can be used.
     async fn ensure_keys_loaded(&self) -> Result<(), AgentError> {
@@ -692,7 +692,7 @@ impl VtSshSession {
             return Ok(());
         }
 
-        // Do NOT repopulate RAM while the screen is locked (§10, C). A sign
+        // Do NOT repopulate RAM while the screen is locked. A sign
         // here is rejected by the validator anyway; reloading would undo the
         // lock-wipe. Checked before the keychain I/O to skip a pointless read,
         // and RE-checked after it (below) because the screen can lock during
@@ -732,7 +732,7 @@ impl VtSshSession {
     /// `commit_authorization`) has returned — while a permit is live its
     /// security read guard blocks revocation, and this must not add
     /// unbounded-latency work there. The notify itself is fire-and-forget
-    /// (docs/app-bundle.md §3). Single-sourced so both sign paths keep the
+    /// (docs/app-bundle.md#notifications). Single-sourced so both sign paths keep the
     /// ordering invariant identical.
     fn fire_cache_hit_note(
         &self,
@@ -909,7 +909,7 @@ struct HandlerSuccess {
     /// `(operation, scope display)` when the permit's decision was a cache
     /// hit. The dispatcher fires the transparency notification from this
     /// AFTER `commit()` — never while the permit (and its security read
-    /// guard) is live (docs/app-bundle.md §3).
+    /// guard) is live (docs/app-bundle.md#notifications).
     cache_hit_note: Option<(&'static str, String)>,
 }
 
@@ -1118,7 +1118,7 @@ impl Session for VtSshSession {
         // clock — it precedes any human-gated operation. A
         // bind that fails to decode (host certificate, unsupported curve) is
         // refused without changing state, mirroring `BindState::apply`. See
-        // docs/authorization-scopes-v2.md §3.1.
+        // docs/unified-authorization-engine.md#scopes.
         if extension.name.as_str() == "session-bind@openssh.com" {
             let outcome = match extension.parse_message::<SessionBind>() {
                 Ok(Some(bind)) => {
@@ -1140,7 +1140,7 @@ impl Session for VtSshSession {
             };
         }
         // `ui-status@vt` is the shell's token-gated channel
-        // (docs/app-bundle.md §5). Like session-bind it precedes the lock
+        // (docs/app-bundle.md#status-and-revoke-boundary). Like session-bind it precedes the lock
         // check (a locked agent must still report `locked: true`), the
         // keychain path (it reads no store), and the
         // idle-clock touch (it is meant to be polled; keeping the agent
@@ -1238,7 +1238,7 @@ impl Session for VtSshSession {
         if let Some(permit) = authorization {
             // Captured before commit consumes the permit; used only after the
             // guard is released — a blocking notify while the permit is live
-            // would stall revocation (docs/app-bundle.md §3).
+            // would stall revocation (docs/app-bundle.md#notifications).
             let reuse_remaining = permit.reuse_remaining();
             if let Err(failure) = commit_authorization(permit).await {
                 tracing::warn!("authorization commit invalidated after operation success");
@@ -1527,7 +1527,7 @@ pub async fn run_ssh_agent(
                 now_wall.duration_since(prev_wall).ok(),
             ) {
                 let dropped = watcher_authorization.invalidate_all().await;
-                // §10 (C): lock/sleep must also wipe decrypted SSH keys from
+                // Lock/sleep must also wipe decrypted SSH keys from
                 // RAM, not just grants — screen lock does not otherwise clear
                 // them and (with a long idle timeout) they would linger.
                 // `ensure_keys_loaded` reloads silently on the next use once
@@ -1548,7 +1548,7 @@ pub async fn run_ssh_agent(
     });
     tracing::info!(
         "Authorization: sign(ttl={}s) decrypt(ttl={}s) auth=fresh run=fresh (0 = always prompt; \
-         scopes: destination/workspace/connection — see docs/authorization-scopes-v2.md)",
+         scopes: destination/workspace/connection — see docs/unified-authorization-engine.md)",
         cache_ttls.sign_secs,
         cache_ttls.decrypt_secs,
     );
@@ -1994,7 +1994,7 @@ ZWN0ZWQtdGVzdAEC
         assert!(matches!(session.bind_state, BindState::Unbound));
     }
 
-    // --- ui-status@vt tests (docs/app-bundle.md §5) ---
+    // --- ui-status@vt tests (docs/app-bundle.md#status-and-revoke-boundary) ---
 
     fn ui_status_req(token_b64: &str, action: &str) -> Extension {
         Extension {

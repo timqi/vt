@@ -63,7 +63,7 @@ fn tty_name() -> String {
 
 /// Shorten a parent command line to `basename(argv[0]) + args`. A long
 /// absolute argv[0] (`/opt/homebrew/Cellar/…/bin/zsh -c …`) drowned the
-/// signal on every display surface (Touch ID `via:`, approval page 父进程,
+/// signal on every display surface (Touch ID `via:`, approval page Parent process,
 /// notifications); the field is client-claimed display data everywhere, so
 /// the shortening happens once at collection.
 fn basename_cmdline(first: &str, rest: &[String]) -> String {

@@ -58,8 +58,8 @@ tag = "v1"
 new_sqlite_classes = ["AccountDO"]
 
 # Per-IP throttle on the unauthenticated POSTs: /api/enroll (a host asking for
-# its own VT_PASSKEY_TOKEN, which pages the phone; docs/host-token.md) and the
-# admin bootstrap / login-challenge routes (docs/worker-slim.md §3). Without
+# its own VT_PASSKEY_TOKEN, which pages the phone; docs/worker-slim.md) and the
+# admin bootstrap / login-challenge routes (docs/worker-slim.md#bootstrap). Without
 # this binding the Worker refuses them (503) rather than run them unthrottled.
 # `namespace_id` is any integer unique among the rate limits in this account.
 # 3 attempts / minute / IP is plenty for a human.
@@ -71,8 +71,8 @@ simple = { limit = 3, period = 60 }
 
 # No [vars]. Everything the operator can set — caching, cache-hit pushes, the
 # approval UV policy, push subscriptions — lives encrypted in the Durable
-# Object and is edited on the admin 设置 tab; the WebAuthn origin is captured
-# at bootstrap (docs/worker-slim.md §4).
+# Object and is edited on the admin Settings tab; the WebAuthn origin is captured
+# at bootstrap (docs/worker-slim.md#approval-policy).
 #
 # The one secret (wrangler secret put — never inlined):
 #   SECRET   32 random bytes, base64url:
@@ -80,7 +80,7 @@ simple = { limit = 3, period = 60 }
 #            A KEK over the root key stored in the Durable Object; host tokens,
 #            admin sessions, the config blob and the DEK-cache key all derive
 #            from that root key, so this value alone opens nothing. Rotate it
-#            from the 设置 tab (轮换 SECRET), which keeps everything; setting a
+#            from the Settings tab (Rotate SECRET), which keeps everything; setting a
 #            fresh value WITHOUT rotating is the factory reset
 #            (docs/cf-worker-deploy.md).
 # Upgrading from the VT_AUTH_CF / CREDENTIALS_JSON / CACHE_SECKEY build:

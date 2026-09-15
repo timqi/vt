@@ -42,7 +42,7 @@ install:
 
 # Assemble VT.app (macOS): Rust binary + Swift menu-bar shell + icns.
 # Ad-hoc signed by default; export VT_CODESIGN_ID for a stable identity
-# (last keychain re-auth ever — see docs/app-bundle.md §7).
+# (reduces Keychain re-authorization — see docs/app-bundle.md#install-and-signing).
 # VT_APP_BIN: reuse a prebuilt `vt` instead of `just build` (CI passes the
 # target-specific release binary to avoid a second compile).
 app:

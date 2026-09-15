@@ -100,7 +100,7 @@ pub async fn rotate_passcode() -> Result<()> {
     let encrypted_passphrase = store.encrypted_passphrase_bytes()?;
     let decrypted_passphrase = passphrase_cipher
         .decrypt(&encrypted_passphrase)
-        .context("Failed to decrypt passphrase (docs/app-bundle.md §2).")?;
+        .context("Failed to decrypt passphrase (docs/app-bundle.md#master-key-wrap-v2).")?;
     let passphrase_array: [u8; 32] = decrypted_passphrase
         .try_into()
         .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;

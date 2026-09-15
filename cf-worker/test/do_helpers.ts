@@ -138,7 +138,7 @@ export const TEST_PROJECT = '/home/tester/repo/.git';
  *  and project, derived by the same seam production uses. */
 export const testCtx = (project = TEST_PROJECT): Promise<string> => cacheCtx(TEST_TOKEN_ID, project);
 /** A v4-shaped ctx (no token half): such keys stay listable and clearable
- *  through 清除全部 but can never be addressed by the console. */
+ *  through Clear all but can never be addressed by the console. */
 export const FAKE_CTX = 'testctx0000000000000000000000000000000000';
 
 let saltCounter = 0;

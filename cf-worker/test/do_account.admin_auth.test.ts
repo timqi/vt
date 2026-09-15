@@ -1,4 +1,4 @@
-// Passkey admin auth end to end (docs/worker-slim.md §3): bootstrap mints the
+// Passkey admin auth end to end (docs/worker-slim.md#sessions): bootstrap mints the
 // root key and the first session; login is a discoverable-credential
 // assertion over a single-use challenge; every admin op and the audit-stream
 // upgrade verify the cookie in the DO; revocations bump the epoch and end

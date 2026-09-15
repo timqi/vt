@@ -256,7 +256,7 @@ pub enum SshCommands {
         // The three duration knobs are `Option` so "flag passed" is
         // distinguishable from "compiled default": effective value is
         // flag > config.toml `[agent]` > built-in default
-        // (docs/app-bundle.md §4).
+        // (docs/app-bundle.md#agent-defaults-and-menu-overrides).
         #[arg(
             short = 't',
             long = "timeout",
@@ -394,7 +394,7 @@ async fn run(cli: Cli, config: config::ResolvedConfig) -> Result<()> {
                 use server_macos::ssh_agent::{AuthCacheTtls, RunAllowlist};
                 let audit_push = build_audit_push_config(audit_url, audit_key, *no_audit_push);
                 // flag > config.toml [agent] > built-in default
-                // (docs/app-bundle.md §4).
+                // (docs/app-bundle.md#agent-defaults-and-menu-overrides).
                 let file_cfg = config::load_agent_file_config();
                 let run_allow_spec = run_allow.clone().or(file_cfg.run_allow).unwrap_or_default();
                 let run_allow = RunAllowlist::parse(&run_allow_spec)

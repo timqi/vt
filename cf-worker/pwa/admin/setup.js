@@ -1,7 +1,7 @@
 'use strict';
 
 // Passkey ceremonies of the admin shell: the setup view (bootstrap, the first
-// credential) and the Passkey tab (add / revoke / 自检). The master never
+// credential) and the Passkey tab (add / revoke / self-check). The master never
 // leaves this page: only a credential entry — wrapped master, public key, ids,
 // label — is POSTed, to /api/admin/bootstrap or /api/admin/credentials-add.
 //
@@ -37,7 +37,7 @@ function vtPasskeyCeremony(RP_ID) {
         extensions: { prf: {} },
       },
     });
-    if (!cred) throw new Error('注册被取消');
+    if (!cred) throw new Error('Registration cancelled');
     var credId = new Uint8Array(cred.rawId);
     var att = new Uint8Array(cred.response.attestationObject);
     return { credId: credId, cose: extractCose(att) };
@@ -49,16 +49,16 @@ function vtPasskeyCeremony(RP_ID) {
   // we request prf) would otherwise be appended to p.
   function extractCose(att) {
     var top = window.vtCbor.read(att, 0).value;
-    if (!(top instanceof Map)) throw new Error('attestationObject 非 CBOR map');
+    if (!(top instanceof Map)) throw new Error('attestationObject is not a CBOR map');
     var authData = top.get('authData');
-    if (!(authData instanceof Uint8Array)) throw new Error('attestationObject 缺少 authData');
-    if (authData.length < 55) throw new Error('authData 过短');
+    if (!(authData instanceof Uint8Array)) throw new Error('attestationObject lacks authData');
+    if (authData.length < 55) throw new Error('authData too short');
     var flags = authData[32];
-    if (!(flags & 0x40)) throw new Error('authData 未含 attestedCredentialData (AT 未置位)');
+    if (!(flags & 0x40)) throw new Error('authData has no attestedCredentialData (AT flag unset)');
     var off = 37 + 16; // rpIdHash(32)+flags(1)+signCount(4)=37, + aaguid(16)
     var credIdLen = (authData[off] << 8) | authData[off + 1]; off += 2;
     off += credIdLen;
-    if (off > authData.length) throw new Error('credIdLen 越界');
+    if (off > authData.length) throw new Error('credIdLen out of bounds');
     var parsed = window.vtCbor.read(authData, off); // exactly one COSE map
     return authData.slice(off, parsed.end);
   }
@@ -75,10 +75,10 @@ function vtPasskeyCeremony(RP_ID) {
         extensions: { prf: { eval: { first: PRF_INPUT } } },
       },
     });
-    if (!assertion) throw new Error('验证被取消');
+    if (!assertion) throw new Error('Verification cancelled');
     var ext = assertion.getClientExtensionResults && assertion.getClientExtensionResults();
     var prf = ext && ext.prf && ext.prf.results && ext.prf.results.first;
-    if (!prf) throw new Error('此 Passkey 不支持 PRF 扩展，请换用 1Password / YubiKey / 新版系统');
+    if (!prf) throw new Error('This Passkey lacks the PRF extension; use 1Password / YubiKey / a newer OS');
     return { rawId: new Uint8Array(assertion.rawId), K: new Uint8Array(prf) };
   }
 
@@ -97,14 +97,14 @@ function vtPasskeyCeremony(RP_ID) {
     var ctTag = new Uint8Array(await crypto.subtle.encrypt(
       { name: 'AES-GCM', iv: iv, additionalData: a.aad }, key, masterKey));
     vt.zeroize(kWrap);
-    if (ctTag.length !== 48) throw new Error('密文长度异常: ' + ctTag.length);
+    if (ctTag.length !== 48) throw new Error('unexpected ciphertext length: ' + ctTag.length);
     return { k: vt.b64uEnc(concat(iv, ctTag)), h: vt.b64uEnc(a.hRaw) };
   }
 
   async function unwrapMasterKey(K, credId, kStr) {
     var kWrap = await vt.deriveKWrap(K);
     var kb = vt.b64uDec(kStr);
-    if (kb.length !== 60) { vt.zeroize(kWrap); throw new Error('k 长度异常: ' + kb.length); }
+    if (kb.length !== 60) { vt.zeroize(kWrap); throw new Error('unexpected k length: ' + kb.length); }
     var iv = kb.slice(0, 12), ctTag = kb.slice(12);
     var a = await aad(credId);
     var key = await crypto.subtle.importKey('raw', kWrap, { name: 'AES-GCM' }, false, ['decrypt']);
@@ -114,10 +114,10 @@ function vtPasskeyCeremony(RP_ID) {
         { name: 'AES-GCM', iv: iv, additionalData: a.aad }, key, ctTag));
     } catch (e) {
       vt.zeroize(kWrap);
-      throw new Error('AES-GCM 解密失败：PRF 输出与记录不匹配');
+      throw new Error('AES-GCM decrypt failed: PRF output does not match the record');
     }
     vt.zeroize(kWrap);
-    if (mk.length !== 32) throw new Error('master_key 长度异常: ' + mk.length);
+    if (mk.length !== 32) throw new Error('unexpected master_key length: ' + mk.length);
     return mk;
   }
 
@@ -131,7 +131,7 @@ function vtPasskeyCeremony(RP_ID) {
   async function importMasterFromExport(blobB64u, passphrase) {
     var blob = vt.b64uDec((blobB64u || '').trim());
     if (blob.length !== 60) {
-      throw new Error('导出串长度异常: ' + blob.length + ' 字节（应为 60，确认完整复制了 `vt secret export` 的输出）');
+      throw new Error('unexpected export blob length: ' + blob.length + ' bytes (expected 60; copy the whole `vt secret export` output)');
     }
     var iv = blob.slice(0, 12);
     var ctTag = blob.slice(12); // 48 = ct(32) || tag(16)
@@ -143,10 +143,10 @@ function vtPasskeyCeremony(RP_ID) {
       mk = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ctTag));
     } catch (e) {
       vt.zeroize(keyBytes); vt.zeroize(h1);
-      throw new Error('解密失败：导出口令或导出串不正确');
+      throw new Error('Decrypt failed: wrong passphrase or export blob');
     }
     vt.zeroize(keyBytes); vt.zeroize(h1);
-    if (mk.length !== 32) { vt.zeroize(mk); throw new Error('mac_key 长度异常: ' + mk.length); }
+    if (mk.length !== 32) { vt.zeroize(mk); throw new Error('unexpected mac_key length: ' + mk.length); }
     return mk;
   }
 
@@ -188,13 +188,13 @@ vt.views.setup = function (view, data) {
   async function buildFirstEntry(label) {
     var blobB64 = $('#master-blob').value;
     var pass = $('#master-pass').value;
-    if (!(blobB64 || '').trim()) throw new Error('请先在 Mac 上执行 `vt secret export` 并粘贴其输出');
-    if (!pass) throw new Error('请输入 `vt secret export` 时设置的导出口令');
+    if (!(blobB64 || '').trim()) throw new Error('Run `vt secret export` on the Mac first and paste its output');
+    if (!pass) throw new Error('Enter the passphrase set at `vt secret export`');
     var masterKey = await pk.importMasterFromExport(blobB64, pass);
     try {
-      setStatus('① 注册新 Passkey…（请完成生物识别）');
+      setStatus('① Registering the Passkey… (complete the biometric prompt)');
       var c = await pk.createPasskey(label);
-      setStatus('② 读取 PRF…（请再次完成生物识别）');
+      setStatus('② Reading PRF… (complete the prompt again)');
       var pr = await pk.assertPrf([c.credId]);
       var w = await pk.wrapMasterKey(pr.K, c.credId, masterKey);
       vt.zeroize(pr.K);
@@ -207,28 +207,28 @@ vt.views.setup = function (view, data) {
     $('#setup-taken').hidden = true;
     try {
       var entry = await buildFirstEntry(($('#bootstrap-label').value || '').trim());
-      setStatus('③ 提交…');
+      setStatus('③ Submitting…');
       var resp = await vt.postJson('bootstrap', { entry: entry });
-      if (resp.status === 204) { setStatus('✓ 已注册并登录', 'ok'); location.reload(); return; }
+      if (resp.status === 204) { setStatus('✓ Registered and logged in', 'ok'); location.reload(); return; }
       if (resp.status === 409) {
-        // Someone registered first (§3.3 step 5). Not you ⇒ factory reset.
+        // Unexpected prior registration requires reset (docs/cf-worker-deploy.md#bootstrap).
         var info = await resp.json();
         var taken = $('#setup-taken');
-        taken.textContent = '此服务已于 ' + vt.fmtTime(info.ms) + ' 由 IP ' + (info.ip || '?') +
-          ' 完成初始化。如果不是你：换一个新的 SECRET（wrangler secret put SECRET）后重新打开本页引导；旧配置随即作废。';
+        taken.textContent = 'This service was initialized at ' + vt.fmtTime(info.ms) + ' from IP ' + (info.ip || '?') +
+          '. If that was not you: set a new SECRET (wrangler secret put SECRET) and reopen this page; the old config is then void.';
         taken.hidden = false;
-        setStatus('已被初始化', 'error');
+        setStatus('Already initialized', 'error');
         return;
       }
       throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()));
     } catch (e) {
-      setStatus('错误：' + vtPasskeyError(e, '未找到匹配 Passkey 或操作被取消'), 'error');
+      setStatus('Error: ' + vtPasskeyError(e, 'No matching Passkey, or the prompt was cancelled'), 'error');
       console.error(e);
     } finally { btn.disabled = false; }
   });
 };
 
-// ── Passkey tab: add / revoke / 自检 ─────────────────────────────────────────
+// ── Passkey tab: add / revoke / self-check ─────────────────────────────────────────
 
 vt.tabs.setup = function (panel, data) {
   var $ = function (sel) { return panel.querySelector(sel); };
@@ -244,7 +244,7 @@ vt.tabs.setup = function (panel, data) {
 
   async function load() {
     var resp = await vt.apiFetch(vt.api('credentials'), { headers: { 'Accept': 'application/json' } });
-    if (!resp.ok) { setStatus('查询失败 HTTP ' + resp.status, 'error'); return; }
+    if (!resp.ok) { setStatus('Load failed: HTTP ' + resp.status, 'error'); return; }
     var json = await resp.json();
     entries = json.credentials || [];
     epoch = json.epoch;
@@ -255,24 +255,24 @@ vt.tabs.setup = function (panel, data) {
   // Unwrap the master with one of the existing passkeys, register the new one,
   // wrap for it and post only the entry.
   async function runAdd(label) {
-    if (!entries.length) throw new Error('没有现有 Passkey');
+    if (!entries.length) throw new Error('No existing Passkey');
     var masterKey = null;
     try {
-      setStatus('① 用现有 Passkey 解出 master_key…');
+      setStatus('① Unlocking master_key with an existing Passkey…');
       var a = await pk.assertPrf(entries.map(function (e) { return vt.b64uDec(e.i); }));
       var used = vt.b64uEnc(a.rawId);
       var old = entries.filter(function (e) { return e.i === used; })[0];
-      if (!old) { vt.zeroize(a.K); throw new Error('使用的 Passkey 不在现有列表中'); }
+      if (!old) { vt.zeroize(a.K); throw new Error('The Passkey used is not in the current list'); }
       masterKey = await pk.unwrapMasterKey(a.K, a.rawId, old.k);
       vt.zeroize(a.K);
-      setStatus('② 注册新 Passkey…（请完成生物识别）');
+      setStatus('② Registering the new Passkey… (complete the biometric prompt)');
       var c = await pk.createPasskey(label);
-      setStatus('③ 读取新 Passkey 的 PRF…（请再次完成生物识别）');
+      setStatus('③ Reading the new Passkey\'s PRF… (complete the prompt again)');
       var pr = await pk.assertPrf([c.credId]);
       var w = await pk.wrapMasterKey(pr.K, c.credId, masterKey);
       vt.zeroize(pr.K);
       var resp = await vt.postJson('credentials-add', { entry: pk.buildEntry(c.credId, c.cose, w.k, w.h, label) });
-      if (resp.status === 409) throw new Error('该 Passkey 已注册');
+      if (resp.status === 409) throw new Error('This Passkey is already registered');
       if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()));
     } finally { if (masterKey) vt.zeroize(masterKey); }
   }
@@ -280,31 +280,31 @@ vt.tabs.setup = function (panel, data) {
   async function runRevoke() {
     var h = $('#revoke-pick').value;
     var e = entries.filter(function (x) { return x.h === h; })[0];
-    if (!e) throw new Error('请选择要吊销的条目');
-    if (!confirm('吊销 “' + (e.l || e.i.slice(0, 12)) + '”？所有已登录会话（含本会话）将立即结束。')) return false;
+    if (!e) throw new Error('Pick a Passkey to revoke');
+    if (!confirm('Revoke "' + (e.l || e.i.slice(0, 12)) + '"? Every session, including this one, ends immediately.')) return false;
     var resp = await vt.postJson('credentials-revoke', { h: h });
-    if (resp.status === 409) throw new Error('这是最后一个 Passkey，不能吊销');
+    if (resp.status === 409) throw new Error('This is the last Passkey; it cannot be revoked');
     if (resp.status !== 204) throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()));
     return true;
   }
 
   async function selfCheck() {
-    if (!entries.length) throw new Error('无可校验条目');
+    if (!entries.length) throw new Error('Nothing to verify');
     var ref = null;
     try {
       for (var i = 0; i < entries.length; i++) {
         var e = entries[i];
-        setStatus('自检 ' + (i + 1) + '/' + entries.length + '：' + (e.l || e.i.slice(0, 8)) + '…');
+        setStatus('Self-check ' + (i + 1) + '/' + entries.length + ': ' + (e.l || e.i.slice(0, 8)) + '…');
         var a = await pk.assertPrf([vt.b64uDec(e.i)]);
         var mk = await pk.unwrapMasterKey(a.K, a.rawId, e.k);
         vt.zeroize(a.K);
         if (ref === null) { ref = mk; }
         else {
           var same = bytesEq(ref, mk); vt.zeroize(mk);
-          if (!same) throw new Error('条目 “' + (e.l || i) + '” 解出的 master_key 与其它条目不一致');
+          if (!same) throw new Error('Entry "' + (e.l || i) + '" unlocks a different master_key than the others');
         }
       }
-      setStatus('✓ 自检通过：所有 ' + entries.length + ' 个条目解出同一 master_key', 'ok');
+      setStatus('✓ Self-check passed: all ' + entries.length + ' entries unlock the same master_key', 'ok');
     } finally { if (ref) vt.zeroize(ref); }
   }
 
@@ -327,7 +327,7 @@ vt.tabs.setup = function (panel, data) {
     entries.forEach(function (e) {
       var o = document.createElement('option');
       o.value = e.h;
-      o.textContent = (e.l || '(无标签)') + ' — ' + e.i.slice(0, 12) + '…';
+      o.textContent = (e.l || '(no label)') + ' — ' + e.i.slice(0, 12) + '…';
       sel.appendChild(o);
     });
   }
@@ -341,15 +341,15 @@ vt.tabs.setup = function (panel, data) {
     try {
       if (mode() === 'add') {
         await runAdd(($('#label').value || '').trim());
-        setStatus('✓ 已新增。建议点“自检”逐条验证。', 'ok');
+        setStatus('✓ Added. Run Self-check to verify each entry.', 'ok');
         await load();
       } else if (await runRevoke()) {
         // The epoch bump ended this session too; the 401 on the next request
         // shows the login view, so go there now.
-        vt.showLogin('已吊销，所有会话已结束，请重新登录');
+        vt.showLogin('Revoked; all sessions ended, please log in again');
       }
     } catch (e) {
-      setStatus('错误：' + vtPasskeyError(e, '未找到匹配 Passkey 或操作被取消'), 'error');
+      setStatus('Error: ' + vtPasskeyError(e, 'No matching Passkey, or the prompt was cancelled'), 'error');
       console.error(e);
     } finally { btn.disabled = false; }
   });
@@ -358,7 +358,7 @@ vt.tabs.setup = function (panel, data) {
     var btn = this; btn.disabled = true;
     try { await selfCheck(); }
     catch (e) {
-      setStatus('自检失败：' + vtPasskeyError(e, '取消或未匹配 Passkey（自检中止）'), 'error');
+      setStatus('Self-check failed: ' + vtPasskeyError(e, 'cancelled or no matching Passkey (aborted)'), 'error');
       console.error(e);
     } finally { btn.disabled = false; }
   });
@@ -366,10 +366,10 @@ vt.tabs.setup = function (panel, data) {
   // textContent everywhere (labels are operator-controlled at registration).
   var list = vt.list($('#creds').parentNode);   // rows on a phone, the table on desktop
   function renderCurrent() {
-    $('#current-meta').textContent = entries.length + ' 个 · epoch ' + epoch;
+    $('#current-meta').textContent = entries.length + ' total · epoch ' + epoch;
     list.clear();
     entries.forEach(function (e) {
-      var name = e.l || '(无标签)';
+      var name = e.l || '(no label)';
       var id = String(e.i || '').slice(0, 12) + '…';
       var when = '';
       if (typeof e.t === 'number' && e.t > 0) {
@@ -382,7 +382,7 @@ vt.tabs.setup = function (panel, data) {
         row: function () { return { main: name, sub: id + (when ? ' · ' + when : '') }; },
       }));
     });
-    if (!entries.length) list.empty('没有 Passkey');
+    if (!entries.length) list.empty('No Passkeys');
   }
   vt.onLayout(renderCurrent);
 

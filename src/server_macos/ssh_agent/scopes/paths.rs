@@ -76,7 +76,7 @@ pub(super) fn cwd_root_acceptable(cwd: &std::path::Path, home: Option<&std::path
 /// install location (system, homebrew, nix) qualifies. A renamed copy evades
 /// the match — acceptable: it lands in the unbound-non-ssh workspace arm,
 /// which stays within the documented same-UID concession
-/// (docs/authorization-scopes-v2.md §3.3).
+/// (docs/unified-authorization-engine.md#scopes).
 pub(super) fn is_ssh_client_path(path: &str) -> bool {
     path.rsplit('/').next() == Some("ssh")
 }

@@ -1,4 +1,4 @@
-// What the console owns in storage (docs/worker-slim.md §2–§4): the root key
+// What the console owns in storage (docs/worker-slim.md): the root key
 // and the config blob, plus the admin session and login ceremonies that guard
 // them. Two keys, one writer:
 //
@@ -196,7 +196,7 @@ export class AccountAdmin {
 
   /** The decrypted state, or null when unconfigured. Loaded once per instance;
    *  an unreadable root or blob is logged once and is the same state as absent
-   *  (§4.3) — there is no defaults fallback. */
+   *  (docs/worker-slim.md#bootstrap) — there is no defaults fallback. */
   load(): Promise<Loaded | null> {
     if (this.loaded !== undefined) return Promise.resolve(this.loaded);
     return this.loading ??= (async () => {
@@ -221,7 +221,7 @@ export class AccountAdmin {
       return null;
     }
     // First success under the NEW SECRET (the appended wrap) ends the rotation
-    // window (§2); under the old one both wraps stay until it is deployed.
+    // window; under the old one both wraps stay until it is deployed.
     if (at > 0) await this.storage.put(ROOT_KEY, { wraps: [rootRec.wraps[at]!] } satisfies RootRecord);
     const kcfg = await aesKey(await this.derive(root, 'vt-config-key-v1'));
     const sealed = await this.storage.get<Sealed>(CFG_KEY);
@@ -376,7 +376,7 @@ export class AccountAdmin {
     return new Response(null, { status: 204, headers: { 'Set-Cookie': await this.cookieFor(cur) } });
   }
 
-  // ── Rotation (§2): R stays, a second wrap is appended ────────────────
+  // ── Rotation: R stays, a second wrap is appended ────────────────────
 
   /** Mint a new SECRET, wrap R under it beside the current wrap, and return
    *  the value once for `wrangler secret put SECRET`. The first successful
@@ -523,7 +523,7 @@ export class AccountAdmin {
         const sub = cfg.push.find(s => s.endpoint === endpoint);
         if (!sub || !cfg.vapid) return new Response('unknown subscription', { status: 404 });
         const payload: PushPayload = {
-          v: 1, kind: 'test', title: 'VT 推送测试', body: `${sub.label || '此设备'} 已订阅审批通知`,
+          v: 1, kind: 'test', title: 'VT push test', body: `${sub.label || 'This device'} is subscribed to approval notices`,
           url: `${cfg.origin}${ADMIN_AUDIT_PATH}`, tag: 'test',
         };
         return Response.json(await sendPush(sub, JSON.stringify(payload), cfg.vapid, cfg.origin, 60, 'normal'));

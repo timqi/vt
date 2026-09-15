@@ -1,4 +1,4 @@
-// Admin session cookie (docs/worker-slim.md §3.1) — the pure half. Minting
+// Admin session cookie (docs/worker-slim.md#sessions) — the pure half. Minting
 // and verification take the session key as bytes so this file has no storage,
 // no Env and no Worker types; account_admin.ts derives K_sess from the root
 // key and calls in here.

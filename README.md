@@ -1,371 +1,193 @@
 # VT (Vault)
 
-A small KMS for macOS Keychain and phone Passkey approval. Secrets stay
-encrypted at rest and every decrypt/sign operation has an explicit approval
-path.
-
-## Features
-
-- AES-256-GCM records backed by macOS Keychain or phone Passkey approval
-- Raw secrets, TOTP, and transient environment/file injection
-- Touch ID-gated SSH signing with optional scoped approval reuse
-- Portable Ed25519 identities for macOS, Linux, and CI
-- Remote sudo approval
-
-## Documentation
-
-Use [`docs/README.md`](docs/README.md) as the documentation map. The most
-common paths are:
-
-- [`docs/cf-worker-deploy.md`](docs/cf-worker-deploy.md): deploy phone approval;
-- [`docs/sudo.md`](docs/sudo.md): use VT as a Linux sudo/PAM factor;
-- [`docs/sign-vt-design.md`](docs/sign-vt-design.md): SSH identity selection,
-  signing, and fallback;
-- [`config.example.toml`](config.example.toml): configuration template.
+VT keeps secrets encrypted and releases them through macOS Keychain / Touch ID
+or phone Passkey approval. It supports raw secrets, TOTP, transient injection,
+Ed25519 SSH identities, and remote sudo approval.
 
 ## Installation
 
-Download prebuilt artifacts from [GitHub Releases](https://github.com/timqi/vt/releases):
-the bare `vt` binary (macOS arm64, Linux amd64) and, for macOS, **VT.app** — a
-menu-bar app bundling the same `vt` CLI plus native VT-branded notifications
-(including cache-hit transparency), live grant status with one-click
-revoke-all, and agent supervision.
+Download `vt` (macOS arm64 or Linux amd64) or **VT.app** (macOS) from
+[GitHub Releases](https://github.com/timqi/vt/releases). VT.app bundles the CLI
+with agent supervision, grant status, revocation, and native notifications.
+Put `~/.local/bin` on your `PATH`.
 
-Or build from source (recipes live in the `justfile`, run `just` to list them):
-
-```bash
-# CLI only: builds (musl-static on Linux, native on macOS) and installs to ~/.local/bin
-just install
-
-# macOS menu-bar app: assembles VT.app, installs to /Applications, symlinks ~/.local/bin/vt
-just install-app
-```
-
-Installing the **downloaded** VT.app tarball (vs `just install-app`):
+To install a downloaded VT.app archive:
 
 ```bash
-tar xzf VT-app-darwin-arm64-*.tar.gz            # CLI extract avoids Gatekeeper quarantine
+tar xzf VT-app-darwin-arm64-*.tar.gz
 mv VT.app /Applications/
-ln -sf /Applications/VT.app/Contents/MacOS/vt ~/.local/bin/vt   # put the CLI on PATH
-# If Gatekeeper still blocks it (e.g. extracted via Finder):
-#   xattr -dr com.apple.quarantine /Applications/VT.app
+mkdir -p ~/.local/bin
+ln -sf /Applications/VT.app/Contents/MacOS/vt ~/.local/bin/vt
 ```
 
-The release build is **ad-hoc signed**, so each release re-triggers the
-one-time Keychain authorization prompt on first launch. See
-[docs/app-bundle.md](docs/app-bundle.md) — including the wrap v2 requirement:
-a keychain store still on the retired path-bound wrap v1 must be rebound with
-the previous release's `vt secret rebind` before upgrading.
+Or build and install from source:
+
+```bash
+just install       # CLI
+just install-app   # macOS app and CLI
+```
+
+Release bundles are ad-hoc signed; upgrades may require renewed Keychain
+permission. For Gatekeeper, an existing agent installation, or a pre-v2 vault,
+follow the [macOS installation and upgrade guide](docs/app-bundle.md).
 
 ## Quick Start
 
-> Vault bootstrap and local key management (`init`, `secret *`,
-> `ssh agent`/`add`/`list`/`remove`/`comment`/`show`) require macOS Keychain and
-> local authentication. Linux uses a forwarded VT agent or the Worker;
-> `ssh keygen` and `ssh connect` work on both platforms. Steps 1–2 assume macOS.
+| Approval path | Setup |
+|---|---|
+| Local Touch ID on macOS | [macOS quick start](#macos-quick-start) |
+| Phone approval on Linux, CI, or macOS | [Phone approval](#phone-approval) |
+| Remote host using a Mac agent | [SSH forwarding](docs/sign-vt-design.md#forwarded-relay) |
 
-1. Initialize the vault (creates the `rusty.vault.store` keychain item):
-   ```bash
-   vt init
-   ```
+Local vault and stored-key management require macOS. Portable SSH identities
+and the client commands work on macOS and Linux.
 
-2. Start the SSH agent (listens on `~/.ssh/vt.sock`):
-   ```bash
-   vt ssh agent
-   ```
+### macOS quick start
 
-3. Create and read secrets:
-   ```bash
-   # Create an encrypted secret (prompts for type, then the value without echo)
-   vt create
-
-   # Non-interactive (no terminal): stdin is the plaintext, type from --type
-   printf %s "$SECRET" | vt create --type raw
-
-   # Paste a URL printed by `vt create` to decrypt it.
-   vt read 'vt://0<your-record>'
-   ```
-
-### Linux / headless quick start
-
-There is no local Keychain on Linux. Configure the Worker transport, then use
-the same `create`, `read`, and `inject` commands; the approval URL is opened on
-the phone.
+Initialize the vault:
 
 ```bash
-vt enroll --url https://vt.example.com   # approve on the phone; compare the pairing code
-# Paste a URL produced by `vt create`.
-vt read 'vt://0<your-record>'
+vt init
 ```
 
-`vt enroll` writes this host's own `VT_PASSKEY_TOKEN` (valid 7 days, refreshed
-on every use) and `VT_PASSKEY_URL` to `~/.config/vt/config.toml`; see
-[`config.example.toml`](config.example.toml) for the other keys and keep that
-file private. Tokens can be revoked per host on the Worker's admin page.
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `version` | Show version information |
-| `init` | (macOS) Initialize passcode and passphrase in keychain |
-| `doctor` | Diagnose config sources, transport routing, Worker reachability, and caller-visible agent cache state |
-| `enroll [--url URL]` | Request this host's own Worker token via a phone Passkey approval (pairing code shown on both ends) and write it to the config file |
-| `create [--type raw\|totp]` | Encrypt a secret: interactive hidden input or piped stdin (one trailing newline stripped); piped type defaults to `raw`, never pass plaintext in argv |
-| `read <vt>` | Decrypt a vt protocol string |
-| `inject [-r FILE] -- cmd...` | Transiently decrypt `vt://` in the file / env / argv, then exec the command |
-| `inject --recover` | Restore ciphertext for any file left decrypted by a crashed/rebooted supervisor (run at login/boot; no auth) |
-| `auth [--reason <text>]` | Trigger bio auth via SSH agent forwarding (for PAM/sudo) |
-| `run -- argv...` | (SSH-agent path) Ask a forwarded macOS agent to launch an allowlisted program locally after Touch ID |
-| `secret export` | (macOS) Export the encrypted master secret |
-| `secret import` | (macOS) Import an encrypted master secret |
-| `secret rotate-passcode` | (macOS) Rotate the passcode for the master secret |
-| `ssh agent` | (macOS) Start the SSH agent (supports sign/decrypt auth caches, audit push, and `run@vt` allowlisting) |
-| `ssh add [-f <file>] [-c <comment>]` | (macOS) Add an Ed25519 SSH private key (from file or stdin); other key types are refused |
-| `ssh list` | (macOS) List stored SSH keys (shows fingerprint, algorithm, comment, and public key) |
-| `ssh comment <fingerprint> -c <comment>` | (macOS) Change the comment of a stored key |
-| `ssh remove <fingerprint>` | (macOS) Remove an SSH key by fingerprint |
-| `ssh remove-all` | (macOS) Remove all stored SSH keys |
-| `ssh show <fingerprint>` | (macOS) Show the public key for a stored key |
-| `ssh keygen [-l <label>] [-c <comment>] [--key-file <path>]` | Generate a portable Ed25519 identity stored as a `vt://` record; prints the OpenSSH public key (cross-platform) |
-| `ssh connect [--forward-real-agent] [ssh args...]` | Git SSH driver — `GIT_SSH_COMMAND="vt ssh connect"`; signs with a portable `vt://` identity or a discovered VT-agent key. The flag must precede SSH args. |
-
-### Inject Command
-
-`inject` temporarily decrypts a config file (and/or env vars and argv) so a
-child process can read plaintext, then atomically restores the ciphertext
-backup after `--timeout` seconds.
+Start the agent through VT.app, or use `vt ssh agent` for a standalone CLI
+installation:
 
 ```bash
-# Run a service against an in-place-decrypted config; restored to ciphertext
-# ~2s after exec, regardless of when the child finishes.
+open /Applications/VT.app
+```
+
+Then [create and read a secret](#create-and-read-secrets).
+
+### Phone approval
+
+First [deploy and bootstrap a Worker](docs/cf-worker-deploy.md), or use an
+existing one. Enroll each host:
+
+```bash
+vt enroll --url https://vt.example.com
+```
+
+Open the approval URL on your phone and compare the pairing code before
+approving. Enrollment saves the host's credentials in the VT config file;
+keep it private. Host revocation and token renewal are covered by the
+[Worker guide](docs/cf-worker-deploy.md#enroll-hosts).
+
+### Create and read secrets
+
+```bash
+vt create                         # choose raw or TOTP, then enter the value
+vt read 'vt://0<your-record>'      # replace with the URL printed by create
+```
+
+For piped input, send plaintext through stdin rather than command arguments:
+
+```bash
+printf %s "$SECRET" | vt create --type raw
+```
+
+Treat the printed `vt://` record as opaque encrypted data. Pre-2.0 `vt://mac/`
+records are refused; convert them with the previous release's
+`vt rewrap --no-dry-run` before upgrading.
+
+## Inject Command
+
+Use `inject` to give a command decrypted environment values without storing
+those values in shell configuration:
+
+```bash
+# API_TOKEN and DATABASE_URL already contain vt:// records.
+vt inject --only-env API_TOKEN,DATABASE_URL -- ./run.sh
+```
+
+`--only-env` limits environment-variable decryption; other variables remain
+inherited, and argument/file substitution still applies. Without it, `inject`
+substitutes records in all inherited environment variables and command arguments.
+
+For a config file containing records:
+
+```bash
 vt inject -r config.yaml -- ./run.sh
-
-# Need the plaintext elsewhere? Compose with standard Unix tools; the command
-# must read the file before the same timeout window closes:
-vt inject -r config.yaml -- cat config.yaml        # decrypt → stdout
-vt inject -r config.yaml -- cp config.yaml /tmp/c  # decrypt → another path
-vt inject -r config.yaml -- jq .api_key config.yaml
-
-# No file: only substitute vt:// in env vars and argv, then exec.
-vt inject -- ./run.sh
 ```
 
-Options:
-- `-r, --replace-file <FILE>`: Decrypt vt:// in the file in place; restore from backup after timeout
-- `-t, --timeout <SECONDS>`: Seconds before the backup is rolled back over the decrypted original (default: 2)
-- `--recover`: Sweep `~/.local/state/vt/inject/` and restore any file a crashed
-  or rebooted restore supervisor left decrypted. Needs no auth (it only moves
-  the ciphertext backup back). Safe to run from a login/boot hook.
+The file is decrypted in place, then restored after `--timeout` (default two
+seconds), independently of when the command finishes. The command must read it
+within that window. Restoration does not erase copies, arguments, or the child
+process's environment. A decryption failure prevents the command from starting.
 
-Overlap protection: only one exposure window per file may be open at a time.
-A second `inject -r` of the same file is refused while the first window is
-open — retry after it closes (the error says how long). If a previous run's
-restore supervisor died (crash/reboot), the refusal points at
-`vt inject --recover`. A file containing no `vt://` records is also refused:
-there is nothing to decrypt, which usually means the wrong file — or plaintext
-left behind by a broken exposure.
-
-Injection aborts the entire batch if any record fails to decrypt: no environment
-values or files are changed and the command is not started. Repeated records are
-decrypted once, and a decrypted value containing `vt://` text is inserted literally.
-
-The temporary publication file is reserved empty before the supervisor starts;
-restoration cancels its name before consuming the ciphertext backup. A delayed
-parent cannot recreate that file after restoration. The recovery deadline is
-recorded before supervisor startup, so `--recover` can also cancel a stalled
-startup after the deadline and grace period; that parent's publication then fails.
-The normal restore timer starts in the supervisor. Cancellation or restore errors
-preserve the backup and any existing recovery record for a later retry.
-
-### SSH Agent
-
-VT can act as an SSH agent, storing private keys in VT's encrypted
-macOS Keychain-backed store
-and requiring Touch ID by default for every signing operation. Opt-in auth
-caching can reduce repeated prompts; see [Auth Caching](#auth-caching).
+Overlapping file injections and files with no records are refused. After a
+crash or reboot leaves a file decrypted, restore its ciphertext backup with:
 
 ```bash
-# Add a key from file (Ed25519 only; an RSA or ECDSA key is refused)
+vt inject --recover
+```
+
+Recovery requires no approval and can run from a login/boot hook. Failed
+restoration preserves recovery state for a retry.
+
+## SSH
+
+With the Mac agent running, import an existing Ed25519 key and use its socket:
+
+```bash
 vt ssh add -f ~/.ssh/id_ed25519
-# Optionally override the key's embedded comment
-vt ssh add -f ~/.ssh/id_ed25519 -c "work laptop"
-# Add a key interactively (paste key, Ctrl+D, then enter comment)
-vt ssh add
-
-# List stored keys
-vt ssh list
-
-# Show public key (for adding to GitHub, servers, etc.)
-vt ssh show SHA256:...
-
-# Start the SSH agent (it listens on ~/.ssh/vt.sock):
-eval $(vt ssh agent)
-
-# Start with approval reuse (skip repeated Touch ID within a time window;
-# grants are activity-scoped — see "Auth Caching" below):
-eval $(vt ssh agent --ssh-auth-cache-duration 28800 --decrypt-auth-cache-duration 3600)
-
-# Set SSH_AUTH_SOCK to use the agent (add to your shell profile)
 export SSH_AUTH_SOCK=~/.ssh/vt.sock
-
-# Now ssh/git commands use vt for authentication
-# The Touch ID prompt names the key and the verified destination (OpenSSH >= 8.9)
-ssh git@github.com
-git push origin main
-
-# Change a key's comment
-vt ssh comment SHA256:... -c "new comment"
-
-# Remove a key
-vt ssh remove SHA256:...
+ssh user@your-server
 ```
 
-Keys are stored as a single encrypted JSON blob inside `rusty.vault.store` (under `encrypted_ssh_keys`), using the same `mac_cipher` as other secrets.
+For a portable identity backed by your configured approval path:
 
-#### Auth Caching
-
-By default (`--ssh-auth-cache-duration 0`), Touch ID is required for every
-sign/decrypt request. Setting a duration enables **activity-scoped** approval
-reuse — the Touch ID prompt always states exactly what is being granted and
-for how long:
-
-| Caller | Grant scope |
-|--------|-------------|
-| `ssh` / `git fetch` / `git push` (OpenSSH ≥ 8.9) | The **destination server** (verified via `session-bind@openssh.com`): one approval covers repeated one-shot connections to the same host with the same key, from any local caller |
-| `ssh-keygen -Y sign` (git commit signing), local `vt ssh connect` | The caller's **git workspace** (kernel-derived `.git` root): one approval covers the project, including multi-host fan-outs and TTY-less AI agents / CI working in the same checkout |
-| Local caller outside any git repository | The caller's **exact working directory** (kernel-derived, a separate grant family from git workspaces) |
-| Local caller from a broad shared directory (`$HOME`, `/`, temp roots) | The **calling application** (kernel-derived parent process): repeated requests from the same app instance — e.g. a daemon's `gh` helper — share one approval; grants die when the app exits |
-| Forwarded / relay traffic (`ssh -A`, `--forward-real-agent`) | vt extensions (`decrypt@vt`, `sign@vt`) are confined **per connection**: a remote host can reuse only its own approvals and never rides local grants. Raw SSH signs arriving through a forwarding-capable connection are never cached at all |
-| OpenSSH < 8.9, `auth@vt`, `run@vt` | Never cached — always prompts |
-
-`--ssh-auth-cache-duration <SECS>` and `--decrypt-auth-cache-duration <SECS>`
-are separate knobs (a cached decrypt grant releases per-record DEK material,
-so you may want it shorter or disabled). TTLs are strict (no sliding
-refresh), and every grant is revoked immediately when the agent locks, the
-screen locks, the Mac sleeps/wakes, or the idle timeout fires — the duration
-is effectively "within this presence session, at most N hours", so generous
-values (8h sign / 1h decrypt) are reasonable.
-
-For **unattended periodic jobs** (editor auto-fetch, cron), caching is the
-wrong tool — any TTL eventually prompts while you are away. Give fetch a
-read-only credential instead (a GitHub read-only deploy key via a `Host`
-alias with `IdentitiesOnly yes`, or HTTPS with a `contents:read` token), or
-keep an ssh `ControlMaster`/`ControlPersist` window longer than the fetch
-interval so the connection never re-authenticates.
-
-### Portable SSH identity for git (`vt://`)
-
-Unlike `vt ssh add` (which stores keys in VT's encrypted macOS Keychain-backed
-store, macOS-only), `vt ssh keygen`
-mints an Ed25519 key whose private seed is stored as an ordinary `vt://` record — the same
-encrypted format as every other secret. One key works on macOS, Linux, and headless/CI hosts,
-and the plaintext seed never touches disk.
-
-```
-# Generate once (on any host). Writes ~/.config/vt/git-ssh (ciphertext, 0600)
-# and ~/.config/vt/git-ssh.pub, and prints the public key to add to GitHub.
+```bash
 vt ssh keygen -l github
-
-# On each host that runs git push, copy BOTH ciphertext and .pub files.
-# Alternatively set VT_GIT_SSH_PRIVATE_KEY and VT_GIT_SSH_PUB to their contents:
 git config core.sshCommand "vt ssh connect"
-git push        # signs via the existing ceremony: Touch ID locally, phone passkey on headless hosts
 ```
 
-Prefer the default key file. `VT_GIT_SSH_PRIVATE_KEY` is useful for CI or
-wrappers, but generic `vt inject -- …` scans `vt://` values in inherited
-environment variables; do not let that variable reach an unrestricted inject
-command.
+Register the printed public key with your server or Git provider. Agent signing
+keeps the key on the Mac; portable signing can decrypt it into caller memory.
+See the [SSH contract](docs/sign-vt-design.md) for identity distribution, selection,
+fallback, and forwarding.
 
-`vt ssh connect` runs system SSH through an ephemeral signer. When the configured
-route permits it, `sign@vt` signs with a key held by the Mac agent without
-exporting the private key. Eligible failures fall back to decrypt-then-sign only
-if a portable record is available; this places the seed in the caller's memory
-for the connect process lifetime. Explicit rejection does not trigger fallback.
-A forwarded agent needs only its socket; backend pins remain authoritative. See
-[the signing contract](docs/sign-vt-design.md) for discovery, routing, and
-[the relay reference](docs/ssh-vt-design.md) for `--forward-real-agent`.
+### Auth Caching
 
-### sudo via Touch ID or phone passkey
+Approval reuse allows repeated operations without another prompt during the
+approved window. Configure it only when that standing authority is acceptable;
+lock and presence checks can end local reuse before its TTL.
 
-Use `vt auth` as a `sudo` authentication factor: a forwarded Mac agent gives a
-Touch ID approval, while a headless host uses the phone Passkey path. An
-unavailable or rejected VT approval falls through to the normal password stack.
+[Agent authorization](docs/unified-authorization-engine.md) and
+[Worker DEK caching](docs/dek-cache.md) define their separate scopes and limits.
+For unattended periodic jobs, prefer a restricted credential such as a read-only
+deploy key; approval caching cannot guarantee unattended access.
 
-Use [`docs/sudo.md`](docs/sudo.md) for the supported `setup-pam.sh` workflow,
-verification, removal, and the Worker-token security boundary.
+## Configuration and help
 
-## VT Protocol Format
+The [config template](config.example.toml) owns variables, defaults, and routing
+precedence. Use `VT_BACKEND=agent` or `VT_BACKEND=passkey` to require one approval
+path; `auto` permits fallback on eligible agent failures.
 
-```
-vt://{type}{data}
+```bash
+vt --help
+vt inject --help
 ```
 
-- **type**: `0` for raw secrets, `1` for TOTP
-- **data**: Base64 URL-safe encoded AES-256-GCM envelope (per-record DEK derived from the master key + a salt carried in the URL)
+Use `vt <command> --help` for the full command and option reference. Linux sudo
+setup and removal are in [sudo.md](docs/sudo.md); other tasks are indexed in the
+[documentation map](docs/README.md).
 
-Records printed by `vt create` contain an authenticated envelope, not just
-base64-encoded plaintext.
+## Diagnostics
 
-> Legacy `vt://mac/…` records (pre-2.0) are no longer readable and fail as invalid records. Convert them with `vt rewrap --no-dry-run` on the previous release before upgrading.
+```bash
+vt doctor
+```
 
-## Environment Variables
+Doctor reports configuration sources, routing, and caller-visible agent reuse.
+It probes the agent and configured Worker independently of backend pins, without
+authorizing work. Missing sockets, refused/unsupported diagnostics, and build
+mismatches are reported separately.
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `VT_PASSKEY_URL` | Cloudflare Worker base URL for phone approval | unset |
-| `VT_PASSKEY_TOKEN` | This host's Worker token (`vt1.…`, written by `vt enroll`; nothing else is accepted) | unset |
-| `VT_PASSKEY_UV` | Requested WebAuthn user-verification level for phone approval (`discouraged`/`preferred`/`required`); same as `--uv`, raise-only — the Worker's policy decides the floor | unset |
-| `VT_BACKEND` | `auto`, `agent`, or `passkey` transport selection | `auto` |
-| `VT_CONFIG` | Override the config-file path | `~/.config/vt/config.toml` |
-| `VT_GIT_SSH_PRIVATE_KEY` / `VT_GIT_SSH_PUB` | Optional portable SSH identity inputs | unset |
-| `SSH_AUTH_SOCK` | SSH agent socket path (used by clients to reach `vt ssh agent`) | falls back to `~/.ssh/vt.sock` |
-| `RUST_LOG` | Log level | `info` (release) / `debug` (dev) |
-
-## Secret Management
-
-VT's macOS store is one Keychain item, `rusty.vault.store`, containing the
-passcode blob plus the encrypted master passphrase and SSH keys.
-Run the agent as the user who initialized it.
-
-The store is wrap v2 only, derived from passcode, `$USER`, and a fixed label,
-not the binary path. A store on the retired path-bound wrap v1 is rejected;
-rebind it with the previous release's
-[`vt secret rebind`](docs/app-bundle.md#2-master-key-wrap-v2)
-first. Keychain access approval and Touch ID/local
-operation approval are separate. Signing identity changes can require renewed
-Keychain approval; packaging and migration details belong to
-[app-bundle.md](docs/app-bundle.md).
-
-## Architecture
-
-One Rust binary contains the cross-platform client and macOS-only vault/agent.
-The client uses SSH-agent extensions (plain JSON over the kernel-owned socket)
-or the Worker's phone WebAuthn/PRF ceremony. Portable SSH keygen/connect are cross-platform; local
-Keychain and agent management are macOS-only.
-
-Environment variables override `~/.config/vt/config.toml`; `VT_CONFIG` selects
-another file. Keep it mode 600. In `auto`, the agent socket is tried when it
-exists, with Worker fallback only on recoverable errors (a missing socket or a
-non-vt agent included). `VT_BACKEND=agent` and `VT_BACKEND=passkey` pin the
-transport. See
-[config.example.toml](config.example.toml) for configuration and
-[structured-errors.md](docs/structured-errors.md) for fallback classification.
-
-## Passkey Approval (Cloudflare Worker)
-
-For hosts without the local macOS agent/Keychain store (Linux servers, CI,
-headless boxes), `vt`
-decrypts `vt://` records through a phone WebAuthn ceremony served by the
-Cloudflare Worker in `cf-worker/`. The CLI reaches it via `VT_PASSKEY_URL` +
-`VT_PASSKEY_TOKEN`.
-
-See [docs/cf-worker-deploy.md](docs/cf-worker-deploy.md) for the full deployment
-guide (Wrangler config, the secret, first-Passkey bootstrap on `/admin`, and
-CLI wiring). The admin console is passkey login; there is no Cloudflare Access
-application to create. See [docs/README.md](docs/README.md) for cache,
-SSH, error-protocol, audit, and notification documentation.
+Findings do not cause a nonzero exit code. HTTP reachability does not validate a
+host token or prove approval works. Scope classification applies to this probe's
+launcher and connection; another caller may differ. Doctor does not repair
+configuration or restart agents.
 
 ## License
 

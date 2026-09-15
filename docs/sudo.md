@@ -1,126 +1,63 @@
-# sudo / PAM approval
+# Linux sudo approval
 
-Use `vt auth` as an optional `sudo` factor on a Linux host. A successful VT
-approval satisfies PAM; a failure or timeout falls through to the normal
-password stack.
-
-## Choose an approval path
-
-| Path | Host setup | Approval |
-|---|---|---|
-| Forwarded agent | A forwarded `vt ssh agent` socket (`ssh -A`) | Touch ID on the Mac |
-| Phone Passkey | `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN` | WebAuthn approval on the phone |
-
-With the default `VT_BACKEND=auto`, VT tries the agent first, then the Worker
-path when configured. A plain Linux server normally uses only the phone path;
-a host reached with `ssh -A` can use the forwarded Mac agent. `VT_BACKEND=agent`
-or `passkey` disables that fallback; see `config.example.toml`.
+VT provides an optional PAM factor: successful human approval satisfies sudo;
+failure or timeout falls through to the normal password stack.
 
 ## Install
 
-Run the repository's setup script as root on the target Linux host. It reads
-the invoking user's `~/.config/vt/config.toml`; explicit environment values
-still take precedence.
+Choose a forwarded Mac agent for Touch ID or enroll this host for phone approval.
+[config.example.toml](../config.example.toml) controls backend selection.
+Run the installer on the Linux host:
 
 ```bash
 sudo ./setup-pam.sh
-
-# Or use a particular config file / one-time override.
-sudo VT_CONFIG=/path/to/config.toml ./setup-pam.sh
-sudo VT_PASSKEY_TOKEN='…' ./setup-pam.sh
 ```
 
-The script validates the configured path, asks which `vt` binary to use (see
-below), copies it to `/usr/local/bin/vt` (root:root, 0755), writes a root-only
-helper at `/usr/local/bin/vt-sudo-auth.sh` that calls that copy, and adds this
-line before the existing sudo authentication stack when it is not already
-present:
+The installer reads the invoking user's VT config and asks which binary to
+install when needed. Pin either input explicitly:
 
-```
-auth    sufficient    pam_exec.so seteuid quiet /usr/local/bin/vt-sudo-auth.sh
+```bash
+sudo VT_CONFIG=/path/to/config.toml VT_BIN=/path/to/vt ./setup-pam.sh
 ```
 
-Re-running the script refreshes both the binary copy and the helper's embedded
-values without adding a second PAM line.
-
-### Which binary gets installed
-
-sudo replaces `PATH` with `secure_path`, so a `vt` in `~/.local/bin` (where
-`just install` puts it) is not on the script's `PATH`. The script therefore
-probes `$PATH`, `~/.local/bin`, `~/bin`, the repository's `target/*/release`,
-`/usr/local/bin`, and `/usr/bin`, prints each hit with its owner, mtime, and
-`--version`, and — when more than one turns up — asks which to install:
-
-```
-Found vt binary/binaries:
-  1) /home/you/.local/bin/vt
-      owner=you  mtime=2026-01-01 12:00:00  vt v20260101-abc1234
-  2) /usr/local/bin/vt
-      owner=root  mtime=2025-12-01 09:00:00  vt v20251201-def5678
-Install which one to /usr/local/bin/vt? [1-2, default 1]
-```
-
-The version string of a candidate is obtained as the invoking user (`runuser`)
-where possible, so nothing runs as root before you have chosen it. With no
-terminal available the script takes candidate 1 and says so. `VT_BIN=/path/to/vt`
-in the environment pins the choice and skips the prompt entirely.
+It installs a root-owned binary copy and a root-only helper, then adds the PAM
+factor to `/etc/pam.d/sudo`. Re-running refreshes the copy and helper without
+adding another PAM entry. After upgrading VT, run the installer again.
 
 ## Verify
 
-For the forwarded-agent path, make the Mac agent available before connecting:
+With the Mac agent running, forward its socket to the server:
 
 ```bash
 export SSH_AUTH_SOCK=~/.ssh/vt.sock
-vt ssh agent
 ssh -A user@your-server
 sudo whoami
 ```
 
-For the phone path, run `sudo whoami` on the server and approve the ceremony on
-the phone. The helper waits up to 60 seconds, then PAM falls back to the normal
-password prompt.
+For the phone path, run `sudo whoami` on the server and approve on the phone.
+The helper waits up to 60 seconds before falling back to the password stack.
+Subscribe the phone to Web Push if PAM does not reliably display the approval URL.
 
-## Security and operational limits
+## Security limits
 
-- The generated helper is `root:root` and mode `0700`; it embeds the configured
-  tokens. Keep it readable only by root.
-- The helper must call a binary the authenticating user cannot write. PAM runs it
-  as root, so pointing it at a user-owned `~/.local/bin/vt` would let any process
-  running as that user replace the binary and have it executed as root. That is
-  why the script installs its own root-owned copy under `/usr/local/bin` rather
-  than referencing the resolved path, and why a symlink back to the user's copy
-  is not a substitute. The copy is a snapshot: after upgrading `vt`, re-run
-  `setup-pam.sh`. A stale copy keeps working until it no longer matches the
-  Worker protocol, at which point sudo falls back to the password stack.
-- `VT_PASSKEY_TOKEN` is that host's own token from `vt enroll`, revocable on the
-  admin tokens tab. Theft can create approval requests and probe the DEK
-  cache for entries this host's token already holds, but it cannot decrypt
-  without a phone approval or a live cache entry. Prefer a small set of bastion hosts for the
-  Worker path.
-- `pam_exec` often exposes stderr but not stdout. The Worker URL is emitted on
-  stderr; subscribe the phone to Web Push on the admin 设置 tab if terminal
-  feedback is not reliable in your PAM environment.
-- `auth@vt` is never cached. An approval always requires Touch ID or a phone
-  Passkey ceremony.
-- The approval reason carries the command sudo was asked to run
-  (`sudo whoami` -> `sudo sudo by you — sudo whoami`). `pam_exec` is forked by
-  sudo itself, so the helper reads `/proc/$PPID/cmdline`; it stays empty when
-  `/proc` is unreadable, and only the first 100 characters are kept so a long
-  command cannot overflow the argument limit and fail the whole factor. This is
-  display-only: argv belongs to the caller, and VT renders `--reason` as a
-  client-claimed line after the agent's own truth lines (Touch ID shows 100
-  characters, the agent rejects a reason above 8 KiB). Never treat it as an
-  authorization fact.
-- That command line is also pushed to the phone and stored in worker audit
-  rows. The helper blanks `VAR=value` assignments
-  (`sudo TOKEN=… cmd`), but a secret passed as a plain argument (`-pSECRET`)
-  is still displayed and retained. On a host where that is unacceptable, drop
-  the `${SUDO_CMD…}` part of the `--reason` string in
-  `/usr/local/bin/vt-sudo-auth.sh` — re-running `setup-pam.sh` restores it.
-- Only `/etc/pam.d/sudo` is modified. `sudo -i` reads `/etc/pam.d/sudo-i` on
-  Debian and Ubuntu; add the same `auth` line there if you want login shells
-  covered.
+- The helper must execute a root-owned binary that the authenticating user
+  cannot replace; a symlink to a user-owned CLI is not an equivalent installation.
+- The root-only helper embeds its configured token; do not broaden its permissions.
+- `auth@vt` is always fresh; a cache entry cannot satisfy sudo presence approval.
+- Host-token theft permits approval requests and access to that token's live
+  cached DEKs; it does not remove the approval requirement for sudo.
+- The displayed command is advisory, not an authorization fact. It is sent to
+  the phone and retained in audit; ordinary secret arguments may be exposed even
+  though environment assignments are blanked.
+- To omit command text, remove the `${SUDO_CMD…}` part of the generated helper's
+  reason. Re-running the installer restores it.
+- Only `/etc/pam.d/sudo` is configured. Debian/Ubuntu login shells may use
+  `/etc/pam.d/sudo-i`; configure that stack separately if required.
 
-To remove the integration, delete the `pam_exec.so` line from `/etc/pam.d/sudo`
-and then remove `/usr/local/bin/vt-sudo-auth.sh`, plus the `/usr/local/bin/vt`
-copy if nothing else on the host uses it.
+## Remove
+
+Delete the VT `pam_exec.so` entry from each PAM file you configured, then remove
+`/usr/local/bin/vt-sudo-auth.sh`. Remove the `/usr/local/bin/vt` copy only when
+nothing else uses it.
+
+The installed helper and PAM line are defined by [setup-pam.sh](../setup-pam.sh).

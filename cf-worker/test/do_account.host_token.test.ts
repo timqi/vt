@@ -259,7 +259,7 @@ describe('authenticating with a host token', () => {
   });
 });
 
-// SECRET is a KEK over the root key (docs/worker-slim.md §2): rotating it
+// SECRET is a KEK over the root key (docs/worker-slim.md#root-key-and-custody): rotating it
 // through the console keeps R, so every host token keeps verifying; the old
 // value dies on the first load under the new one. A FRESH secret without that
 // rotation is the factory reset — root:v1 is unreadable, bootstrap replaces it
@@ -358,7 +358,7 @@ describe('SECRET rotation and reset', () => {
     expect((await post('/api/audit-ingest', body, await sign(new Uint8Array(32).fill(9)))).status).toBe(401);
     expect((await post('/api/audit-ingest', body, await sign(await hostSecret(tokenId)))).status).toBe(200);
 
-    // The hostname-salted master key (refactor.md §1) is a rejected input now:
+    // A hostname-salted master key is not a per-host token (docs/worker-slim.md#host-tokens):
     // no token id, no row, whatever it was signed with.
     const legacyBody = { ...body, agent_id: 'mac' };
     const legacyRaw = new TextEncoder().encode(JSON.stringify(legacyBody));

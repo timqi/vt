@@ -1,69 +1,31 @@
-# VT documentation map
+# Documentation map
 
-This page is the fast path for both humans and coding agents. Start here, then
-open only the document relevant to the change.
+Find the document that owns the task; implementation history stays in Git.
 
-## Source of truth
+## Use and operate
 
-The code is authoritative for behavior. Documentation is authoritative for
-operator workflows and security decisions. If they disagree, verify the code
-and update the relevant document in the same change.
-
-| Need | Read first | Implementation anchor |
-|---|---|---|
-| Install or use VT | [`README.md`](../README.md) | `src/main.rs` |
-| Configure auth/routing | [`config.example.toml`](../config.example.toml) | `src/config.rs` (file hydration), `src/config/client.rs` (`ResolvedConfig`), `src/client.rs` |
-| Issue / revoke per-host Worker tokens (`vt enroll`) | [`host-token.md`](host-token.md) | `cf-worker/src/host_token.ts` (derivation), `cf-worker/src/account_tokens.ts` (lifecycle), `src/cf.rs` (`WorkerAuth`, `enroll`), `src/config.rs` (`upsert_config_values`) |
-| Understand record parsing and decrypt batches | [`README.md` — protocol](../README.md#vt-protocol-format) | `src/core.rs` (`VtUrl`), `src/client/records.rs` (`DecryptBatch`), `src/core/crypto.rs` |
-| Use VT for Linux sudo/PAM | [`sudo.md`](sudo.md) | `setup-pam.sh`, `src/client.rs` |
-| Deploy the phone approval Worker | [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/index.ts`, `cf-worker/src/do_account.ts` |
-| Admin login, bootstrap, passkey add/revoke | [`worker-slim.md`](worker-slim.md) §3, [`cf-worker-deploy.md`](cf-worker-deploy.md) | `cf-worker/src/admin_auth.ts` (session cookie), `cf-worker/src/account_admin.ts` (root key, config blob, bootstrap/login), `cf-worker/src/credentials.ts`, `cf-worker/pwa/admin/setup.js` |
-| Understand Worker audit and Web Push notifications | [`cf-worker-deploy.md`](cf-worker-deploy.md), [`worker-slim.md`](worker-slim.md) §5 | `cf-worker/src/account_audit.ts`, `cf-worker/src/account_notifications.ts`, `cf-worker/src/webpush.ts`, `cf-worker/src/account_admin.ts` |
-| Tune approval user verification (UV) | [`cf-worker-deploy.md`](cf-worker-deploy.md#6-settings-设置-tab) | `cf-worker/src/uv_policy.ts` (policy), `cf-worker/src/account_admin.ts` (`uv_policy` in the config blob), `cf-worker/src/webauthn.ts` (enforcement), `cf-worker/pwa/approve.js` |
-| Understand DEK caching | [`dek-cache.md`](dek-cache.md) | `cf-worker/src/do_account.ts` (ceremony and audit), `cf-worker/src/account_cache.ts` (cache storage), `cf-worker/src/storage_batch.ts` (shared batch deletion and prefix paging), `src/cf.rs` |
-| Sealed-box envelope (phone → CLI, phone → cache, cache hit → CLI), browser floor, test vectors | [`sealed-box-v1.md`](sealed-box-v1.md) | `cf-worker/pwa/common.js` (`vt.sealBox`), `cf-worker/src/cache_crypto.ts`, `src/cf.rs` (`open_sealed_deks`) |
-| Follow the slim refactor (open deletions) | [`refactor.md`](refactor.md) (plan) | `cf-worker/src/account_audit.ts` (table rebuilds) |
-| Worker trust model: `SECRET`, root key, config blob, rotation, reset | [`worker-slim.md`](worker-slim.md) §2, §4 | `cf-worker/src/account_admin.ts`, `cf-worker/src/types.ts` (`Env`) |
-| Change the PWA's look, controls, or page states (approve and admin shells) | [`design/ui-ux.md`](design/ui-ux.md) | `cf-worker/pwa/approve.js` (`vt.mountApprove`), `cf-worker/pwa/common.js`, `cf-worker/pwa/admin/admin.html` + `admin.js` (shell, tabs, dialog), `cf-worker/pwa/admin/admin.css` |
-| Use SSH identities | [`README.md` — portable identity](../README.md#portable-ssh-identity-for-git-vt) | `src/ssh_sign.rs`, `src/client.rs` |
-| Understand agent signing, identity selection, and decrypt-then-sign fallback | [`sign-vt-design.md`](sign-vt-design.md) | `src/ssh_sign.rs` (`resolve_identities`, `decide_sign_route`), `src/client.rs` (`VTClient::sign_vt`), `src/server_macos/ssh_agent/handlers.rs` (`handle_sign_vt`) |
-| Understand extension errors | [`structured-errors.md`](structured-errors.md) | `src/core/wire.rs`, `src/client.rs` |
-| Understand SSH-agent authorization and caching | [`unified-authorization-engine.md`](unified-authorization-engine.md) | `src/core/authorization.rs`, `src/server_macos/authorization.rs`, `src/server_macos/ssh_agent.rs` (dispatcher), `src/server_macos/ssh_agent/handlers.rs` (operations) |
-| Understand grant scopes (destination / workspace / relay) | [`authorization-scopes-v2.md`](authorization-scopes-v2.md) | `src/core/authorization.rs` (`GrantScope`), `src/server_macos/ssh_agent/scopes.rs` (`BindState`, `resolve_workspace`), `src/server_macos/ssh_agent/scopes/process.rs` (kernel queries), `src/server_macos/ssh_agent/scopes/paths.rs` (path policy) |
-| Enable agent audit push | [`agent-audit.md`](agent-audit.md) | `src/main.rs` (`build_audit_push_config`), `src/server_macos/audit.rs` |
-| Understand prompt/notification fields and audit context | [`approval-transparency.md`](approval-transparency.md) | `src/caller_meta.rs` (client-claimed display fields), `src/server_macos/ssh_agent/handlers.rs` (operation prompts), `src/server_macos/ssh_agent/scopes.rs` (truth lines), `cf-worker/src/notify.ts`, `cf-worker/pwa/approve.js` |
-| Diagnose config/routing/caching (`vt doctor`) | [`diag-design.md`](diag-design.md) | `src/client/doctor.rs`, `src/config/client.rs` (shared routing), `src/server_macos/ssh_agent/handlers.rs` (`handle_diag`) |
-| Build/install VT.app, menu bar UI, native notifications, key-wrap v2 | [`app-bundle.md`](app-bundle.md) | `app/VTShell.swift`, `src/server_macos/security.rs` (`notify_macos`, `derive_passcode_cipher`), `src/core/crypto.rs` (`derive_passphrase_secret_v2`) |
-
-## Reading guide
-
-Each feature document owns its current contract; filenames ending in `-design`
-do not imply pending work. In particular:
-
-- [`sign-vt-design.md`](sign-vt-design.md) owns SSH identity selection and fallback;
-  [`ssh-vt-design.md`](ssh-vt-design.md) covers portable storage and relay rationale.
-
-Implementation history belongs in Git. Verify older decision notes against code
-before treating them as current requirements.
-
-## Editing workflow
-
-Find the symbol with `rg`, read its owning document and implementation, then
-update that document with the smallest coherent change. Run focused tests before
-the relevant [repository gates](../AGENTS.md#validation-and-deployment-entry-points).
-Linux checks do not validate macOS-only behavior. Update this map only when
-ownership or entry points change.
-
-## Change routing
-
-| Change | Update |
+| Task | Document |
 |---|---|
-| CLI command or flag | `README.md`, `src/main.rs` help, and the feature doc |
-| `VT_*` variable or config-file behavior | `config.example.toml`, `README.md`, `src/config.rs` |
-| Worker secret, config knob, route, or admin page | `cf-worker-deploy.md`, `worker-slim.md` §4, `cf-worker/wrangler.toml.example`, relevant cache doc; `design/ui-ux.md` for a new control or page state |
-| Wire format or exit code | `structured-errors.md` and protocol tests |
-| Security invariant | the relevant design doc plus a code comment/test |
+| Install, use the CLI, inject secrets, diagnose routing | [Project README](../README.md) |
+| Configure client routing and agent defaults | [Config template](../config.example.toml) |
+| Deploy, bootstrap, update, or reset phone approval | [Worker deployment](cf-worker-deploy.md) |
+| Operate the macOS menu app and agent | [VT.app](app-bundle.md) |
+| Install or remove Linux sudo approval | [sudo](sudo.md) |
+| Enable local-agent audit delivery | [Agent audit](agent-audit.md) |
 
-[`AGENTS.md`](../AGENTS.md) is the canonical agent guide; `CLAUDE.md` is its
-compatibility symlink. Keep red lines and test gates there, not a second product
-manual; user-facing procedures belong here or in the linked feature documents.
+## Design contracts
+
+| Question | Document |
+|---|---|
+| What does an agent approval authorize, and when does it expire? | [Authorization](unified-authorization-engine.md) |
+| Where do SSH keys live, and what can forwarding expose? | [SSH identities](sign-vt-design.md) |
+| What do Worker keys, host tokens, and admin sessions authorize? | [Worker trust model](worker-slim.md) |
+| What authority does a cached DEK grant? | [DEK cache](dek-cache.md) |
+| What must an approver see and trust? | [Approval transparency](approval-transparency.md) |
+| What makes the phone/admin interface usable? | [PWA interaction](design/ui-ux.md) |
+| How do errors affect exit codes, fallback, and retries? | [Extension errors](structured-errors.md) |
+| What sealed-box format must the three implementations share? | [Sealed box](sealed-box-v1.md) |
+
+[AGENTS.md](../AGENTS.md) owns editing rules, documentation standards, and
+validation gates. The remaining [scope decision](refactor.md) is an open task,
+not a current contract.

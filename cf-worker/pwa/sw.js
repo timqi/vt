@@ -1,6 +1,6 @@
 'use strict';
 
-// Root-scope service worker for Web Push (docs/worker-slim.md §5.6). No fetch
+// Root-scope service worker for Web Push (docs/worker-slim.md#installed-app). No fetch
 // handler and no caching: the Worker renders every page per request.
 self.addEventListener('push', function (e) {
   var d = {};

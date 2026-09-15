@@ -1,4 +1,4 @@
-// Web Push fan-out (docs/worker-slim.md §5). Notifications never authorize or
+// Web Push fan-out (docs/worker-slim.md#web-push). Notifications never authorize or
 // finalize a challenge and never run on the ceremony path: every send is a
 // waitUntil task, and the CLI is never told whether it landed.
 
@@ -27,7 +27,7 @@ export class AccountNotifications {
   ) {}
 
   // One sendPush per subscription. The push service's answer decides the row
-  // (worker-slim.md §5.5): 404/410 is dead for good, everything else keeps it
+  // (docs/worker-slim.md#delivery-limits): 404/410 is dead for good, everything else keeps it
   // and is logged.
   private push(payload: PushPayload, ttlS: number, urgency: 'normal' | 'high'): void {
     this.ctx.waitUntil((async () => {
@@ -47,7 +47,7 @@ export class AccountNotifications {
 
   approval(challenge: Challenge): void {
     // A cache-extension ceremony is NOT pushed. Its entire flow is console-
-    // resident: the operator picks the entries on the admin DEK 缓存 tab and the
+    // resident: the operator picks the entries on the admin DEK Cache tab and the
     // Passkey ceremony mounts inline on that same page, so a push would notify
     // the person already watching the result. The audit tab still receives the
     // request row (op_kind='cache-extend') and the effect row (status='extended').
@@ -60,9 +60,9 @@ export class AccountNotifications {
     }, 300, 'high');
   }
 
-  // 免审批 notice shared by the Worker DEK-cache hit (opDekCache) and the agent
+  // Approval-free notice shared by the Worker DEK-cache hit (opDekCache) and the agent
   // Touch-ID-cache hit (agentCacheHit); `note` names the skipped factor when it
-  // isn't the default phone approval. Opt-in (`cache_hit_notify`, 设置 tab, off
+  // isn't the default phone approval. Opt-in (`cache_hit_notify`, Settings tab, off
   // by default: hits can fire many times a minute and bury the approvals that
   // need a tap): silence drops only the real-time FYI — the audit row is
   // written unconditionally.
@@ -85,6 +85,6 @@ export class AccountNotifications {
     // agent minting hostnames — cheap to cap anyway.
     if (this.agentCacheNotifyMs.size > 256) this.agentCacheNotifyMs.clear();
     this.agentCacheNotifyMs.set(key, now);
-    this.cacheHit(op.meta, op.salts, '缓存命中，免 Touch ID');
+    this.cacheHit(op.meta, op.salts, 'cache hit, no Touch ID');
   }
 }

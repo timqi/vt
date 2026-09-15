@@ -16,7 +16,7 @@
 // approvals is `discouraged`, and a deployment that wants the biometric step
 // back configures it instead of patching the PWA.
 //
-// CAVEAT (docs/cf-worker-deploy.md §6, security-key caveat): a CTAP2
+// CAVEAT (docs/cf-worker-deploy.md#settings): a CTAP2
 // security key derives the PRF extension from a different secret when it
 // completes without user verification, so a YubiKey enrolled under `required`
 // cannot unwrap its master key from a `discouraged` ceremony. It fails closed —
@@ -70,8 +70,8 @@ function levelMap(v: unknown): Record<string, UvLevel> {
   return out;
 }
 
-/** Parse the `uv_policy` object of the config blob (docs/worker-slim.md §4.1),
- *  the same shape the 设置 tab PUTs:
+/** Parse the `uv_policy` object of the config blob (docs/worker-slim.md#approval-policy),
+ *  the same shape the Settings tab PUTs:
  *
  *    {"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{"prod":"required"}}
  *

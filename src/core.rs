@@ -272,7 +272,7 @@ pub struct SignRes {
 
 /// Request: client → agent for `diag@vt` (read-only diagnostics; no Touch ID,
 /// never cached, not audit-pushed). Empty in v1; reserved for future filters.
-/// See `docs/diag-design.md`.
+/// See `docs/unified-authorization-engine.md#visibility`.
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct DiagReq {}
 
@@ -309,8 +309,8 @@ pub struct DiagCacheReport {
 }
 
 /// How the agent scope-classifies a connection (activity scopes V2 —
-/// docs/authorization-scopes-v2.md). Lives here (not in the macOS-only agent
-/// module) so the agent's wire tags and the CLI's human explanations are one
+/// docs/unified-authorization-engine.md#scopes). Lives here rather than in the
+/// macOS-only agent so its wire tags and the CLI's human explanations are one
 /// compile-checked mapping — adding a variant forces both [`Self::as_wire`]
 /// and [`Self::human`] arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,7 +453,7 @@ pub struct DiagPeerReport {
     pub is_vt_relay: bool,
 }
 
-// ---- ui-status@vt (docs/app-bundle.md §5) -----------------------------------
+// ---- ui-status@vt (docs/app-bundle.md#status-and-revoke-boundary) ------------
 
 pub const UI_STATUS_ACTION_STATUS: &str = "status";
 pub const UI_STATUS_ACTION_REVOKE_ALL: &str = "revoke_all";
@@ -482,7 +482,7 @@ pub struct UiStatusRes {
     pub sign_ttl_secs: u64,
     pub decrypt_ttl_secs: u64,
     /// Idle timeout in seconds — surfaced so the shell can show *why* grants
-    /// clear after a quiet spell (docs/app-bundle.md §10). Policy, not secret.
+    /// clear after a quiet spell (docs/app-bundle.md#key-wiping-and-idle-timeout). Policy, not secret.
     pub idle_timeout_secs: u64,
     pub run_allow_len: usize,
     pub audit_push: bool,

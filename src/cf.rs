@@ -152,7 +152,7 @@ struct ChallengeReq<'a> {
 /// ceremony path: the Worker fills both from the host-token record, which is
 /// the only verified source. The macOS agent's audit push still sets them —
 /// there the agent names the session host. tty / ppid / ssh_client were
-/// dropped from the wire entirely (docs/approval-transparency.md §1b).
+/// dropped from the wire entirely (docs/worker-slim.md#host-tokens).
 #[derive(Serialize, Default)]
 pub struct ChallengeMeta {
     pub op_kind: String,
@@ -170,7 +170,7 @@ pub struct ChallengeMeta {
     pub reason: String,
     /// One suggested display name per entry of `salts_b64u`, same order, `""`
     /// when unknown (the env var name or file basename `inject` read the
-    /// record from). A suggestion only: the Worker shows it as 自报 and stores
+    /// record from). A suggestion only: the Worker shows it as "claimed" and stores
     /// nothing until the approver adopts it (docs/dek-cache.md).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<String>,
@@ -467,7 +467,7 @@ pub async fn enroll(worker_url: &str, host: &str, user: &str) -> Result<Zeroizin
         let text = resp.text().await.unwrap_or_default();
         let hint = match status {
             429 => " (rate limited — wait a minute, or approve/expire the pending requests first)",
-            503 => " (the Worker has no LIMITER binding; see docs/host-token.md)",
+            503 => " (the Worker has no LIMITER binding; see docs/cf-worker-deploy.md)",
             _ => "",
         };
         bail!("enroll: HTTP {status}: {text}{hint}");

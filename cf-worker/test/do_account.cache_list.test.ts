@@ -122,7 +122,7 @@ describe('opCacheList — inventory without secrets', () => {
 // A clear is the authority-REDUCING half of the admin surface. The contract:
 // the count a clear returns is what storage actually removed — never what the
 // request intended. cache-clear-entries addresses exact keys (no scan, so no
-// cap to fall past); 清除全部 pages the `dek:` prefix to its end.
+// cap to fall past); Clear all pages the `dek:` prefix to its end.
 
 /** Write `n` entries at fully controlled keys, so a test can decide exactly
  *  where they land in the sorted `dek:` prefix. '0…' sorts before every
@@ -199,12 +199,12 @@ describe('cache-clear-entries — exact keys', () => {
       expect((await doPost('cache-clear-entries', { entries })).status).toBe(400);
     }
     // A v4-shaped key has no token half, so the console cannot address it; it
-    // is cleared by 清除全部 or lapses.
+    // is cleared by Clear all or lapses.
     expect((await doPost('cache-clear-entries', { entries: [{ ...ref, token_id: FAKE_CTX }] })).status).toBe(400);
   });
 });
 
-describe('清除全部 — exhaustive by contract', () => {
+describe('Clear all — exhaustive by contract', () => {
   it('continues across short nonempty pages', async () => {
     await inDO(async h => {
       const target = await putAt(h, 'z', 7);

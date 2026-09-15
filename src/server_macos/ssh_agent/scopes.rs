@@ -71,7 +71,7 @@ impl PeerIdentity {
 //
 // Grants are keyed by activity: raw SSH signs by session-bind-verified
 // destination (BindState, below), local vt peers by kernel-derived workspace,
-// relay peers per connection. See docs/authorization-scopes-v2.md.
+// relay peers per connection. See docs/unified-authorization-engine.md#scopes.
 
 /// A workspace the peer is operating in: the nearest `.git`-containing
 /// ancestor of its kernel-derived cwd. `subject` is the root directory's
@@ -280,7 +280,7 @@ const MAX_SESSION_BINDS: usize = 16;
 
 /// Destination binding state of one agent connection, driven by verified
 /// `session-bind@openssh.com` messages (OpenSSH ≥ 8.9 sends one per hop).
-/// See docs/authorization-scopes-v2.md §3.2.
+/// See docs/unified-authorization-engine.md#scopes.
 #[derive(Debug)]
 pub(super) enum BindState {
     Unbound,
@@ -455,7 +455,7 @@ fn scoped_label(basis: ScopedBasis<'_>) -> String {
     }
 }
 
-/// Append the §6 prompt transparency line: present exactly when an approval
+/// Append the prompt transparency line: present exactly when an approval
 /// can create a reusable grant. The label is agent-derived (kernel workspace
 /// path / verified host key) but sanitized like every other prompt field.
 pub(super) fn append_reuse_line(message: &mut String, label: &Option<String>, ttl_secs: u64) {
@@ -527,7 +527,7 @@ impl VtSshSession {
     }
 
     /// Append the raw-sign destination truth line from the session-bind
-    /// state (docs/approval-transparency.md §A1). `reuse_names_destination`
+    /// state (docs/approval-transparency.md#truth-before-claims). `reuse_names_destination`
     /// is true when the reuse line already carries the destination label (a
     /// destination-reusable scope — the only reusable arm a bound non-relay
     /// peer can reach), in which case the plain line would be a duplicate. A
@@ -591,12 +591,12 @@ impl VtSshSession {
         }
     }
 
-    // ---- Activity-scope construction (docs/authorization-scopes-v2.md) ----
+    // ---- Activity-scope construction (docs/unified-authorization-engine.md) ----
     //
     // Each helper returns the scope(s) plus a human reuse label. The label is
     // `Some` exactly when an approval can create a reusable grant, and is
     // built from the same data the scope digest binds — the prompt must state
-    // what is being granted (§6 transparency invariant).
+    // what is being granted (docs/approval-transparency.md#what-the-approval-must-show).
 
     /// The per-connection confinement arm shared by relay and plain-ssh
     /// peers: `Some(label)` exactly when the connection subject resolved.
@@ -629,7 +629,7 @@ impl VtSshSession {
         })
     }
 
-    /// The scope basis, with the §4 consistency check applied to the
+    /// The scope basis, with the claimed-cwd consistency check applied to the
     /// directory-shaped arms: a claimed `pwd` outside the git/cwd root
     /// degrades to Fresh. The app arm carries no root to check against —
     /// its claimed pwd stays display-only, like the connection arms.
@@ -973,7 +973,7 @@ mod tests {
 
     #[test]
     fn destination_line_shown_when_bound_and_fresh() {
-        // docs/approval-transparency.md §A1: with the default TTL of 0 the
+        // docs/approval-transparency.md#truth-before-claims: with the default TTL of 0 the
         // reuse line never appears, so the verified destination must get its
         // own truth line.
         let mut s = test_session(0, 0);
@@ -1117,7 +1117,7 @@ mod tests {
 
     #[test]
     fn reuse_label_present_iff_scope_reusable() {
-        // §6 transparency invariant: the prompt reuse line exists exactly
+        // Transparency invariant: the prompt reuse line exists exactly
         // when the approval can create a standing grant — across every
         // classification arm.
         let inputs = vec![(crate::core::SecretType::RAW, [9u8; SALT_LEN])];

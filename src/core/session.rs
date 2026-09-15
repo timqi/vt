@@ -67,7 +67,7 @@ pub enum NotifyKind {
     TouchIdRejected,
     Locked,
     /// A grant reuse satisfied sign/decrypt without a Touch ID prompt
-    /// (docs/app-bundle.md §3) — transparency for otherwise-silent reuse.
+    /// (docs/app-bundle.md#notifications) — transparency for otherwise-silent reuse.
     CacheHit,
 }
 

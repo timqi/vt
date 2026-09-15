@@ -6,7 +6,7 @@ export interface Env {
   ACCOUNT: DurableObjectNamespace;
   ASSETS: Fetcher;
   /** The one Wrangler secret: a KEK over the root key `R` stored in the
-   *  Durable Object (account_admin.ts, docs/worker-slim.md §2). Every other
+   *  Durable Object (account_admin.ts, docs/worker-slim.md#root-key-and-custody). Every other
    *  key — host tokens, admin sessions, the config blob, the cache scalar —
    *  derives from `R`, so this value alone opens nothing. Never logged, never
    *  sent to a host or a browser. */
@@ -62,7 +62,7 @@ export interface AuditRow {
    *  NOT NULL DEFAULT 'ceremony', so a read always has a value. */
   source: string;
   // Agent-authoritative context, source='agent' rows only
-  // (docs/approval-transparency.md §B). NULL = pre-field agent or non-agent
+  // (docs/approval-transparency.md#presentation). NULL = pre-field agent or non-agent
   // row; '' / 0 = a new agent said "not applicable" (fresh scope, non-sign op).
   /** Kernel-verified peer executable basename. */
   peer_exe: string | null;
@@ -107,7 +107,7 @@ export type AdminWsMessage =
   | { kind: 'audit'; event: 'insert' | 'update'; row: AuditRow };
 
 /** One record as every surface shows it: `name` is operator-owned (adopted or
- *  typed on the console), `claimed` is the client's 自报 (display only). */
+ *  typed on the console), `claimed` is the client's claim (display only). */
 export interface RecordName {
   salt_b64u: string;
   name: string | null;
@@ -295,13 +295,13 @@ export interface CacheListResponse {
   /** Entries scanned to build this listing. */
   scanned: number;
   /** True when the scan hit its cap — some entries are NOT shown. Never silently
-   *  truncate: the UI must say so, and 清除全部 still covers everything. */
+   *  truncate: the UI must say so, and Clear all still covers everything. */
   truncated: boolean;
   /** TTL options (seconds) an extension may request. */
   ttl_options_s: number[];
 }
 
-// ── Web Push (docs/worker-slim.md §5) ──────────────────────────────────────
+// ── Web Push (docs/worker-slim.md#web-push) ─────────────────────────────────
 
 /** One browser subscription, stored under K_cfg (account_admin.ts): endpoint +
  *  `p256dh` + `auth` together let anyone push readable notifications to that
@@ -352,7 +352,7 @@ export interface ChallengeMeta {
   /** Token path only: the IP of the token's PREVIOUS use when it differs from
    *  `ip` — an IP-change hint for the approver. '' / absent otherwise. */
   ip_prev?: string;
-  /** Client-suggested record names, one per salt, '' when unknown (自报). */
+  /** Client-suggested record names, one per salt, '' when unknown (claimed). */
   names?: string[];
 }
 
@@ -450,7 +450,7 @@ export interface ApprovePageData {
   /** One per salt: the owned name (truth line) and the client's claim. */
   records: RecordName[];
   /** TTL options (seconds) the PWA renders as cache-duration radios. Always
-   *  includes 0 ("不缓存", the default); only [0] when there is nothing to cache. */
+   *  includes 0 ("No cache", the default); only [0] when there is nothing to cache. */
   cache_options_s: number[];
   /** base64url 32-byte X25519 public key the PWA seals cached DEKs to. Empty
    *  string when the ceremony has no DEKs (PWA hides the UI). */
@@ -538,7 +538,7 @@ export interface AgentAuditEntry {
   /** `a_<agent_id>_<8 random bytes b64u>` — UNIQUE retry-dedup key. */
   token_id: string;
   meta?: Partial<ChallengeMeta>;
-  // Agent-authoritative context (docs/approval-transparency.md §B). Unlike
+  // Agent-authoritative context (docs/approval-transparency.md#presentation). Unlike
   // `meta` these are kernel/agent-derived, never client-claimed. All ABSENT
   // from an old agent — the ingest preserves absence as SQL NULL, while a
   // new agent sends ''/0/false for "not applicable".

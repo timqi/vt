@@ -5,7 +5,7 @@
 //   • rename is a session-gated PUT; an empty name deletes;
 //   • oversize / miscounted suggestions are refused at the edge (400);
 //   • names flow to audit rows (ceremony + hit), the cache listing and the hit push;
-//   • a record with neither name nor claim is labeled by its salt prefix, never 未命名.
+//   • a record with neither name nor claim is labeled by its salt prefix, never "unnamed".
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { env } from 'cloudflare:test';
@@ -54,7 +54,7 @@ async function createWithNames(salts: string[], names: string[] | undefined) {
 }
 
 describe('suggestions on the approval page', () => {
-  it('shows a claim as 自报 and never as the owned name', async () => {
+  it('shows a claim as claimed and never as the owned name', async () => {
     const salts = [nextSalt(), nextSalt()];
     const ch = await createWithNames(salts, ['GH_TOKEN', '']);
     const page = await doGet(`page?approve_token=${ch.approve_token}`);
@@ -200,7 +200,7 @@ describe('names on the audit, cache and push surfaces', () => {
       [[salts[0], 'GH_TOKEN', 'GH_TOKEN'], [salts[1], 'second', '']].sort());
   });
 
-  it('names the served records in the hit push, claims marked 自报', async () => {
+  it('names the served records in the hit push, claims marked (claimed)', async () => {
     const send = vi.spyOn(webpush, 'sendPush').mockResolvedValue({ status: 201 });
     const tasks: Promise<unknown>[] = [];
     const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']) as CryptoKeyPair;
@@ -228,7 +228,7 @@ describe('names on the audit, cache and push surfaces', () => {
     const body = JSON.parse(send.mock.calls[1]![1] as string) as { kind: string; body: string };
     expect(body.kind).toBe('cache_hit');
     // A record with neither name nor claim is its salt's first 8 chars.
-    expect(body.body).toContain(`records: A, B（自报）, ${salts[2]!.slice(0, 8)}…`);
+    expect(body.body).toContain(`records: A, B (claimed), ${salts[2]!.slice(0, 8)}…`);
     send.mockRestore();
   });
 });

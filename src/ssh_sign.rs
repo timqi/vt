@@ -5,7 +5,7 @@
 //! encrypt/decrypt ceremony with zero core/worker changes. `keygen` creates the
 //! identity here and `connect` is the git SSH driver implemented below.
 //!
-//! See `docs/ssh-vt-design.md` for the full design and security boundary.
+//! See `docs/sign-vt-design.md` for identity and forwarding boundaries.
 
 use anyhow::{bail, Context, Result};
 
@@ -198,7 +198,7 @@ fn write_new_file(path: &std::path::Path, contents: &[u8], mode: u32) -> Result<
 /// With `forward_real_agent` the ephemeral agent additionally acts as a
 /// filtering extension relay to the UPSTREAM real vt agent and is forwarded to
 /// the remote via standard agent forwarding — see `route_extension` and
-/// `docs/ssh-vt-design.md` (Forwarded relay).
+/// `docs/sign-vt-design.md#forwarded-relay`.
 pub async fn connect(
     vt_client: VTClient,
     args: Vec<String>,
@@ -784,7 +784,7 @@ impl ssh_agent_lib::agent::Session for SignerSession {
 //
 // The macOS `vt ssh agent` confines grants for connections that can carry
 // forwarded remote traffic to a per-connection `(pid, start_time)` subject
-// (activity scopes V2 — docs/authorization-scopes-v2.md). A plain forwarded
+// (docs/unified-authorization-engine.md#scopes). A plain forwarded
 // `ssh` is recognised by executable basename (`is_ssh_client_path`). With
 // `vt ssh connect --forward-real-agent`, the peer reaching the real agent is
 // instead the `vt` relay process, so the agent must recognise IT too and give
@@ -1065,7 +1065,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
-    // §9.3: the seed round-trips through base64url and reconstructs the same key.
+    // The seed round-trips through base64url and reconstructs the same key.
     // Guards NEW-B1 (an alphabet/padding mismatch would corrupt the key silently).
     #[test]
     fn seed_base64url_roundtrip_preserves_key() {

@@ -12,7 +12,7 @@ use ssh_agent_lib::proto::{Extension, Unparsed};
 // ---------------------------------------------------------------------------
 
 /// Outcome of the dedicated `diag@vt` call. Unlike [`VTClient::try_agent_extension`],
-/// the wire shapes stay distinct (see `docs/diag-design.md` §4): an agent that
+/// the wire shapes stay distinct (see `README.md#diagnostics`): an agent that
 /// merely *ignores* the unknown extension name (an older vt agent) answers SSH
 /// success with an empty payload, which is a different signal from an explicit
 /// `SSH_AGENT_FAILURE` (non-vt agent or a locked agent).
@@ -75,7 +75,7 @@ fn doctor_redact(key: &str, value: &str) -> String {
     // Bearer secrets: presence + length is enough to diagnose; showing a
     // prefix in terminal scrollback helps nobody.
     // VT_PASSKEY_TOKEN: say WHICH kind — the token id is public (it travels in
-    // a request header) and is what the admin 主机令牌 tab lists, so it is the
+    // a request header) and is what the admin Hosts tab lists, so it is the
     // one thing worth echoing; anything else (malformed, or the Worker master
     // pasted verbatim) is refused by the Worker and flagged here.
     if key == "VT_PASSKEY_TOKEN" {
@@ -126,7 +126,7 @@ fn routing_report(config: &ResolvedConfig) -> String {
 
 /// `vt doctor`: diagnose config sources, transport routing, and (when an
 /// agent is reachable) cache behavior via `diag@vt`. Read-only, never
-/// hard-fails on findings — always exits 0; see `docs/diag-design.md`.
+/// hard-fails on findings — always exits 0; see `README.md#diagnostics`.
 pub async fn doctor(config: &ResolvedConfig) -> Result<()> {
     println!("vt doctor — vt {}", env!("VT_VERSION"));
 

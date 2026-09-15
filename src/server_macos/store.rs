@@ -25,7 +25,7 @@ const STORE_NAME: &str = "store";
 const LOCK_FILE_NAME: &str = "vt-keychain.lock";
 pub const STORE_SCHEMA_VERSION: u32 = 1;
 
-/// Wrap-derivation version for `encrypted_passphrase` (docs/app-bundle.md §2):
+/// Wrap-derivation version for `encrypted_passphrase` (docs/app-bundle.md#master-key-wrap-v2):
 /// a fixed label, so the binary can move. The retired v1 mixed the binary
 /// path in; `derive_passcode_cipher` rejects anything but v2.
 /// `STORE_SCHEMA_VERSION` intentionally stays 1: old binaries can still parse

@@ -63,7 +63,7 @@ pub enum ScopeFamily {
 }
 
 impl ScopeFamily {
-    /// Stable tag for audit telemetry (docs/approval-transparency.md §B).
+    /// Stable tag for audit telemetry (docs/approval-transparency.md#presentation).
     /// One-way: never parsed back, so — unlike `ContextBasis` — no
     /// `from_wire` counterpart exists.
     pub fn as_wire(self) -> &'static str {
@@ -94,7 +94,7 @@ pub struct GrantScope {
     /// Human label of the scoped resource (destination host, workspace root,
     /// parent app) — the same string the Touch ID reuse line shows. Never
     /// hashed; carried into the grant store for `ui-status@vt` snapshots and
-    /// cache-hit notifications (docs/app-bundle.md §5). Memory-only.
+    /// cache-hit notifications (docs/app-bundle.md#status-and-revoke-boundary). Memory-only.
     display: String,
 }
 
@@ -312,7 +312,7 @@ impl GrantScope {
 
     /// True when an approval under this scope can create a standing grant —
     /// the condition under which the prompt must carry a reuse line
-    /// (docs/authorization-scopes-v2.md §6). Currently exercised only by the
+    /// (docs/approval-transparency.md). Currently exercised only by the
     /// invariant tests.
     #[cfg(test)]
     pub fn is_reusable(&self) -> bool {
@@ -488,7 +488,7 @@ struct KeyedScope {
 }
 
 /// One live grant as reported to the token-gated `ui-status@vt` channel
-/// (docs/app-bundle.md §5) — the deliberate whole-store exception to
+/// (docs/app-bundle.md#status-and-revoke-boundary) — the deliberate whole-store exception to
 /// diag@vt's caller-scoped counts. No digests, subjects, or key material;
 /// `display` is the same string the approval prompt showed.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -616,7 +616,7 @@ impl GrantStore {
     }
 
     /// Whole-store enumeration for the token-gated `ui-status@vt` channel
-    /// ONLY (docs/app-bundle.md §5). Sorted for stable UI ordering.
+    /// ONLY (docs/app-bundle.md#status-and-revoke-boundary). Sorted for stable UI ordering.
     fn snapshot_at(&self, now_mono: Instant, now_wall: SystemTime) -> Vec<GrantSnapshot> {
         let mut grants: Vec<GrantSnapshot> = self
             .entries
@@ -999,7 +999,7 @@ impl AuthorizationEngine {
     }
 
     /// Whole-store grant enumeration. ONLY for the token-gated `ui-status@vt`
-    /// handler (docs/app-bundle.md §5) — every other read surface stays
+    /// handler (docs/app-bundle.md#status-and-revoke-boundary) — every other read surface stays
     /// caller-scoped (`live_len`). Read-lock only; never sweeps or mutates.
     pub async fn snapshot(&self) -> Vec<GrantSnapshot> {
         self.store

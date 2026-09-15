@@ -366,8 +366,8 @@ impl VtSshSession {
     /// discloses no secret and mints no DEK), never cached, not audit-pushed
     /// (no human decision to record), and — enforced in `extension()` — it
     /// does not reset the idle-activity clock. `live_entries` is scoped to
-    /// THIS connection's resolved context; see `docs/diag-design.md` §3.4 for
-    /// the accepted disclosure tradeoffs.
+    /// THIS connection's resolved context; accepted disclosure tradeoffs are in
+    /// `docs/unified-authorization-engine.md#visibility`.
     pub(super) async fn handle_diag(
         &self,
         decrypted: &[u8],
@@ -414,7 +414,7 @@ impl VtSshSession {
         )))
     }
 
-    /// `ui-status@vt` (docs/app-bundle.md §5): token-gated status/revoke
+    /// `ui-status@vt` (docs/app-bundle.md#status-and-revoke-boundary): token-gated status/revoke
     /// channel for the VT.app shell. Runs BEFORE the lock check and the
     /// Keychain store load, never touches the idle clock, is
     /// never cached and never audit-pushed. The only whole-store grant
@@ -630,7 +630,7 @@ impl VtSshSession {
     /// Local callers get a kernel-verified workspace scope (one approval
     /// covers a same-project multi-host fan-out); relay callers stay confined
     /// to their connection. Duration `0` (the default) keeps per-request
-    /// prompts. See docs/authorization-scopes-v2.md §3.4.
+    /// prompts. See docs/unified-authorization-engine.md#scopes.
     pub(super) async fn handle_sign_vt(
         &self,
         decrypted: &[u8],

@@ -1,29 +1,11 @@
-# Slim refactor — targets and order
+# Open authorization-scope decision
 
-Status: **plan**. This document owns the `slim` branch: what leaves, what
-changes shape, what stays untouched. Each step is one reviewable change; the
-row is deleted here when it lands and the owning feature doc is updated in the
-same change.
+Decide whether local workspace, cwd, and parent-application scopes should remain
+separate or become one same-user local scope alongside verified destination
+scope. Forwarded traffic must remain confined.
 
-## Keep as is
+Before changing the policy, identify which approvals become broader and which
+workflows gain or lose prompt reuse. The current contract is
+[unified-authorization-engine.md](unified-authorization-engine.md).
 
-Two custodies stay: macOS Keychain + Touch ID for the local path, PRF passkey
-via the Worker for everything else. `auto` routing (agent first, Worker on
-recoverable errors), `inject` including `-r` file mode, `run@vt`, PAM `auth`,
-`diag@vt`, `ui-status@vt`, agent audit push, Worker DEK cache
-with its approve/extend ladders and admin.
-
-## 1. Migration layers (landed)
-
-Keychain wrap v1 and the audit SQLite rebuilds are gone. Rule: a
-compatibility branch is removed, never widened, and its test moves to a
-"rejected input" test.
-
-## 2. Decide, then do or drop
-
-- **Agent grant scopes.** `src/core/authorization.rs` + `ssh_agent/scopes.rs`
-  are 4k lines for four scope families. Candidate shape: two scopes only —
-  `local` (kernel-verified same-user caller) and `destination` (the
-  `session-bind@openssh.com` host key on a forwarded connection). Workspace,
-  cwd, and parent-app families would go. Needs a decision on how much prompt
-  reuse the local path loses.
+This is an unresolved task, not implemented behavior; remove it when decided.

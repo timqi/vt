@@ -63,18 +63,18 @@ function badRequest(msg: string): Response {
 }
 
 // Human TTL label matching the PWA's (approve.js ttlLabel), used in the approval
-// page's 命令 field so the approver reads the same wording everywhere.
-function ttlLabelZh(s: number): string {
-  // Days/weeks first: an approver reading "168 小时" on their phone cannot judge
+// page's Command field so the approver reads the same wording everywhere.
+function ttlLabel(s: number): string {
+  // Days/weeks first: an approver reading "168 h" on their phone cannot judge
   // it at a glance, and this string is the authority they are granting.
-  if (s % (7 * 86400) === 0) return (s / (7 * 86400)) + ' 周';
-  if (s % 86400 === 0) return (s / 86400) + ' 天';
-  if (s % 3600 === 0) return (s / 3600) + ' 小时';
-  if (s % 60 === 0) return (s / 60) + ' 分钟';
-  return s + ' 秒';
+  if (s % (7 * 86400) === 0) return (s / (7 * 86400)) + ' w';
+  if (s % 86400 === 0) return (s / 86400) + ' d';
+  if (s % 3600 === 0) return (s / 3600) + ' h';
+  if (s % 60 === 0) return (s / 60) + ' min';
+  return s + ' s';
 }
 
-function fmtTimeZh(ms: number): string {
+function fmtTime(ms: number): string {
   if (typeof ms !== 'number' || !Number.isFinite(ms)) return '?';
   return new Date(ms).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
 }
@@ -85,25 +85,25 @@ function fmtTimeZh(ms: number): string {
 // records, and for how long.
 function extendSummary(intent: CacheExtendIntent): string {
   const shown = intent.records.slice(0, 8).join(', ');
-  const more = intent.records.length > 8 ? ` …等 ${intent.records.length} 条` : '';
+  const more = intent.records.length > 8 ? ` … ${intent.records.length} total` : '';
   return [
-    'op: 延长 DEK 缓存有效期',
-    `scope: ${intent.host || '?'} · ${intent.project || '?'} · ${intent.salts_b64u.length} 条缓存`,
+    'op: extend DEK cache expiry',
+    `scope: ${intent.host || '?'} · ${intent.project || '?'} · ${intent.salts_b64u.length} entries`,
     `records: ${shown}${more}`,
-    `ttl: ${ttlLabelZh(intent.ttl_s)}（自批准时刻起算，覆盖原有效期）`,
-    `until: 现有效期最晚至 ${fmtTimeZh(intent.expires_ms)}`,
+    `ttl: ${ttlLabel(intent.ttl_s)} (from approval time, replaces the current expiry)`,
+    `until: currently expires by ${fmtTime(intent.expires_ms)}`,
   ].join('\n');
 }
 
 // Outcome line for the audit row, so a partial commit is legible without digging
-// through Worker logs (e.g. "4 条已延长 · 跳过: no_gain=2").
+// through Worker logs (e.g. "4 extended · skipped: no_gain=2").
 function extendOutcomeSummary(
   skips: Record<string, number>, total: number, latest: number,
 ): string {
-  const parts = [`${total} 条已延长`];
-  if (latest > 0) parts.push(`新有效期至 ${fmtTimeZh(latest)}`);
+  const parts = [`${total} extended`];
+  if (latest > 0) parts.push(`new expiry ${fmtTime(latest)}`);
   const skipStr = Object.entries(skips).map(([k, v]) => `${k}=${v}`).join(' ');
-  if (skipStr) parts.push(`跳过: ${skipStr}`);
+  if (skipStr) parts.push(`skipped: ${skipStr}`);
   return parts.join(' · ');
 }
 
@@ -123,18 +123,18 @@ function isPendingExpired(ch: Challenge, now: number): boolean {
 // host/user are what the requester typed; ip/origin are edge-verified.
 function enrollSummary(intent: EnrollIntent): string {
   const lines = [
-    'op: 签发主机令牌（7 天滑动有效期，每次使用自动续期）',
-    `host: ${intent.host || '?'}（自报）`,
+    'op: issue host token (7-day sliding expiry, renewed on every use)',
+    `host: ${intent.host || '?'} (claimed)`,
   ];
-  if (intent.user) lines.push(`user: ${intent.user}（自报）`);
-  if (intent.origin) lines.push(`from: ${intent.origin}（已验证）`);
-  lines.push(`pair: ${intent.pair_code}（与终端上显示的配对码比对）`);
+  if (intent.user) lines.push(`user: ${intent.user} (claimed)`);
+  if (intent.origin) lines.push(`from: ${intent.origin} (verified)`);
+  lines.push(`pair: ${intent.pair_code} (compare with the code shown in the terminal)`);
   return lines.join('\n');
 }
 
 // Ops the edge reaches on behalf of daemons and the approval page: token- or
 // capability-gated there, never by an admin session. Everything else is an
-// admin op and needs a verified session cookie (docs/worker-slim.md §3).
+// admin op and needs a verified session cookie (docs/worker-slim.md#sessions).
 const PUBLIC_OPS = new Set(['create', 'approve', 'reject', 'dek-cache', 'audit-ingest', 'page', 'enroll-create']);
 
 // One log line per decision, then the audit row's terminal state. `latency`
@@ -193,8 +193,11 @@ export class AccountDO extends DurableObject<Env> {
       this.tokens.initialize();
     });
     // Schedule initial alarm if none set (alarm() re-arms itself thereafter).
+    // An alarm already in the past is one the runtime failed to deliver (seen
+    // after wrangler dev restarts); re-arm rather than trust it, else the sweep
+    // never runs again until the next opCreate.
     this.ctx.storage.getAlarm()
-      .then(a => { if (a == null) return this.ctx.storage.setAlarm(Date.now() + TTL_MS); })
+      .then(a => { if (a == null || a <= Date.now()) return this.ctx.storage.setAlarm(Date.now() + TTL_MS); })
       .catch(e => logErr('alarm.init_failed', e));
   }
 
@@ -216,7 +219,7 @@ export class AccountDO extends DurableObject<Env> {
       case 'admin-login-challenge': return this.admin.loginChallenge();
       case 'admin-login':           return this.admin.login(request);
     }
-    // Unconfigured (§4.3): nothing but the open ops above answers.
+    // Unconfigured (docs/worker-slim.md#bootstrap): only the open ops above answer.
     if (!(await this.admin.load())) return notConfigured();
     if (!PUBLIC_OPS.has(op)) {
       const session = await this.admin.session(request);
@@ -857,7 +860,7 @@ export class AccountDO extends DurableObject<Env> {
     this.audit.agent(op);
     // An agent cache hit (sign / decrypt@vt served from the Touch ID auth
     // cache) had no human in the loop, so surface it like the Worker DEK-cache
-    // 免审批 notice. Throttled; fire-and-forget.
+    // approval-free notice. Throttled; fire-and-forget.
     if (op.outcome === 'cache_hit') this.notifications.agentCacheHit(op);
     return Response.json({ ok: true });
   }
@@ -925,7 +928,7 @@ export class AccountDO extends DurableObject<Env> {
     return out;
   }
 
-  // Admin: clear the named entries (the cache tab's 撤销). Authority-REDUCING,
+  // Admin: clear the named entries (the cache tab's Revoke). Authority-REDUCING,
   // so the session alone is sufficient — no ceremony. Exact keys, no scan: the
   // count is what storage removed.
   private async opCacheClearEntries(request: Request): Promise<Response> {
@@ -991,7 +994,7 @@ export class AccountDO extends DurableObject<Env> {
     const summary = extendSummary(intent);
     const ch = await this.mintAdminCeremony(now, {
       op_kind: 'cache-extend', command: summary, host: 'admin', user: '', pwd: '', project, ppid_cmd: '',
-      ip: request.headers.get('CF-Connecting-IP') ?? '', reason: '延长已授权的 DEK 缓存有效期',
+      ip: request.headers.get('CF-Connecting-IP') ?? '', reason: 'extend the expiry of granted DEK caches',
     }, { extend: intent });
     log('cache.extend_requested', { at: tokenPrefix(ch.approve_token), ttl_s: ttlS, entries: targets.length });
     const resp: CacheExtendCreateResponse = {

@@ -23,7 +23,7 @@ use crate::cf::{cf_post_with_timeout, hmac_auth_header, ChallengeMeta};
 
 /// Agent-derived audit context: kernel/agent-authoritative fields that ride
 /// as top-level siblings of the client-claimed `meta`
-/// (docs/approval-transparency.md §B) — the trust boundary between the two
+/// (docs/approval-transparency.md#presentation) — the trust boundary between the two
 /// is the point. The agent always sends every field, using `""`/`0`/`false`
 /// for "not applicable" (fresh scope, unknown peer, non-sign op); the Worker
 /// stores a field that is *absent* (old agent) as SQL NULL, keeping the two

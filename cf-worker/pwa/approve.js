@@ -35,15 +35,15 @@
 
         if (showMeta) {
             // The decision line (operation, record count) and the decision
-            // fields (记录, 主机, 命令) stay above the fold; the rest of the
-            // request folds into 详情 (docs/approval-transparency.md §C6).
+            // fields (records, host, command) stay above the fold; the rest of the
+            // request folds into Details (docs/approval-transparency.md#presentation).
             var metaSec = el('section', 'vt-ap-meta-section');
             refs.decision = el('h2', 'vt-ap-decision');
             metaSec.appendChild(refs.decision);
             refs.meta = el('dl', 'vt-ap-meta');
             metaSec.appendChild(refs.meta);
             refs.details = el('details', 'vt-ap-details');
-            refs.details.appendChild(el('summary', null, '详情'));
+            refs.details.appendChild(el('summary', null, 'Details'));
             refs.detailMeta = el('dl', 'vt-ap-meta');
             refs.details.appendChild(refs.detailMeta);
             metaSec.appendChild(refs.details);
@@ -54,33 +54,33 @@
 
         var cacheSec = el('section', 'vt-ap-cache-section');
         cacheSec.hidden = true;
-        cacheSec.appendChild(el('h2', null, '缓存解密授权'));
+        cacheSec.appendChild(el('h2', null, 'Cache decrypt authorization'));
         var warn = el('p', 'hint cache-warn');
         // Cache key binds the host token (hard) + project (advisory) — see
         // docs/dek-cache.md. The copy states each half's trust level so the
         // promised boundary matches the implemented one. Built as nodes to keep
         // the <strong> emphasis under CSP.
-        warn.appendChild(document.createTextNode('选择后，在该时长内、'));
-        warn.appendChild(el('strong', null, '同一主机令牌（已验证）且同一项目（客户端自报）'));
-        warn.appendChild(document.createTextNode('对这些记录的解密将'));
-        warn.appendChild(el('strong', null, '免手机审批'));
-        warn.appendChild(document.createTextNode('。默认不缓存。'));
+        warn.appendChild(document.createTextNode('For the chosen duration, decrypts of these records from the '));
+        warn.appendChild(el('strong', null, 'same host token (verified) and same project (client-claimed)'));
+        warn.appendChild(document.createTextNode(' will '));
+        warn.appendChild(el('strong', null, 'skip phone approval'));
+        warn.appendChild(document.createTextNode('. Default: no cache.'));
         cacheSec.appendChild(warn);
         // The reuse scope this approval would arm: the client-reported project
         // (its repository's common git dir, so every worktree shares one cache)
-        // — the approver must see that before tapping 同意.
+        // — the approver must see that before tapping Approve.
         refs.cacheScope = el('p', 'hint cache-scope');
         refs.cacheScope.hidden = true;
         cacheSec.appendChild(refs.cacheScope);
-        // Duration control: a glass segmented control, 不缓存 first and default.
+        // Duration control: a glass segmented control, No cache first and default.
         refs.cacheOpts = el('div', 'seg glass');
         refs.cacheOpts.setAttribute('role', 'radiogroup');
-        refs.cacheOpts.setAttribute('aria-label', '缓存时长');
+        refs.cacheOpts.setAttribute('aria-label', 'Cache duration');
         cacheSec.appendChild(refs.cacheOpts);
         refs.cacheSection = cacheSec;
         root.appendChild(cacheSec);
 
-        // Action bar: the status line over 同意 (2fr) / 拒绝 (1fr). Floats over
+        // Action bar: the status line over Approve (2fr) / Reject (1fr). Floats over
         // the standalone card; sticks to the sheet's bottom inline (admin.css).
         var bar = el('div', 'vt-ap-bar glass');
         refs.status = el('p', 'vt-ap-status');
@@ -88,9 +88,9 @@
         refs.status.setAttribute('aria-live', 'polite');
         bar.appendChild(refs.status);
         var actions = el('div', 'vt-ap-actions');
-        refs.approve = el('button', 'vt-ap-approve', '同意');
+        refs.approve = el('button', 'vt-ap-approve', 'Approve');
         refs.approve.type = 'button';
-        refs.reject = el('button', 'vt-ap-reject', '拒绝');
+        refs.reject = el('button', 'vt-ap-reject', 'Reject');
         refs.reject.type = 'button';
         actions.appendChild(refs.approve);
         actions.appendChild(refs.reject);
@@ -121,7 +121,7 @@
         var setStatus = vt.statusLine(refs.status);
 
         // Name inputs of the unnamed records, keyed by index into salts_b64u.
-        // Read at the 同意 tap (no await in between) and posted with the
+        // Read at the Approve tap (no await in between) and posted with the
         // approval; the Worker writes them only after the assertion verifies.
         var nameInputs = [];
 
@@ -139,21 +139,21 @@
                     var text = el('span', 'rec-text');
                     text.appendChild(el('strong', null, r.name));
                     if (r.claimed && r.claimed !== r.name) {
-                        text.appendChild(el('span', 'muted', '（客户端称 ' + r.claimed + '）'));
+                        text.appendChild(el('span', 'muted', ' (client calls it ' + r.claimed + ')'));
                     }
                     li.appendChild(text);
                 } else {
                     var input = document.createElement('input');
                     input.type = 'text';
                     input.className = 'vt-ap-name';
-                    input.placeholder = '记录名';
+                    input.placeholder = 'record name';
                     input.maxLength = 40;
                     input.autocomplete = 'off';
-                    input.setAttribute('aria-label', '记录名');
+                    input.setAttribute('aria-label', 'Record name');
                     input.setAttribute('data-index', String(records.indexOf(r)));
                     li.appendChild(input);
                     if (r.claimed) {
-                        var chip = el('button', 'chip', '客户端称 ' + r.claimed);
+                        var chip = el('button', 'chip', 'client calls it ' + r.claimed);
                         chip.type = 'button';
                         chip.addEventListener('click', function () { input.value = r.claimed; });
                         li.appendChild(chip);
@@ -195,41 +195,41 @@
                 var enrolling = !!data.enroll_pair_code;
                 var hostVerified = !enrolling && !!data.host_verified;
                 var records = Array.isArray(data.records) ? data.records : [];
-                // 类型 + 记录 · N 条 (N worker-derived) form the decision line;
+                // Type + N records (N worker-derived) form the decision line;
                 // the records themselves, named first, sit right under it.
                 refs.decision.textContent = (meta.op_kind || '')
-                    + (records.length > 0 ? ' · 记录 ' + records.length + ' 条' : '');
+                    + (records.length > 0 ? ' · ' + records.length + ' records' : '');
                 if (records.length > 0) refs.meta.parentNode.insertBefore(renderRecords(records), refs.meta);
                 var who = [meta.user, meta.host].filter(Boolean).join('@');
-                addRow(refs.meta, hostVerified ? '主机（已验证）' : '主机', who);
-                addRow(refs.meta, '命令', meta.command);
+                addRow(refs.meta, hostVerified ? 'Host (verified)' : 'Host', who);
+                addRow(refs.meta, 'Command', meta.command);
                 // Enrollment: the pairing code is the approver's proof that this
                 // request is the terminal in front of them, not a stranger's
                 // concurrent one. Big, on its own row.
                 if (enrolling) {
                     var prow = document.createElement('div');
-                    prow.appendChild(el('dt', null, '配对码'));
+                    prow.appendChild(el('dt', null, 'Pairing code'));
                     prow.appendChild(el('dd', 'vt-ap-pair', data.enroll_pair_code));
                     refs.meta.appendChild(prow);
                 }
-                addRow(refs.detailMeta, '目录', meta.pwd);
-                addRow(refs.detailMeta, '项目', meta.project);
-                addRow(refs.detailMeta, '父进程', meta.ppid_cmd);
+                addRow(refs.detailMeta, 'Directory', meta.pwd);
+                addRow(refs.detailMeta, 'Project', meta.project);
+                addRow(refs.detailMeta, 'Parent process', meta.ppid_cmd);
                 // Host-token path: this token last spoke from another IP.
-                addRow(refs.detailMeta, 'IP（已验证）', meta.ip
-                    ? meta.ip + (meta.ip_prev ? '（上次 ' + meta.ip_prev + '）' : '') : '');
-                addRow(refs.detailMeta, '原因', meta.reason);
+                addRow(refs.detailMeta, 'IP (verified)', meta.ip
+                    ? meta.ip + (meta.ip_prev ? ' (last ' + meta.ip_prev + ')' : '') : '');
+                addRow(refs.detailMeta, 'Reason', meta.reason);
                 refs.details.hidden = !refs.detailMeta.firstChild;
                 refs.metaNote.textContent = enrolling
-                    ? '主机 / 用户为申请方自报；IP 与来源已由服务端验证。仅当配对码与终端上显示的一致时批准。'
+                    ? 'Host / user are claimed by the requester; IP and origin are server-verified. Approve only if the pairing code matches the terminal.'
                     : hostVerified
-                        ? '记录名由服务端保存；主机 / 用户来自已登记的主机令牌，IP 已验证；其余为客户端自报信息，仅供参考。'
-                        : '记录名由服务端保存；除 IP 外均为客户端自报信息，仅供参考（该主机尚未 vt enroll）。';
+                        ? 'Record names are server-stored; host / user come from the enrolled host token, IP is verified; the rest is client-claimed, for reference only.'
+                        : 'Record names are server-stored; everything but the IP is client-claimed, for reference only (host not yet enrolled).';
             }
         }
 
         // ── DEK-cache duration selector ──────────────────────────────────
-        // Shown when this ceremony has DEKs to cache. Default = 0 ("不缓存"),
+        // Shown when this ceremony has DEKs to cache. Default = 0 ("No cache"),
         // which writes nothing.
         (function renderCacheOptions() {
             var optsList = data.cache_options_s || [];
@@ -238,12 +238,12 @@
             var scope = (data.metadata && data.metadata.project) || '';
             if (scope) {
                 refs.cacheScope.innerHTML = '';
-                refs.cacheScope.appendChild(document.createTextNode('缓存范围（项目）: '));
+                refs.cacheScope.appendChild(document.createTextNode('Cache scope (project): '));
                 refs.cacheScope.appendChild(el('strong', null, scope));
                 var literal = (data.metadata && data.metadata.pwd) || '';
                 if (literal && literal !== scope) {
                     refs.cacheScope.appendChild(
-                        document.createTextNode('（本次目录 ' + literal + '，同一项目的其他目录也将命中）'));
+                        document.createTextNode(' (this directory: ' + literal + '; other directories of the project hit too)'));
                 }
                 refs.cacheScope.hidden = false;
             }
@@ -254,7 +254,7 @@
                 input.type = 'radio';
                 input.name = 'cache-ttl';
                 input.value = String(s);
-                if (i === 0) input.checked = true; // 0 first → default 不缓存
+                if (i === 0) input.checked = true; // 0 first → default No cache
                 label.appendChild(input);
                 label.appendChild(el('span', null, ttlLabel(s)));
                 refs.cacheOpts.appendChild(label);
@@ -273,9 +273,9 @@
             var k = null, kWrap = null, masterKey = null, deks = null;
             var shared = null, bindingKey = null;
             try {
-                setStatus('请触摸 Passkey 完成验证…');
+                setStatus('Touch the Passkey to verify…');
                 // Read before the ceremony: the inputs are what the approver saw
-                // when they tapped 同意, not whatever a later edit made of them.
+                // when they tapped Approve, not whatever a later edit made of them.
                 var adoptNames = typedNames();
 
                 var PRF_INPUT = await prfInputReady;
@@ -303,26 +303,26 @@
                     },
                 });
 
-                setStatus('正在处理…');
+                setStatus('Processing…');
 
                 var usedId = b64uEnc(new Uint8Array(assertion.rawId));
                 var entry = null;
                 for (var j = 0; j < data.allow_credentials.length; j++) {
                     if (data.allow_credentials[j].id_b64u === usedId) { entry = data.allow_credentials[j]; break; }
                 }
-                if (!entry) throw new Error('使用的 Passkey 不在允许列表中');
+                if (!entry) throw new Error('The Passkey used is not on the allow list');
 
                 var ext = assertion.getClientExtensionResults && assertion.getClientExtensionResults();
                 var prfResult = ext && ext.prf && ext.prf.results && ext.prf.results.first;
                 if (!prfResult) {
-                    setStatus('此 Passkey 不支持 PRF 扩展，请换用 1Password 或 YubiKey', 'error');
+                    setStatus('This Passkey lacks the PRF extension; use 1Password or YubiKey', 'error');
                     return;
                 }
                 k = new Uint8Array(prfResult);
 
                 kWrap = await vt.deriveKWrap(k);
                 var kBytes = b64uDec(entry.k_b64u);
-                if (kBytes.length !== 60) throw new Error('k 字段长度异常: ' + kBytes.length);
+                if (kBytes.length !== 60) throw new Error('unexpected k length: ' + kBytes.length);
                 var iv = kBytes.slice(0, 12);
                 var ctTag = kBytes.slice(12);
                 var hBytes = b64uDec(entry.h_b64u);
@@ -335,10 +335,10 @@
                     masterKeyBuf = await crypto.subtle.decrypt(
                         { name: 'AES-GCM', iv: iv, additionalData: aad }, kWrapKey, ctTag);
                 } catch (_) {
-                    throw new Error('AES-GCM 解密失败：PRF 输出与注册记录不匹配，可能需要重新注册 Passkey');
+                    throw new Error('AES-GCM decrypt failed: PRF output does not match the registration; the Passkey may need re-registering');
                 }
                 masterKey = new Uint8Array(masterKeyBuf);
-                if (masterKey.length !== 32) throw new Error('master_key 长度异常: ' + masterKey.length);
+                if (masterKey.length !== 32) throw new Error('unexpected master_key length: ' + masterKey.length);
 
                 var salts = data.salts_b64u || [];
                 deks = new Uint8Array(Math.max(salts.length, 1) * 32);
@@ -355,7 +355,7 @@
                 masterKey = null; kWrap = null; k = null;
 
                 var daemonPk = b64uDec(data.daemon_pubkey_b64u);
-                if (daemonPk.length !== 32) throw new Error('daemon_pubkey 长度异常');
+                if (daemonPk.length !== 32) throw new Error('unexpected daemon_pubkey length');
                 var sealedDeks = await vt.sealBox(deks, daemonPk);
 
                 // INVARIANT: cache sealing MUST happen here — after sealing to the
@@ -365,7 +365,7 @@
                 var cacheSealed = null;
                 if (cacheTtlS > 0 && data.cache_pubkey_b64u && salts.length > 0) {
                     var cachePk = b64uDec(data.cache_pubkey_b64u);
-                    if (cachePk.length !== 32) throw new Error('cache_pubkey 长度异常');
+                    if (cachePk.length !== 32) throw new Error('unexpected cache_pubkey length');
                     cacheSealed = [];
                     for (var ci = 0; ci < salts.length; ci++) {
                         var dekSlice = deks.subarray(ci * 32, (ci + 1) * 32);
@@ -391,7 +391,7 @@
                 vt.zeroize(shared); shared = null;
                 vt.zeroize(bindingKey); bindingKey = null;
 
-                setStatus('正在提交…');
+                setStatus('Submitting…');
                 var resp = await fetch('/api/approve', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -409,15 +409,15 @@
                         adopt_names: adoptNames,
                     }),
                 });
-                if (!resp.ok) throw new Error('提交失败（HTTP ' + resp.status + '）');
-                setStatus('✓ 审批成功', 'ok');
+                if (!resp.ok) throw new Error('Submit failed (HTTP ' + resp.status + ')');
+                setStatus('✓ Approved', 'ok');
                 refs.approve.disabled = true;
                 refs.reject.disabled = true;
                 onSettled('approved');
             } catch (e) {
                 var m = (e && e.message) ? e.message : String(e);
-                if (/NotAllowed|not allowed/i.test(m)) m = '未找到匹配的 Passkey，或操作被取消';
-                setStatus('错误：' + m, 'error');
+                if (/NotAllowed|not allowed/i.test(m)) m = 'No matching Passkey, or the prompt was cancelled';
+                setStatus('Error: ' + m, 'error');
                 console.error(e);
             } finally {
                 vt.zeroize(k); vt.zeroize(kWrap); vt.zeroize(masterKey); vt.zeroize(deks);
@@ -428,7 +428,7 @@
         async function runReject() {
             refs.approve.disabled = true; refs.reject.disabled = true;
             try {
-                setStatus('请触摸 Passkey 完成拒绝…');
+                setStatus('Touch the Passkey to reject…');
                 var assertion = await navigator.credentials.get({
                     publicKey: {
                         challenge: b64uDec(data.reject_challenge_b64u),
@@ -440,7 +440,7 @@
                     },
                 });
                 var usedId = b64uEnc(new Uint8Array(assertion.rawId));
-                setStatus('正在提交拒绝…');
+                setStatus('Submitting rejection…');
                 var resp = await fetch('/api/reject', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -453,17 +453,17 @@
                     }),
                 });
                 if (!resp.ok) {
-                    if (resp.status === 410) setStatus('请求已失效（已审批或超时）', 'error');
-                    else setStatus('拒绝失败（HTTP ' + resp.status + '）', 'error');
+                    if (resp.status === 410) setStatus('Request no longer valid (already decided or timed out)', 'error');
+                    else setStatus('Reject failed (HTTP ' + resp.status + ')', 'error');
                     refs.approve.disabled = false; refs.reject.disabled = false;
                     return;
                 }
-                setStatus('✓ 已拒绝', 'ok');
+                setStatus('✓ Rejected', 'ok');
                 onSettled('rejected');
             } catch (e) {
                 var m = (e && e.message) ? e.message : String(e);
-                if (/NotAllowed|not allowed/i.test(m)) m = '未找到匹配的 Passkey，或操作被取消';
-                setStatus('错误：' + m, 'error');
+                if (/NotAllowed|not allowed/i.test(m)) m = 'No matching Passkey, or the prompt was cancelled';
+                setStatus('Error: ' + m, 'error');
                 console.error(e);
                 refs.approve.disabled = false; refs.reject.disabled = false;
             }

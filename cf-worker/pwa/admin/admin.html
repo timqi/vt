@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
   <title>VT</title>
@@ -17,33 +17,33 @@
        phone and the same strip, sticky at the top, on desktop (admin.css). -->
   <header class="page-head" id="page-head" hidden>
     <h1 id="page-title">VT</h1>
-    <nav class="tabbar glass" id="tabs" aria-label="控制台"></nav>
+    <nav class="tabbar glass" id="tabs" aria-label="Console"></nav>
   </header>
   <p id="shell-status" class="status" role="status" aria-live="polite"></p>
 
-  <!-- setup: no root key yet. The bootstrap form of docs/worker-slim.md §3.3;
+  <!-- setup: no root key yet. The bootstrap form of docs/worker-slim.md#bootstrap;
        the master is decrypted in this browser only and never posted. -->
   <section id="setup-view" class="view" hidden>
     <section class="card">
-      <div class="card-head"><h2>初始化：注册首个 Passkey</h2></div>
-      <p id="setup-reset" class="warn" hidden>⚠️ 检测到已有配置无法用当前 <code>SECRET</code> 解密（SECRET 已更换或丢失）。继续引导将覆盖它：Passkey、推送订阅与设置需重新配置，每台主机需重新 <code>vt enroll</code>。</p>
-      <p class="hint">此服务尚未初始化。首个 Passkey 的 master 必须等于 macOS <code>mac_key</code>：在 <strong>Mac 本机</strong>执行（Touch ID 门控），按提示设置一个一次性导出口令：</p>
+      <div class="card-head"><h2>Setup: register the first Passkey</h2></div>
+      <p id="setup-reset" class="warn" hidden>⚠️ Existing config cannot be decrypted with the current <code>SECRET</code> (changed or lost). Continuing overwrites it: Passkeys, push subscriptions and settings must be redone, and every host must <code>vt enroll</code> again.</p>
+      <p class="hint">Not initialized yet. The first Passkey's master must equal the macOS <code>mac_key</code>: run this <strong>on the Mac</strong> (Touch ID gated) and set a one-time export passphrase:</p>
       <pre class="cmd"><code>vt secret export</code></pre>
-      <p class="hint">把输出的 base64 与导出口令填入下方——解密只在本浏览器进行，<code>mac_key</code> 不上传。注册完成后本页即登录；请从正式域名打开本页，它将成为 WebAuthn origin。</p>
+      <p class="hint">Paste the base64 output and the passphrase below. Decryption happens in this browser only; <code>mac_key</code> is never uploaded. You are logged in once registered. Open this page from its final domain: it becomes the WebAuthn origin.</p>
       <div class="field">
-        <label for="master-blob">导出串（base64）</label>
-        <textarea id="master-blob" rows="3" placeholder="vt secret export 的输出，60 字节 base64url"></textarea>
+        <label for="master-blob">Export blob (base64)</label>
+        <textarea id="master-blob" rows="3" placeholder="output of vt secret export, 60-byte base64url"></textarea>
       </div>
       <div class="field">
-        <label for="master-pass">导出口令</label>
-        <input id="master-pass" type="password" placeholder="export 时设置的一次性口令">
+        <label for="master-pass">Export passphrase</label>
+        <input id="master-pass" type="password" placeholder="one-time passphrase set at export">
       </div>
       <div class="field">
-        <label for="bootstrap-label">标签</label>
-        <input id="bootstrap-label" type="text" placeholder="便于识别，如 iphone-icloud" maxlength="64">
+        <label for="bootstrap-label">Label</label>
+        <input id="bootstrap-label" type="text" placeholder="e.g. iphone-icloud" maxlength="64">
       </div>
       <section class="actions">
-        <button id="bootstrap-run" type="button">注册并登录</button>
+        <button id="bootstrap-run" type="button">Register and log in</button>
         <span class="status" role="status" aria-live="polite"></span>
       </section>
       <p id="setup-taken" class="warn" hidden></p>
@@ -53,9 +53,9 @@
   <!-- login: configured, no valid session. -->
   <section id="login-view" class="view" hidden>
     <section class="card">
-      <div class="card-head"><h2>登录</h2></div>
+      <div class="card-head"><h2>Log in</h2></div>
       <section class="actions">
-        <button id="login-run" type="button">使用 Passkey 登录</button>
+        <button id="login-run" type="button">Log in with Passkey</button>
         <span class="status" role="status" aria-live="polite"></span>
       </section>
     </section>
@@ -64,50 +64,50 @@
   <main id="console" hidden>
 
     <section class="tab-panel" id="tab-audit" hidden>
-      <p class="hint">每个挑战一行（pending / approved / rejected / expired）。「记录」列显示本次涉及记录的名称（服务端保存；客户端自报的名称标为「自报」，可在详情里点击重命名）。「缓存」列显示该次审批授予的 DEK 缓存时长；缓存的查看与撤销在「DEK 缓存」页。点击行查看命令、IP 等完整详情。保留 90 天，到期自动删除。</p>
+      <p class="hint">Kept 90 days. Tap a row for details.</p>
       <section class="filters">
-        <label>状态 <span class="select"><select id="f-status">
-          <option value="">全部</option>
+        <label><span class="sr-only">Status</span><span class="select"><select id="f-status">
+          <option value="">All statuses</option>
           <option value="pending">pending</option>
           <option value="approved">approved</option>
           <option value="rejected">rejected</option>
           <option value="expired">expired</option>
         </select></span></label>
-        <label>主机 <input class="f-host" type="text" placeholder="host"></label>
-        <button id="apply" type="button">查询</button>
+        <label><span class="sr-only">Host</span><input class="f-host" type="text" placeholder="host"></label>
+        <button id="apply" type="button">Search</button>
       </section>
       <div class="table-wrap"><table id="audit"><thead><tr>
-        <th>时间</th><th>状态</th><th>主机</th><th>项目</th><th>记录</th><th>缓存</th>
+        <th>Time</th><th>Status</th><th>Host</th><th>Project</th><th>Records</th><th>Cache</th>
       </tr></thead><tbody class="rows"></tbody></table></div>
       <section class="actions">
-        <button id="more" type="button">加载更多</button>
+        <button id="more" type="button">Load more</button>
         <span class="status" role="status" aria-live="polite"></span>
       </section>
     </section>
 
     <section class="tab-panel" id="tab-cache" hidden>
-      <p class="hint">当前<strong>真实存在</strong>的 DEK 缓存，每条记录一行，按「主机 · 项目」分组。在有效期内，持有同一 <code>VT_PASSKEY_TOKEN</code> 且项目（git 公共目录，否则为工作目录）一致的调用者可<strong>免手机审批</strong>解密该记录，所以此处的每一行都是一份仍然生效的授权。勾选条目或整个项目后可撤销（立即生效）或延长；<strong>延长必须经手机 Passkey 重新批准</strong>，一次一个项目，把每条的有效期重设为「批准时刻 + 所选时长」，可反复续期。已过期的缓存不再显示，也无法续期——只能重新审批。</p>
+      <p class="hint">Each row is a live approval-free grant. Revoke is immediate; extend needs a Passkey.</p>
       <section class="filters">
-        <label>主机 <input class="f-host" type="text" placeholder="host"></label>
-        <label>项目 <input class="f-project" type="text" placeholder="project"></label>
-        <button class="refresh" type="button">刷新</button>
+        <label><span class="sr-only">Host</span><input class="f-host" type="text" placeholder="host"></label>
+        <label><span class="sr-only">Project</span><input class="f-project" type="text" placeholder="project"></label>
+        <button class="refresh" type="button">Refresh</button>
         <span class="filter-spacer"></span>
         <div class="filter-danger">
-          <button class="clear-all-cache danger" type="button">清除全部</button>
+          <button class="clear-all-cache danger" type="button">Clear all</button>
         </div>
       </section>
       <section id="bulkbar" hidden>
         <span id="bulk-count" class="badge"></span>
-        <label id="extend-ttl-label">延长时长 <span class="select"><select id="extend-ttl"></select></span></label>
-        <button id="extend-selected" type="button">申请延长（需 Passkey）</button>
-        <button id="revoke-selected" type="button" class="danger">撤销</button>
+        <label id="extend-ttl-label">Extend by <span class="select"><select id="extend-ttl"></select></span></label>
+        <button id="extend-selected" type="button">Extend (Passkey)</button>
+        <button id="revoke-selected" type="button" class="danger">Revoke</button>
         <span id="extend-note" class="hint"></span>
       </section>
       <!-- Three columns; host, project and user live in the group header and
            the row's sheet. -->
       <div class="table-wrap"><table id="cache"><thead><tr>
-        <th class="col-pick"><input id="pick-all" type="checkbox" aria-label="全选"></th>
-        <th>记录</th><th>剩余 · 到期</th>
+        <th class="col-pick"><input id="pick-all" type="checkbox" aria-label="Select all"></th>
+        <th>Record</th><th>Remaining · Expires</th>
       </tr></thead><tbody class="rows"></tbody></table></div>
       <section class="actions">
         <span class="status" role="status" aria-live="polite"></span>
@@ -115,17 +115,17 @@
     </section>
 
     <section class="tab-panel" id="tab-tokens" hidden>
-      <p class="hint">每台主机经 <code>vt enroll</code> + 手机 Passkey 审批后获得<strong>自己的</strong> <code>VT_PASSKEY_TOKEN</code>。令牌有效期 7 天，<strong>每次使用自动重设为「此刻 + 7 天」</strong>；到期或被吊销后该主机的解密请求会被拒绝，需重新 enroll。吊销立即生效，不需要 Passkey。此处不显示令牌密文（Worker 从不存储它）。令牌派生自 Worker 的根密钥：轮换 <code>SECRET</code> 不影响令牌，恢复出厂（重新引导）会让所有令牌失效，每台主机需重新 enroll。</p>
+      <p class="hint">One token per <code>vt enroll</code>; expires 7 days after last use. Revoke is immediate.</p>
       <section class="filters">
-        <label>状态 <span class="select"><select class="f-live">
-          <option value="live">仅有效</option>
-          <option value="">全部（含已过期 / 已吊销）</option>
+        <label><span class="sr-only">Status</span><span class="select"><select class="f-live">
+          <option value="live">Live only</option>
+          <option value="">All (incl. expired/revoked)</option>
         </select></span></label>
-        <label>主机 <input class="f-host" type="text" placeholder="host"></label>
-        <button class="refresh" type="button">刷新</button>
+        <label><span class="sr-only">Host</span><input class="f-host" type="text" placeholder="host"></label>
+        <button class="refresh" type="button">Refresh</button>
       </section>
       <div class="table-wrap"><table id="tokens"><thead><tr>
-        <th>主机 / 用户</th><th>签发 IP · 来源</th><th>最近使用 / IP</th><th>剩余 / 到期时间</th><th>操作</th>
+        <th>Host / User</th><th>Issued from IP · Origin</th><th>Last used / IP</th><th>Remaining / Expires</th><th>Actions</th>
       </tr></thead><tbody class="rows"></tbody></table></div>
       <section class="actions">
         <span class="status" role="status" aria-live="polite"></span>
@@ -133,91 +133,91 @@
     </section>
 
     <section class="tab-panel" id="tab-setup" hidden>
-      <p class="hint">审批 ceremony 与本控制台登录共用这些 Passkey。新增时用现有 Passkey 的 PRF 解出 master 再为新 Passkey 包装，master 不离开本浏览器；吊销会结束所有会话（含本会话），最后一个 Passkey 不可吊销。</p>
+      <p class="hint">Used for approvals and this console. Revoking one ends all sessions; the last one cannot be revoked.</p>
 
       <section id="current-section" class="card">
         <div class="card-head">
-          <h2>当前 Passkey</h2>
+          <h2>Current Passkeys</h2>
           <span id="current-meta" class="badge"></span>
         </div>
         <div class="table-wrap"><table id="creds"><thead><tr>
-          <th>标签</th><th>凭据 ID</th><th>注册日期</th>
+          <th>Label</th><th>Credential ID</th><th>Registered</th>
         </tr></thead><tbody class="rows"></tbody></table></div>
       </section>
 
-      <div id="modes" class="seg glass" role="radiogroup" aria-label="操作模式">
-        <label><input type="radio" name="mode" value="add" checked><span>新增</span></label>
-        <label><input type="radio" name="mode" value="revoke"><span>吊销</span></label>
+      <div id="modes" class="seg glass" role="radiogroup" aria-label="Mode">
+        <label><input type="radio" name="mode" value="add" checked><span>Add</span></label>
+        <label><input type="radio" name="mode" value="revoke"><span>Revoke</span></label>
       </div>
 
       <section id="label-section" class="field">
-        <label for="label">标签</label>
-        <input id="label" type="text" placeholder="便于识别，如 iphone-icloud" maxlength="64">
+        <label for="label">Label</label>
+        <input id="label" type="text" placeholder="e.g. iphone-icloud" maxlength="64">
       </section>
 
       <section id="revoke-section" class="card" hidden>
         <div class="field">
-          <label for="revoke-pick">吊销条目</label>
+          <label for="revoke-pick">Passkey to revoke</label>
           <span class="select"><select id="revoke-pick"></select></span>
         </div>
-        <p class="warn">⚠️ 吊销 ≠ 密钥轮换：仅从允许列表移除，master_key 不变。若该 Passkey 的密文与 PRF 曾泄露，仍可离线解出同一 master_key。</p>
+        <p class="warn">⚠️ Revoke is not key rotation: master_key stays the same and a leaked wrap + PRF can still recover it offline.</p>
       </section>
 
       <section class="actions">
-        <button id="run" type="button">执行</button>
-        <button id="selfcheck" type="button" class="ghost">自检（逐条验证）</button>
+        <button id="run" type="button">Run</button>
+        <button id="selfcheck" type="button" class="ghost">Self-check (verify each)</button>
         <span class="status" role="status" aria-live="polite"></span>
       </section>
     </section>
 
     <section class="tab-panel" id="tab-settings" hidden>
       <section class="card">
-        <div class="card-head"><h2>会话</h2></div>
-        <p class="hint">登录会话 8 小时后到期。「退出登录」只清除本浏览器的 cookie；「退出所有会话」使每个已登录设备立即失效（吊销 Passkey 也会如此）。</p>
+        <div class="card-head"><h2>Sessions</h2></div>
+        <p class="hint">Sessions expire after 8 hours. Log out clears this browser only; Log out everywhere invalidates every device (revoking a Passkey does too).</p>
         <section class="actions">
-          <button id="logout" type="button" class="ghost">退出登录</button>
-          <button id="sessions-revoke" type="button" class="danger">退出所有会话</button>
+          <button id="logout" type="button" class="ghost">Log out</button>
+          <button id="sessions-revoke" type="button" class="danger">Log out everywhere</button>
           <span id="session-status" class="status" role="status" aria-live="polite"></span>
         </section>
       </section>
       <section class="card">
-        <div class="card-head"><h2>缓存与审批</h2></div>
-        <p class="hint">设置保存在 Durable Object 的加密配置里，保存即生效。审批页始终提供缓存时长，默认「不缓存」即不写入；命中通知每次免审批解密都会推送，默认关闭。UV 策略只能提高审批的验证级别，格式见 <code>docs/cf-worker-deploy.md</code>；留空为默认（<code>discouraged</code>）。</p>
+        <div class="card-head"><h2>Cache and approvals</h2></div>
+        <p class="hint">Saved in the Durable Object, effective immediately. The approval page always offers a cache duration; the default "no cache" writes nothing. Hit notifications push on every approval-free decrypt, off by default. UV policy can only raise the verification level; format in <code>docs/cf-worker-deploy.md</code>, empty means <code>discouraged</code>.</p>
         <div class="field">
-          <label class="switch"><input id="cfg-hit-notify" type="checkbox"> <span>缓存命中时推送通知</span></label>
+          <label class="switch"><input id="cfg-hit-notify" type="checkbox"> <span>Push a notification on cache hit</span></label>
         </div>
         <div class="field">
-          <label for="cfg-uv">UV 策略（JSON）</label>
+          <label for="cfg-uv">UV policy (JSON)</label>
           <textarea id="cfg-uv" rows="3" placeholder='{"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{"prod-db":"required"}}'></textarea>
         </div>
         <section class="actions">
-          <button id="cfg-save" type="button">保存</button>
+          <button id="cfg-save" type="button">Save</button>
           <span id="cfg-status" class="status" role="status" aria-live="polite"></span>
         </section>
       </section>
       <section class="card">
         <div class="card-head"><h2>SECRET</h2></div>
-        <p class="hint">Worker 唯一的 Wrangler secret，只用来包裹根密钥；轮换不影响 Passkey、主机令牌、推送订阅与缓存。点击后新值<strong>只显示一次</strong>：执行 <code>wrangler secret put SECRET</code> 粘贴它。新旧两个值在此期间都有效，Worker 第一次以新值启动后旧值即作废。</p>
+        <p class="hint">The Worker's only Wrangler secret; it wraps the root key, so rotating it keeps Passkeys, host tokens, push subscriptions and caches. The new value is <strong>shown once</strong>: run <code>wrangler secret put SECRET</code> and paste it. Both values work until the Worker first starts with the new one.</p>
         <section class="actions">
-          <button id="rotate-secret" type="button" class="danger">轮换 SECRET</button>
+          <button id="rotate-secret" type="button" class="danger">Rotate SECRET</button>
           <span id="rotate-status" class="status" role="status" aria-live="polite"></span>
         </section>
         <section id="rotate-output" class="card" hidden>
-          <div class="card-head"><h2>新 SECRET</h2><button id="rotate-copy" type="button" class="ghost">复制</button></div>
+          <div class="card-head"><h2>New SECRET</h2><button id="rotate-copy" type="button" class="ghost">Copy</button></div>
           <textarea id="rotate-value" rows="2" readonly></textarea>
-          <p class="hint"><code>wrangler secret put SECRET</code>，粘贴上面的值。关闭本页后无法再次查看；未及时部署可再次轮换。</p>
+          <p class="hint"><code>wrangler secret put SECRET</code>, paste the value above. It cannot be shown again after leaving this page; rotate again if you missed it.</p>
         </section>
       </section>
       <section class="card">
-        <div class="card-head"><h2>推送</h2></div>
-        <p class="hint">Web Push 直接送达本设备，无第三方。iOS 16.4+：Safari → 分享 → 添加到主屏幕，从图标打开本页再点「开启推送」；移除图标即停止推送。审批、enroll 与缓存命中（需开启上面的命中通知）都走这里。</p>
+        <div class="card-head"><h2>Push</h2></div>
+        <p class="hint">Web Push straight to this device, no third party. iOS 16.4+: Safari → Share → Add to Home Screen, open from the icon, then Enable push; removing the icon stops it. Approvals, enroll and cache hits (with the option above) all arrive here.</p>
         <section class="actions">
-          <button id="subscribe" type="button" disabled>开启推送</button>
-          <input id="push-label" type="text" placeholder="设备名，如 iphone" maxlength="64" aria-label="设备名">
+          <button id="subscribe" type="button" disabled>Enable push</button>
+          <input id="push-label" type="text" placeholder="device name, e.g. iphone" maxlength="64" aria-label="Device name">
           <span class="status" role="status" aria-live="polite"></span>
         </section>
         <div class="table-wrap"><table id="subs"><thead><tr>
-          <th>设备</th><th>推送服务</th><th>订阅时间</th><th>操作</th>
+          <th>Device</th><th>Push service</th><th>Subscribed</th><th>Actions</th>
         </tr></thead><tbody class="rows"></tbody></table></div>
       </section>
     </section>
@@ -228,7 +228,7 @@
        ceremony mounts through the SAME vt.mountApprove() the /a/:token page uses. -->
   <dialog id="detail" aria-modal="true" aria-labelledby="detail-title">
     <div class="sheet-grab" aria-hidden="true"></div>
-    <button id="detail-close" type="button" aria-label="关闭">×</button>
+    <button id="detail-close" type="button" aria-label="Close">×</button>
     <div class="sheet-body" id="detail-body">
       <h2 id="detail-title" hidden></h2>
       <dl id="detail-dl"></dl>

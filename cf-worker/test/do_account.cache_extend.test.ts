@@ -85,7 +85,7 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
       salts_b64u: keys.map(k => refOf(k).salt_b64u),
     });
     // What the approver reads names the scope and the records.
-    expect(ch.meta.command).toMatch(/testbox · \/home\/tester\/repo\/\.git · 2 条缓存/);
+    expect(ch.meta.command).toMatch(/testbox · \/home\/tester\/repo\/\.git · 2 entries/);
     expect(ch.meta.command).toMatch(/records: /);
   });
 
@@ -235,7 +235,7 @@ describe('opApprove → commitExtend — the only path that moves expires_ms', (
     // The effect row says plainly what moved and what did not.
     const effect = (await inDO(auditRows)).find(r => r.status === 'extended');
     expect(effect).toBeTruthy();
-    expect(effect!.reason).toMatch(/1 条已延长/);
+    expect(effect!.reason).toMatch(/1 extended/);
     expect(effect!.reason).toMatch(/expired=1/);
   });
 
@@ -250,7 +250,7 @@ describe('opApprove → commitExtend — the only path that moves expires_ms', (
     const after = await inDO(h => readEntries(h, keys));
     for (const e of after) expect(e.expires_ms).toBe(far);
     const effect = (await inDO(auditRows)).find(r => r.status === 'extended');
-    expect(effect!.reason).toMatch(/0 条已延长/);
+    expect(effect!.reason).toMatch(/0 extended/);
     expect(effect!.reason).toMatch(/no_gain=2/);
   });
 
@@ -380,13 +380,13 @@ describe('extension audit', () => {
     const ceremony = rows.find(r => r.op_kind === 'cache-extend');
     expect(ceremony).toBeTruthy();
     expect(ceremony!.status).toBe('approved');
-    expect(ceremony!.command).toMatch(/延长 DEK 缓存有效期/);
+    expect(ceremony!.command).toMatch(/extend DEK cache expiry/);
 
     const effect = rows.find(r => r.status === 'extended');
     expect(effect).toBeTruthy();
     expect(effect!.op_kind).toBe('cache');
     expect(effect!.source).toBe('cache');
-    expect(effect!.reason).toMatch(/3 条已延长/);
+    expect(effect!.reason).toMatch(/3 extended/);
   });
 
   it('never rewrites cache_ttl_s (the chosen TTL) while bumping cache_expires_ms per origin', async () => {

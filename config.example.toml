@@ -26,7 +26,7 @@
 # WebAuthn user-verification level to ASK FOR on the approval page:
 # discouraged (one click in the passkey prompt) | preferred | required (adds a
 # biometric step). Same as the global `vt --uv` flag, which overrides this.
-# Raise-only: the worker applies max(its own UV policy (admin 设置 tab), this), so
+# Raise-only: the worker applies max(its own UV policy (admin Settings tab), this), so
 # a host can demand more verification but never less. Unset = whatever the
 # worker's policy says.
 # VT_PASSKEY_UV = "required"
@@ -54,7 +54,7 @@
 # Startup defaults for `vt ssh agent`, so a supervisor (the VT.app menu-bar
 # shell) can spawn the agent without hardcoding your flags. Explicit CLI flags
 # always override these; none of these keys is an environment variable.
-# See docs/app-bundle.md §4.
+# See docs/app-bundle.md#agent-defaults-and-menu-overrides.
 # [agent]
 # timeout = 300                      # idle seconds before keys are cleared
 # ssh_auth_cache_duration = 0        # sign approval reuse seconds; 0 = always prompt

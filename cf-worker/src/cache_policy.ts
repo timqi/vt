@@ -90,7 +90,7 @@ export function isLive(v: unknown, now: number): v is CacheEntry {
 
 /** Decide the new absolute expiry for ONE entry, or why it is skipped.
  *
- *  Always measured from NOW — the moment of approval — so "延长 1 天" means one day
+ *  Always measured from NOW — the moment of approval — so "extend 1 d" means one day
  *  from the tap, not one day from whenever the entry happened to be created.
  *  created_ms is forensic metadata: required for the entry to be live at all,
  *  never an anchor for the new expiry.

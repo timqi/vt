@@ -22,7 +22,7 @@
   // returns to the login view rather than any tab rendering on stale data.
   vt.apiFetch = async function (url, init) {
     var resp = await fetch(url, init);
-    if (resp.status === 401) vt.showLogin('会话已失效，请重新登录');
+    if (resp.status === 401) vt.showLogin('Session expired, please log in again');
     return resp;
   };
   vt.postJson = function (path, body) {
@@ -122,19 +122,19 @@
     };
   };
 
-  // ── Record names (audit 记录 column + dialog, cache rows) ─────────────────
+  // ── Record names (audit Records column + dialog, cache rows) ─────────────────
   // One record's label: the operator-owned name, else the client's claim marked
-  // 自报, else the salt's first 8 chars — a handle that matches across rows
+  // claimed, else the salt's first 8 chars — a handle that matches across rows
   // (mirrors account_names.nameLabel).
   function isSaltLabel(r) { return !r.name && !r.claimed; }
   vt.recordLabel = function (r) {
-    return r.name || (r.claimed ? r.claimed + '（自报）' : (r.salt_b64u || '').slice(0, 8) + '…');
+    return r.name || (r.claimed ? r.claimed + ' (claimed)' : (r.salt_b64u || '').slice(0, 8) + '…');
   };
 
-  // Column content: the labels joined (a salt handle in <code>), or `N 条` for
+  // Column content: the labels joined (a salt handle in <code>), or `N records` for
   // a row that stored no records; null when there is nothing to show.
   vt.recordsSummary = function (records, n) {
-    if (!records || !records.length) return n > 0 ? vt.el('span', null, n + ' 条') : null;
+    if (!records || !records.length) return n > 0 ? vt.el('span', null, n + ' records') : null;
     var span = vt.el('span', 'rec-summary');
     records.forEach(function (r, i) {
       if (i) span.appendChild(document.createTextNode(', '));
@@ -166,14 +166,14 @@
         var li = document.createElement('li');
         var btn = vt.el('button', 'rec-name' + (r.name ? '' : ' unnamed') + (isSaltLabel(r) ? ' salt' : ''), vt.recordLabel(r));
         btn.type = 'button';
-        btn.title = '点击重命名';
+        btn.title = 'Click to rename';
         btn.addEventListener('click', function (e) { e.stopPropagation(); edit(li, r); });
         li.appendChild(btn);
-        if (r.name && r.claimed && r.claimed !== r.name) li.appendChild(vt.el('span', 'cell-sub', '客户端称 ' + r.claimed));
+        if (r.name && r.claimed && r.claimed !== r.name) li.appendChild(vt.el('span', 'cell-sub', 'client calls it ' + r.claimed));
         ul.appendChild(li);
       });
       if (!expanded && records.length > limit) {
-        var more = vt.el('button', 'rec-name more', '+' + (records.length - limit) + ' 条');
+        var more = vt.el('button', 'rec-name more', '+' + (records.length - limit) + ' more');
         more.type = 'button';
         more.addEventListener('click', function (e) { e.stopPropagation(); expanded = true; render(); });
         ul.appendChild(vt.el('li', null)).appendChild(more);
@@ -183,7 +183,7 @@
       var input = document.createElement('input');
       input.type = 'text'; input.maxLength = 40; input.value = r.name || r.claimed || '';
       input.className = 'rec-edit';
-      input.setAttribute('aria-label', '记录名');
+      input.setAttribute('aria-label', 'Record name');
       input.addEventListener('click', function (e) { e.stopPropagation(); });
       input.addEventListener('keydown', function (e) {
         if (e.key === 'Escape') { e.stopPropagation(); render(); }
@@ -206,7 +206,7 @@
           if (onSaved) onSaved(r);
         } catch (e) {
           input.disabled = false; saving = false;
-          input.setCustomValidity('保存失败：' + (e.message || e));
+          input.setCustomValidity('Save failed: ' + (e.message || e));
           input.reportValidity();
           return;
         }
@@ -366,8 +366,8 @@
   // Marks are single Unicode glyphs (no icon set); the label sits under the
   // mark on a phone, beside it on desktop.
   var TABS = [
-    ['audit', '审计', '≣'], ['cache', 'DEK 缓存', '◷'], ['tokens', '主机令牌', '⌂'],
-    ['setup', 'Passkey', '⚷'], ['settings', '设置', '⚙\uFE0E'],
+    ['audit', 'Audit', '≣'], ['cache', 'DEK Cache', '◷'], ['tokens', 'Hosts', '⌂'],
+    ['setup', 'Passkey', '⚷'], ['settings', 'Settings', '⚙\uFE0E'],
   ];
   var started = {};
 
@@ -448,15 +448,15 @@
       btn.disabled = true;
       try {
         var ch = await vt.postJson('login-challenge');
-        if (!ch.ok) throw new Error(ch.status === 429 ? '登录尝试过多，请稍后再试' : 'HTTP ' + ch.status);
+        if (!ch.ok) throw new Error(ch.status === 429 ? 'Too many login attempts, try again later' : 'HTTP ' + ch.status);
         var c = await ch.json();
-        setStatus('请完成 Passkey 验证…');
+        setStatus('Complete the Passkey prompt…');
         // No allowCredentials: registration required resident keys, so the
         // authenticator discovers the credential and the page lists nothing.
         var a = await navigator.credentials.get({ publicKey: {
           challenge: vt.b64uDec(c.challenge_b64u), rpId: c.rp_id, userVerification: 'required',
         } });
-        if (!a) throw new Error('验证被取消');
+        if (!a) throw new Error('Verification cancelled');
         var r = a.response;
         var resp = await vt.postJson('login', {
           challenge_id: c.challenge_id,
@@ -465,12 +465,12 @@
           authenticator_data_b64u: vt.b64uEnc(new Uint8Array(r.authenticatorData)),
           signature_b64u: vt.b64uEnc(new Uint8Array(r.signature)),
         });
-        if (resp.status !== 204) throw new Error(resp.status === 401 ? '登录失败：Passkey 未注册或验证未通过' : 'HTTP ' + resp.status);
-        setStatus('已登录', 'ok');
+        if (resp.status !== 204) throw new Error(resp.status === 401 ? 'Login failed: Passkey not registered or verification failed' : 'HTTP ' + resp.status);
+        setStatus('Logged in', 'ok');
         location.reload();
       } catch (e) {
         var msg = (e && e.message) ? e.message : String(e);
-        if (/NotAllowed|not allowed/i.test(msg)) msg = '未找到匹配 Passkey 或操作被取消';
+        if (/NotAllowed|not allowed/i.test(msg)) msg = 'No matching Passkey, or the prompt was cancelled';
         setStatus(msg, 'error');
       } finally { btn.disabled = false; }
     });
@@ -479,12 +479,12 @@
   document.addEventListener('DOMContentLoaded', function () {
     var shellStatus = vt.statusLine(document.getElementById('shell-status'));
     var data = vt.bootData();
-    if (!data) { shellStatus('页面初始化失败：缺少或无法解析 vt-data', 'error'); return; }
+    if (!data) { shellStatus('Page init failed: vt-data missing or unparsable', 'error'); return; }
     switch (data.state) {
       case 'console': show('console'); bootConsole(data); break;
       case 'login': vt.showLogin(''); break;
       case 'setup': show('setup-view'); vt.views.setup(document.getElementById('setup-view'), data); break;
-      default: shellStatus('未知页面状态：' + String(data.state), 'error');
+      default: shellStatus('Unknown page state: ' + String(data.state), 'error');
     }
   });
 })();

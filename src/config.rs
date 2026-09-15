@@ -210,7 +210,7 @@ fn upsert_toml(existing: &str, pairs: &[(&str, &str)]) -> anyhow::Result<String>
 
 /// Optional `[agent]` table in the same config file: startup *defaults* for
 /// `vt ssh agent`, so a supervisor (the VT.app shell) can spawn the agent
-/// without hardcoding the operator's flags (docs/app-bundle.md §4). Explicit
+/// without hardcoding flags (docs/app-bundle.md#agent-defaults-and-menu-overrides). Explicit
 /// CLI flags always override these; the env-over-file invariant is untouched
 /// because no key here is an env var (`hydrate_env_from_file` skips tables).
 #[derive(Debug, Default, Clone, serde::Deserialize)]

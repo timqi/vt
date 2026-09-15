@@ -1,6 +1,6 @@
 // Operator-owned display names for records, keyed by the 16-byte salt the
 // Worker sees on every ceremony (docs/dek-cache.md). The client may suggest a
-// name (`meta.names`, 自报); nothing lands here without the approver typing or
+// name (`meta.names`, claimed); nothing lands here without the approver typing or
 // adopting it on the approval page or the console renaming it. Synchronous SQL
 // like account_audit.ts, so a lookup never opens a ceremony's input gate.
 
@@ -36,7 +36,7 @@ export function checkAdopt(raw: unknown, count: number): { index: number; name: 
 // the owned name, else the client's claim marked as such, else the salt's
 // first 8 characters — a stable handle the operator can match across rows.
 export function nameLabel(r: RecordName): string {
-  return r.name ?? (r.claimed ? `${r.claimed}（自报）` : `${r.salt_b64u.slice(0, 8)}…`);
+  return r.name ?? (r.claimed ? `${r.claimed} (claimed)` : `${r.salt_b64u.slice(0, 8)}…`);
 }
 
 export class AccountNames {

@@ -58,9 +58,9 @@
     // Parse the #vt-data block; null (and a console error) when absent/invalid.
     vt.bootData = function () {
         var raw = document.getElementById('vt-data');
-        if (!raw) { console.error('页面初始化失败：缺少 vt-data 块'); return null; }
+        if (!raw) { console.error('page init failed: vt-data block missing'); return null; }
         try { return JSON.parse(raw.textContent); }
-        catch (e) { console.error('页面数据解析失败', e); return null; }
+        catch (e) { console.error('page data parse failed', e); return null; }
     };
 
     // Absolute local time, YYYY-MM-DD HH:MM:SS; '' for anything but a positive ms.
@@ -75,27 +75,27 @@
     // Coarse remaining-time label; callers re-render on a ticker, so minute
     // granularity is honest (never a second-precision value that is stale).
     vt.fmtRemaining = function (ms) {
-        if (ms <= 0) return '已过期';
+        if (ms <= 0) return 'expired';
         var mins = Math.floor(ms / 60000);
-        if (mins < 1) return '< 1 分钟';
-        if (mins < 60) return mins + ' 分钟';
-        // Roll over to days past 24h: with a one-week ceiling, "167 小时 47 分" is
+        if (mins < 1) return '< 1 min';
+        if (mins < 60) return mins + ' min';
+        // Roll over to days past 24h: with a one-week ceiling, "167 h 47 min" is
         // a number an operator has to do arithmetic on before judging the risk.
         if (mins >= 1440) {
             var d = Math.floor(mins / 1440), dh = Math.floor((mins % 1440) / 60);
-            return d + ' 天' + (dh ? ' ' + dh + ' 小时' : '');
+            return d + ' d' + (dh ? ' ' + dh + ' h' : '');
         }
         var h = Math.floor(mins / 60), m = mins % 60;
-        return h + ' 小时' + (m ? ' ' + m + ' 分' : '');
+        return h + ' h' + (m ? ' ' + m + ' min' : '');
     };
 
     vt.ttlLabel = function (s) {
-        if (s === 0) return '不缓存';
-        if (s % 604800 === 0) return (s / 604800) + ' 周';
-        if (s % 86400 === 0) return (s / 86400) + ' 天';
-        if (s % 3600 === 0) return (s / 3600) + ' 小时';
-        if (s % 60 === 0) return (s / 60) + ' 分钟';
-        return s + ' 秒';
+        if (s === 0) return 'No cache';
+        if (s % 604800 === 0) return (s / 604800) + ' w';
+        if (s % 86400 === 0) return (s / 86400) + ' d';
+        if (s % 3600 === 0) return (s / 3600) + ' h';
+        if (s % 60 === 0) return (s / 60) + ' min';
+        return s + ' s';
     };
 
     var PRF_INFO_BYTES = new TextEncoder().encode('vt-master-wrap-v1');
@@ -141,7 +141,7 @@
         try {
             kp = await crypto.subtle.generateKey(X25519, false, ['deriveBits']);
         } catch (_) {
-            throw new Error('此浏览器不支持 X25519（需 Safari 17 / Chrome 133 / Firefox 130 及以上）');
+            throw new Error('This browser lacks X25519 (needs Safari 17 / Chrome 133 / Firefox 130 or newer)');
         }
         return { privateKey: kp.privateKey, pk: new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey)) };
     };
@@ -151,7 +151,7 @@
     vt.x25519 = async function (privateKey, peerPk) {
         var pub = await crypto.subtle.importKey('raw', peerPk, X25519, false, []);
         var ss = new Uint8Array(await crypto.subtle.deriveBits({ name: 'X25519', public: pub }, privateKey, 256));
-        if (ss.every(function (b) { return b === 0; })) throw new Error('X25519 共享密钥为零');
+        if (ss.every(function (b) { return b === 0; })) throw new Error('X25519 shared secret is zero');
         return ss;
     };
 
@@ -159,7 +159,7 @@
     // info), nonce 0^12, m, aad=epk‖rpk). One ephemeral key per message; the
     // AES key is derived straight into a non-extractable CryptoKey.
     vt.sealBox = async function (m, recipientPk) {
-        if (recipientPk.length !== 32) throw new Error('recipient key 长度异常');
+        if (recipientPk.length !== 32) throw new Error('unexpected recipient key length');
         var eph = await vt.x25519Keypair();
         var header = new Uint8Array(64);
         header.set(eph.pk, 0);

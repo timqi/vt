@@ -149,7 +149,7 @@ describe('opDekCache — batched reads', () => {
 
   // Rejected input: an entry sealed by the previous release's libsodium
   // crypto_box_seal (docs/sealed-box-v1.md, Rollout). The operator step is
-  // 清除全部 DEK 缓存; one left behind must be a miss that removes itself, never
+  // Clear all DEK caches; one left behind must be a miss that removes itself, never
   // an open under the old algorithm and never a 500.
   it('misses on a pre-v1 libsodium entry and sweeps it', async () => {
     const salts = await armCache(2);

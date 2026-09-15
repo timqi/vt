@@ -1,6 +1,6 @@
 // Web Push is the only channel. These tests pin what the ceremony path must
 // never do (await a push, report one to the CLI) and what fan-out does with
-// the push service's answers, inside the real DO (docs/worker-slim.md §5).
+// the push service's answers, inside the real DO (docs/worker-slim.md#web-push).
 
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
@@ -78,7 +78,7 @@ describe('AccountNotifications push contract', () => {
       expect(p.kind).toBe('approval');
       expect(p.url).toBe(`https://vt.test.invalid/a/${ch.approve_token}`);
       expect(p.tag).toBe(`a:${ch.approve_token}`);
-      expect(p.title).toBe('VT 审批: decrypt');
+      expect(p.title).toBe('VT approval: decrypt');
       expect(p.body).not.toContain('https://');
       expect(p.body).toContain(`${ch.meta.user}@${ch.meta.host}`);
     });
@@ -138,7 +138,7 @@ describe('AccountNotifications push contract', () => {
       expect(send).toHaveBeenCalledTimes(8);
       const p = JSON.parse(send.mock.calls[0]![1]) as { kind: string; body: string; url: string; tag: string };
       expect(p.kind).toBe('cache_hit');
-      expect(p.body).toContain('缓存命中，免 Touch ID');
+      expect(p.body).toContain('cache hit, no Touch ID');
       expect(p.url).toBe('https://vt.test.invalid/admin#audit');
       expect(p.tag).toBe(`cache:${op.meta.host}`);
       expect(send.mock.calls[0]!.slice(4)).toEqual([3600, 'normal']);

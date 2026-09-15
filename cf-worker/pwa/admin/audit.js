@@ -62,26 +62,33 @@ vt.tabs.audit = function (panel) {
   // distinguishes them (approved=hit, miss, cleared).
   function opKindLabel(row) {
     if (row.op_kind === 'cache') {
-      if (row.status === 'approved') return 'DEK缓存自动审批';
-      if (row.status === 'write_failed') return 'DEK缓存写入失败';
-      if (row.status === 'extended') return 'DEK缓存已延长';
-      return 'DEK缓存';
+      if (row.status === 'approved') return 'DEK cache auto-approval';
+      if (row.status === 'write_failed') return 'DEK cache write failed';
+      if (row.status === 'extended') return 'DEK cache extended';
+      return 'DEK cache';
     }
     // The admin-requested, Passkey-approved cache extension ceremony.
-    if (row.op_kind === 'cache-extend') return '延长DEK缓存(审批)';
+    if (row.op_kind === 'cache-extend') return 'Extend DEK cache (approval)';
     return row.op_kind || '';
+  }
+
+  // Challenge TTL (do_account.ts TTL_MS). The server's read-time expiry check is
+  // authoritative; a stored 'pending' past this is only awaiting the alarm sweep.
+  var CHALLENGE_TTL_MS = 5 * 60 * 1000;
+  function pendingLapsed(row) {
+    return row.status === 'pending' && Date.now() - row.created_ms >= CHALLENGE_TTL_MS;
   }
 
   function statusBadge(row) {
     var span = document.createElement('span');
-    var s = row.status || '—';
+    var s = pendingLapsed(row) ? 'expired' : (row.status || '—');
     // Cache rows render a distinct, self-explaining badge instead of a bare
     // "approved" (which would look like a normal phone approval).
     if (row.op_kind === 'cache') {
       span.className = 'badge badge-' + (s === 'write_failed' ? 'rejected'
         : s === 'extended' ? 'expired' : 'approved');
-      span.textContent = (s === 'write_failed') ? '缓存写入失败'
-        : (s === 'extended') ? '缓存已延长' : '缓存命中';
+      span.textContent = (s === 'write_failed') ? 'cache write failed'
+        : (s === 'extended') ? 'cache extended' : 'cache hit';
       return span;
     }
     span.className = 'badge badge-' + s;
@@ -95,23 +102,25 @@ vt.tabs.audit = function (panel) {
   function renderRow(r) {
     // data-cache-live drives the cache-expiry timer: it only re-renders a row
     // when this flag flips from live→elapsed, avoiding needless DOM churn.
+    // data-pending-live: same trick for a pending row that ages past TTL.
     var live = hasLiveCache(r);
+    var pendingLive = r.status === 'pending' && !pendingLapsed(r);
     var badge = statusBadge(r);
     var recs = vt.recordsSummary(r.records, r.salts);
     var proj = vt.projectName(r.project);
-    // 缓存: live → TTL label; armed-but-elapsed → grey 过期; never armed → —.
-    var cache = (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) ? (live ? ttlLabel(r.cache_ttl_s) : '过期') : '—';
+    // Cache: live → TTL label; armed-but-elapsed → grey expired; never armed → —.
+    var cache = (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) ? (live ? ttlLabel(r.cache_ttl_s) : 'expired') : '—';
     return list.item({
       cls: 'clickable',
-      attrs: { id: r.id, 'cache-live': live ? '1' : '0' },
+      attrs: { id: r.id, 'cache-live': live ? '1' : '0', 'pending-live': pendingLive ? '1' : '0' },
       click: function () { openDetail(r.id); },
       cells: function () {
-        // 记录: the row's records by name (server-owned, else the 自报 claim),
+        // Records: the row's records by name (server-owned, else the client's claim),
         // or the bare count for rows written before names were stored.
         // Command and IP live in the detail sheet.
         return [cell(fmtTime(r.created_ms)), cell(badge), cellClipped(r.host, 'col-host'),
           cellClipped(proj, 'col-proj'), cellClipped(recs, 'col-rec'),
-          cell(cache, cache === '过期' ? 'cache-expired' : null)];
+          cell(cache, cache === 'expired' ? 'cache-expired' : null)];
       },
       row: function () {
         // Sub line: the project, then the records; the full path is in the sheet.
@@ -120,7 +129,7 @@ vt.tabs.audit = function (panel) {
         return {
           main: r.host || '—',
           sub: [line,
-            vt.el('div', null, fmtTime(r.created_ms) + (cache !== '—' ? ' · 缓存 ' + cache : ''))],
+            vt.el('div', null, fmtTime(r.created_ms) + (cache !== '—' ? ' · cache ' + cache : ''))],
           trail: badge,
         };
       },
@@ -260,32 +269,32 @@ vt.tabs.audit = function (panel) {
     var d = vt.dialog.open({ onClose: onDialogClosed });
     var dl = d.dl;
     openDetailId = id;
-    addRow(dl, '状态', r.status + (r.verify_failures ? '（验证失败 ' + r.verify_failures + ' 次）' : ''));
-    addRow(dl, '来源', r.source || 'ceremony');
-    addRow(dl, '类型', opKindLabel(r));
-    addRow(dl, '主机', r.host);
-    addRow(dl, '用户', r.user);
-    addRow(dl, '目录', r.pwd);
-    addRow(dl, '项目', r.project);
-    addRow(dl, '终端', r.tty);
-    addRow(dl, '父进程', r.ppid_cmd);
-    if (r.ppid != null) addRow(dl, '父进程PID', r.ppid);
+    addRow(dl, 'Status', r.status + (r.verify_failures ? ' (' + r.verify_failures + ' verify failures)' : ''));
+    addRow(dl, 'Source', r.source || 'ceremony');
+    addRow(dl, 'Type', opKindLabel(r));
+    addRow(dl, 'Host', r.host);
+    addRow(dl, 'User', r.user);
+    addRow(dl, 'Directory', r.pwd);
+    addRow(dl, 'Project', r.project);
+    addRow(dl, 'TTY', r.tty);
+    addRow(dl, 'Parent process', r.ppid_cmd);
+    if (r.ppid != null) addRow(dl, 'Parent PID', r.ppid);
     // Agent-authoritative fields (source='agent' rows; addRow skips ''/null,
     // so pre-migration and non-agent rows render unchanged).
-    addRow(dl, '调用进程', r.peer_exe);
-    addRow(dl, '密钥', r.key_fp);
-    addRow(dl, '目的主机', r.dest);
-    addRow(dl, '复用范围', r.scope_label);
-    addRow(dl, '范围类型', r.scope_family);
-    if (typeof r.grant_ttl_s === 'number' && r.grant_ttl_s > 0) addRow(dl, '授权时长', ttlLabel(r.grant_ttl_s));
-    if (r.relayed === 1) addRow(dl, '经中继', '是');
-    addRow(dl, 'SSH 来源', r.ssh_client);
+    addRow(dl, 'Caller', r.peer_exe);
+    addRow(dl, 'Key', r.key_fp);
+    addRow(dl, 'Destination', r.dest);
+    addRow(dl, 'Reuse scope', r.scope_label);
+    addRow(dl, 'Scope family', r.scope_family);
+    if (typeof r.grant_ttl_s === 'number' && r.grant_ttl_s > 0) addRow(dl, 'Grant duration', ttlLabel(r.grant_ttl_s));
+    if (r.relayed === 1) addRow(dl, 'Relayed', 'yes');
+    addRow(dl, 'SSH client', r.ssh_client);
     addRow(dl, 'IP', r.ip);
-    addRow(dl, 'DEK 数', r.salts);
+    addRow(dl, 'DEKs', r.salts);
     // Records with inline rename; a saved name updates this row's cached copy so
     // the table cell and a later re-open agree without a refetch.
     if (r.records && r.records.length) {
-      dl.appendChild(vt.el('dt', null, '记录'));
+      dl.appendChild(vt.el('dt', null, 'Records'));
       var dd = vt.el('dd', null);
       dd.appendChild(vt.recordList(r.records, function () {
         var fresh = renderRow(r);
@@ -295,15 +304,15 @@ vt.tabs.audit = function (panel) {
       }));
       dl.appendChild(dd);
     }
-    if (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) addRow(dl, '缓存 TTL', ttlLabel(r.cache_ttl_s));
+    if (typeof r.cache_ttl_s === 'number' && r.cache_ttl_s > 0) addRow(dl, 'Cache TTL', ttlLabel(r.cache_ttl_s));
     // Actual expiry (updated by an approved extension); shown alongside the
     // originally-approved TTL so an extended row is self-explaining.
-    if (typeof r.cache_expires_ms === 'number') addRow(dl, '缓存到期', fmtTime(r.cache_expires_ms));
-    addRow(dl, '命令', r.command, true);
-    addRow(dl, '原因', r.reason);
-    addRow(dl, '创建时间', fmtTime(r.created_ms));
-    addRow(dl, '终态时间', fmtTime(r.finalized_ms));
-    addRow(dl, '延迟(ms)', r.latency_ms);
+    if (typeof r.cache_expires_ms === 'number') addRow(dl, 'Cache expires', fmtTime(r.cache_expires_ms));
+    addRow(dl, 'Command', r.command, true);
+    addRow(dl, 'Reason', r.reason);
+    addRow(dl, 'Created', fmtTime(r.created_ms));
+    addRow(dl, 'Finalized', fmtTime(r.finalized_ms));
+    addRow(dl, 'Latency (ms)', r.latency_ms);
     addRow(dl, 'token', r.token_id);
     // Pending ceremony rows (token_id IS the approve_token) get the approval
     // ceremony mounted inline — approve/reject happen right here, no new tab.
@@ -369,11 +378,11 @@ vt.tabs.audit = function (panel) {
       activeHost = $('.f-host').value.trim();
       pendingLoad = true;
     }
-    setStatus(more ? '加载更多…' : '查询中…');
+    setStatus(more ? 'Loading more…' : 'Loading…');
     try {
       var resp = await vt.apiFetch(buildUrl(more), { headers: { 'Accept': 'application/json' } });
       if (resp.status === 401) return; // the shell shows the login view
-      if (!resp.ok) { setStatus('查询失败 HTTP ' + resp.status, 'error'); return; }
+      if (!resp.ok) { setStatus('Load failed: HTTP ' + resp.status, 'error'); return; }
       var json = await resp.json();
       var rows = (json && json.rows) || [];
       render(rows, more);
@@ -382,9 +391,9 @@ vt.tabs.audit = function (panel) {
       }
       exhausted = rows.length < 100;
       $('#more').disabled = exhausted;
-      setStatus('已加载 ' + Object.keys(byId).length + ' 条' + (exhausted ? ' · 已全部加载' : ' · 加载更多'), 'ok');
+      setStatus(Object.keys(byId).length + ' rows loaded' + (exhausted ? ' · all loaded' : ' · more available'), 'ok');
     } catch (e) {
-      setStatus('网络错误：' + (e.message || e), 'error');
+      setStatus('Network error: ' + (e.message || e), 'error');
     } finally {
       // Drain events buffered during this fresh snapshot (applyEvent re-checks seq
       // so anything already covered by the snapshot is dropped).
@@ -410,9 +419,9 @@ vt.tabs.audit = function (panel) {
   $('.actions').appendChild(wsDot);
   function setWsStatus(state) {
     wsDot.className = 'ws-' + state;
-    wsDot.textContent = state === 'live' ? '● 实时'
-      : state === 'sync' ? '● 同步中'
-        : '● 已断开';
+    wsDot.textContent = state === 'live' ? '● live'
+      : state === 'sync' ? '● syncing'
+        : '● disconnected';
   }
   setWsStatus('down');
 
@@ -442,7 +451,7 @@ vt.tabs.audit = function (panel) {
     ws.onclose = function (e) {
       ws = null; setWsStatus('down');
       // 4001: the DO closed it because the session's exp_s passed.
-      if (e && e.code === 4001) { vt.showLogin('会话已过期，请重新登录'); return; }
+      if (e && e.code === 4001) { vt.showLogin('Session expired, please log in again'); return; }
       scheduleReconnect();
     };
   }
@@ -491,15 +500,20 @@ vt.tabs.audit = function (panel) {
   }
 
   // ── Cache-expiry ticker (client-side) ─────────────────────────────────────
-  // The 缓存 column is a pure time calc, so nothing pushes a "cache expired"
+  // The Cache column is a pure time calc, so nothing pushes a "cache expired"
   // event. Periodically re-render only rows whose live cache has just elapsed
-  // (data-cache-live flips 1→0), turning the column grey 过期 without a round-trip.
+  // (data-cache-live flips 1→0), turning the column grey expired without a round-trip.
+  // Likewise a pending row past TTL (data-pending-live 1→0) shows expired before
+  // the alarm sweep pushes the real update.
   setInterval(function () {
     Object.keys(trById).forEach(function (id) {
       var tr = trById[id];
-      if (!tr || tr.getAttribute('data-cache-live') !== '1') return;
+      if (!tr) return;
       var r = byId[id];
-      if (r && !hasLiveCache(r)) {
+      if (!r) return;
+      var cacheLapsed = tr.getAttribute('data-cache-live') === '1' && !hasLiveCache(r);
+      var pendLapsed = tr.getAttribute('data-pending-live') === '1' && pendingLapsed(r);
+      if (cacheLapsed || pendLapsed) {
         var fresh = renderRow(r);
         if (tr.parentNode) tr.parentNode.replaceChild(fresh, tr);
         trById[id] = fresh;

@@ -39,6 +39,7 @@ body {
   color: var(--fg);
   font: var(--body)/1.45 -apple-system, BlinkMacSystemFont, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
   -webkit-text-size-adjust: 100%;
+  touch-action: manipulation; /* no double-tap zoom */
   overflow-x: hidden;
 }
 
@@ -120,13 +121,18 @@ h2 { font-size: var(--body); margin: 18px 0 8px; }
 section { margin: 14px 0; }
 label { display: flex; flex-direction: column; gap: 4px; font-size: var(--cap); color: var(--muted); }
 
-/* Filter bar: controls + buttons bottom-aligned on one row, one height. */
-.filters { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
-.filters button { margin: 0; }
+/* Filter bar: one row, captions read by screen readers only (placeholders and
+   option text carry the meaning); controls share the leftover width. */
+.filters { display: flex; align-items: center; flex-wrap: nowrap; gap: 8px; }
+.filters label { flex: 1 1 0; min-width: 0; }
+.filters label > .select, .filters label > input[type="text"] { width: 100%; min-width: 0; }
+.filters button { flex: 0 0 auto; margin: 0; white-space: nowrap; }
 .filters input[type="text"], .filters button { height: 44px; padding-top: 0; padding-bottom: 0; }
-.filters .filter-spacer { flex: 1 1 auto; }
+.filters button { padding-left: 12px; padding-right: 12px; }
+.filters .filter-spacer { flex: 0 0 0; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 /* The destructive buttons wrap together as one unit, right-aligned. */
-.filters .filter-danger { display: flex; gap: 8px; margin-left: auto; }
+.filters .filter-danger { display: flex; flex: 0 0 auto; gap: 8px; margin-left: auto; }
 .filters .filter-danger button { margin: 0; }
 .cache-expired { color: var(--muted); }
 
@@ -172,6 +178,7 @@ label { display: flex; flex-direction: column; gap: 4px; font-size: var(--cap); 
 input[type="text"], input[type="password"], select, textarea {
   background: var(--panel); color: var(--fg); border: 1px solid var(--border);
   border-radius: var(--r-ctl); padding: 8px 12px; font: inherit; min-width: 180px; min-height: 44px;
+  font-size: max(16px, 1em); /* iOS Safari zooms in on focus below 16px */
 }
 textarea { width: 100%; min-width: 0; font-family: var(--mono); font-size: var(--cap); }
 /* Native <select> in the control skin: the wrapper draws the chevron (CSP has
@@ -288,7 +295,7 @@ tbody tr.clickable { cursor: pointer; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .expired .cell-main, .expired .row-main { color: var(--muted); }
-/* 主机 · 项目 header of the cache tab: a row of the same list, set apart by
+/* Host · project header of the cache tab: a row of the same list, set apart by
    weight and a tinted surface; its label toggles the scope's rows. */
 .group-head { background: var(--panel-2); cursor: pointer; }
 .group-head .group-label, .group-head .row-main { font-weight: 600; font-size: var(--sec); }
@@ -387,7 +394,7 @@ th.col-pick input, td.col-pick input, .row-lead input { accent-color: var(--acce
    the largest element on the page. */
 dd.vt-ap-pair { font-size: 28px; font-weight: 700; letter-spacing: 2px; }
 .vt-ap-meta-note { margin-top: 8px; }
-/* Collapsed request details (目录 / 项目 / 父进程 / IP / 原因). */
+/* Collapsed request details (directory / project / parent / IP / reason). */
 .vt-ap-details { margin-top: 8px; border-top: 1px solid var(--border); }
 .vt-ap-details > summary { cursor: pointer; color: var(--muted); font-size: var(--sec); padding: 12px 0; list-style-position: inside; }
 /* Record lines: owned names bold and read-only; an unnamed record is a name
@@ -413,7 +420,7 @@ dd.vt-ap-pair { font-size: 28px; font-weight: 700; letter-spacing: 2px; }
    above the duration control. */
 .vt-ap-cache-section .cache-scope { margin: 0 0 8px; font-size: var(--cap); overflow-wrap: anywhere; }
 .vt-ap-cache-section .cache-scope strong { font-family: var(--mono); }
-/* Action bar: 同意 2fr / 拒绝 1fr at 50px with the status line above them.
+/* Action bar: Approve 2fr / Reject 1fr at 50px with the status line above them.
    Standalone it floats over the card's bottom; in the sheet it sticks to the
    sheet's bottom. The card pads for it. */
 .vt-ap-bar { padding: 8px 12px 12px; border-radius: var(--r-bar); }

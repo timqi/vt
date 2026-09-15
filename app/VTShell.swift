@@ -1,4 +1,4 @@
-// VT.app menu-bar shell (docs/app-bundle.md §6).
+// VT.app menu-bar shell (docs/app-bundle.md#lifecycle-ownership).
 //
 // Roles:
 //  - menu-bar UI: agent status, live grants (via the token-gated
@@ -345,7 +345,7 @@ final class AgentSupervisor {
         proc.executableURL = URL(fileURLWithPath: vt)
         // Token over the stdin pipe (fd 0): inherited descriptor, never an
         // env var (`ps e`) or a file. The agent reads exactly 32 bytes and
-        // closes it (docs/app-bundle.md §5).
+        // closes it (docs/app-bundle.md#status-and-revoke-boundary).
         var arguments = ["ssh", "agent", "--ui-token-fd", "0"]
         // Menu-chosen durations (if any) as explicit spawn flags —
         // flag > config.toml [agent] > default. Absent key ⇒ no flag.
@@ -565,7 +565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// background queue — never the main thread — so a slow/mid-restart agent
     /// can't freeze the menu bar; only the state write + icon update hop back
     /// to main. Safe by construction: ui-status never resets the agent's idle
-    /// clock (docs/app-bundle.md §5). Callers on main read the last result;
+    /// clock (docs/app-bundle.md#status-and-revoke-boundary). Callers on main read the last result;
     /// the 3s timer keeps it fresh (≤3s stale on menu open).
     private func poll() {
         let token = supervisor.tokenB64 // read on main; supervisor mutates it on main
@@ -646,7 +646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // Managed agent failed to start (e.g. keychain store still on the
-        // retired wrap v1 — docs/app-bundle.md §2).
+        // retired wrap v1 — docs/app-bundle.md#master-key-wrap-v2).
         if !supervisor.isManaged, !agentReachable, let err = supervisor.lastError, !err.isEmpty {
             menu.addItem(disabled("⚠ agent failed to start:"))
             menu.addItem(disabled("   \(String(err.prefix(120)))"))
@@ -677,7 +677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Cache duration (managed agent only — applying restarts the agent,
         // which reads the TTL at startup). Choices persist in UserDefaults
-        // and are passed as spawn flags (§4/§6); the checkmark reflects the
+        // and are passed as spawn flags; the checkmark reflects the
         // agent's live TTL from ui-status, whatever its source.
         if let s = lastStatus, supervisor.isManaged {
             let cacheItem = NSMenuItem(title: "Cache Duration", action: nil, keyEquivalent: "")
@@ -692,7 +692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(cacheItem)
 
             // Idle timeout — VISIBLE so cache expiry is debuggable, not
-            // "mysterious" (docs/app-bundle.md §10). Line shows the live
+            // "mysterious" (docs/app-bundle.md#key-wiping-and-idle-timeout). Line shows the live
             // value; submenu configures it.
             let idleItem = NSMenuItem(
                 title: "Idle timeout — \(AppDelegate.fmtTTL(s.idle_timeout_secs)) (clears cache when unused)",

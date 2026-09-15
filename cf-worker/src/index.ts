@@ -33,7 +33,7 @@ const STRICT_CSP =
 // at /pwa/*. Allowed under CSP `img-src 'self'` (same-origin). Minimal set: a
 // vector favicon (any tab size), the 512 PNG for iOS home-screen / PWA install
 // (iOS does not accept SVG for apple-touch-icon), and the manifest that makes
-// the installed app standalone so Web Push works on iOS (worker-slim.md §5.6).
+// the installed app standalone so Web Push works on iOS (docs/worker-slim.md#installed-app).
 const FAVICON_TAGS =
   '<link rel="icon" href="/pwa/icon.svg" type="image/svg+xml">' +
   '<link rel="apple-touch-icon" href="/pwa/icon-512.png">' +
@@ -46,7 +46,7 @@ const FAVICON_TAGS =
 // admin.css stays stale, which desyncs markup from styles. The .html page
 // shells need no token — the Worker reads them server-side per request.)
 // Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
-const ASSET_VER = '20260914-4a9844a';
+const ASSET_VER = '20260915-0739-dev';
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
@@ -156,7 +156,7 @@ for (const p of ['/sw.js', '/manifest.webmanifest']) {
 // ── Admin surface (passkey session) ───────────────────────────────────────
 //
 // Every request here is verified in the DO, the only place that knows the
-// current epoch (docs/worker-slim.md §3): the edge adds rate limiting and body
+// current epoch (docs/worker-slim.md#sessions): the edge adds rate limiting and body
 // caps and forwards Cookie, Origin and CF-Connecting-IP. Three POSTs are open
 // (bootstrap, login-challenge, login); everything else needs the session cookie.
 
@@ -230,7 +230,7 @@ app.get('/api/admin/*', async (c) => {
   return adminResponse(await accountStub(c).fetch(`https://account.do/op/${op}${url.search}`, { headers: adminHeaders(c) }));
 });
 
-// Two PUTs: the config knobs (§4.1; anything else in the body is 400) and a
+// Two PUTs: the config knobs (other fields in the body are rejected) and a
 // record rename — `{salt_b64u, name}`, name checked like a suggestion, ''
 // deletes. Both session-gated in the DO.
 app.put('/api/admin/config', (c) => adminPost(c, 'admin-config', ADMIN_OPEN_POST_MAX_BYTES));
@@ -463,7 +463,7 @@ app.post('/api/enroll', async (c) => {
 // signed with the Mac's own host token (`vt ssh agent --audit-key vt1.…`,
 // `agent_id = t:<token_id>`). Same gate as the daemon routes: shape and cap
 // here, MAC and liveness in the DO — a revoked token stops writing rows. The
-// hostname-keyed master form is gone (refactor.md §1).
+// Only per-host tokens are accepted (docs/worker-slim.md#host-tokens).
 const AUDIT_INGEST_MAX_BYTES = 64 * 1024;
 app.post('/api/audit-ingest', async (c) => {
   // 0. Reject a declared oversized body before parsing the auth header;

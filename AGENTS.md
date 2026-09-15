@@ -4,6 +4,43 @@ This is the canonical agent guide; `CLAUDE.md` is a relative symlink to it.
 VT is one Rust binary with a macOS SSH-agent transport (Touch ID, Keychain)
 and a Cloudflare Worker transport (Passkey/WebAuthn).
 
+## Start here
+
+- [docs/README.md](docs/README.md) owns task-to-document navigation.
+  Find the symbol with `rg`, then read its owning doc, implementation, and nearby
+  tests before editing. Verify historical plans against code.
+- [README.md](README.md) owns installation and CLI quick starts; feature docs own
+  procedures and security decisions. This guide owns agent-facing red lines.
+- Keep changes scoped. Update the owning doc when behavior, configuration, routes,
+  secrets, or security assumptions change. Use stable paths and symbols, not line
+  numbers; register new documents in the map. Do not duplicate operator procedures here.
+
+## Documentation
+
+A document holds contracts, facts, and commands. State its purpose and goals;
+keep only the design constraints needed to judge future changes. The reasoning
+history belongs in the commit that made the decision; the history is `git log`.
+
+- One reason per file, named in its opening: an operator runbook, one area's
+  behavior/security contract, or agent instructions. Delete a paragraph that
+  does not serve that reason; do not move it into an archive document.
+- A rule is one sentence, a fact one bullet, a command a code block. No "what
+  it replaced", incident history, completed plans, or justification longer than
+  a clause. Keep unresolved work explicitly separate from current contracts.
+- Nothing the code already says: no copied types, generated config, directory
+  trees, helper call sequences, CSS values, or test-function inventories. Link
+  to the owning file. Preserve independent cross-implementation wire contracts.
+- One owner per fact. Link from other documents instead of repeating it; merge
+  overlapping documents only after removing duplication.
+- Keep installation, recovery, and still-required upgrade steps in operator
+  runbooks; remove release-specific migration steps when their window ends.
+- Write documentation in English; describe localized UI controls in English
+  while preserving exact commands, protocol fields, and identifiers.
+- A growing document must name what reader need requires the added content.
+  After moves or merges, update navigation and all repository references;
+  use semantic heading anchors rather than section numbers. Check local links
+  and headings. Keep validation limits without narrating tests.
+
 ## Principles
 
 1. **Less code is the feature.** Every line is a liability; a security tool
@@ -23,7 +60,7 @@ and a Cloudflare Worker transport (Passkey/WebAuthn).
    storage.
 5. **Compatibility is removed, never widened.** A migration branch ships for
    one release with its operator step named, then goes; its test becomes a
-   rejected-input test. See [docs/refactor.md](docs/refactor.md).
+   rejected-input test.
 6. **No speculative generality.** The third repeat earns an abstraction. No
    knobs, traits, or config keys for a caller that does not exist.
 7. **Fail closed, fail loudly.** An unavailable check denies; an error reaches
@@ -35,218 +72,151 @@ and a Cloudflare Worker transport (Passkey/WebAuthn).
 
 ## Budgets
 
-The target is disordered growth and duplication; line counts are a proxy, so
-the rules fail on the thing, not on the number.
+Line counts are a proxy for growth and duplication, not a reason to weaken code.
 
-1. **Growth is a claim.** A change that adds net lines to an area names, in
-   the commit, what the feature could not have been without them.
-2. **Splitting is not a reduction.** A module splits when it has two reasons
-   to exist; a header that needs "and" is the tripwire.
-3. **The third copy is a bug.** Same logic in three places is fixed or deleted;
-   a copy-paste pair past ~30 lines is reported at two.
-4. **Never traded for a number.** Tests, failure paths, fresh-approval
-   semantics, lock/epoch invalidation, structured error codes, type and seam
-   declarations.
-5. **Ceilings are a prompt with a deadline.** `just size` prints the table
-   below with live numbers. Crossing a ceiling asks "what is in there?"; if the
-   answer is "the right things", raise it with that sentence. A ceiling exceeded
-   for more than one release without a raise or a deletion is the failure this
-   section exists to catch.
+- Net growth names in the commit what the feature could not have been without it.
+- Split a module only when it has two reasons to exist; splitting is not reduction.
+- Fix or delete the third copy; report a copy-paste pair past ~30 lines at two.
+- Never trim tests, failure paths, fresh approval, lock/epoch invalidation,
+  structured errors, or type/seam declarations to meet a number.
+- An exceeded ceiling needs deletion or a justified raise within one release.
+  Explain what belongs there; run `just size` for current counts.
 
-| Area | Ceiling | What the size is |
+| Area | Ceiling | Counted scope |
 | --- | --- | --- |
-| `src/core/` | 1.7k | `core.rs` + `core/`: record format, crypto, wire envelopes, authorization engine and session model — platform-blind; `authorization.rs` is half of it, pending refactor.md §2 |
-| `src/client/` | 1.8k | `client.rs` + `client/`: transport routing, CLI verbs, `inject` with its recovery supervisor, `doctor`, record parsing |
-| `src/server_macos/` | 4.5k | SSH agent, scopes, Keychain, socket owner check, audit push, UI status; refactor.md §2 decides the scopes share |
-| root `src/*.rs` | 2.0k | entry, config, `cf.rs` Worker client, `ssh_sign.rs` relay routing, caller metadata, audit push |
-| `cf-worker/src/` | 4.1k | one DO owning state, routes, host tokens, DEK cache policy, WebAuthn, notifications, admin page; raised from 3.5k when the passkey admin session and config-in-DO of worker-slim.md landed: the root key, config blob, passkey admin session and login ceremony (`account_admin.ts` ≈ 450, `admin_auth.ts`) are the right things, and nothing else in the area is a copy; 4.1k adds the operator-owned record `names` table and its adopt/rename validator |
-| one module | 750 | rule 2 before splitting; `core/authorization.rs`, `server_macos/ssh_agent.rs`, `cf-worker/src/do_account.ts` are the open tripwires |
+| `src/core/` | 1.7k | `core.rs` + `core/` |
+| `src/client/` | 1.8k | `client.rs` + `client/` |
+| `src/server_macos/` | 4.5k | macOS server tree |
+| root `src/*.rs` | 2.0k | root modules excluding `core.rs` / `client.rs`, plus `config/` |
+| `cf-worker/src/` | 4.1k | Worker TypeScript |
+| one module | 750 | consider responsibilities before splitting |
 
-Non-blank, non-comment lines, `#[cfg(test)]` and `*.test.ts` excluded. No
-repo-wide number. Ceilings are the post-slim targets; `just size` shows the
-open root overage.
-
-## Start here
-
-- [docs/README.md](docs/README.md) owns the feature/source map, change routing,
-  and editing workflow. Use `rg` to find the symbol, then read its feature doc,
-  implementation, and nearby tests before editing. Do not duplicate that map here.
-- [README.md](README.md) owns installation and CLI quick starts; `docs/*.md`
-  owns procedures and security decisions. This guide owns agent-facing red lines.
-  Verify historical design notes against code; do not implement superseded plans.
-- Keep changes scoped; update the owning feature doc when behavior, configuration,
-  routes, secrets, or security assumptions change. Use stable file paths and
-  symbols, not line numbers. Register new documents in the documentation map.
+Non-blank, non-comment lines; `#[cfg(test)]` and `*.test.ts` excluded. No
+repo-wide number. The open scope decision lives in [docs/refactor.md](docs/refactor.md).
 
 ## Configuration and data handling
 
-- Environment variables override `~/.config/vt/config.toml`; `VT_CONFIG` selects
-  that file, which may contain secrets and should be mode 600. `VT_BACKEND` is
-  the only routing input: `auto` probes the agent socket when it exists and
-  falls back to the Worker on recoverable errors (socket missing, non-vt
-  agent); `VT_PASSKEY_URL` + `VT_PASSKEY_TOKEN` enable the Worker.
-  `VT_BACKEND=agent` and `VT_BACKEND=passkey` pin the transport. Never silently
-  broaden fallback. See [config.example.toml](config.example.toml).
-- `inject --only-env` restricts env-var decryption to the named variables; a
-  wrapper uses it so a command never receives unrelated environment secrets.
-- Plaintext secrets and private seeds must never enter logs, examples, or test
-  output. Do not introduce disk/argv exposure beyond explicit product flows such
-  as transient injection.
-  Notifications must never block or fail protected operations; agent cache-hit
-  notifications run only after `permit.commit()` returns, fire-and-forget.
-  Web Push is the Worker's only channel: fan-out runs via `waitUntil` after the
-  ceremony write, never on the ceremony path, never a warning to the CLI.
-  See [docs/app-bundle.md](docs/app-bundle.md), [docs/worker-slim.md](docs/worker-slim.md) §5.
+Routing and precedence: [config.example.toml](config.example.toml).
+Errors and fallback classes: [docs/structured-errors.md](docs/structured-errors.md).
+
+- Environment overrides config; `VT_CONFIG` selects the file (mode 600).
+  `VT_BACKEND` alone selects routing: `auto` tries an existing agent socket and
+  falls back only on recoverable errors; `agent` / `passkey` pin the transport.
+  Never silently broaden fallback.
+- Wrappers use `inject --only-env` to limit environment-variable decryption.
+  Plaintext secrets and private seeds never enter logs, examples, or test output.
+  Do not add disk/argv exposure beyond explicit product flows such as injection.
 - Preserve structured extension envelopes and stable exit codes; error details
-  must not reflect client data. See [docs/structured-errors.md](docs/structured-errors.md).
+  must not reflect client data.
+- Notifications never block or fail protected operations. Agent cache-hit notices
+  run after `permit.commit()` returns, fire-and-forget. Worker Web Push is the only
+  channel; fan-out uses `waitUntil` after the ceremony write, never a CLI warning.
+  See [local notifications](docs/app-bundle.md#notifications) and
+  [Web Push](docs/worker-slim.md#web-push).
 
 ## Transient file injection
 
-The operator entry is [README.md](README.md); recovery mechanics and tests live
-in [src/client/inject.rs](src/client/inject.rs). Keep these implementation bounds:
+Usage: [README.md](README.md#inject-command). Recovery mechanics and tests:
+[src/client/inject.rs](src/client/inject.rs). Preserve these race boundaries:
 
-- `vt inject -r` uses a self-exec restore supervisor, dispatched before Tokio/clap
-  initialization. `--recover` stays unauthenticated and restores ciphertext only.
-- The deterministic `.{name}.vt-backup` ciphertext backup IS the exposure lock:
-  create it with `O_EXCL` before plaintext reaches disk, refuse overlap (`EEXIST`),
-  and remove a newly created backup if filling it or obtaining its generation
-  fails. Never remove another exposure's lock; never randomize the backup name.
-  Refuse `-r` files with no `vt://` records.
-- Every restore consumes the backup by atomic `rename`, never copy+delete.
-  Every sidecar records `(dev, ino)`; an id-less record is unknown state (never
-  parsed, never restored, never retired). Arming retires stale sidecars for that
-  backup path. Recovery checks generation and mtime versus the recorded deadline
-  (mtime catches a successor reusing the inode), including a re-probe after
-  publication cancellation. Never restore a known successor's backup.
-- Supervisor and parent failure paths also check their armed `(dev, ino)` before
-  restoring. Preserve recovery records on cancellation/restore failure or unknown
-  backup state; stat errors must not be mistaken for absence. Only successful
-  restoration or a known gone/superseded generation permits stale-record cleanup.
-- Reserve the empty publication temp before arming; write only through its held
-  fd, never recreate its path. Every restorer cancels publication before consuming
-  the backup; cancellation errors preserve backup and recovery record. Record the
-  recovery deadline before supervisor startup so stalled startup is recoverable.
+- The self-exec restore supervisor dispatches before Tokio/clap initialization.
+  `--recover` stays unauthenticated and restores ciphertext only.
+- The deterministic `.{name}.vt-backup` IS the exposure lock: create with `O_EXCL`
+  before plaintext reaches disk, refuse overlap and files without `vt://` records.
+  Clean up a newly created backup if filling it or obtaining its generation fails;
+  never remove another exposure's lock or randomize the backup name.
+- Restore by atomic `rename`, never copy+delete. Every sidecar and every parent /
+  supervisor failure path checks the armed `(dev, ino)`. Id-less records are unknown
+  state: never parse, restore, or retire them. Arming retires stale sidecars for
+  that backup path; recovery checks generation and mtime against the recorded
+  deadline, including a re-probe after publication cancellation. Never restore a successor.
+- Preserve recovery records on cancellation/restore failure or unknown backup state;
+  stat errors are not absence. Cleanup requires successful restoration or a known
+  gone/superseded generation.
+- Reserve the empty publication temp before arming; write only through its held fd,
+  never recreate its path. Every restorer cancels publication before consuming the
+  backup; cancellation failure preserves backup and recovery record. Record the
+  deadline before supervisor startup so stalled startup remains recoverable.
 
 ## SSH-agent authorization
 
-- All auth/run/sign/decrypt operations use the unified engine. `auth@vt` and
-  `run@vt` always require fresh approval; a decrypt item that is not a v2
-  envelope is a `BadRequest`, never a fresh-prompt batch. Duration `0` means
-  `Fresh`, never `StrictTtl(0)`. Reusable grants remain
-  operation/subject/resource-scoped. Commit the non-cloneable permit only after
-  operation success AND envelope serialization; failure drops without a
-  grant. A live permit blocks revocation: no unbounded-latency work while held.
-  See [docs/unified-authorization-engine.md](docs/unified-authorization-engine.md).
-- Lock, idle timeout, observed screen lock, and detected wake advance the epoch
-  even with no stored grants; live locked/non-interactive failures revoke grants.
-  Screen lock/wake and idle also wipe decrypted SSH keys. Automatic key reload
-  checks interactivity before AND after Keychain I/O; idle timeout stays >= 60s.
-  See [docs/app-bundle.md](docs/app-bundle.md).
-- Preserve activity scope families: verified destination for bound raw signs;
-  kernel-derived workspace, exact cwd, then parent app for broad shared cwds.
-  Forwarding-capable/tainted raw signs never cache; relay/SSH-carried vt extensions
-  stay per-connection and cannot reuse local scopes. `session-bind@openssh.com`
-  is SSH-wire (not a vt envelope), before the lock check, and never resets idle activity.
-  See [docs/authorization-scopes-v2.md](docs/authorization-scopes-v2.md).
-- Prompts must state reusable scope; agent-derived truth lines precede every
-  client-reported line. See [docs/approval-transparency.md](docs/approval-transparency.md).
-- `run@vt` is agent-only, allowlist-gated, and returns no child output/exit code.
-  Never expose it through the Worker or `--forward-real-agent`. That opt-in relay
-  forwards only encrypt/decrypt/auth/sign/diag extensions, payloads unparsed;
-  refuse run, ui-status, session-bind, and unknown extensions.
-  See [src/ssh_sign.rs](src/ssh_sign.rs) (`route_extension`).
-- `diag@vt` is plaintext, read-only, prompt-free, not audit-pushed, and
-  never resets idle. `live_entries` counts only grants this caller could reuse;
-  never-cache callers report 0. See [docs/diag-design.md](docs/diag-design.md).
-- `ui-status@vt` alone exposes the whole grant store: dispatched before the lock
-  check and any Keychain read, gated by constant-time comparison of the 32-byte
-  spawn token piped to `--ui-token-fd` (never env/argv/file; absent/wrong token
-  fails unstructured).
-  Only `status` and authority-reducing `revoke_all`: never grant/extend/approve,
-  reset idle, or audit-push. Grant display labels are memory-only.
-  See [docs/app-bundle.md](docs/app-bundle.md).
-- The Keychain store is wrap v2 only: `derive_passcode_cipher` rejects any other
-  `wrap_v` before unwrapping (remedy: `vt secret rebind` on the previous
-  release, which this release no longer ships); never re-add a v1 reader, an
-  in-binary upgrade, or a rebind command. The 64-byte `passcode_and_auth_token`
-  blob keeps its width (second half unread).
-  See [docs/app-bundle.md](docs/app-bundle.md).
+Authorization and scopes: [unified-authorization-engine.md](docs/unified-authorization-engine.md).
+Lifecycle, status token, and Keychain format: [app-bundle.md](docs/app-bundle.md).
+
+- All auth/run/sign/decrypt operations use the unified engine. `auth@vt` / `run@vt`
+  always require fresh approval; non-v2 decrypt envelopes are `BadRequest`.
+  Duration `0` means `Fresh`, never `StrictTtl(0)`. Reusable grants remain scoped
+  by operation, subject, and resource.
+- Commit the non-cloneable permit only after operation success AND envelope
+  serialization; failure drops without a grant. A live permit blocks revocation:
+  no unbounded-latency work while held.
+- Lock, idle, observed screen lock, and detected wake advance the epoch even with
+  no grants; live locked/non-interactive failures revoke grants. Screen lock/wake
+  and idle also wipe decrypted SSH keys. Reload checks interactivity before AND
+  after Keychain I/O; idle timeout stays >= 60s.
+- Preserve scope families: verified destination, kernel-derived workspace, exact
+  cwd, then parent app for broad shared cwds. Forwarding-capable/tainted raw signs
+  never cache; relay/SSH-carried vt extensions stay per-connection, never local.
+  `session-bind@openssh.com` stays SSH-wire, before the lock check, without idle activity.
+- Prompts state reusable scope; agent truth precedes client claims.
+  See [approval-transparency.md](docs/approval-transparency.md).
+- `run@vt` is agent-only, allowlist-gated, with no child output/exit code. Never
+  expose it through the Worker or `--forward-real-agent`; that relay forwards only
+  encrypt/decrypt/auth/sign/diag, unparsed. See [sign-vt-design.md](docs/sign-vt-design.md).
+- `diag@vt` is plaintext, read-only, prompt-free, not audit-pushed, and never resets
+  idle. Count only caller-reusable grants; never-cache callers report 0.
+  See [authorization visibility](docs/unified-authorization-engine.md#visibility).
+- Only `ui-status@vt` exposes all grants: before lock checks and Keychain reads,
+  gated by constant-time comparison of the 32-byte spawn token piped to
+  `--ui-token-fd` (never env/argv/file; absent/wrong token fails unstructured).
+  Only status and revoke-all; never grant/extend/approve, reset idle, or audit-push.
+  Display labels stay memory-only.
+- Keychain is wrap v2 only; reject other `wrap_v` values before unwrapping. Never
+  re-add a v1 reader, in-binary upgrade, or rebind command. Preserve the 64-byte
+  `passcode_and_auth_token` blob (second half unread). Migration belongs in the app doc.
 
 ## Worker cache and admin
 
-Cache policy and operator details: [docs/dek-cache.md](docs/dek-cache.md).
+Root, admin, and host authority: [worker-slim.md](docs/worker-slim.md).
+Cache storage, TTL ladders, and UI: [dek-cache.md](docs/dek-cache.md).
 
-- `SECRET` is the only Wrangler secret and only a KEK: the root key `R` is
-  generated at bootstrap, stored as `root:v1` wrapped under
-  HKDF(`SECRET`, `vt-kek-v1`), unwrapped into DO memory only, never logged.
-  Every other key derives from `R` (`account_admin.ts`): host tokens, `K_cfg`,
-  `K_sess`, the cache scalar. Rotation appends a second wrap and returns the
-  new value once; the first load under the new `SECRET` drops the old wrap;
-  never a third. A root that does not unwrap is unconfigured (fail closed,
-  `config.unreadable` once), and bootstrap over it is the factory reset.
-  No `[vars]`: `cache_hit_notify`, `uv_policy` live in
-  `cfg:v1` and `PUT /api/admin/config` accepts nothing else; `origin` is
-  captured at bootstrap and immutable. See [docs/worker-slim.md](docs/worker-slim.md).
-- Hosts authenticate with per-host tokens (`vt1.<id>.<secret>`, secret =
-  HKDF(`R`, id)); the edge checks header shape and body caps, the DO compares
-  the MAC (`verifyHostMac`, constant time) before it touches the token, then
-  checks liveness and slides expiry to now + 7 d on every use, never reviving
-  a revoked/expired token. `/api/enroll` is unauthenticated: keep the per-IP
-  rate limiter (`LIMITER`, absent → 503), the pending cap, and the pairing
-  code. Issue a token only inside `opApprove` → `commitEnroll`; never store
-  the secret. On the token path `meta.host`/`user` come from the record, never
-  the body. Every daemon request, audit push included, carries a host token;
-  never add a token-less or master-keyed branch. See [docs/host-token.md](docs/host-token.md).
-- The host `token_id` is the hard cache boundary; client `project` (common git
-  dir, else cwd) is advisory and Worker-derived IP is audit metadata. Derive the
-  key only inside `cacheCtx` for both reads and writes; it refuses a missing
-  `token_id`. Retain literal `meta.pwd` and show `metadata.project` beside
-  approval duration controls.
-- There is no cache switch: option `0` = `不缓存`, the approval page's
-  default, is the no-cache path; the scalar is `HKDF(R, vt-cache-seckey-v1)`.
-  A hit is not a phone approval: always audit it. `cache_hit_notify` independently enables best-effort hit pushes
-  and is off by default. The unit is one entry `dek:{token_id}:{project_h}:{salt}`
-  (no groups); its `created_ms` is immutable.
-- Session-gated list/clear need no Passkey; extension requires a verified Passkey
-  via `opApprove` -> `commitExtend`, never a session alone. Extension is per
-  entry, one `token_id` + `project` per ceremony (a mixed scope is a 400):
-  never resurrect an expired entry, never shorten expiry, a no-gain entry is
-  skipped; re-read entries with no await before the write, and audit
-  authorization plus actual effects. Expiry is approval-time + TTL, not a lifetime
-  budget. Keep distinct approve/extend TTL ladders and finite expiries, never
-  null/Infinity; policy lives in [cf-worker/src/cache_policy.ts](cf-worker/src/cache_policy.ts).
-- Record names are operator-owned (`names` table keyed by salt, adopted on a
-  verified approve or renamed with the session cookie); a client's `meta.names`
-  is a suggestion, shown as 自报 and never stored on its own.
-- Listing shows live entries only (`expires_ms <= now` filtered in the DO) and
-  exposes no sealed material or storage key — an entry is addressed by
-  `{token_id, project, salt_b64u}` and the DO re-derives the key in `cacheCtx`
-  — and reports `truncated`. A clear of named entries deletes exact keys;
-  清除全部 must exhaust the `dek:` prefix; both report actual deletions and
-  fail loudly if incomplete. Revocation happens only on the DEK 缓存 tab; the audit tab has no
-  cache actions. The audit
-  table's only deletion is the retention sweep; there is no clear-audit op.
-  `audit.cache_ttl_s` stays immutable; only `audit.cache_expires_ms` tracks extension.
-  Every multi-key storage `get`/`put`/`delete` is chunked to <= 128 keys.
-- Admin is a passkey session: `/admin` and every `/api/admin/*` op are verified
-  in the DO (`AccountAdmin.session`), never at the edge; the cookie is
-  `__Host-vt_admin` (8 h absolute, MAC'd under `K_sess` from `R`, bound to
-  `config.epoch`); every non-GET and the audit-stream upgrade also require
-  `Origin == config.origin`. Only bootstrap, login-challenge and login are open,
-  and the first two sit behind `LIMITER login:<ip>` (absent → 503). Revoking a
-  passkey or 退出所有会话 bumps the epoch; the last credential is never revoked.
-  Unconfigured (no readable `root:v1`) fails closed everywhere but `/admin`,
-  bootstrap and public assets. A `Cf-Access-Jwt-Assertion` header means nothing.
-  `opCreate` decides the UV level from `config.uv_policy` against the verified
-  host; the edge decides nothing.
-  `pwa/*` (admin included) is public and carries no data: a shell on disk is
-  markup plus `{{VT_DATA}}`; data reaches a page only through the shell route
-  (state for this cookie) or the gated API. Preserve `STRICT_CSP`, HTML UTF-8 content type, and
-  global security headers on fresh responses; template JSON uses
-  `escapeJsonForHtml`, never raw interpolation.
-  See [cf-worker/src/index.ts](cf-worker/src/index.ts) and
-  [cf-worker/src/page.ts](cf-worker/src/page.ts). Real secrets belong in Wrangler
-  secret storage, never TOML examples: [docs/cf-worker-deploy.md](docs/cf-worker-deploy.md).
+- `SECRET` is the only Wrangler secret and only a KEK; other derived keys come
+  from root `R`, unwrapped only in DO memory. Rotation permits at most two wraps.
+  An unreadable root fails closed as unconfigured (`config.unreadable` once).
+  No `[vars]`: config lives in the DO; only `cache_hit_notify` / `uv_policy` are
+  mutable settings, and bootstrap origin stays immutable.
+- Every daemon request, audit push included, requires a live per-host token.
+  Verify its MAC in constant time in the DO before token access; never revive
+  expired/revoked tokens or store token secrets. Issue only via `opApprove` →
+  `commitEnroll`; host/user come from the token record, never the body.
+  Preserve enrollment rate limiting (absent `LIMITER` → 503), pending cap, and pairing code.
+- Derive cache keys only in `cacheCtx` for reads and writes; refuse missing
+  `token_id`. Client project is advisory; preserve literal pwd and show project
+  beside approval duration controls. Record names are operator-owned: client
+  suggestions stay self-reported until verified adoption or session-gated rename.
+- Default approval `0` means no cache; no cache switch. Cache hits always audit,
+  never count as phone approval. Hit pushes are independent and off by default.
+  Entries are individual, with immutable `created_ms` and finite expiries.
+- Session permits list/clear; extension needs verified Passkey via `opApprove` →
+  `commitExtend`, one token + project per ceremony. Never resurrect, shorten, or
+  write a no-gain entry. Re-read without await before writing; audit authorization
+  and actual effects. Expiry is approval-time + TTL; preserve distinct TTL ladders.
+- List live entries only, report truncation, expose no sealed material/storage key.
+  Named clears delete exact keys; clear-all exhausts the prefix. Report actual
+  deletions and fail loudly if incomplete. Multi-key storage operations use <= 128 keys.
+- Cache revocation belongs on the cache tab; audit deletion is retention-only,
+  never a clear-audit op. `audit.cache_ttl_s` is immutable; extension updates only
+  `audit.cache_expires_ms`.
+- The DO verifies admin sessions and decides UV against the verified host; the
+  edge never authorizes. Sessions have absolute expiry and bind to config epoch;
+  mutations and audit-stream upgrades require matching Origin. Passkey revocation
+  and revoke-all-sessions bump epoch; never revoke the last credential.
+- Preserve the documented bootstrap/login exceptions and their rate limits
+  (absent limiter → 503). Unconfigured allows only admin shell, bootstrap, and
+  public assets; Cloudflare Access headers grant nothing.
+- Public PWA shells contain no data. Inject data only through gated routes/APIs;
+  use `escapeJsonForHtml`, preserve `STRICT_CSP`, HTML UTF-8, and global security
+  headers. Real secrets never belong in TOML examples.
 
 ## Validation and deployment entry points
 

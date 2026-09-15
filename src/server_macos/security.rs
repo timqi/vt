@@ -115,7 +115,7 @@ mod cgsession {
 /// When the running binary lives inside an `.app` bundle
 /// (`…/Contents/MacOS/<exe>`), return the path of the bundled `VTApp` shell
 /// binary, which doubles as the `UNUserNotificationCenter` helper
-/// (docs/app-bundle.md §3). The notification then carries VT's own bundle
+/// (docs/app-bundle.md#notifications). The notification then carries VT's own bundle
 /// identity/icon instead of Script Editor's. The shell is named `VTApp`
 /// because the default APFS volume is case-insensitive — `VT` would collide
 /// with the `vt` CLI beside it.
@@ -175,7 +175,7 @@ fn first_line(s: &str) -> &str {
     s.split('\n').next().unwrap_or(s)
 }
 
-/// Cache-hit transparency notification (docs/app-bundle.md §3). Called by
+/// Cache-hit transparency notification (docs/app-bundle.md#notifications). Called by
 /// the agent only AFTER `permit.commit()` returned — never while a permit
 /// (and thus the security read gate) is live — and is itself fire-and-forget
 /// via `notify_macos`'s reaper thread. Throttled per kind so a burst
@@ -527,7 +527,7 @@ pub fn derive_passcode_cipher(store: &super::store::KeychainStore) -> Result<Aes
     ensure!(
         store.wrap_v == WRAP_V2,
         "rusty.vault.store has wrap version {}, this release reads only wrap v{WRAP_V2} — \
-         run `vt secret rebind` on the previous vt release first (docs/app-bundle.md §2)",
+         run `vt secret rebind` on the previous vt release first (docs/app-bundle.md#master-key-wrap-v2)",
         store.wrap_v
     );
     let passcode_arr = split_passcode(store)?;

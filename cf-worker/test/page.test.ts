@@ -67,19 +67,19 @@ describe('cache creation time rendering', () => {
   it('shows the original creation timestamp before and after extension', () => {
     const created = new Date(2026, 0, 2, 3, 4, 5).getTime();
     for (const expires of [Date.now() + 60_000, Date.now() + 86_400_000]) {
-      expect(creationLine(created, expires)).toBe('创建于 2026-01-02 03:04:05');
+      expect(creationLine(created, expires)).toBe('created 2026-01-02 03:04:05');
     }
   });
 
   it('labels legacy entries without a creation timestamp as unknown', () => {
-    expect(creationLine(null, Date.now() + 60_000)).toBe('创建于 未知');
+    expect(creationLine(null, Date.now() + 60_000)).toBe('created unknown');
   });
 });
 
 // No browser here: the shell scripts are loaded into a stub DOM to prove they
 // parse, register their entry points, and only look up ids the shell declares.
 // Real WebAuthn, cookies and the installed PWA are checked by hand
-// (docs/design/ui-ux.md § Validation).
+// (docs/design/ui-ux.md#validation).
 describe('admin shell scripts against the shell markup', () => {
   const html = pwa('admin/admin.html');
   const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]));
