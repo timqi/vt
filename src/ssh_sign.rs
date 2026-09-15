@@ -215,6 +215,9 @@ pub async fn connect(
     // 2. Best-effort audit context from our own argv (we are git's child).
     //    op_kind stays "decrypt" (decrypt's existing meta); the human-meaningful
     //    label rides the `command` field shown on the approval page / audit.
+    //    Our parent is the `sh -c` wrapper git spawns, so `ppid_cmd` would
+    //    only echo that label back.
+    crate::caller_meta::suppress_parent_cmd();
     let host = parse_ssh_host(&args).unwrap_or_default();
     let op = if args.iter().any(|a| a.contains("git-receive-pack")) {
         "push"

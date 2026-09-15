@@ -71,25 +71,40 @@ fn who_at_host(user: &str, host: &str) -> String {
     }
 }
 
-/// Drop a trailing ` -> {who}` from the client command label when the header
-/// already names `who` (`ssh-sign: fetch -> git@github.com` under a
+/// `who_at_host` plus, when the client sat in an SSH session, its peer
+/// address as `(ssh 10.0.0.5)` — `SSH_CLIENT` also carries two port numbers,
+/// which say nothing to the approver.
+fn header_who(meta: &crate::core::ClientMeta, host: &str) -> String {
+    let mut who = who_at_host(&meta.user, host);
+    if let Some(addr) = meta.ssh_client.split_whitespace().next() {
+        if !who.is_empty() {
+            who.push(' ');
+        }
+        who.push_str("(ssh ");
+        who.push_str(&sanitize_prompt(addr, 60));
+        who.push(')');
+    }
+    who
+}
+
+/// Drop a trailing ` -> {dest}` from the client command label when the header
+/// already names `dest` (`ssh-sign: fetch -> git@github.com` under a
 /// `… on git@github.com` header). Display only; the scope is unchanged.
-fn strip_repeated_destination(body: &str, who: &str) -> String {
-    if who.is_empty() {
+fn strip_repeated_destination(body: &str, dest: &str) -> String {
+    if dest.is_empty() {
         return body.to_string();
     }
-    body.strip_suffix(who)
+    body.strip_suffix(dest)
         .and_then(|rest| rest.strip_suffix(" -> "))
         .unwrap_or(body)
         .to_string()
 }
 
-/// Append the extra context lines (pwd, parent process, ssh-from) to the
+/// Append the client-claimed context lines (pwd, parent process) to the
 /// Touch ID prompt body. Each is on its own line — `LAContext`'s
 /// `localizedReason` renders multi-line strings. Empty fields are skipped so
-/// the prompt stays compact for old clients. All three are client claims:
-/// `via:` is cut short (the header already names the operation) and `ssh:`
-/// keeps only the peer address (`SSH_CLIENT` also carries two port numbers).
+/// the prompt stays compact for old clients; `via:` is cut short because the
+/// header already names the operation.
 fn append_meta_lines(message: &mut String, meta: &crate::core::ClientMeta) {
     if !meta.pwd.is_empty() {
         message.push_str("\npwd: ");
@@ -98,10 +113,6 @@ fn append_meta_lines(message: &mut String, meta: &crate::core::ClientMeta) {
     if !meta.ppid_cmd.is_empty() {
         message.push_str("\nvia: ");
         message.push_str(&sanitize_prompt(&meta.ppid_cmd, 40));
-    }
-    if let Some(addr) = meta.ssh_client.split_whitespace().next() {
-        message.push_str("\nssh: ");
-        message.push_str(&sanitize_prompt(addr, 80));
     }
 }
 
@@ -217,7 +228,7 @@ impl VtSshSession {
         validate_mac_key_material(store, passphrase_cipher)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
 
-        let who = who_at_host(&req.meta.user, &req.host);
+        let who = header_who(&req.meta, &req.host);
         let n = req.items.len();
         let mut local_auth_message =
             header_with_who(&format!("decrypt {} {}", n, plural_secrets(n)), "on", &who);
@@ -246,7 +257,7 @@ impl VtSshSession {
             self.cache_ttls.decrypt_secs,
         );
         let body = sanitize_prompt_multiline(
-            &strip_repeated_destination(&req.command, &who),
+            &strip_repeated_destination(&req.command, &who_at_host(&req.meta.user, &req.host)),
             PROMPT_COMMAND_MAX_LINE_LEN,
             PROMPT_COMMAND_MAX_LINES,
         );
@@ -323,7 +334,7 @@ impl VtSshSession {
             return Err((ErrKind::BadRequest, Some(DETAIL_DISPLAY_FIELD_TOO_LARGE)));
         }
 
-        let who = who_at_host(&req.meta.user, &req.host);
+        let who = header_who(&req.meta, &req.host);
         let mut auth_message = header_with_who("auth", "on", &who);
         self.append_relay_origin(&mut auth_message);
         self.append_caller_line(&mut auth_message);
@@ -532,7 +543,7 @@ impl VtSshSession {
         // Build the Touch ID message. The resolved canonical path is shown on
         // its own line so the user is approving the *resolved* program, not
         // the (potentially confusing) raw argv[0] from a remote peer.
-        let who = who_at_host(&req.meta.user, &req.host);
+        let who = header_who(&req.meta, &req.host);
         let exe_display = sanitize_prompt(&resolved.display().to_string(), 160);
         let mut auth_message = header_with_who("run on this Mac", "from", &who);
         // The vt relay refuses run@vt, so the relay marker is a dead path
@@ -681,7 +692,7 @@ impl VtSshSession {
         };
 
         // Rich prompt from vt context (mirrors handle_decrypt formatting).
-        let who = who_at_host(&req.meta.user, &req.host);
+        let who = header_who(&req.meta, &req.host);
         let mut auth_message = header_with_who("ssh-sign", "for", &who);
         self.append_relay_origin(&mut auth_message);
         self.append_caller_line(&mut auth_message);
@@ -709,8 +720,11 @@ impl VtSshSession {
             ctx.key_fp = fp_str.clone();
             ctx
         };
+        // The header already reads `ssh-sign`; keep only the op (`push`).
+        let command =
+            strip_repeated_destination(&req.command, &who_at_host(&req.meta.user, &req.host));
         let body = sanitize_prompt_multiline(
-            &strip_repeated_destination(&req.command, &who),
+            command.strip_prefix("ssh-sign: ").unwrap_or(&command),
             PROMPT_COMMAND_MAX_LINE_LEN,
             PROMPT_COMMAND_MAX_LINES,
         );
@@ -871,14 +885,24 @@ mod tests {
             ppid_cmd: "zsh -i".into(),
             ssh_client: "10.0.0.5 5234 22".into(),
         };
-        let mut msg = String::from("decrypt 1: [read] on qiqi@alpha");
+        let mut msg = format!("decrypt 1: [read] on {}", header_who(&meta, "alpha"));
         append_meta_lines(&mut msg, &meta);
         let lines: Vec<&str> = msg.split('\n').collect();
-        assert_eq!(lines[0], "decrypt 1: [read] on qiqi@alpha");
+        // SSH peer address rides the header, ports dropped; no `ssh:` row.
+        assert_eq!(lines[0], "decrypt 1: [read] on qiqi@alpha (ssh 10.0.0.5)");
         assert_eq!(lines[1], "pwd: /tmp");
         assert_eq!(lines[2], "via: zsh -i");
-        assert_eq!(lines[3], "ssh: 10.0.0.5", "ports carry no decision value");
-        assert_eq!(lines.len(), 4, "tty must not be rendered on prompt");
+        assert_eq!(lines.len(), 3, "tty and ssh must not be rendered as rows");
+    }
+
+    #[test]
+    fn header_who_without_ssh_session_is_plain() {
+        let meta = crate::core::ClientMeta {
+            user: "qiqi".into(),
+            ..Default::default()
+        };
+        assert_eq!(header_who(&meta, "alpha"), "qiqi@alpha");
+        assert_eq!(header_who(&crate::core::ClientMeta::default(), ""), "");
     }
 
     #[test]
@@ -1062,16 +1086,16 @@ mod tests {
         let meta = crate::core::ClientMeta {
             pwd: huge.clone(),
             ppid_cmd: huge.clone(),
-            ssh_client: huge,
+            ssh_client: huge.clone(),
             ..Default::default()
         };
-        let mut msg = String::new();
+        let mut msg = header_who(&meta, &huge);
         append_meta_lines(&mut msg, &meta);
-        // pwd:100, via:40, ssh:80 — plus the labels and newlines.
-        // Conservative upper bound: each line under 120 chars (label + 100 + …).
+        // header: host 60 + ssh 60; pwd:100, via:40 — plus labels and newlines.
+        // Conservative upper bound: each line under 140 chars.
         for line in msg.split('\n').filter(|l| !l.is_empty()) {
             assert!(
-                line.chars().count() <= 120,
+                line.chars().count() <= 140,
                 "prompt line too long ({} chars): {}",
                 line.chars().count(),
                 line,

@@ -1,6 +1,15 @@
 //! Transport-neutral client display claims, never agent authorization scope.
 
 use crate::core::sanitize_for_display as sanitize;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set once by `vt ssh connect`: its parent is always git's/ssh's wrapper
+/// shell, so `ppid_cmd` would repeat the `command` label on every surface.
+static SUPPRESS_PARENT_CMD: AtomicBool = AtomicBool::new(false);
+
+pub fn suppress_parent_cmd() {
+    SUPPRESS_PARENT_CMD.store(true, Ordering::Relaxed);
+}
 
 pub fn get_hostname() -> String {
     // gethostname(3); 256 covers every platform's HOST_NAME_MAX+1.
@@ -23,7 +32,11 @@ pub fn collect_client_meta() -> crate::core::ClientMeta {
         user: username(),
         pwd: cwd(),
         tty: tty_name(),
-        ppid_cmd: parent_cmd(),
+        ppid_cmd: if SUPPRESS_PARENT_CMD.load(Ordering::Relaxed) {
+            String::new()
+        } else {
+            parent_cmd()
+        },
         ssh_client: ssh_client_env(),
     })
 }
