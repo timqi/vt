@@ -84,7 +84,8 @@ mod cgsession {
         Some(SessionFlags {
             is_locked: read_bool(&dict, "CGSSessionScreenIsLocked"),
             is_on_console: read_bool(&dict, "kCGSSessionOnConsoleKey"),
-            is_login_done: read_bool(&dict, "kCGSSessionLoginDoneKey"),
+            // Apple spells this one `kCGSession…`, not `kCGSSession…`.
+            is_login_done: read_bool(&dict, "kCGSessionLoginDoneKey"),
         })
     }
 
