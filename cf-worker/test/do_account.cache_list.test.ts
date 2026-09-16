@@ -297,7 +297,7 @@ describe('Clear all — exhaustive by contract', () => {
   });
 });
 
-// Removed surfaces (docs/refactor.md rule: a migration's test becomes a
+// Removed surfaces (AGENTS.md rule: a migration's test becomes a
 // rejected-input test): the per-approval and per-group clears, and the audit
 // wipe. Retention is the only deletion the audit table knows.
 describe('removed clear ops are unknown', () => {

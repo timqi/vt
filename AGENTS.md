@@ -92,7 +92,7 @@ Line counts are a proxy for growth and duplication, not a reason to weaken code.
 | one module | 750 | consider responsibilities before splitting |
 
 Non-blank, non-comment lines; `#[cfg(test)]` and `*.test.ts` excluded. No
-repo-wide number. The open scope decision lives in [docs/refactor.md](docs/refactor.md).
+repo-wide number.
 
 ## Configuration and data handling
 

@@ -29,5 +29,4 @@ Find the document that owns the task; implementation history stays in Git.
 | What sealed-box format must the three implementations share? | [Sealed box](sealed-box-v1.md) |
 
 [AGENTS.md](../AGENTS.md) owns editing rules, documentation standards, and
-validation gates. The remaining [scope decision](refactor.md) is an open task,
-not a current contract.
+validation gates.
