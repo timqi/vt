@@ -5,12 +5,70 @@
 // with no workerd. (That the public /pwa/* route serves pwa/admin/* is a route
 // behaviour, tested in test/do_account.admin_shell.test.ts.)
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { renderTemplate, escapeJsonForHtml, pageVars, type PageChrome } from '../src/page';
 
 const pwa = (p: string) => readFileSync(new URL(`../pwa/${p}`, import.meta.url), 'utf8');
+
+describe('notification cleanup on PWA visits', () => {
+  function setup(statuses: Array<number | Error>, visibilityState = 'visible') {
+    const notifications = statuses.map((_, i) => ({
+      tag: 'a:' + String(i).padStart(16, '0'), close: vi.fn(),
+    }));
+    const other = { tag: 'cache:host', close: vi.fn() };
+    const listeners: Record<string, () => void> = {};
+    const document = { visibilityState, addEventListener: (name: string, fn: () => void) => { listeners[name] = fn; } };
+    const fetch = vi.fn(async (path: string, _options: unknown) => {
+      const status = statuses[Number(path.split('/').pop())];
+      if (status instanceof Error) throw status;
+      return { status, json: async () => ({ error: status === 410 ? 'gone' : 'not_found' }) };
+    });
+    const getNotifications = vi.fn(async () => [...notifications, other]);
+    const context = {
+      document, TextEncoder, fetch,
+      navigator: { serviceWorker: { addEventListener() {}, ready: Promise.resolve({ getNotifications }) } },
+      window: { addEventListener: (name: string, fn: () => void) => { listeners[name] = fn; } },
+    };
+    runInNewContext(pwa('common.js'), context);
+    return { notifications, other, listeners, document, fetch, getNotifications };
+  }
+
+  it('closes ended and removed requests, preserving pending, unavailable and unrelated notices', async () => {
+    const h = setup([410, 404, 200, 503, new Error('offline')]);
+    await vi.waitFor(() => expect(h.fetch).toHaveBeenCalledTimes(5));
+    expect(h.notifications.map(n => n.close.mock.calls.length)).toEqual([1, 1, 0, 0, 0]);
+    expect(h.other.close).not.toHaveBeenCalled();
+    expect(h.fetch).toHaveBeenCalledWith('/api/page/0000000000000000', { cache: 'no-store', redirect: 'error' });
+  });
+
+  it('retains notifications on malformed or unrelated error responses and retries on the next visit', async () => {
+    const h = setup([410, 404], 'hidden');
+    h.fetch.mockImplementationOnce(async () => ({ status: 410, json: async () => { throw new Error('invalid JSON'); } }));
+    h.fetch.mockImplementationOnce(async () => ({ status: 404, json: async () => ({ error: 'upstream_failure' }) }));
+    await Promise.resolve();
+    h.document.visibilityState = 'visible';
+    await h.listeners.visibilitychange();
+    expect(h.notifications.every(n => n.close.mock.calls.length === 0)).toBe(true);
+    expect(h.fetch).toHaveBeenCalledTimes(2);
+    await h.listeners.pageshow();
+    expect(h.notifications.map(n => n.close.mock.calls.length)).toEqual([1, 1]);
+  });
+
+  it('checks on return to the foreground and on restored pages, without overlapping sweeps', async () => {
+    const h = setup([410], 'hidden');
+    await Promise.resolve();
+    expect(h.getNotifications).not.toHaveBeenCalled();
+    h.document.visibilityState = 'visible';
+    h.listeners.visibilitychange();
+    h.listeners.pageshow();
+    await vi.waitFor(() => expect(h.notifications[0].close).toHaveBeenCalledTimes(1));
+    expect(h.getNotifications).toHaveBeenCalledTimes(1);
+    h.listeners.pageshow();
+    await vi.waitFor(() => expect(h.getNotifications).toHaveBeenCalledTimes(2));
+  });
+});
 
 describe('cache creation time rendering', () => {
   class Element {

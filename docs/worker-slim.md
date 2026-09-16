@@ -118,6 +118,12 @@ app has none — an opened window is an auxiliary context that iOS presents as a
 in-app browser. Each hand-off fires once, and after a decision the page leaves
 for the admin console: the spent token would only render as 410.
 
+Opening or returning to a visible PWA page checks this device's approval and
+enrollment notifications against the page API and closes those reported as
+handled, expired, or no longer retained; pending requests, failed lookups, and
+other notification kinds remain. Cleanup is best-effort and does not wake a
+closed app or retract notifications on other devices.
+
 ## Host tokens
 
 Each host enrolls for its own token; there is no master daemon credential.

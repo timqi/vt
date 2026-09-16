@@ -198,7 +198,34 @@
             if (document.querySelector('.vt-approve')) return;
             if (u.pathname !== location.pathname) location.replace(u.href);
         });
+        var cleaningNotifications = false;
+        async function cleanNotifications() {
+            if (document.visibilityState !== 'visible' || cleaningNotifications) return;
+            cleaningNotifications = true;
+            try {
+                var reg = await navigator.serviceWorker.ready;
+                if (!reg.getNotifications) return;
+                var notifications = await reg.getNotifications();
+                for (var notification of notifications) {
+                    // Only approval/enrollment tags; cache-hit and test notices stay.
+                    if (!/^a:[A-Za-z0-9_-]{16}$/.test(notification.tag)) continue;
+                    try {
+                        var res = await fetch('/api/page/' + notification.tag.slice(2), {
+                            cache: 'no-store', redirect: 'error',
+                        });
+                        if (res.status !== 404 && res.status !== 410) continue;
+                        var data = await res.json();
+                        if ((res.status === 410 && data.error === 'gone') ||
+                            (res.status === 404 && data.error === 'not_found')) notification.close();
+                    } catch (_) { /* unknown state: retain the notification for the next visit */ }
+                }
+            } catch (_) { /* notification access is best-effort */ }
+            finally { cleaningNotifications = false; }
+        }
+        document.addEventListener('visibilitychange', cleanNotifications);
+        window.addEventListener('pageshow', cleanNotifications);
         navigator.serviceWorker.ready.then(function (reg) {
+            cleanNotifications();
             var sw = navigator.serviceWorker.controller || reg.active;
             if (sw) sw.postMessage({ type: 'vt-pending' });
         }).catch(function () { /* no worker registered: notifications are off anyway */ });
