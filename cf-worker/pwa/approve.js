@@ -35,8 +35,9 @@
 
         if (showMeta) {
             // The decision line (operation, record count) and the decision
-            // fields (records, host, command) stay above the fold; the rest of the
-            // request folds into Details (docs/approval-transparency.md#presentation).
+            // fields (records, host, command, reason) stay above the fold; the
+            // rest of the request folds into Details
+            // (docs/approval-transparency.md#presentation).
             var metaSec = el('section', 'vt-ap-meta-section');
             refs.decision = el('h2', 'vt-ap-decision');
             metaSec.appendChild(refs.decision);
@@ -194,6 +195,10 @@
                 var who = [meta.user, meta.host].filter(Boolean).join('@');
                 addRow(refs.meta, hostVerified ? 'Host (verified)' : 'Host', who);
                 addRow(refs.meta, 'Command', meta.command);
+                // `auth` carries its whole "what runs" in the reason (the
+                // command lives in `command` only for inject/read), so the
+                // reason is a decision field, never a Details line.
+                addRow(refs.meta, 'Reason', meta.reason);
                 // Enrollment: the pairing code is the approver's proof that this
                 // request is the terminal in front of them, not a stranger's
                 // concurrent one. Big, on its own row.
@@ -209,7 +214,6 @@
                 // Host-token path: this token last spoke from another IP.
                 addRow(refs.detailMeta, 'IP (verified)', meta.ip
                     ? meta.ip + (meta.ip_prev ? ' (last ' + meta.ip_prev + ')' : '') : '');
-                addRow(refs.detailMeta, 'Reason', meta.reason);
                 refs.details.hidden = !refs.detailMeta.firstChild;
                 refs.metaNote.textContent = enrolling
                     ? 'Host / user are claimed by the requester; IP and origin are server-verified. Approve only if the pairing code matches the terminal.'
