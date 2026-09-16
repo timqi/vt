@@ -169,6 +169,24 @@
           <label for="cfg-uv">UV policy (JSON)</label>
           <textarea id="cfg-uv" rows="3" placeholder='{"default":"discouraged","by_op":{"decrypt":"required"},"by_host":{"prod-db":"required"}}'></textarea>
         </div>
+        <div class="field">
+          <label class="switch"><input id="cfg-slack" type="checkbox"> <span>Slack Bot channel</span></label>
+        </div>
+        <div id="cfg-slack-fields" hidden>
+          <p class="hint">Approval requests post to the channel, @-mention the listed users and are edited in place on the decision; cache hits follow the option above. Setup in <code>docs/slack.md</code>. The bot token is stored encrypted and never shown again.</p>
+          <div class="field">
+            <label for="cfg-slack-token">Bot token (xoxb-…)</label>
+            <input id="cfg-slack-token" type="password" autocomplete="off" placeholder="leave empty to keep the stored token">
+          </div>
+          <div class="field">
+            <label for="cfg-slack-channel">Channel ID</label>
+            <input id="cfg-slack-channel" type="text" placeholder="C0123456789">
+          </div>
+          <div class="field">
+            <label for="cfg-slack-mention">Mention member IDs (one per line, optional)</label>
+            <textarea id="cfg-slack-mention" rows="2" placeholder="U01ABCDEF"></textarea>
+          </div>
+        </div>
         <section class="actions">
           <button id="cfg-save" type="button">Save</button>
           <span id="cfg-status" class="status" role="status" aria-live="polite"></span>

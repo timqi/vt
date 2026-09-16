@@ -196,6 +196,36 @@ describe('AccountAdmin config blob', () => {
     // Unreadable root ⇒ the setup view, flagged as a reset.
     expect(await (await rotated.state(get())).json()).toEqual({ state: 'setup', rp_id: null, reset: true });
   });
+
+  it('keeps the Slack bot token write-only and validates the channel config', async () => {
+    const storage = fakeStorage();
+    const admin = await configured(storage);
+    const put = (slack: unknown) => admin.adminOp('config', new Request('https://a/x', { method: 'PUT', body: JSON.stringify({ slack }) }));
+    const view = async () => ((await (await admin.adminOp('config', get())).json()) as { slack: unknown }).slack;
+    expect(await view()).toBeNull();
+    expect(admin.slackConfig()).toBeNull();
+    for (const bad of [
+      { channel: 'C1' },                                       // no token stored yet
+      { bot_token: 'xoxb-a b', channel: 'C1' },
+      { bot_token: 'xoxb-a', channel: '' },
+      { bot_token: 'xoxb-a', channel: 'C1', mention: ['<@U1>'] },
+      { bot_token: 'xoxb-a', channel: 'C1', mention: 'U1' },
+      'xoxb-a',
+    ]) expect((await put(bad)).status).toBe(400);
+    expect(await view()).toBeNull();
+
+    expect((await put({ bot_token: 'xoxb-a', channel: 'C1', mention: ['U1'] })).status).toBe(200);
+    expect(await view()).toEqual({ channel: 'C1', mention: ['U1'], bot_token_set: true });
+    expect(JSON.stringify(storage.map.get('cfg:v1'))).not.toContain('xoxb-a');
+    // An empty token keeps the stored one; the rest is replaced.
+    expect((await put({ bot_token: '', channel: 'C2' })).status).toBe(200);
+    expect(admin.slackConfig()).toEqual({ bot_token: 'xoxb-a', channel: 'C2', mention: [] });
+    expect((await put(null)).status).toBe(200);
+    expect(await view()).toBeNull();
+    // A blob written before the field reads as off.
+    delete (admin.current as { slack?: unknown }).slack;
+    expect(admin.slackConfig()).toBeNull();
+  });
 });
 
 describe('push fan-out', () => {
@@ -221,7 +251,7 @@ describe('push fan-out', () => {
 
     const tasks: Promise<unknown>[] = [];
     const notifications = new AccountNotifications(
-      { waitUntil: (t: Promise<unknown>) => { tasks.push(t); } }, admin);
+      { storage: admin['storage'] as DurableObjectStorage, waitUntil: (t: Promise<unknown>) => { tasks.push(t); } }, admin);
     const posted: string[] = [];
     vi.stubGlobal('fetch', async (url: string) => {
       posted.push(url);
@@ -241,9 +271,9 @@ describe('push fan-out', () => {
 
   it('sends nothing before a subscription exists', async () => {
     const tasks: Promise<unknown>[] = [];
+    const admin = await configured();
     const notifications = new AccountNotifications(
-      { waitUntil: (t: Promise<unknown>) => { tasks.push(t); } },
-      await configured());
+      { storage: admin['storage'] as DurableObjectStorage, waitUntil: (t: Promise<unknown>) => { tasks.push(t); } }, admin);
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
     notifications.approval(challenge());

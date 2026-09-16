@@ -212,7 +212,7 @@ describe('names on the audit, cache and push surfaces', () => {
     await configure({ cache_hit_notify: true });
     await inDO(async ({ inst }) => {
       await inst.admin.pushOp('vapid', new Request('https://account.do/op/x'));
-      inst.notifications = new AccountNotifications({ waitUntil: (t: Promise<unknown>) => { tasks.push(t); } }, inst.admin);
+      inst.notifications = new AccountNotifications({ storage: inst.ctx.storage, waitUntil: (t: Promise<unknown>) => { tasks.push(t); } }, inst.admin);
     });
     const salts = [nextSalt(), nextSalt(), nextSalt()];
     const ch = await createWithNames(salts, ['A', 'B', '']);

@@ -175,7 +175,23 @@ export interface Challenge {
    *  token_id minted for this ceremony. The secret is re-derived (never stored)
    *  when the poll socket delivers or re-delivers the token. */
   enroll_token_id?: string;
+  /** Slack message posted for this ceremony, written back by the send task
+   *  after creation; the decision edits it in place. Never authorizes. */
+  slack?: SlackMsgRef;
 }
+
+// ── Slack Bot channel (docs/slack.md) ────────────────────────────────────
+
+/** Console-owned, in the config blob. `bot_token` is a bearer credential and
+ *  never leaves the DO. */
+export interface SlackConfig {
+  bot_token: string;
+  channel: string;
+  /** User ids to @-mention on a pending approval. */
+  mention: string[];
+}
+
+export interface SlackMsgRef { channel: string; ts: string }
 
 // ── Host-token enrollment (unauthenticated request, phone-approved) ────────
 

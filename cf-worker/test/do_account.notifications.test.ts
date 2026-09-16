@@ -47,7 +47,7 @@ async function withPush(
     };
     const tasks: Promise<unknown>[] = [];
     const notifications = new AccountNotifications(
-      { waitUntil(task: Promise<unknown>) { tasks.push(task); } }, admin);
+      { storage: state.storage, waitUntil(task: Promise<unknown>) { tasks.push(task); } }, admin);
     const send = vi.spyOn(webpush, 'sendPush').mockResolvedValue({ status: 201 });
     try {
       await test({ notifications, admin, hitNotify, tasks, send });
@@ -142,6 +142,116 @@ describe('AccountNotifications push contract', () => {
       expect(p.url).toBe('https://vt.test.invalid/admin#audit');
       expect(p.tag).toBe(`cache:${op.meta.host}`);
       expect(send.mock.calls[0]!.slice(4)).toEqual([3600, 'normal']);
+    });
+  });
+});
+
+// The Slack Bot channel (docs/slack.md): fetch is stubbed so the assertions are
+// on the request bodies, the challenge writeback and the logged failures.
+describe('AccountNotifications slack channel', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  type Call = { method: string; body: Record<string, unknown> };
+  function stubSlack(answer: (c: Call) => Record<string, unknown> | Response | Promise<Record<string, unknown>>) {
+    const calls: Call[] = [];
+    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+      expect(init.headers).toMatchObject({ Authorization: 'Bearer xoxb-test' });
+      const c = { method: url.replace('https://slack.com/api/', ''), body: JSON.parse(init.body as string) as Record<string, unknown> };
+      calls.push(c);
+      const a = await answer(c);
+      return a instanceof Response ? a : Response.json(a);
+    });
+    return calls;
+  }
+  const slackOn = async (admin: AccountAdmin) => {
+    const r = await admin.adminOp('config', new Request('https://account.do/op/x', { method: 'PUT',
+      body: JSON.stringify({ slack: { bot_token: 'xoxb-test', channel: 'C123', mention: ['U1', 'U2'] } }) }));
+    expect(r.status).toBe(200);
+  };
+
+  it('posts the pending message, stores its handle, and edits it on the decision', async () => {
+    await withPush(async ({ notifications, admin, tasks }) => {
+      await slackOn(admin);
+      const calls = stubSlack(() => ({ ok: true, ts: '1.2', channel: 'C999' }));
+      const ch = makeChallenge({ salts_b64u: ['a', 'b'] });
+      await inDO(({ state }) => state.storage.put(`ch:${ch.approve_token}`, ch));
+      notifications.approval(ch);
+      await Promise.all(tasks);
+      expect(calls).toHaveLength(1);
+      const post = calls[0]!.body as { channel: string; text: string; attachments: Array<{ blocks: Array<Record<string, unknown>> }> };
+      expect(post.channel).toBe('C123');
+      expect(post.text).toBe('⏳ vt approval: decrypt — pending');
+      const blocks = post.attachments[0]!.blocks;
+      expect(blocks[0]).toMatchObject({ text: { text: '<@U1> <@U2>' } });
+      expect((blocks[1]!.text as { text: string }).text).toContain('2 records');
+      expect(blocks[2]).toMatchObject({ elements: [{ url: `https://vt.test.invalid/a/${ch.approve_token}` }] });
+      const stored = await inDO(({ state }) => state.storage.get<typeof ch>(`ch:${ch.approve_token}`));
+      expect(stored!.slack).toEqual({ channel: 'C999', ts: '1.2' });
+
+      stored!.status = 'approved';
+      stored!.finalized_ms = stored!.created_ms + 1500;
+      notifications.decided(stored!, 'approved');
+      await Promise.all(tasks);
+      expect(calls[1]!.method).toBe('chat.update');
+      const upd = calls[1]!.body as { channel: string; ts: string; text: string; attachments: Array<{ color: string; blocks: Array<Record<string, unknown>> }> };
+      expect([upd.channel, upd.ts, upd.text]).toEqual(['C999', '1.2', '✅ vt approval: decrypt — approved']);
+      expect(upd.attachments[0]!.blocks).toHaveLength(1);
+      expect((upd.attachments[0]!.blocks[0]!.text as { text: string }).text).toContain('1500 ms');
+    });
+  });
+
+  it('edits straight to the terminal state when the decision beat the send', async () => {
+    await withPush(async ({ notifications, admin, tasks }) => {
+      await slackOn(admin);
+      const ch = makeChallenge();
+      const calls = stubSlack(async () => {
+        // The decision lands while the post is in flight.
+        await inDO(({ state }) => state.storage.put(`ch:${ch.approve_token}`, { ...ch, status: 'rejected', finalized_ms: ch.created_ms + 10 }));
+        return { ok: true, ts: '9.9' };
+      });
+      await inDO(({ state }) => state.storage.put(`ch:${ch.approve_token}`, ch));
+      notifications.approval(ch);
+      await Promise.all(tasks);
+      expect(calls.map(c => c.method)).toEqual(['chat.postMessage', 'chat.update']);
+      expect((calls[1]!.body as { text: string }).text).toBe('❌ vt approval: decrypt — rejected');
+    });
+  });
+
+  it('escapes client context, logs failures, and never writes a handle without a ts', async () => {
+    await withPush(async ({ notifications, admin, tasks }) => {
+      await slackOn(admin);
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const calls = stubSlack(() => ({ ok: false, error: 'channel_not_found' }));
+      const ch = makeChallenge({ meta: makeMeta({ pwd: '<https://evil|/tmp>' }) });
+      await inDO(({ state }) => state.storage.put(`ch:${ch.approve_token}`, ch));
+      notifications.approval(ch);
+      await Promise.all(tasks);
+      const section = (calls[0]!.body as { attachments: Array<{ blocks: Array<{ text: { text: string } }> }> }).attachments[0]!.blocks[1]!.text.text;
+      expect(section).toContain('&lt;https://evil|/tmp&gt;');
+      expect(section).not.toContain('<https');
+      expect((await inDO(({ state }) => state.storage.get<typeof ch>(`ch:${ch.approve_token}`)))!.slack).toBeUndefined();
+      expect(err.mock.calls.map(c => JSON.parse(String(c[0])) as { event: string; err: string }))
+        .toEqual([{ event: 'slack.send_failed', err: 'slack channel_not_found', stack: expect.any(String) }]);
+      notifications.decided(ch, 'expired'); // no handle → nothing to edit
+      await Promise.all(tasks);
+      expect(calls).toHaveLength(1);
+    });
+  });
+
+  it('posts cache hits only when hit notify is on, with no mention or button', async () => {
+    await withPush(async ({ notifications, admin, hitNotify, tasks }) => {
+      await slackOn(admin);
+      const calls = stubSlack(() => ({ ok: true }));
+      notifications.cacheHit(makeMeta(), 2);
+      expect(tasks).toEqual([]);
+      await hitNotify(true);
+      notifications.cacheHit(makeMeta(), 2, undefined, ['db']);
+      await Promise.all(tasks);
+      expect(calls).toHaveLength(1);
+      const body = calls[0]!.body as { text: string; attachments: Array<{ blocks: Array<{ text: { text: string } }> }> };
+      expect(body.text).toBe('vt cache hit (no approval): decrypt');
+      expect(body.attachments[0]!.blocks).toHaveLength(1);
+      expect(body.attachments[0]!.blocks[0]!.text.text).toContain('records: db');
     });
   });
 });

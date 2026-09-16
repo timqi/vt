@@ -113,10 +113,11 @@ Errors and fallback classes: [docs/structured-errors.md](docs/structured-errors.
 - Preserve structured extension envelopes and stable exit codes; error details
   must not reflect client data.
 - Notifications never block or fail protected operations. Agent cache-hit notices
-  run after `permit.commit()` returns, fire-and-forget. Worker Web Push is the only
-  channel; fan-out uses `waitUntil` after the ceremony write, never a CLI warning.
-  See [local notifications](docs/app-bundle.md#notifications) and
-  [Web Push](docs/worker-slim.md#web-push).
+  run after `permit.commit()` returns, fire-and-forget. Worker channels are Web
+  Push and the Slack Bot; fan-out uses `waitUntil` after the ceremony write, never
+  a CLI warning. Only the Slack message handle is written back to a challenge,
+  never status. See [local notifications](docs/app-bundle.md#notifications),
+  [Web Push](docs/worker-slim.md#web-push) and [Slack](docs/slack.md).
 
 ## Transient file injection
 
@@ -189,8 +190,9 @@ Cache storage, TTL ladders, and UI: [dek-cache.md](docs/dek-cache.md).
 - `SECRET` is the only Wrangler secret and only a KEK; other derived keys come
   from root `R`, unwrapped only in DO memory. Rotation permits at most two wraps.
   An unreadable root fails closed as unconfigured (`config.unreadable` once).
-  No `[vars]`: config lives in the DO; only `cache_hit_notify` / `uv_policy` are
-  mutable settings, and bootstrap origin stays immutable.
+  No `[vars]`: config lives in the DO; only `cache_hit_notify` / `uv_policy` /
+  `slack` are mutable settings, and bootstrap origin stays immutable. The Slack
+  bot token is write-only: the console API reports only that one is set.
 - Every daemon request, audit push included, requires a live per-host token.
   Verify its MAC in constant time in the DO before token access; never revive
   expired/revoked tokens or store token secrets. Issue only via `opApprove` →

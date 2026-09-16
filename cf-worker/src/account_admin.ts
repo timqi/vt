@@ -9,7 +9,8 @@
 // under a fresh nonce; writes are serialized here because the crypto awaits
 // open the DO input gate.
 
-import type { PushPayload, PushSubscription } from './types';
+import type { PushPayload, PushSubscription, SlackConfig } from './types';
+import { parseSlackConfig } from './slack';
 import { b64uEnc, b64uDec, ctEq, decodeB64uExact, hkdfSha256, hmacSha256, isB64uString, randomBytes } from './crypto';
 import { generateVapid, sendPush, type VapidKeys } from './webpush';
 import { type CredentialEntry, parseCredentialEntry, lookupByCredentialId } from './credentials';
@@ -51,6 +52,8 @@ export interface Config {
   uv_policy: unknown;
   vapid: VapidKeys | null;
   push: PushSubscription[];
+  /** Slack Bot channel (docs/slack.md); absent on blobs written before it. */
+  slack?: SlackConfig | null;
 }
 
 interface Sealed { n: string; c: string }
@@ -326,7 +329,7 @@ export class AccountAdmin {
       const root = randomBytes(32);
       const cfg: Config = {
         v: 1, origin, epoch: 1, credentials: [entry], bootstrap: { ms: Date.now(), ip },
-        cache_hit_notify: false, uv_policy: null, vapid: null, push: [],
+        cache_hit_notify: false, uv_policy: null, vapid: null, push: [], slack: null,
       };
       const cur = await this.keysFor(root, cfg);
       const rootRec: RootRecord = { wraps: [await sealWith(await this.kek(), ROOT_AAD, root)] };
@@ -486,11 +489,19 @@ export class AccountAdmin {
         return json({ credentials: cfg.credentials, epoch: cfg.epoch });
       case 'config': {
         const { origin, epoch, cache_hit_notify, uv_policy } = cfg;
-        if (request.method !== 'PUT') return json({ origin, epoch, cache_hit_notify, uv_policy });
+        // The bot token is write-only: the console learns only that one is set.
+        const slackView = (c: Config) => c.slack ? { channel: c.slack.channel, mention: c.slack.mention, bot_token_set: true } : null;
+        if (request.method !== 'PUT') return json({ origin, epoch, cache_hit_notify, uv_policy, slack: slackView(cfg) });
         const body = await jsonObject(request);
         if (body instanceof Response) return body;
         for (const k of Object.keys(body)) {
-          if (!['cache_hit_notify', 'uv_policy'].includes(k)) return new Response(`unknown key ${k}`, { status: 400 });
+          if (!['cache_hit_notify', 'uv_policy', 'slack'].includes(k)) return new Response(`unknown key ${k}`, { status: 400 });
+        }
+        let slack: SlackConfig | null | undefined;
+        if ('slack' in body) {
+          const parsed = body.slack === null ? null : parseSlackConfig(body.slack, cfg.slack ?? null);
+          if (typeof parsed === 'string') return new Response(`slack: ${parsed}`, { status: 400 });
+          slack = parsed;
         }
         if ('cache_hit_notify' in body && typeof body.cache_hit_notify !== 'boolean') return new Response('cache_hit_notify must be a boolean', { status: 400 });
         if ('uv_policy' in body && body.uv_policy !== null) {
@@ -500,9 +511,10 @@ export class AccountAdmin {
         const next = await this.write(c => {
           if ('cache_hit_notify' in body) c.cache_hit_notify = body.cache_hit_notify as boolean;
           if ('uv_policy' in body) c.uv_policy = body.uv_policy;
+          if (slack !== undefined) c.slack = slack;
         });
-        log('admin.config', { cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy !== null });
-        return json({ cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy });
+        log('admin.config', { cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy !== null, slack: !!next.slack });
+        return json({ cache_hit_notify: next.cache_hit_notify, uv_policy: next.uv_policy, slack: slackView(next) });
       }
       case 'rotate-secret': {
         const body = await jsonObject(request);
@@ -550,6 +562,10 @@ export class AccountAdmin {
   async pushConfig(): Promise<{ vapid: VapidKeys | null; push: PushSubscription[]; origin: string }> {
     const { vapid, push, origin } = this.current;
     return { vapid, push, origin };
+  }
+
+  slackConfig(): SlackConfig | null {
+    return this.current.slack ?? null;
   }
 
   /** Delete one subscription (a 404/410 from its push service, or the console). */

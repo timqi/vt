@@ -14,6 +14,7 @@ Find the document that owns the task; implementation history stays in Git.
 | Operate the macOS menu app and agent | [VT.app](app-bundle.md) |
 | Install or remove Linux sudo approval | [sudo](sudo.md) |
 | Enable local-agent audit delivery | [Agent audit](agent-audit.md) |
+| Post approvals to a Slack channel | [Slack Bot channel](slack.md) |
 
 ## Design contracts
 

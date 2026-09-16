@@ -2,7 +2,7 @@
 
 // Settings tab: the Passkeys block (setup.js, mounted on its #tab-setup
 // sub-panel), the session (logout / log out everywhere), the config knobs (hit
-// notify, UV policy — GET/PUT /api/admin/config), SECRET rotation, and push
+// notify, UV policy, Slack channel — GET/PUT /api/admin/config), SECRET rotation, and push
 // subscriptions — this device subscribes with the Worker's VAPID key and posts
 // the result; every row can be tested or removed. Rendering is textContent
 // only; the endpoint's keys never come back from the server.
@@ -30,6 +30,27 @@ vt.tabs.settings = function (panel, data) {
     var c = await resp.json();
     $('#cfg-hit-notify').checked = !!c.cache_hit_notify;
     $('#cfg-uv').value = c.uv_policy == null ? '' : JSON.stringify(c.uv_policy);
+    $('#cfg-slack').checked = !!c.slack;
+    $('#cfg-slack-fields').hidden = !c.slack;
+    $('#cfg-slack-token').value = '';
+    $('#cfg-slack-token').placeholder = c.slack ? 'leave empty to keep the stored token' : 'xoxb-…';
+    $('#cfg-slack-channel').value = c.slack ? c.slack.channel : '';
+    $('#cfg-slack-mention').value = c.slack ? c.slack.mention.join('\n') : '';
+  }
+
+  $('#cfg-slack').addEventListener('change', function () {
+    $('#cfg-slack-fields').hidden = !this.checked;
+  });
+
+  function slackBody() {
+    if (!$('#cfg-slack').checked) return null;
+    var body = {
+      channel: $('#cfg-slack-channel').value.trim(),
+      mention: $('#cfg-slack-mention').value.split(/\s+/).filter(Boolean),
+    };
+    var token = $('#cfg-slack-token').value.trim();
+    if (token) body.bot_token = token;
+    return body;
   }
 
   $('#cfg-save').addEventListener('click', async function () {
@@ -42,7 +63,7 @@ vt.tabs.settings = function (panel, data) {
       }
       var resp = await vt.apiFetch(vt.api('config'), {
         method: 'PUT', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ cache_hit_notify: $('#cfg-hit-notify').checked, uv_policy: uv }),
+        body: JSON.stringify({ cache_hit_notify: $('#cfg-hit-notify').checked, uv_policy: uv, slack: slackBody() }),
       });
       if (!resp.ok) { cfgStatus('Save failed: ' + (await resp.text()), 'error'); return; }
       cfgStatus('Saved', 'ok');

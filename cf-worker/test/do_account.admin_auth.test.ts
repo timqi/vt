@@ -190,7 +190,7 @@ describe('session verification in the DO', () => {
     await denied.text();
     const ok = await put({ cache_hit_notify: true, uv_policy: { default: 'required' } });
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toEqual({ cache_hit_notify: true, uv_policy: { default: 'required' } });
+    expect(await ok.json()).toEqual({ cache_hit_notify: true, uv_policy: { default: 'required' }, slack: null });
     // The deleted switch is a rejected input now, like any unknown key.
     const gone = await put({ cache_enabled: true });
     expect(gone.status).toBe(400);

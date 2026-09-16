@@ -88,9 +88,10 @@ in [dek-cache.md](dek-cache.md).
 
 ## Web Push
 
-Web Push is the only notification channel. Delivery is best-effort and runs
-after the ceremony write; it never blocks or fails protected operations.
-Notifications cannot create authority and are not a durable audit ledger.
+Web Push is the primary notification channel; the optional Slack Bot channel is
+described in [slack.md](slack.md). Delivery is best-effort and runs after the
+ceremony write; it never blocks or fails protected operations. Notifications
+cannot create authority and are not a durable audit ledger.
 
 Approval and enrollment requests can notify subscribed phones. Cache-hit notices
 are separately enabled and off by default. Extension approval remains in the

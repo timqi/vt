@@ -449,6 +449,7 @@ export class AccountDO extends DurableObject<Env> {
     settleSockets(this.ctx.getWebSockets(`pt:${fresh.poll_token}`), { status: 'expired' });
     logFinal(this.audit, fresh, 'expired', now);
     this.audit.broadcastRow(auditKey(fresh.approve_token), 'update');
+    this.notifications.decided(fresh, 'expired');
     // Retain `ch:` for RETENTION_MS so an in-flight WS reconnect still sees the
     // terminal status; drop only the routing key now (a later RETENTION sweep
     // drops `ch:`).
@@ -634,6 +635,8 @@ export class AccountDO extends DurableObject<Env> {
     ch.pwa_pk_b64u = body.pwa_pk_b64u;
     ch.binding_tag_b64u = body.binding_tag_b64u;
     ch.finalized_ms = finalizedMs;
+    // The Slack send task may have written its handle while the gate was open.
+    ch.slack = latest.slack;
     // Enrollment: mint the token in the SAME synchronous step as the status
     // flip (the SQL insert and the put have no await between them), so an
     // approved enrollment always has its token and a token always has its
@@ -648,6 +651,7 @@ export class AccountDO extends DurableObject<Env> {
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 
     logFinal(this.audit, ch, 'approved', ch.finalized_ms);
+    this.notifications.decided(ch, 'approved');
 
     // Opt-in DEK cache write. Best-effort: a failure here must never break the
     // approval (the daemon already has its sealed DEKs via the WS path below).
@@ -1125,12 +1129,14 @@ export class AccountDO extends DurableObject<Env> {
     if (!latest || latest.status !== 'pending') {
       return new Response('challenge not pending', { status: 410 });
     }
+    ch.slack = latest.slack;
     await this.ctx.storage.put(`ch:${ch.approve_token}`, ch);
 
     settleSockets(this.ctx.getWebSockets(`pt:${ch.poll_token}`), { status: 'rejected' });
 
     logFinal(this.audit, ch, 'rejected', ch.finalized_ms);
     this.audit.broadcastRow(auditKey(ch.approve_token), 'update');
+    this.notifications.decided(ch, 'rejected');
     return new Response('ok');
   }
 

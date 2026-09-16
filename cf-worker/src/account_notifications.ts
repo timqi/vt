@@ -1,10 +1,13 @@
-// Web Push fan-out (docs/worker-slim.md#web-push). Notifications never authorize or
-// finalize a challenge and never run on the ceremony path: every send is a
-// waitUntil task, and the CLI is never told whether it landed.
+// Web Push fan-out (docs/worker-slim.md#web-push) plus the Slack Bot channel
+// (docs/slack.md). Notifications never authorize or finalize a challenge and
+// never run on the ceremony path: every send is a waitUntil task, and the CLI
+// is never told whether it landed. Only the Slack message handle is merged
+// into a freshly read challenge record.
 
-import { Challenge, ChallengeMeta, DoAuditIngestOp, PushPayload } from './types';
+import { Challenge, ChallengeMeta, ChallengeStatus, DoAuditIngestOp, PushPayload, SlackConfig } from './types';
 import { buildApprovalMessage, buildCacheHitMessage } from './notify';
 import { sendPush } from './webpush';
+import { editApproval, sendApproval, sendCacheHit } from './slack';
 import { AccountAdmin } from './account_admin';
 import { ADMIN_AUDIT_PATH } from './page';
 import { logErr } from './log';
@@ -22,7 +25,7 @@ export class AccountNotifications {
   private agentCacheNotifyMs = new Map<string, number>();
 
   constructor(
-    private readonly ctx: Pick<DurableObjectState, 'waitUntil'>,
+    private readonly ctx: Pick<DurableObjectState, 'storage' | 'waitUntil'>,
     private readonly admin: AccountAdmin,
   ) {}
 
@@ -53,11 +56,43 @@ export class AccountNotifications {
     // request row (op_kind='cache-extend') and the effect row (status='extended').
     if (challenge.extend) return;
     const { title, body } = buildApprovalMessage(challenge.meta.op_kind, challenge.meta, chSalts(challenge));
+    const url = `${this.admin.current.origin}/a/${challenge.approve_token}`;
     this.push({
-      v: 1, kind: challenge.enroll ? 'enroll' : 'approval', title, body,
-      url: `${this.admin.current.origin}/a/${challenge.approve_token}`,
+      v: 1, kind: challenge.enroll ? 'enroll' : 'approval', title, body, url,
       tag: `a:${challenge.approve_token}`,
     }, 300, 'high');
+    const slack = this.admin.slackConfig();
+    if (slack) this.ctx.waitUntil(this.slackSend(slack, challenge, url).catch((e) => logErr('slack.send_failed', e)));
+  }
+
+  // Post the pending message and write its handle onto the latest record so the
+  // decision can edit it. Slack awaits stay outside the get/put pair; a swept
+  // record stays gone. If the decision raced ahead of the send, edit straight to
+  // the terminal state — otherwise the message would sit at ⏳ forever.
+  private async slackSend(cfg: SlackConfig, ch: Challenge, approveUrl: string): Promise<void> {
+    const ref = await sendApproval(cfg, ch.meta, chSalts(ch), approveUrl);
+    if (typeof ref === 'string') { logErr('slack.send_failed', new Error(ref)); return; }
+    const key = `ch:${ch.approve_token}`;
+    const cur = await this.ctx.storage.get<Challenge>(key);
+    if (!cur) return;
+    cur.slack = ref;
+    await this.ctx.storage.put(key, cur);
+    if (cur.status !== 'pending') await this.slackEdit(cfg, cur, cur.status);
+  }
+
+  private async slackEdit(cfg: SlackConfig, ch: Challenge, state: Exclude<ChallengeStatus, 'pending'>): Promise<void> {
+    if (!ch.slack) return;
+    const latency = ch.finalized_ms != null ? ch.finalized_ms - ch.created_ms : undefined;
+    const warning = await editApproval(cfg, ch.slack, state, ch.meta, chSalts(ch), latency);
+    if (warning) logErr('slack.edit_failed', new Error(warning), { state });
+  }
+
+  /** Rewrite the Slack message after a decision or expiry; `ch` must carry the
+   *  handle (callers merge `slack` forward from the latest record). */
+  decided(ch: Challenge, state: Exclude<ChallengeStatus, 'pending'>): void {
+    const slack = this.admin.slackConfig();
+    if (!slack || !ch.slack) return;
+    this.ctx.waitUntil(this.slackEdit(slack, ch, state).catch((e) => logErr('slack.edit_failed', e)));
   }
 
   // Approval-free notice shared by the Worker DEK-cache hit (opDekCache) and the agent
@@ -73,6 +108,12 @@ export class AccountNotifications {
       v: 1, kind: 'cache_hit', title, body,
       url: `${this.admin.current.origin}${ADMIN_AUDIT_PATH}`, tag: `cache:${meta.host}`,
     }, 3600, 'normal');
+    const slack = this.admin.slackConfig();
+    if (slack) {
+      this.ctx.waitUntil(sendCacheHit(slack, meta, salts, note, names)
+        .then((w) => { if (w) logErr('slack.cachehit_failed', new Error(w)); })
+        .catch((e) => logErr('slack.cachehit_failed', e)));
+    }
   }
 
   // Throttled per (op_kind, host); the note names the skipped factor — Touch
