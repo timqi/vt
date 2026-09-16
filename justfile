@@ -238,7 +238,7 @@ bump-assets:
 
 # Deploy the Cloudflare worker (requires wrangler on PATH)
 [working-directory: 'cf-worker']
-deploy-worker:
+deploy-worker: bump-assets
     wrangler deploy
 
 # The GitHub `Release` workflow builds the bare `vt` (macOS arm64 + Linux
