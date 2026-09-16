@@ -456,12 +456,12 @@ final class AgentSupervisor {
 
 func hexKeyTemplateImage(height: CGFloat) -> NSImage {
     // Geometry from cf-worker/pwa/icon.svg (512 viewBox). Content bounding
-    // box in that space: x 152..360, y 90..412. We fit that box, aspect
+    // box in that space: x 150..362, y 86..416. We fit that box, aspect
     // preserved, into a padded status-bar cell so the glyph matches the
     // visual weight of SF Symbol menu-bar icons (which carry internal
     // padding) instead of filling the whole bar height.
-    let contentMinX: CGFloat = 152, contentMinY: CGFloat = 90
-    let contentW: CGFloat = 360 - 152, contentH: CGFloat = 412 - 90
+    let contentMinX: CGFloat = 150, contentMinY: CGFloat = 86
+    let contentW: CGFloat = 362 - 150, contentH: CGFloat = 416 - 86
     let pad: CGFloat = 0.5                      // minimal inset — fill the cell
     let avail = height - 2 * pad
     let scale = avail / contentH               // height-dominant (tall key)
@@ -477,29 +477,31 @@ func hexKeyTemplateImage(height: CGFloat) -> NSImage {
             NSRect(x: ox + (x - contentMinX) * scale, y: oy + (y - contentMinY) * scale,
                    width: w * scale, height: h * scale)
         }
-        NSColor.black.setFill()
-        // hex nut bow
-        let hex = NSBezierPath()
-        hex.move(to: p(360, 180))
-        for (x, y) in [(308, 270), (204, 270), (152, 180), (204, 90), (308, 90)] {
-            hex.line(to: p(CGFloat(x), CGFloat(y)))
+        // Polygon with tangent-arc (rounded) corners, starting mid-edge.
+        func roundedPoly(_ pts: [(CGFloat, CGFloat)], _ radius: CGFloat) -> NSBezierPath {
+            let path = NSBezierPath()
+            path.move(to: p((pts[0].0 + pts[1].0) / 2, (pts[0].1 + pts[1].1) / 2))
+            for i in 0..<pts.count {
+                let v = pts[(i + 1) % pts.count], n = pts[(i + 2) % pts.count]
+                path.appendArc(from: p(v.0, v.1), to: p(n.0, n.1), radius: radius * scale)
+            }
+            path.close()
+            return path
         }
-        hex.close()
+        NSColor.black.setFill()
+        // rounded hex nut bow
+        let hex = roundedPoly([(362, 178), (309, 270), (203, 270), (150, 178), (203, 86), (309, 86)], 34)
         // keyhole punched out of the nut
         let hole = NSBezierPath()
-        hole.appendOval(in: r(226, 136, 60, 60))
-        hole.move(to: p(240, 182))
-        hole.line(to: p(272, 182))
-        hole.line(to: p(282, 246))
-        hole.line(to: p(230, 246))
-        hole.close()
+        hole.appendOval(in: r(225, 131, 62, 62))
+        hole.append(roundedPoly([(243, 168), (269, 168), (282, 240), (230, 240)], 13))
         hex.append(hole.reversed)
         hex.windingRule = .evenOdd
         hex.fill()
-        // shaft + teeth
-        NSBezierPath(roundedRect: r(235, 250, 42, 162), xRadius: 18 * scale, yRadius: 18 * scale).fill()
-        NSBezierPath(roundedRect: r(276, 330, 40, 24), xRadius: 6 * scale, yRadius: 6 * scale).fill()
-        NSBezierPath(roundedRect: r(276, 372, 26, 24), xRadius: 6 * scale, yRadius: 6 * scale).fill()
+        // shaft + teeth (pill ends; teeth start inside the shaft so they merge)
+        NSBezierPath(roundedRect: r(236, 248, 40, 168), xRadius: 20 * scale, yRadius: 20 * scale).fill()
+        NSBezierPath(roundedRect: r(258, 320, 64, 30), xRadius: 15 * scale, yRadius: 15 * scale).fill()
+        NSBezierPath(roundedRect: r(258, 366, 50, 30), xRadius: 15 * scale, yRadius: 15 * scale).fill()
         return true
     }
     image.isTemplate = true
@@ -596,17 +598,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateIcon() {
         guard let button = statusItem.button else { return }
         button.appearsDisabled = !agentReachable
-        if let s = lastStatus {
-            if s.locked {
-                button.title = " ⊘"
-            } else if !s.grants.isEmpty {
-                button.title = " \(s.grants.count)"
-            } else {
-                button.title = ""
-            }
-        } else {
-            button.title = ""
-        }
+        // The grant count stays inside the menu (status line / "Grants (n)"),
+        // never beside the icon; only "locked" shows in the bar.
+        button.title = (lastStatus?.locked ?? false) ? " ⊘" : ""
     }
 
     func menuWillOpen(_ menu: NSMenu) {

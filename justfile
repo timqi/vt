@@ -64,10 +64,10 @@ app:
     # default, so "VT" would collide with the "vt" CLI beside it.
     swiftc -O -o "$APP/Contents/MacOS/VTApp" app/VTShell.swift
     cp "$BIN" "$APP/Contents/MacOS/vt"
-    # AppIcon.icns from the Worker PWA icon (single source of truth).
+    # AppIcon.icns from the blue app tile rendered by `just icons`.
     ICONSET=build/AppIcon.iconset
     rm -rf "$ICONSET" && mkdir -p "$ICONSET"
-    SRC=cf-worker/pwa/icon-512.png
+    SRC=app/icon-512.png
     for SZ in 16 32 64 128 256 512; do
       sips -z $SZ $SZ "$SRC" --out "$ICONSET/icon_${SZ}x${SZ}.png" >/dev/null
       DBL=$((SZ * 2))
@@ -199,6 +199,27 @@ check-worker:
 
 # Everything the CI gates run, in one shot (Rust + worker)
 ci: check lint test check-worker
+
+# Re-render the committed icon PNGs from cf-worker/pwa/icon.svg (the only icon
+# source). The macOS tile is the same key on a blue palette so a VT.app install
+# is told apart from the PWA; `just app` bakes app/icon-512.png into the icns.
+# Run after editing the SVG, then `just bump-assets`.
+icons:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run --quiet --with cairosvg python - <<'PY'
+    import cairosvg
+    src = open('cf-worker/pwa/icon.svg').read()
+    def png(svg, out):
+        cairosvg.svg2png(bytestring=svg.encode(), write_to=out, output_width=512, output_height=512)
+    png(src, 'cf-worker/pwa/icon-512.png')
+    # green -> blue: tile gradient (3), key fill, drop shadow, machined ring
+    for green, blue in [('#b6da57', '#6366f1'), ('#8cc653', '#3b6ef0'), ('#52ab5b', '#2563eb'),
+                        ('#fafff5', '#f5f8ff'), ('#14401c', '#0b1b46'), ('#4c9a2a', '#2563eb')]:
+        src = src.replace(green, blue)
+    png(src, 'app/icon-512.png')
+    PY
+    echo "rendered: cf-worker/pwa/icon-512.png (green), app/icon-512.png (blue)"
 
 # Stamp <YYYYMMDD>-<git short hash> into ASSET_VER (cf-worker/src/index.ts).
 # Run after changing anything shipped from cf-worker/pwa/ (css / js / the page
