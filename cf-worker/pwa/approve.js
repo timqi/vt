@@ -269,6 +269,11 @@
         async function runApprove() {
             var k = null, kWrap = null, masterKey = null, deks = null;
             var shared = null, bindingKey = null;
+            // One ceremony at a time: a second tap while the Passkey sheet is
+            // up starts a second `credentials.get`, which cancels the first — the
+            // page sees NotAllowedError and iOS reports "Unable to use passkey"
+            // when the provider answers the cancelled request.
+            refs.approve.disabled = true; refs.reject.disabled = true;
             try {
                 setStatus('Touch the Passkey to verify…');
                 // Read before the ceremony: the inputs are what the approver saw
@@ -408,14 +413,13 @@
                 });
                 if (!resp.ok) throw new Error('Submit failed (HTTP ' + resp.status + ')');
                 setStatus('✓ Approved', 'ok');
-                refs.approve.disabled = true;
-                refs.reject.disabled = true;
                 onSettled('approved');
             } catch (e) {
                 var m = (e && e.message) ? e.message : String(e);
                 if (/NotAllowed|not allowed/i.test(m)) m = 'No matching Passkey, or the prompt was cancelled';
                 setStatus('Error: ' + m, 'error');
                 console.error(e);
+                refs.approve.disabled = false; refs.reject.disabled = false;
             } finally {
                 vt.zeroize(k); vt.zeroize(kWrap); vt.zeroize(masterKey); vt.zeroize(deks);
                 vt.zeroize(shared); vt.zeroize(bindingKey);
