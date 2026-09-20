@@ -46,7 +46,7 @@ const FAVICON_TAGS =
 // admin.css stays stale, which desyncs markup from styles. The .html page
 // shells need no token — the Worker reads them server-side per request.)
 // Stamped by `just bump-assets` (<YYYYMMDD>-<git short hash>) — don't hand-edit.
-const ASSET_VER = '20260919-42d49f9';
+const ASSET_VER = '20260920-27bb338';
 
 // Defensive cap on display-only meta fields. The CLI already sanitizes, but
 // the worker has no reason to trust the body — anything over the cap is
@@ -144,7 +144,16 @@ app.get('/healthz', c => c.text('ok'));
 app.get('/pwa/*', async (c) => {
   const url = new URL(c.req.url);
   url.pathname = url.pathname.slice('/pwa'.length) || '/';
-  return c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
+  const resp = await c.env.ASSETS.fetch(new Request(url.toString(), c.req.raw));
+  // A URL carrying THIS deploy's token can never change under the browser, so
+  // it is cached outright: without this every page load spends a round trip per
+  // asset revalidating (Workers Assets answers `max-age=0, must-revalidate`),
+  // which on a phone link is most of the wait before the approval page paints.
+  // An unversioned or stale ?v= keeps the platform's revalidate-every-time.
+  if (url.searchParams.get('v') !== ASSET_VER) return resp;
+  const cached = new Response(resp.body, resp);
+  cached.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  return cached;
 });
 
 // Service worker at root scope (a worker under /pwa/ could not control /a/*

@@ -25,6 +25,24 @@ describe('admin shell', () => {
     expect(resp.headers.get('Content-Type')).toMatch(/text\/css/);
   });
 
+  // Versioned URLs are the whole point of ASSET_VER: a browser that has the
+  // file must not spend a round trip asking whether it changed.
+  it('caches an asset URL carrying this deploy version, revalidates the rest', async () => {
+    const shell = await (await SELF.fetch(`${ORIGIN}/admin`)).text();
+    const versioned = shell.match(/\/pwa\/common\.js\?v=[\w.-]+/)?.[0];
+    expect(versioned).toBeTruthy();
+
+    const fresh = await SELF.fetch(`${ORIGIN}${versioned}`);
+    expect(fresh.status).toBe(200);
+    expect(fresh.headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
+
+    for (const path of ['/pwa/common.js', '/pwa/common.js?v=stale']) {
+      const other = await SELF.fetch(`${ORIGIN}${path}`);
+      expect(other.status).toBe(200);
+      expect(other.headers.get('Cache-Control') ?? '').not.toContain('immutable');
+    }
+  });
+
   // The approval page's first paint hangs off this one: a 404 here is a blank
   // page for as long as the big stylesheet takes to arrive.
   it('serves the approve page boot stylesheet', async () => {
