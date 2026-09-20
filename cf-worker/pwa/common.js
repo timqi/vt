@@ -196,7 +196,12 @@
             // An approval already on screen owns the page: navigating away mid
             // ceremony aborts the WebAuthn prompt (it surfaces as "cancelled").
             if (document.querySelector('.vt-approve')) return;
-            if (u.pathname !== location.pathname) location.replace(u.href);
+            if (u.pathname === location.pathname) return;
+            // The loaded console mounts the request in its sheet instead
+            // (audit.js); everything else loads the standalone page.
+            var token = u.pathname.slice('/a/'.length);
+            if (vt.openApprovalSheet && vt.openApprovalSheet(token)) return;
+            location.replace(u.href);
         });
         var cleaningNotifications = false;
         async function cleanNotifications() {

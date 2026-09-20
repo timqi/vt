@@ -384,6 +384,19 @@ th.col-pick input, td.col-pick input, .row-lead input { accent-color: var(--acce
   padding: 12px 20px calc(12px + env(safe-area-inset-bottom));
 }
 #detail-approve .vt-ap-cache-section { margin-top: 0; }
+/* A request opened from a notification has no row above it (admin.js
+   vt.openApprovalSheet): the ceremony carries its own request details and is
+   the whole sheet, so it takes the height the empty detail list leaves instead
+   of the 55vh cap a row's details need. Inside it only the request details
+   scroll — the duration control and the action bar are the decision, and on a
+   short window they would otherwise start below the fold, half-covered by the
+   bar pinned over them. */
+#detail.ceremony-only #detail-approve {
+  display: flex; flex-direction: column;
+  flex: 1 1 auto; min-height: 0; max-height: none; overflow: hidden;
+}
+#detail.ceremony-only .vt-ap-meta-section { flex: 1 1 auto; min-height: 0; overflow: auto; }
+#detail.ceremony-only .vt-ap-cache-section, #detail.ceremony-only .vt-ap-bar { flex: none; }
 @media (min-width: 640px) {
   #detail-dl { grid-template-columns: max-content 1fr; gap: 6px 16px; }
   #detail-dl dt { margin-top: 0; }

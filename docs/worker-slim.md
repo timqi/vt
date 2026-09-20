@@ -114,7 +114,10 @@ and hands it to a page that asks on load; the page navigates itself, because an
 iOS home-screen app answers a tap by showing its start page. Approval and
 enrollment pushes hand it to an already-open window immediately; cache-hit
 notices never navigate, and a page already showing an approval is never
-navigated away — that would abort its WebAuthn prompt. A tap focuses that window, and opens one only when the
+navigated away — that would abort its WebAuthn prompt. A shown console mounts
+the request in its detail sheet instead of navigating — the start page is the
+console, so a tap would otherwise load it and immediately replace it; it falls
+back to the standalone page when the request is no longer readable. A tap focuses that window, and opens one only when the
 app has none — an opened window is an auxiliary context that iOS presents as an
 in-app browser. Each hand-off fires once, and after a decision the page leaves
 for the admin console: the spent token would only render as 410.

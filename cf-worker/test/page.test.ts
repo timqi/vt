@@ -70,6 +70,74 @@ describe('notification cleanup on PWA visits', () => {
   });
 });
 
+// A notification tap reaches an open page as a service-worker message. The
+// console answers it in its own sheet (admin.js vt.openApprovalSheet); anything
+// else loads the standalone /a/<token> document.
+describe('notification hand-off', () => {
+  const URL_ = 'https://vt.test/a/0123456789abcdef';
+
+  function setup(opts: { sheet?: () => boolean; ceremonyOnScreen?: boolean; pathname?: string } = {}) {
+    const listeners: Record<string, (e: unknown) => void> = {};
+    const replace = vi.fn();
+    const context: Record<string, unknown> = {
+      document: {
+        addEventListener() {}, visibilityState: 'hidden',
+        querySelector: () => (opts.ceremonyOnScreen ? {} : null),
+      },
+      location: { origin: 'https://vt.test', pathname: opts.pathname ?? '/admin', replace },
+      addEventListener() {},
+      URL, TextEncoder, crypto, fetch: vi.fn(),
+      navigator: {
+        serviceWorker: {
+          addEventListener: (name: string, fn: (e: unknown) => void) => { listeners[name] = fn; },
+          ready: new Promise(() => {}),   // never resolves: no notification sweep here
+        },
+      },
+    };
+    context.window = context;
+    runInNewContext(pwa('common.js'), context);
+    const sheet = opts.sheet ? vi.fn(opts.sheet) : undefined;
+    if (sheet) (context.vt as Record<string, unknown>).openApprovalSheet = sheet;
+    const send = (url: unknown = URL_) => listeners.message({ data: { type: 'vt-navigate', url } });
+    return { send, replace, sheet };
+  }
+
+  it('hands the token to a console that can mount it, instead of navigating', () => {
+    const h = setup({ sheet: () => true });
+    h.send();
+    expect(h.sheet).toHaveBeenCalledWith('0123456789abcdef');
+    expect(h.replace).not.toHaveBeenCalled();
+  });
+
+  it('navigates when no console claims it', () => {
+    const none = setup();
+    none.send();
+    expect(none.replace).toHaveBeenCalledWith(URL_);
+
+    const refused = setup({ sheet: () => false });
+    refused.send();
+    expect(refused.replace).toHaveBeenCalledWith(URL_);
+  });
+
+  it('leaves a running ceremony, this page, and foreign or non-approval URLs alone', () => {
+    const busy = setup({ sheet: () => true, ceremonyOnScreen: true });
+    busy.send();
+    expect(busy.sheet).not.toHaveBeenCalled();
+    expect(busy.replace).not.toHaveBeenCalled();
+
+    const here = setup({ sheet: () => true, pathname: '/a/0123456789abcdef' });
+    here.send();
+    expect(here.sheet).not.toHaveBeenCalled();
+    expect(here.replace).not.toHaveBeenCalled();
+
+    const off = setup({ sheet: () => true });
+    off.send('https://evil.test/a/0123456789abcdef');
+    off.send('https://vt.test/admin#audit');
+    expect(off.sheet).not.toHaveBeenCalled();
+    expect(off.replace).not.toHaveBeenCalled();
+  });
+});
+
 describe('cache creation time rendering', () => {
   class Element {
     children: Element[] = [];

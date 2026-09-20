@@ -291,9 +291,44 @@
       dl.appendChild(vt.el('dd', mono ? 'mono' : null, String(value)));
     },
   };
+  // A notification tap inside the installed app arrives as a message, not a
+  // navigation (common.js): /admin is the start page, so a tap would load this
+  // whole document and then replace it with /a/<token> — two DO round trips,
+  // two stylesheets and two script sets before the approver sees the request.
+  // A shown console already has the ceremony, so it runs it in this sheet.
+  // Returns false when it cannot, and the caller navigates as before.
+  vt.openApprovalSheet = function (token) {
+    if (!vt.mountApprove || document.getElementById('console').hidden) return false;
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(token)) return false;
+    // Whatever row was open surrenders the sheet (its onClose runs, so no tab
+    // keeps live-refreshing into what is now a ceremony).
+    vt.dialog.close();
+    var box = vt.dialog.open({ title: 'Approval request' }).approve;
+    dialog.classList.add('ceremony-only');   // no row above it: admin.css gives it the sheet
+    var fallback = function () { vt.dialog.close(); location.replace('/a/' + token); };
+    fetch('/api/page/' + encodeURIComponent(token), { headers: { 'Accept': 'application/json' } })
+      .then(function (resp) { return resp.ok ? resp.json() : null; })
+      .then(function (data) {
+        // Dismissed meanwhile, or another sheet took the box: leave it alone.
+        if (!vt.dialog.isOpen() || box.firstChild) return;
+        // Already handled, expired or unreadable: the standalone page owns
+        // that message (410 / 404), so hand the tap back to it.
+        if (!data) return fallback();
+        vt.mountApprove({
+          data: data,
+          root: box,
+          showMeta: true,   // no audit row above it: the ceremony shows the request
+          onSettled: function () { setTimeout(vt.dialog.close, 800); },
+        });
+      })
+      .catch(function () { if (vt.dialog.isOpen()) fallback(); });
+    return true;
+  };
+
   // Logical close happens here (also for Escape); the exit transition continues.
   dialog.addEventListener('close', function () {
     dialogApprove.innerHTML = '';
+    dialog.classList.remove('ceremony-only');
     var cb = dialogOnClose; dialogOnClose = null;
     if (cb) cb();
     if (dialogOpener && dialogOpener.focus) dialogOpener.focus();
