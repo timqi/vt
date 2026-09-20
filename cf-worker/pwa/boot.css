@@ -1,0 +1,54 @@
+/* Critical first paint for approve.html. admin.css is ~8KB gzipped and
+   render-blocking: on a slow phone link the approval page — the one page that
+   is opened from a notification, under time pressure — stayed white until it
+   arrived. This file carries only what painting the loading state needs, so
+   the shell shows its heading and a spinner after ~1KB; approve.js promotes
+   admin.css (media print → all) before it mounts the ceremony.
+
+   Keep it small, and keep the handful of values copied from admin.css's :root
+   in sync with it — admin.css loads after and wins every rule it repeats. */
+
+:root { color-scheme: light dark; }
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding-top: env(safe-area-inset-top);
+  background: light-dark(#f6f7f9, #0f1115);
+  color: light-dark(#1c2129, #e6e8ec);
+  font: 17px/1.45 -apple-system, BlinkMacSystemFont, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+main.approve { max-width: 420px; margin: 0 auto; padding: 20px 16px 0; }
+h1 { font-size: 28px; margin: 0 0 4px; letter-spacing: -.01em; }
+.hint { color: light-dark(#5b6573, #9aa3b2); margin: 8px 0 16px; font-size: 15px; }
+/* The header's two controls, so the wait does not look like a broken page. */
+.approve-nav { display: flex; gap: 8px; margin: 12px 0 0; }
+.approve-nav a, .approve-nav button {
+  display: inline-flex; align-items: center; padding: 6px 14px; min-height: 36px;
+  background: light-dark(#eef1f5, #1f232c); color: light-dark(#1c2129, #e6e8ec);
+  border: 1px solid light-dark(#d8dee6, #2a2f3a);
+  border-radius: 12px; text-decoration: none;
+  font-family: inherit; font-size: 13px; font-weight: 600;
+}
+
+/* The loading state itself (approve.html), replaced by the ceremony the moment
+   mountApprove() clears its root. Indeterminate: the page cannot know how much
+   of the request is left, only that it is still coming. */
+.vt-boot {
+  display: flex; align-items: center; gap: 10px; margin: 0; padding: 22px 0;
+  color: light-dark(#5b6573, #9aa3b2); font-size: 15px;
+}
+.vt-boot::before {
+  content: ""; flex: none; width: 18px; height: 18px; border-radius: 50%;
+  border: 2px solid light-dark(rgba(0, 0, 0, .14), rgba(255, 255, 255, .18));
+  border-top-color: light-dark(#2563eb, #4f8cff);
+  animation: vt-boot-spin 800ms linear infinite;
+}
+@keyframes vt-boot-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .vt-boot::before { animation-duration: 2.4s; } }
+
+/* A wait long enough to look stuck earns one more line. Pure CSS: the scripts
+   that would set it are exactly what has not arrived. */
+.vt-boot-slow { opacity: 0; animation: vt-boot-slow 1ms linear 6s forwards; }
+@keyframes vt-boot-slow { to { opacity: 1; } }

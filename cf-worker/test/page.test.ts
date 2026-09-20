@@ -266,6 +266,16 @@ describe('page shells', () => {
     expect(html).toContain('/pwa/admin/admin.css?v=20260101-abc1234');
   });
 
+  // First paint must not wait for the big stylesheet: boot.css is the only
+  // render-blocking link, admin.css is parked at media="print" and promoted by
+  // approve.js, and the loading state ships in the shell's markup.
+  it('paints a loading state before admin.css', () => {
+    const raw = pwa('approve.html');
+    expect(raw).toMatch(/<link rel="stylesheet" href="\/pwa\/boot\.css\?v=\{\{ASSET_VER\}\}">/);
+    expect(raw).toMatch(/<link rel="stylesheet" id="vt-css" media="print" href="\/pwa\/admin\/admin\.css/);
+    expect(raw).toContain('class="vt-boot"');
+  });
+
   it('renders the admin shell with its state and rp_id', () => {
     const html = render('admin/admin.html', {
       ...pageVars(CHROME),

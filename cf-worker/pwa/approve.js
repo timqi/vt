@@ -485,16 +485,40 @@
     var reload = document.getElementById('ap-reload');
     if (reload) reload.addEventListener('click', function () { location.reload(); });
 
+    // The shell parks admin.css at media="print" so boot.css can paint the
+    // loading state on its own (approve.html). A print stylesheet is fetched at
+    // the lowest priority, so on a slow link these scripts routinely arrive
+    // first: promote it and mount only once it is applied, or the ceremony
+    // paints unstyled and then jumps. Bounded — a stylesheet that fails or
+    // stalls must not hold the approval; it restyles whenever it lands.
+    // The admin shell has no such link.
+    var css = document.getElementById('vt-css');
+    function whenStyled(mount) {
+        if (!css || css.sheet) { if (css) css.media = 'all'; mount(); return; }
+        var mounted = false;
+        var go = function (apply) {
+            if (apply) css.media = 'all';
+            if (!mounted) { mounted = true; mount(); }
+        };
+        css.addEventListener('load', function () { go(true); });
+        css.addEventListener('error', function () { go(false); });
+        setTimeout(function () { go(false); }, 2000);
+    }
+
     var root = document.getElementById('vt-approve-root');
     if (root) {
         var data = vt.bootData();
         if (data) {
-            mountApprove({
+            whenStyled(function () { mountApprove({
                 data: data,
                 root: root,
                 showMeta: true,
                 onSettled: function () { setTimeout(function () { location.replace('/admin'); }, 800); },
-            });
+            }); });
+        } else {
+            // The loading state would otherwise spin forever on a page that is
+            // never going to mount.
+            root.textContent = 'Could not read this request. Refresh to try again.';
         }
     }
 })();

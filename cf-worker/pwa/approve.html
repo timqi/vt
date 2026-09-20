@@ -11,7 +11,14 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>vt approval request</title>
   {{FAVICON_TAGS}}
-  <link rel="stylesheet" href="/pwa/admin/admin.css?v={{ASSET_VER}}">
+  <!-- Two stylesheets, one paint. boot.css is ~1KB and render-blocking: it
+       paints the heading and the loading state while the rest is still in
+       flight. admin.css is parked at media="print" so it blocks nothing;
+       approve.js waits for it, promotes it to 'all' and only then mounts the
+       ceremony — a slow link shows the loading state, never white and never an
+       unstyled approval. -->
+  <link rel="stylesheet" href="/pwa/boot.css?v={{ASSET_VER}}">
+  <link rel="stylesheet" id="vt-css" media="print" href="/pwa/admin/admin.css?v={{ASSET_VER}}">
 </head>
 <body>
   <script type="application/json" id="vt-data">{{VT_DATA}}</script>
@@ -29,7 +36,11 @@
     <!-- The ceremony UI (decision / details / cache selector / action bar) is
          built by approve.js's vt.mountApprove(), the single source shared with
          the admin audit sheet's inline approval. One solid card. -->
-    <div id="vt-approve-root" class="card"></div>
+    <div id="vt-approve-root" class="card">
+      <!-- Discarded by mountApprove()'s first act (root.innerHTML = ''). -->
+      <p class="vt-boot" role="status">Loading approval request…</p>
+      <p class="vt-boot-slow hint">Still loading — check the connection, then Refresh.</p>
+    </div>
   </main>
   <script src="/pwa/common.js?v={{ASSET_VER}}"></script>
   <script src="/pwa/approve.js?v={{ASSET_VER}}"></script>

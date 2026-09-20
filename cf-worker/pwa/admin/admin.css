@@ -1,5 +1,7 @@
-/* The one stylesheet for both shells (docs/design/ui-ux.md): approve.html is a
-   420px phone column, admin.html the tabbed console. Every control and every
+/* The stylesheet for both shells (docs/design/ui-ux.md): approve.html is a
+   420px phone column, admin.html the tabbed console. Everything but the
+   approval page's loading state, which pwa/boot.css paints before this file
+   arrives. Every control and every
    .vt-ap-* rule exists once here. Three layers: canvas (--bg), content (solid
    --panel), chrome (.glass). Phone first; ≥ 768px is the desktop layout. */
 :root {

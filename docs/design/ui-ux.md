@@ -15,6 +15,9 @@ labels and required decision information.
   color or icons alone cannot convey meaning.
 - CSS tokens, dimensions, and component classes belong in
   [admin.css](../../cf-worker/pwa/admin/admin.css), not a parallel specification.
+- The approval page paints a loading state from the small render-blocking
+  [boot.css](../../cf-worker/pwa/boot.css) and promotes admin.css afterwards; a
+  slow network must never show a blank page or an unstyled ceremony.
 
 ## Phone use
 

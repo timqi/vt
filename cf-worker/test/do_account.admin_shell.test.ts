@@ -25,6 +25,15 @@ describe('admin shell', () => {
     expect(resp.headers.get('Content-Type')).toMatch(/text\/css/);
   });
 
+  // The approval page's first paint hangs off this one: a 404 here is a blank
+  // page for as long as the big stylesheet takes to arrive.
+  it('serves the approve page boot stylesheet', async () => {
+    const resp = await SELF.fetch(`${ORIGIN}/pwa/boot.css`);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get('Content-Type')).toMatch(/text\/css/);
+    expect(await resp.text()).toContain('.vt-boot');
+  });
+
   it('renders setup before bootstrap, then login without a cookie and console with one', async () => {
     const setup = await SELF.fetch(`${ORIGIN}/admin`);
     expect(setup.status).toBe(200);
