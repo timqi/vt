@@ -26,6 +26,28 @@
 
     var el = vt.el, ttlLabel = vt.ttlLabel;
 
+    // Both ceremonies run the assertion through here. No `allowCredentials`:
+    // registration requires resident keys (setup.js), so the provider discovers
+    // the credential; a sent id list made 1Password refuse at once for an id not
+    // yet synced to this device. Omitted, not `[]` — omission is the path every
+    // provider treats as discoverable, and what admin.js already does.
+    //
+    // NotAllowedError covers two cases; elapsed time tells them apart: a provider
+    // with no credential for this rpId (or still locked) refuses without a sheet,
+    // well under a second; a sheet the user dismissed or let time out takes longer.
+    async function getAssertion(publicKey) {
+        var started = performance.now();
+        try {
+            return await navigator.credentials.get({ publicKey: publicKey });
+        } catch (e) {
+            if (!e || e.name !== 'NotAllowedError') throw e;
+            console.error(e);
+            throw new Error(performance.now() - started < 1500
+                ? 'No Passkey for this site on this device, or the provider is locked'
+                : 'Passkey prompt cancelled or timed out');
+        }
+    }
+
     // Build the ceremony UI into `root`; return element refs. Class-scoped so
     // duplicate ids can't collide with a host page (e.g. audit's own #status).
     function buildUi(root, showMeta) {
@@ -293,26 +315,24 @@
                 concat.set(pwaPk, approveChHash.length);
                 var effectiveChallenge = await vt.sha256(concat);
 
-                var assertion = await navigator.credentials.get({
-                    publicKey: {
-                        challenge: effectiveChallenge,
-                        rpId: data.rp_id,
-                        allowCredentials: data.allow_credentials.map(function (c) {
-                            return { type: 'public-key', id: b64uDec(c.id_b64u) };
-                        }),
-                        userVerification: UV,
-                        extensions: { prf: { eval: { first: PRF_INPUT } } },
-                    },
+                var assertion = await getAssertion({
+                    challenge: effectiveChallenge,
+                    rpId: data.rp_id,
+                    userVerification: UV,
+                    extensions: { prf: { eval: { first: PRF_INPUT } } },
                 });
 
                 setStatus('Processing…');
 
+                // Lookup, not authorization: the entry supplies h/k for the
+                // master-key unwrap. The Worker looks the credential up again and
+                // verifies the signature; that is the trust boundary.
                 var usedId = b64uEnc(new Uint8Array(assertion.rawId));
                 var entry = null;
                 for (var j = 0; j < data.allow_credentials.length; j++) {
                     if (data.allow_credentials[j].id_b64u === usedId) { entry = data.allow_credentials[j]; break; }
                 }
-                if (!entry) throw new Error('The Passkey used is not on the allow list');
+                if (!entry) throw new Error('The Passkey used is not registered here');
 
                 var ext = assertion.getClientExtensionResults && assertion.getClientExtensionResults();
                 var prfResult = ext && ext.prf && ext.prf.results && ext.prf.results.first;
@@ -415,9 +435,7 @@
                 setStatus('✓ Approved', 'ok');
                 onSettled('approved');
             } catch (e) {
-                var m = (e && e.message) ? e.message : String(e);
-                if (/NotAllowed|not allowed/i.test(m)) m = 'No matching Passkey, or the prompt was cancelled';
-                setStatus('Error: ' + m, 'error');
+                setStatus('Error: ' + ((e && e.message) ? e.message : String(e)), 'error');
                 console.error(e);
                 refs.approve.disabled = false; refs.reject.disabled = false;
             } finally {
@@ -430,15 +448,10 @@
             refs.approve.disabled = true; refs.reject.disabled = true;
             try {
                 setStatus('Touch the Passkey to reject…');
-                var assertion = await navigator.credentials.get({
-                    publicKey: {
-                        challenge: b64uDec(data.reject_challenge_b64u),
-                        rpId: data.rp_id,
-                        allowCredentials: data.allow_credentials.map(function (c) {
-                            return { type: 'public-key', id: b64uDec(c.id_b64u) };
-                        }),
-                        userVerification: UV,
-                    },
+                var assertion = await getAssertion({
+                    challenge: b64uDec(data.reject_challenge_b64u),
+                    rpId: data.rp_id,
+                    userVerification: UV,
                 });
                 var usedId = b64uEnc(new Uint8Array(assertion.rawId));
                 setStatus('Submitting rejection…');
@@ -462,9 +475,7 @@
                 setStatus('✓ Rejected', 'ok');
                 onSettled('rejected');
             } catch (e) {
-                var m = (e && e.message) ? e.message : String(e);
-                if (/NotAllowed|not allowed/i.test(m)) m = 'No matching Passkey, or the prompt was cancelled';
-                setStatus('Error: ' + m, 'error');
+                setStatus('Error: ' + ((e && e.message) ? e.message : String(e)), 'error');
                 console.error(e);
                 refs.approve.disabled = false; refs.reject.disabled = false;
             }

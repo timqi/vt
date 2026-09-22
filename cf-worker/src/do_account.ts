@@ -1140,7 +1140,10 @@ export class AccountDO extends DurableObject<Env> {
     return new Response('ok');
   }
 
-  // Returns the data the approval page needs: challenge + credential info for allowCredentials.
+  // Returns the data the approval page needs: challenge + credential info. The
+  // page sends no allowCredentials (resident keys are discovered); the list
+  // only maps the used rawId to its h/k. Authorization is opApprove's own
+  // lookup + signature verification.
   private async opPageData(url: URL): Promise<Response> {
     const approveToken = url.searchParams.get('approve_token') ?? '';
     // Length-cap before the token becomes a DO storage key (2048-byte limit): an

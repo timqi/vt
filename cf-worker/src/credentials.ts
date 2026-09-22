@@ -3,7 +3,7 @@
 // of pwa/admin/setup.js; the Worker never sees the wrapped master in the clear.
 //
 //   h  b64u(SHA-256(credential_id))   lookup index
-//   i  b64u(credential_id)            for allowCredentials
+//   i  b64u(credential_id)            page matches the used rawId to h/k
 //   k  b64u(iv(12)||ct(32)||tag(16))  AES-GCM(K_wrap, master_key)
 //   p  b64u(COSE pubkey)              for signature verify
 //   l  label
