@@ -134,21 +134,21 @@ impl KeychainStore {
         Ok(store)
     }
 
-    /// `init` / `import` write only where no item exists: an unreadable item
-    /// is never replaced.
-    pub fn require_absent() -> Result<()> {
+    /// `None` only when the Keychain confirms the item does not exist; an
+    /// unreadable or undecodable item is an error, so `init` / `import` never
+    /// replace one they could not read.
+    pub fn load_if_present() -> Result<Option<Self>> {
         use security_framework::passwords::get_generic_password;
-        Self::check_absent(
+        Self::decode_if_present(
             get_generic_password(&format!("rusty.vault.{STORE_NAME}"), "prod")
-                .map(|_| ())
                 .map_err(|error| error.code()),
         )
     }
 
-    fn check_absent(result: std::result::Result<(), i32>) -> Result<()> {
+    fn decode_if_present(result: std::result::Result<Vec<u8>, i32>) -> Result<Option<Self>> {
         match result {
-            Err(-25300) => Ok(()), // errSecItemNotFound
-            Ok(()) => Err(anyhow!("rusty.vault.store already exists")),
+            Err(-25300) => Ok(None), // errSecItemNotFound
+            Ok(raw) => Self::decode(&raw).map(Some),
             Err(code) => Err(anyhow!("cannot establish store absence ({code})")),
         }
     }
@@ -312,9 +312,15 @@ mod tests {
 
     #[test]
     fn creation_requires_confirmed_absence() {
-        assert!(KeychainStore::check_absent(Err(-25300)).is_ok());
-        for result in [Ok(()), Err(-25293), Err(-25299), Err(-50)] {
-            assert!(KeychainStore::check_absent(result).is_err());
+        assert!(KeychainStore::decode_if_present(Err(-25300))
+            .unwrap()
+            .is_none());
+        let present = serde_json::to_vec(&KeychainStore::new_v3(&[1; 8], &[2; 113])).unwrap();
+        assert!(KeychainStore::decode_if_present(Ok(present))
+            .unwrap()
+            .is_some());
+        for result in [Ok(b"not json".to_vec()), Err(-25293), Err(-25299), Err(-50)] {
+            assert!(KeychainStore::decode_if_present(result).is_err());
         }
     }
 

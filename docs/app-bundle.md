@@ -47,9 +47,14 @@ and [se.rs](../src/server_macos/se.rs).
   operation. Password fallback authenticates but cannot unwrap: with Touch ID
   unavailable (sensor absent, lid closed, biometry locked out) the local agent
   fails closed and only the Worker transport remains.
-- A blob is bound to this device and the enrolled fingerprint set. After
-  enrollment changes or on another Mac, recover with `vt secret import` from
-  the exported master; there is no other path.
+- A blob is bound to this device and the enrolled fingerprint set
+  (`biometryCurrentSet`): adding, removing, or re-enrolling any finger makes
+  the store's Secure Enclave key permanently unusable. Run `vt secret export`
+  before changing enrollment. Recover with `vt secret import` from the exported
+  master: over an existing store it re-wraps under a new Secure Enclave key and
+  carries the SSH keys, but only when the imported master opens them; a store
+  without SSH keys must be deleted first. The Worker transport keeps working
+  throughout.
 - `encrypt@vt` is authorized like `decrypt@vt` because minting a DEK also needs
   the master ([unified-authorization-engine.md](unified-authorization-engine.md#approval-policy)).
 - Public SSH keys, fingerprints, and comments live in plaintext in the store;
