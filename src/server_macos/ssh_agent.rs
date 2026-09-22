@@ -534,6 +534,30 @@ struct VtSshSession {
 }
 
 impl VtSshSession {
+    fn identities_with(
+        &self,
+        load: impl FnOnce() -> Result<KeychainStore>,
+    ) -> Result<Vec<Identity>, AgentError> {
+        if self.locked.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        let store = load().map_err(agent_err)?;
+        let identities = keys::public_entries(&store)
+            .map_err(agent_err)?
+            .iter()
+            .filter_map(|entry| {
+                let pubkey = ssh_key::PublicKey::from_openssh(&entry.public_key).ok()?;
+                Some(Identity {
+                    pubkey: pubkey.key_data().clone(),
+                    comment: entry.comment.clone(),
+                })
+            })
+            .collect();
+        if self.locked.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        Ok(identities)
+    }
     /// Build an `AgentAuditEntry` from the post-decision context and hand it to
     /// the fire-and-forget pusher. No-op when audit push is disabled. Holds NO
     /// cache lock; never blocks (spawn_push returns immediately).
@@ -872,22 +896,7 @@ impl Session for VtSshSession {
     /// Public keys come from the store's plaintext list: listing never needs
     /// the master. Touch ID is enforced on sign/extension requests.
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        if self.locked.load(Ordering::Acquire) {
-            return Ok(Vec::new());
-        }
-        let store = KeychainStore::load().map_err(agent_err)?;
-        let identities = keys::public_entries(&store)
-            .map_err(agent_err)?
-            .iter()
-            .filter_map(|entry| {
-                let pubkey = ssh_key::PublicKey::from_openssh(&entry.public_key).ok()?;
-                Some(Identity {
-                    pubkey: pubkey.key_data().clone(),
-                    comment: entry.comment.clone(),
-                })
-            })
-            .collect();
-        Ok(identities)
+        self.identities_with(KeychainStore::load)
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
@@ -1641,6 +1650,31 @@ ZWN0ZWQtdGVzdAEC
     }
 
     // --- Activity-scope classification tests (V2) ---
+
+    #[test]
+    fn identity_listing_rechecks_lock_after_store_io() {
+        let session = test_session(0, 0);
+        let key = PrivateKey::random(&mut rand::rngs::OsRng, Algorithm::Ed25519).unwrap();
+        let mut store = KeychainStore::new_v3(&[1; 8], &[2; 113]);
+        store
+            .ssh_public_keys
+            .push(super::super::store::SshPublicEntry {
+                fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+                algorithm: key.algorithm().to_string(),
+                comment: String::new(),
+                public_key: key.public_key().to_openssh().unwrap(),
+            });
+        let identities = session
+            .identities_with(|| {
+                session.locked.store(true, Ordering::Release);
+                Ok(store)
+            })
+            .unwrap();
+        assert!(
+            identities.is_empty(),
+            "lock during I/O must suppress identities"
+        );
+    }
 
     pub(super) fn test_session(sign_ttl: u64, decrypt_ttl: u64) -> VtSshSession {
         let locked = Arc::new(AtomicBool::new(false));
