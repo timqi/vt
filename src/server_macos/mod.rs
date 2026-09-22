@@ -6,6 +6,7 @@
 pub mod admin;
 pub mod audit;
 pub mod authorization;
+pub mod se;
 pub mod security;
 pub mod ssh_agent;
 pub mod ssh_cli;

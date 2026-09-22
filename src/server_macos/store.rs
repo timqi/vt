@@ -12,6 +12,11 @@
 //! The store is JSON-serialized so it can be eyeballed via
 //! `security find-generic-password -s rusty.vault.store -w | base64 -D | jq`,
 //! and so a future `v: 2` field can drive backwards-incompatible migrations.
+//!
+//! Wrap versions (docs/app-bundle.md#master-key-wrap-v3): v3 seals the master
+//! to a Secure Enclave key (`se_key` blob + `se_wrapped_master` ECIES
+//! ciphertext); v2 wraps it under a passcode-derived AES-GCM key and is read
+//! this release only as the `rotate-passcode` migration source.
 
 use anyhow::{anyhow, ensure, Context, Result};
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
@@ -25,13 +30,25 @@ const STORE_NAME: &str = "store";
 const LOCK_FILE_NAME: &str = "vt-keychain.lock";
 pub const STORE_SCHEMA_VERSION: u32 = 1;
 
-/// Wrap-derivation version for `encrypted_passphrase` (docs/app-bundle.md#master-key-wrap-v2):
-/// a fixed label, so the binary can move. The retired v1 mixed the binary
-/// path in; `derive_passcode_cipher` rejects anything but v2.
-/// `STORE_SCHEMA_VERSION` intentionally stays 1: old binaries can still parse
-/// a v2 store (they fail the unwrap, not the parse), preserving the
-/// export/import escape hatch.
+/// Passcode-derived wrap with a fixed label (`crypto::WRAP_V2_LABEL`). The
+/// retired v1 mixed the binary path in; `check_wrap` rejects anything but
+/// v2/v3. `STORE_SCHEMA_VERSION` intentionally stays 1: old binaries can
+/// still parse a newer store (they fail the unwrap, not the parse),
+/// preserving the export/import escape hatch.
 pub const WRAP_V2: u32 = 2;
+/// Secure Enclave wrap: the only version new stores are written as.
+pub const WRAP_V3: u32 = 3;
+
+/// Public half of one stored SSH key, kept in plaintext so identities can be
+/// listed without the master. Mirrors the private entry in `encrypted_ssh_keys`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SshPublicEntry {
+    pub fingerprint: String,
+    pub algorithm: String,
+    pub comment: String,
+    /// OpenSSH one-line public key.
+    pub public_key: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeychainStore {
@@ -41,26 +58,55 @@ pub struct KeychainStore {
     /// rejected at unwrap with the operator remedy.
     #[serde(default)]
     pub wrap_v: u32,
-    /// base64 of 64 bytes: passcode (32B) + 32 unread bytes. The tail held the
-    /// retired VT_AUTH token; the field name and width stay so existing
-    /// stores need no migration.
+    /// Wrap v2 only: base64 of 64 bytes, passcode (32B) + 32 unread bytes.
+    /// Written empty by v3 (the field stays so older binaries parse the
+    /// store and fail at the wrap check, not the parse).
     pub passcode_and_auth_token: String,
-    /// base64 of AES-GCM ciphertext (nonce || ct) wrapping the 32-byte master passphrase.
+    /// Wrap v2 only: base64 of AES-GCM ciphertext (nonce || ct) wrapping the
+    /// 32-byte master. Empty under v3.
     pub encrypted_passphrase: String,
+    /// Wrap v3: base64 of the Secure Enclave key's `kSecAttrTokenOID` blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se_key: Option<String>,
+    /// Wrap v3: base64 of the ECIES ciphertext of the 32-byte master.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se_wrapped_master: Option<String>,
     /// base64 of AES-GCM ciphertext wrapping the SSH-key JSON blob.
     /// `None` means no SSH keys have been added yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_ssh_keys: Option<String>,
+    /// Plaintext public halves of `encrypted_ssh_keys`, rewritten with it.
+    /// Empty on stores written before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_public_keys: Vec<SshPublicEntry>,
 }
 
 impl KeychainStore {
+    #[cfg(test)]
     pub fn new(passcode_and_auth_token: &[u8], encrypted_passphrase: &[u8]) -> Self {
         Self {
             v: STORE_SCHEMA_VERSION,
             wrap_v: WRAP_V2,
             passcode_and_auth_token: BASE64_URL_SAFE_NO_PAD.encode(passcode_and_auth_token),
             encrypted_passphrase: BASE64_URL_SAFE_NO_PAD.encode(encrypted_passphrase),
+            se_key: None,
+            se_wrapped_master: None,
             encrypted_ssh_keys: None,
+            ssh_public_keys: Vec::new(),
+        }
+    }
+
+    /// A wrap v3 store with no SSH keys yet.
+    pub fn new_v3(se_key: &[u8], se_wrapped_master: &[u8]) -> Self {
+        Self {
+            v: STORE_SCHEMA_VERSION,
+            wrap_v: WRAP_V3,
+            passcode_and_auth_token: String::new(),
+            encrypted_passphrase: String::new(),
+            se_key: Some(BASE64_URL_SAFE_NO_PAD.encode(se_key)),
+            se_wrapped_master: Some(BASE64_URL_SAFE_NO_PAD.encode(se_wrapped_master)),
+            encrypted_ssh_keys: None,
+            ssh_public_keys: Vec::new(),
         }
     }
 
@@ -99,6 +145,22 @@ impl KeychainStore {
         BASE64_URL_SAFE_NO_PAD
             .decode(&self.encrypted_passphrase)
             .context("invalid base64 in encrypted_passphrase")
+    }
+
+    /// `(se_key, se_wrapped_master)`; an absent field is a malformed v3 store.
+    pub fn se_material_bytes(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let decode = |field: &Option<String>, name: &str| -> Result<Vec<u8>> {
+            let b64 = field
+                .as_deref()
+                .ok_or_else(|| anyhow!("wrap v3 store lacks {name}"))?;
+            BASE64_URL_SAFE_NO_PAD
+                .decode(b64)
+                .with_context(|| format!("invalid base64 in {name}"))
+        };
+        Ok((
+            decode(&self.se_key, "se_key")?,
+            decode(&self.se_wrapped_master, "se_wrapped_master")?,
+        ))
     }
 
     pub fn encrypted_ssh_keys_bytes(&self) -> Result<Option<Vec<u8>>> {
@@ -213,5 +275,43 @@ mod tests {
         let json = r#"{"v":1,"passcode_and_auth_token":"AA","encrypted_passphrase":"BB"}"#;
         let parsed: KeychainStore = serde_json::from_str(json).unwrap();
         assert!(parsed.encrypted_ssh_keys.is_none());
+        assert!(parsed.se_key.is_none());
+        assert!(parsed.ssh_public_keys.is_empty());
+        // Marker-less stores are wrap v1: parse, then fail the wrap check.
+        assert_eq!(parsed.wrap_v, 0);
+    }
+
+    #[test]
+    fn test_v3_roundtrip_keeps_v2_fields_present_but_empty() {
+        let mut store = KeychainStore::new_v3(&[7u8; 570], &[8u8; 113]);
+        store.ssh_public_keys.push(SshPublicEntry {
+            fingerprint: "SHA256:x".into(),
+            algorithm: "ssh-ed25519".into(),
+            comment: "c".into(),
+            public_key: "ssh-ed25519 AAAA c".into(),
+        });
+        let json = serde_json::to_string(&store).unwrap();
+        // An older binary requires both v2 fields: they must serialize.
+        assert!(json.contains(r#""passcode_and_auth_token":"""#));
+        assert!(json.contains(r#""encrypted_passphrase":"""#));
+        let parsed: KeychainStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.wrap_v, WRAP_V3);
+        let (blob, wrapped) = parsed.se_material_bytes().unwrap();
+        assert_eq!(blob, vec![7u8; 570]);
+        assert_eq!(wrapped, vec![8u8; 113]);
+        assert_eq!(parsed.ssh_public_keys, store.ssh_public_keys);
+        assert!(parsed.passcode_and_auth_token_bytes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_v2_store_still_parses_and_has_no_se_material() {
+        let store = KeychainStore::new(&[0u8; 64], &[1u8; 60]);
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(!json.contains("se_key"));
+        assert!(!json.contains("ssh_public_keys"));
+        let parsed: KeychainStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.wrap_v, WRAP_V2);
+        let err = parsed.se_material_bytes().unwrap_err().to_string();
+        assert!(err.contains("lacks se_key"), "{err}");
     }
 }

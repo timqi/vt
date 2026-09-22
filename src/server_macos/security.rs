@@ -289,6 +289,7 @@ pub fn classify_la_error(code: i32) -> EvalOutcome {
 mod la {
     use super::{classify_la_error, EvalOutcome};
     use block2::RcBlock;
+    use objc2::rc::Retained;
     use objc2::runtime::Bool;
     use objc2_foundation::{NSError, NSString};
     use objc2_local_authentication::{LAContext, LAPolicy};
@@ -317,7 +318,10 @@ mod la {
         unsafe { ctx.canEvaluatePolicy_error(policy.raw()).is_ok() }
     }
 
-    pub(super) fn evaluate(policy: Policy, reason: &str) -> EvalOutcome {
+    /// Evaluate `policy` on a fresh context and hand the context back with
+    /// the outcome: on success it is the evaluated context wrap v3 binds to
+    /// the Secure Enclave key.
+    pub(super) fn evaluate(policy: Policy, reason: &str) -> (EvalOutcome, Retained<LAContext>) {
         let ctx = unsafe { LAContext::new() };
         let reason_ns = NSString::from_str(reason);
         let (tx, rx) = mpsc::sync_channel::<(bool, i32)>(1);
@@ -343,11 +347,11 @@ mod la {
             Ok(v) => v,
             Err(_) => {
                 tracing::error!("LAContext reply channel closed unexpectedly");
-                return EvalOutcome::Rejected;
+                return (EvalOutcome::Rejected, ctx);
             }
         };
         if ok {
-            return EvalOutcome::Success;
+            return (EvalOutcome::Success, ctx);
         }
         let outcome = classify_la_error(code);
         if matches!(outcome, EvalOutcome::TryFallback) {
@@ -356,7 +360,7 @@ mod la {
                 "biometry unavailable for evaluatePolicy; falling back to password"
             );
         }
-        outcome
+        (outcome, ctx)
     }
 }
 
@@ -374,22 +378,41 @@ mod la {
 /// PasscodeNotSet) **falls through to the system password**
 /// (`DeviceOwnerAuthentication` policy).
 pub fn authenticate(reason: &str) -> AuthOutcome {
+    authenticate_ctx(reason).0
+}
+
+/// [`authenticate`] plus, on `Success(Biometric)`, the evaluated context the
+/// Secure Enclave key can be bound to. A password success carries no context:
+/// the wrap v3 key's `biometryCurrentSet` policy cannot be met by it.
+pub fn authenticate_ctx(reason: &str) -> (AuthOutcome, Option<super::se::BiometricContext>) {
     // Pre-check: screen lock state. Cached for 1s to bound CPU under spammy
     // callers (locked-screen + tight-loop client = naturally O(1)).
     match screen_state_cached() {
         SessionState::NotInteractive => {
             notify_locked_rejected(reason);
-            return AuthOutcome::Unavailable(UnavailableReason::NotInteractive);
+            return (
+                AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
+                None,
+            );
         }
         SessionState::NoSession => {
-            return AuthOutcome::Unavailable(UnavailableReason::NoGuiSession);
+            return (
+                AuthOutcome::Unavailable(UnavailableReason::NoGuiSession),
+                None,
+            );
         }
         SessionState::Interactive => {}
     }
 
     if la::can_evaluate(la::Policy::WithBiometrics) {
-        match la::evaluate(la::Policy::WithBiometrics, reason) {
-            EvalOutcome::Success => return AuthOutcome::Success(AuthMethod::Biometric),
+        let (outcome, ctx) = la::evaluate(la::Policy::WithBiometrics, reason);
+        match outcome {
+            EvalOutcome::Success => {
+                return (
+                    AuthOutcome::Success(AuthMethod::Biometric),
+                    Some(super::se::BiometricContext::from_evaluated(ctx)),
+                )
+            }
             EvalOutcome::Rejected => {
                 // Disambiguate: the screen could have locked between the cached
                 // pre-check and now. Re-query uncached so a transient lock is
@@ -397,18 +420,27 @@ pub fn authenticate(reason: &str) -> AuthOutcome {
                 match screen_state_now() {
                     SessionState::NotInteractive => {
                         notify_locked_rejected(reason);
-                        return AuthOutcome::Unavailable(UnavailableReason::NotInteractive);
+                        return (
+                            AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
+                            None,
+                        );
                     }
                     SessionState::NoSession => {
-                        return AuthOutcome::Unavailable(UnavailableReason::NoGuiSession);
+                        return (
+                            AuthOutcome::Unavailable(UnavailableReason::NoGuiSession),
+                            None,
+                        );
                     }
                     SessionState::Interactive => {}
                 }
                 notify_touch_id_rejected(reason);
-                return AuthOutcome::Rejected;
+                return (AuthOutcome::Rejected, None);
             }
             EvalOutcome::NotInteractive => {
-                return AuthOutcome::Unavailable(UnavailableReason::NotInteractive);
+                return (
+                    AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
+                    None,
+                );
             }
             EvalOutcome::TryFallback => {
                 // Biometry locked/unavailable: drop into the password fallback.
@@ -426,70 +458,104 @@ pub fn authenticate(reason: &str) -> AuthOutcome {
     match screen_state_now() {
         SessionState::NotInteractive => {
             notify_locked_rejected(reason);
-            return AuthOutcome::Unavailable(UnavailableReason::NotInteractive);
+            return (
+                AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
+                None,
+            );
         }
         SessionState::NoSession => {
-            return AuthOutcome::Unavailable(UnavailableReason::NoGuiSession);
+            return (
+                AuthOutcome::Unavailable(UnavailableReason::NoGuiSession),
+                None,
+            );
         }
         SessionState::Interactive => {}
     }
 
-    match la::evaluate(la::Policy::DeviceOwner, reason) {
+    let outcome = match la::evaluate(la::Policy::DeviceOwner, reason).0 {
         EvalOutcome::Success => AuthOutcome::Success(AuthMethod::Password),
         EvalOutcome::NotInteractive => AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
         EvalOutcome::Rejected | EvalOutcome::TryFallback => AuthOutcome::Rejected,
-    }
+    };
+    (outcome, None)
 }
 
 pub fn local_authentication(reason: &str) -> bool {
     authenticate(reason).is_success()
 }
 
-/// Build the initial KeychainStore (passcode blob + encrypted passphrase)
-/// and write it as a single keychain item. Used by `vt init`,
-/// `vt secret import`, and `vt secret rotate-passcode` — all three either
-/// create the store fresh (init/import) or replace it wholesale (rotate),
-/// so this single call is the only write.
-pub fn create_and_save_passcode_passphrase(real_passphrase: &[u8; 32]) -> Result<()> {
-    use super::store::KeychainStore;
+/// Wrap `master` under a freshly generated Secure Enclave key and return
+/// the v3 store to save. `vt init` / `vt secret import` save it as is;
+/// `rotate-passcode` carries the SSH keys over first. Fails closed with
+/// `se.unavailable` where there is no Secure Enclave.
+pub fn new_store_v3(master: &[u8; 32]) -> Result<super::store::KeychainStore> {
+    let (blob, wrapped) = super::se::generate_and_wrap(master)?;
+    Ok(super::store::KeychainStore::new_v3(&blob, &wrapped))
+}
 
-    // 64 bytes: the passcode, then 32 random bytes nothing reads. The second
-    // half was the retired VT_AUTH token; keeping the width means stores
-    // written before and after the removal are byte-compatible.
-    let passcode = AesGcmCrypto::generate_key();
-    let mut passcode_and_auth_token = Vec::with_capacity(64);
-    passcode_and_auth_token.extend_from_slice(&passcode);
-    passcode_and_auth_token.extend_from_slice(&AesGcmCrypto::generate_key());
-
-    // New stores are always wrap v2 (KeychainStore::new sets wrap_v).
-    let passphrase_secret = derive_passphrase_secret_v2(&passcode)?;
-    let aes = AesGcmCrypto::new(&passphrase_secret)?;
-    let encrypted_passphrase = aes.encrypt(real_passphrase)?;
-
-    // Carry the SSH-key blob over only when the master it is sealed under is
-    // the one being written (rotate-passcode). `secret import` of a different
-    // master would otherwise leave a blob no path can open or clear.
-    let mut store = KeychainStore::new(&passcode_and_auth_token, &encrypted_passphrase);
-    if let Ok(existing) = KeychainStore::load() {
-        let same_master = derive_passcode_cipher(&existing)
-            .and_then(|c| load_mac_key(&existing, &c))
-            .map(|k| k.as_slice() == real_passphrase)
-            .unwrap_or(false);
-        if same_master {
-            store.encrypted_ssh_keys = existing.encrypted_ssh_keys;
-        }
-    }
-    store.save()?;
-    tracing::info!("keychain store saved!");
+/// Accept only wrap versions this release can unwrap. A v1 (path-bound) or
+/// unknown marker fails here, before any unwrap, with the operator remedy.
+pub fn check_wrap(store: &super::store::KeychainStore) -> Result<()> {
+    use super::store::{WRAP_V2, WRAP_V3};
+    ensure!(
+        store.wrap_v == WRAP_V2 || store.wrap_v == WRAP_V3,
+        "rusty.vault.store has wrap version {}, this release reads wrap v{WRAP_V2} (migration \
+         source) and v{WRAP_V3} — run `vt secret rebind` on the previous vt release first \
+         (docs/app-bundle.md#master-key-wrap-v3)",
+        store.wrap_v
+    );
     Ok(())
 }
 
-/// Decrypt the raw 32-byte master key from the store: the HKDF IKM for v2
-/// envelope DEK derivation. The passphrase cipher is supplied separately so
-/// callers can hold it long-term (serve) without keeping the decrypted
-/// master key in memory; the key comes back `Zeroizing` and callers drop it
-/// as soon as derivation is complete.
-pub(super) fn load_mac_key(
+/// One human authorization that can unwrap a store's master: wrap v2 derives
+/// the passcode cipher after the ordinary prompt; wrap v3 binds the evaluated
+/// biometric context to the Secure Enclave key. CLI paths hold one of these
+/// per command; the agent holds its sessions in `SeSessions`.
+pub enum MasterAccess {
+    Passcode(Box<AesGcmCrypto>),
+    Enclave(super::se::SeSession),
+}
+
+impl MasterAccess {
+    pub fn open(store: &super::store::KeychainStore, reason: &str) -> Result<Self> {
+        check_wrap(store)?;
+        if store.wrap_v == super::store::WRAP_V2 {
+            ensure!(
+                authenticate(reason).is_success(),
+                "Local authentication failed for {reason}"
+            );
+            return Ok(Self::Passcode(Box::new(derive_passcode_cipher(store)?)));
+        }
+        let (blob, _) = store.se_material_bytes()?;
+        let (outcome, ctx) = authenticate_ctx(reason);
+        ensure!(
+            outcome.is_success(),
+            "Local authentication failed for {reason}"
+        );
+        let ctx = ctx.ok_or_else(|| {
+            anyhow::anyhow!(
+                "se.biometry_required: wrap v3 unwraps only after Touch ID; the password \
+                 fallback cannot satisfy the Secure Enclave key"
+            )
+        })?;
+        Ok(Self::Enclave(super::se::SeSession::open(&blob, ctx)?))
+    }
+
+    /// The raw 32-byte master: the HKDF IKM for every DEK and the SSH-blob
+    /// cipher key. Callers derive and drop it in the same scope.
+    pub fn master(&self, store: &super::store::KeychainStore) -> Result<Zeroizing<[u8; 32]>> {
+        match self {
+            Self::Passcode(cipher) => unwrap_master_v2(store, cipher),
+            Self::Enclave(session) => {
+                let (_, wrapped) = store.se_material_bytes()?;
+                Ok(session.unwrap_master(&wrapped)?)
+            }
+        }
+    }
+}
+
+/// Decrypt the raw master from a wrap v2 store through its passcode cipher.
+pub(super) fn unwrap_master_v2(
     store: &super::store::KeychainStore,
     passphrase_cipher: &AesGcmCrypto,
 ) -> Result<Zeroizing<[u8; 32]>> {
@@ -501,35 +567,25 @@ pub(super) fn load_mac_key(
     Ok(key)
 }
 
-/// Preflight the encrypted master key without constructing a long-lived cipher
-/// or retaining raw key material across a human authorization prompt.
-pub(crate) fn validate_mac_key_material(
-    store: &super::store::KeychainStore,
-    passphrase_cipher: &AesGcmCrypto,
-) -> Result<()> {
-    drop(load_mac_key(store, passphrase_cipher)?);
-    Ok(())
+/// Preflight the stored master before consulting grants or prompting, without
+/// retaining raw key material across a human prompt: v2 unwraps and drops
+/// (deterministic, no prompt); v3 can only check the material's shape.
+pub(crate) fn validate_master_material(store: &super::store::KeychainStore) -> Result<()> {
+    check_wrap(store)?;
+    if store.wrap_v == super::store::WRAP_V2 {
+        drop(unwrap_master_v2(store, &derive_passcode_cipher(store)?)?);
+        return Ok(());
+    }
+    let (blob, wrapped) = store.se_material_bytes()?;
+    Ok(super::se::check_material(&blob, &wrapped)?)
 }
 
-/// The master key as the AES-GCM cipher over the SSH-keys blob.
-pub fn load_mac_cipher(
-    store: &super::store::KeychainStore,
-    passphrase_cipher: &AesGcmCrypto,
-) -> Result<AesGcmCrypto> {
-    let key = load_mac_key(store, passphrase_cipher)?;
-    AesGcmCrypto::new(&key)
-}
-
-/// Derive the passphrase cipher from the passcode bytes inside an
-/// already-loaded store. Only wrap v2 is readable: a v1 (path-bound) or
-/// unknown marker fails closed here, before any unwrap, with the operator
-/// remedy. Pure CPU work; does not touch the keychain.
+/// Derive the wrap v2 passphrase cipher from the passcode bytes inside an
+/// already-loaded store. Pure CPU work; does not touch the keychain.
 pub fn derive_passcode_cipher(store: &super::store::KeychainStore) -> Result<AesGcmCrypto> {
-    use super::store::WRAP_V2;
     ensure!(
-        store.wrap_v == WRAP_V2,
-        "rusty.vault.store has wrap version {}, this release reads only wrap v{WRAP_V2} — \
-         run `vt secret rebind` on the previous vt release first (docs/app-bundle.md#master-key-wrap-v2)",
+        store.wrap_v == super::store::WRAP_V2,
+        "wrap v{} store has no passcode cipher",
         store.wrap_v
     );
     let passcode_arr = split_passcode(store)?;
@@ -550,22 +606,14 @@ fn split_passcode(store: &super::store::KeychainStore) -> Result<[u8; 32]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    use tracing_test::traced_test;
-
-    #[traced_test]
-    #[test]
-    #[ignore]
-    fn test_create_and_save_passcode_passphrase() {
-        let real_passphrase = AesGcmCrypto::generate_key();
-        let result = create_and_save_passcode_passphrase(&real_passphrase);
-        assert!(result.is_ok())
-    }
 
     /// In-memory v2 store wrapping `master` under its own passcode. No
     /// keychain access.
-    fn v2_store(master: &[u8; 32]) -> super::super::store::KeychainStore {
+    pub(in crate::server_macos) fn v2_store(
+        master: &[u8; 32],
+    ) -> super::super::store::KeychainStore {
         use super::super::store::KeychainStore;
         let passcode = AesGcmCrypto::generate_key();
         let mut tokens = Vec::new();
@@ -578,21 +626,43 @@ mod tests {
 
     /// Rejected input: the retired path-bound wrap v1 (explicit marker or
     /// the marker-less form older stores parse as 0) and an unknown version
-    /// fail closed before any unwrap, naming the remedy, and the store is
-    /// not mutated.
+    /// fail closed before any unwrap, naming the remedy.
     #[test]
-    fn test_non_v2_wrap_is_rejected() {
+    fn test_unknown_wrap_is_rejected_before_unwrap() {
         let master = AesGcmCrypto::generate_key();
         for wrap_v in [1u32, 0, 99] {
             let mut store = v2_store(&master);
             store.wrap_v = wrap_v;
-            let err = derive_passcode_cipher(&store).err().expect("rejected");
+            let err = check_wrap(&store).expect_err("rejected");
             assert!(
                 err.to_string().contains(&format!("wrap version {wrap_v}")),
                 "{err}"
             );
             assert!(err.to_string().contains("previous vt release"), "{err}");
+            assert!(validate_master_material(&store).is_err());
         }
+    }
+
+    /// The migration source still unwraps without a prompt; a v3 store
+    /// passes the shape preflight and has no passcode cipher.
+    #[test]
+    fn test_v2_unwraps_and_v3_preflights_by_shape() {
+        use super::super::store::KeychainStore;
+        let master = AesGcmCrypto::generate_key();
+        let store = v2_store(&master);
+        check_wrap(&store).unwrap();
+        validate_master_material(&store).unwrap();
+        let got = MasterAccess::Passcode(Box::new(derive_passcode_cipher(&store).unwrap()))
+            .master(&store)
+            .unwrap();
+        assert_eq!(got.as_slice(), &master);
+
+        let v3 = KeychainStore::new_v3(&[1u8; 570], &[2u8; super::super::se::WRAPPED_MASTER_LEN]);
+        check_wrap(&v3).unwrap();
+        validate_master_material(&v3).unwrap();
+        assert!(derive_passcode_cipher(&v3).is_err());
+        let short = KeychainStore::new_v3(&[1u8; 570], &[2u8; 32]);
+        assert!(validate_master_material(&short).is_err());
     }
 
     #[test]
@@ -684,229 +754,6 @@ mod tests {
         // -13: sensor temporarily disconnected (e.g. external Touch ID device).
         // Treat as TryFallback so the user can still auth via password.
         assert_eq!(classify_la_error(-13), EvalOutcome::TryFallback);
-    }
-
-    // ---- Secure Enclave wrap-v3 spike ------------------------------------
-    //
-    // Keychain-less SE key: `kSecAttrIsPermanent = false`, the SE-wrapped
-    // private key (`kSecAttrTokenOID`, ~570 bytes, device-bound) is ours to
-    // store, and `SecKeyCreateWithData` with that attribute rebuilds the
-    // handle. No data-protection keychain, so no restricted entitlement:
-    // ad-hoc and self-signed binaries carrying `keychain-access-groups` are
-    // SIGKILLed by AMFI (-424/-413), and a permanent SE key fails -34018.
-    //
-    // Findings (macOS, Apple Silicon, 2026-09-22; docs/secure-enclave.md):
-    //   Q1 blob round-trips; the ACL (biometryCurrentSet | privateKeyUsage)
-    //      travels inside the blob.
-    //   Q2 one evaluated LAContext bound via `kSecUseAuthenticationContext`
-    //      unwraps repeatedly (~5 ms) with no further prompt, for as long as
-    //      the process holds it (40 s+ observed, no expiry). `invalidate()`
-    //      and even dropping the context do NOT close a warm handle: ctkd
-    //      keeps the last context used on the token authorized until another
-    //      context performs a token op; then the invalidated one fails. A
-    //      never-evaluated context always prompts. Grant revocation must
-    //      therefore drop ctx + handle and treat `invalidate()` as advisory.
-    //   Q3 a rebuilt (new ad-hoc cdhash) binary reloads the blob.
-    //
-    //   cargo test spike_se -- --ignored --nocapture                 # Q1 + Q2
-    //   VT_SPIKE=keep  cargo test spike_se -- --ignored --nocapture  # leave blob
-    //   touch src/main.rs && VT_SPIKE=reuse cargo test spike_se -- --ignored --nocapture  # Q3
-    mod spike_se {
-        use core_foundation::base::{CFType, TCFType, ToVoid};
-        use core_foundation::data::CFData;
-        use core_foundation::dictionary::CFMutableDictionary;
-        use core_foundation::error::{CFError, CFErrorRef};
-        use core_foundation::string::CFString;
-        use objc2::rc::Retained;
-        use objc2_foundation::NSString;
-        use objc2_local_authentication::{LAContext, LAPolicy};
-        use security_framework::access_control::{ProtectionMode, SecAccessControl};
-        use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
-        use security_framework_sys::item::{
-            kSecAttrKeyClass, kSecAttrKeyClassPrivate, kSecAttrKeyType,
-            kSecAttrKeyTypeECSECPrimeRandom, kSecAttrTokenID, kSecAttrTokenIDSecureEnclave,
-            kSecUseAuthenticationContext,
-        };
-        use security_framework_sys::key::SecKeyCreateWithData;
-        use std::time::Instant;
-
-        const STATE: &str = "/tmp/vt-spike-se.bin";
-        const ALG: Algorithm = Algorithm::ECIESEncryptionCofactorVariableIVX963SHA256AESGCM;
-        /// `kSecAttrTokenOID`: not in security-framework-sys.
-        const TOKEN_OID: &str = "toid";
-        // security-framework-sys access_control flags (not re-exported).
-        const BIOMETRY_CURRENT_SET: usize = 1 << 3;
-        const PRIVATE_KEY_USAGE: usize = 1 << 30;
-
-        fn generate() -> SecKey {
-            let ac = SecAccessControl::create_with_protection(
-                Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
-                BIOMETRY_CURRENT_SET | PRIVATE_KEY_USAGE,
-            )
-            .expect("access control");
-            let mut opts = GenerateKeyOptions::default();
-            // No `set_location` => kSecAttrIsPermanent false: nothing is
-            // written to any keychain.
-            opts.set_key_type(KeyType::ec())
-                .set_size_in_bits(256)
-                .set_token(Token::SecureEnclave)
-                .set_access_control(ac);
-            SecKey::new(&opts).unwrap_or_else(|e| panic!("Q1 FAIL: SE key generation: {e:?}"))
-        }
-
-        /// The SE-wrapped private key (what CryptoKit calls
-        /// `dataRepresentation`): opaque, device-bound, useless off-SE.
-        fn export_blob(key: &SecKey) -> Vec<u8> {
-            let attrs = key.attributes();
-            let v = attrs
-                .find(CFString::from_static_string(TOKEN_OID).to_void())
-                .expect("Q1 FAIL: no kSecAttrTokenOID on SE key");
-            unsafe { CFData::wrap_under_get_rule(v.cast()) }.to_vec()
-        }
-
-        /// Rebuild the private-key handle. The blob travels as
-        /// `kSecAttrTokenOID`; passing it as the key data instead makes the
-        /// token mint a *new* key (verified). `ctx` binds
-        /// `kSecUseAuthenticationContext`.
-        fn import_blob(blob: &[u8], ctx: Option<&Retained<LAContext>>) -> Result<SecKey, String> {
-            let mut attrs = CFMutableDictionary::<CFType, CFType>::new();
-            unsafe {
-                let s = |r| CFString::wrap_under_get_rule(r).as_CFType();
-                attrs.set(
-                    CFString::from_static_string(TOKEN_OID).as_CFType(),
-                    CFData::from_buffer(blob).as_CFType(),
-                );
-                attrs.set(s(kSecAttrKeyType), s(kSecAttrKeyTypeECSECPrimeRandom));
-                attrs.set(s(kSecAttrKeyClass), s(kSecAttrKeyClassPrivate));
-                attrs.set(s(kSecAttrTokenID), s(kSecAttrTokenIDSecureEnclave));
-                if let Some(ctx) = ctx {
-                    let raw = Retained::as_ptr(ctx) as *const std::os::raw::c_void;
-                    attrs.set(
-                        s(kSecUseAuthenticationContext),
-                        CFType::wrap_under_get_rule(raw),
-                    );
-                }
-                let mut err: CFErrorRef = std::ptr::null_mut();
-                let k = SecKeyCreateWithData(
-                    CFData::from_buffer(&[]).as_concrete_TypeRef(),
-                    attrs.to_immutable().as_concrete_TypeRef(),
-                    &mut err,
-                );
-                if k.is_null() {
-                    return Err(format!("{:?}", CFError::wrap_under_create_rule(err)));
-                }
-                Ok(SecKey::wrap_under_create_rule(k))
-            }
-        }
-
-        fn evaluated_ctx() -> Retained<LAContext> {
-            let ctx = unsafe { LAContext::new() };
-            let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
-            let block = block2::RcBlock::new(
-                move |ok: objc2::runtime::Bool, _e: *mut objc2_foundation::NSError| {
-                    let _ = tx.send(ok.as_bool());
-                },
-            );
-            unsafe {
-                ctx.evaluatePolicy_localizedReason_reply(
-                    LAPolicy::DeviceOwnerAuthenticationWithBiometrics,
-                    &NSString::from_str("vt SE spike: unwrap master"),
-                    &block,
-                );
-            }
-            assert!(rx.recv().unwrap(), "Touch ID rejected");
-            ctx
-        }
-
-        fn timed_decrypt(key: &SecKey, ct: &[u8], what: &str) -> Result<Vec<u8>, String> {
-            let t = Instant::now();
-            let r = key.decrypt_data(ALG, ct).map_err(|e| format!("{e:?}"));
-            eprintln!(
-                "{what}: {:?} in {:?}",
-                r.as_ref().map(|_| "ok"),
-                t.elapsed()
-            );
-            r
-        }
-
-        #[test]
-        #[ignore]
-        fn spike_se_wrap_v3() {
-            let mode = std::env::var("VT_SPIKE").unwrap_or_default();
-
-            let (blob, master, ct) = if mode == "reuse" {
-                let state = std::fs::read(STATE).expect("run with VT_SPIKE=keep first");
-                let (master, rest) = state.split_at(32);
-                let (ct, blob) = rest.split_at(65 + 32 + 16); // ECIES: epk + pt + tag
-                (blob.to_vec(), master.to_vec(), ct.to_vec())
-            } else {
-                let k = generate();
-                let blob = export_blob(&k);
-                eprintln!("Q1: SE key generated, blob {} bytes", blob.len());
-                let master: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
-                let ct = k
-                    .public_key()
-                    .expect("public key")
-                    .encrypt_data(ALG, &master)
-                    .expect("ECIES encrypt");
-                eprintln!("wrapped: {} -> {} bytes", master.len(), ct.len());
-                (blob, master, ct)
-            };
-
-            // Q1: reload without a context — the system prompts on its own.
-            let k0 = import_blob(&blob, None).expect("Q1 FAIL: SecKeyCreateWithData");
-            let pt = timed_decrypt(&k0, &ct, "unwrap via reloaded blob, no ctx (system prompt)")
-                .expect("Q1 FAIL: decrypt via reloaded blob");
-            assert_eq!(pt, master);
-            eprintln!("Q1 OK: blob round-trips through SecKeyCreateWithData");
-            drop(k0);
-
-            // Q2a: one evaluated context, three unwraps, one prompt.
-            let ctx = evaluated_ctx();
-            let key = import_blob(&blob, Some(&ctx)).expect("import with ctx");
-            for i in 1..=3 {
-                let pt = timed_decrypt(&key, &ct, &format!("unwrap #{i} (same ctx)"))
-                    .expect("Q2 FAIL: decrypt with evaluated ctx");
-                assert_eq!(pt, master);
-            }
-            eprintln!("Q2a: 3 unwraps done — count the prompts you saw (expect 1)");
-
-            // Q2b: does `invalidate()` close the grant? Fresh ciphertext per
-            // probe so no cached ECDH result can masquerade as authorization.
-            let pubk = key.public_key().expect("pub");
-            let probe = |label: &str| {
-                let fresh_ct = pubk.encrypt_data(ALG, &master).unwrap();
-                let held = key.decrypt_data(ALG, &fresh_ct).is_ok();
-                let fresh = import_blob(&blob, Some(&ctx))
-                    .ok()
-                    .and_then(|k| k.decrypt_data(ALG, &fresh_ct).ok())
-                    .is_some();
-                eprintln!("Q2b {label}: held handle ok={held}, fresh import ok={fresh}");
-            };
-            probe("before invalidate");
-            unsafe { ctx.invalidate() };
-            probe("right after invalidate");
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            probe("3s after invalidate");
-
-            // Q2c: a never-evaluated context must prompt (no SEP-side grace
-            // window); its token op evicts `ctx` from ctkd's warm slot.
-            let fresh = unsafe { LAContext::new() };
-            let k = import_blob(&blob, Some(&fresh)).expect("import with fresh ctx");
-            let r = timed_decrypt(&k, &ct, "unwrap with NEW unevaluated ctx (expect prompt)");
-            eprintln!("Q2c: {:?}", r.as_ref().map(|_| "ok"));
-            probe("after another ctx did a token op");
-
-            if mode == "keep" {
-                let mut state = master.clone();
-                state.extend_from_slice(&ct);
-                state.extend_from_slice(&blob);
-                std::fs::write(STATE, state).unwrap();
-                eprintln!("kept {STATE}; rebuild, then VT_SPIKE=reuse");
-            } else if mode == "reuse" {
-                eprintln!("Q3 OK: rebuilt binary reloaded the blob");
-            }
-        }
     }
 
     #[test]

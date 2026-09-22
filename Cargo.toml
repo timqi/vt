@@ -72,9 +72,6 @@ block2 = "0.6"
 ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }
 subtle = "2"
 
-[dev-dependencies]
-tracing-test = "0.2.5"
-
 [profile.release]
 strip = true
 lto = "fat"
