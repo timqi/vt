@@ -191,8 +191,8 @@ pub struct EncryptReq {
 /// NOTE: there is intentionally no `salt` field on the *request* side. Letting
 /// a client supply a salt would let any peer on the socket extract the
 /// salt from a stored `vt://0{salt||ct}` URL, request its DEK via
-/// `encrypt@vt` (no Touch ID), and decrypt the ciphertext locally — bypassing
-/// the Touch ID gate that protects `decrypt@vt`. Salt MUST originate inside
+/// `encrypt@vt` under an encrypt grant, and decrypt the ciphertext locally —
+/// bypassing the per-record `decrypt@vt` scope. Salt MUST originate inside
 /// the agent.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct EncryptResItem {

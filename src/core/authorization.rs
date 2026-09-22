@@ -27,6 +27,9 @@ pub enum Operation {
     Run,
     Sign,
     Decrypt,
+    Encrypt,
+    /// SSH key store mutation over the agent protocol (`ssh-add`); always fresh.
+    KeyStore,
 }
 
 impl Operation {
@@ -37,7 +40,15 @@ impl Operation {
             Operation::Run => "run",
             Operation::Sign => "sign",
             Operation::Decrypt => "decrypt",
+            Operation::Encrypt => "encrypt",
+            Operation::KeyStore => "keystore",
         }
+    }
+
+    /// Operations whose protected step needs the unwrapped master key. A
+    /// platform authenticator opens its key-custody session only for these.
+    pub fn needs_master(self) -> bool {
+        !matches!(self, Operation::Auth | Operation::Run)
     }
 }
 
@@ -241,6 +252,35 @@ impl GrantScope {
         )
     }
 
+    /// Encrypt scope: DEK minting for one record type under a resolved
+    /// activity. `anchor` is the family's kernel-verified identity (workspace
+    /// or cwd canonical root, parent executable path; empty for a
+    /// connection). No salt exists before minting, so the type is the resource.
+    pub fn encrypt(
+        family: ScopeFamily,
+        subject: Option<SubjectId>,
+        anchor: &str,
+        secret_type: u8,
+    ) -> Self {
+        let Some(subject) = subject else {
+            return Self::fresh(Operation::Encrypt);
+        };
+        let label: &[u8] = match family {
+            ScopeFamily::Workspace => b"vt-authz-encrypt-ws-v1",
+            ScopeFamily::CwdFallback => b"vt-authz-encrypt-cwd-v1",
+            ScopeFamily::ParentApp => b"vt-authz-encrypt-app-v1",
+            ScopeFamily::Connection => b"vt-authz-encrypt-conn-v1",
+            ScopeFamily::Destination => return Self::fresh(Operation::Encrypt),
+        };
+        Self::hashed(
+            Operation::Encrypt,
+            family,
+            subject,
+            label,
+            &[Field(anchor.as_bytes()), Tag(secret_type)],
+        )
+    }
+
     /// Relay decrypt scope: type + salt + claimed host/pwd, bounded by the
     /// relay connection's kernel-derived subject.
     pub fn decrypt_v2(
@@ -323,6 +363,17 @@ impl GrantScope {
     /// Feeds the audit rows' `scope_family` field.
     pub fn family(&self) -> Option<ScopeFamily> {
         self.key.as_ref().map(|k| k.family)
+    }
+
+    /// The policy the authenticator was handed for `scopes` under `reuse`:
+    /// `Fresh` unless every scope can mint a grant. Handlers use it to find
+    /// the key-custody session their approval left behind.
+    pub fn session_policy(scopes: &[GrantScope], reuse: ReusePolicy) -> ReusePolicy {
+        if !scopes.is_empty() && scopes.iter().all(|scope| scope.key.is_some()) {
+            reuse
+        } else {
+            ReusePolicy::Fresh
+        }
     }
 }
 
@@ -410,9 +461,18 @@ pub enum ValidationError {
     Invalidated,
 }
 
+/// `operation` and `reuse` let a platform authenticator bind the approval to
+/// its key custody: a reusable approval of a master-needing operation leaves
+/// a session behind for cache hits, a fresh one only for the permit holder.
 #[async_trait]
 pub trait AuthorizationAuthenticator: Send + Sync {
-    async fn authenticate(&self, prompt: &str, revocation_pending: Arc<AtomicBool>) -> AuthOutcome;
+    async fn authenticate(
+        &self,
+        prompt: &str,
+        operation: Operation,
+        reuse: ReusePolicy,
+        revocation_pending: Arc<AtomicBool>,
+    ) -> AuthOutcome;
 }
 
 /// Must query current state rather than a TTL-cached snapshot. The engine calls
@@ -862,9 +922,20 @@ impl AuthorizationEngine {
         let authenticator = Arc::clone(&self.authenticator);
         let revocation_pending = Arc::clone(&self.revocation_pending);
         let prompt_engine = Arc::clone(self);
+        // A request without reusable keys can never mint a grant: tell the
+        // authenticator it is effectively fresh (`GrantScope::session_policy`).
+        let session_reuse = match keys {
+            Some(_) => request.reuse,
+            None => ReusePolicy::Fresh,
+        };
         let prompt_task = tokio::spawn(async move {
             let outcome = authenticator
-                .authenticate(&request.prompt, Arc::clone(&revocation_pending))
+                .authenticate(
+                    &request.prompt,
+                    operation,
+                    session_reuse,
+                    Arc::clone(&revocation_pending),
+                )
                 .await;
             if matches!(outcome, AuthOutcome::Unavailable(_)) {
                 // Defensive fallback for authenticators that did not publish
@@ -1151,6 +1222,8 @@ mod tests {
         async fn authenticate(
             &self,
             _prompt: &str,
+            _operation: Operation,
+            _reuse: ReusePolicy,
             revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -1174,6 +1247,8 @@ mod tests {
         async fn authenticate(
             &self,
             _prompt: &str,
+            _operation: Operation,
+            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -1428,6 +1503,19 @@ mod tests {
         assert!(GrantScope::sign_workspace(subject, "/repo", "fp").is_reusable());
         assert!(!GrantScope::fresh(Operation::Sign).is_reusable());
         assert!(!GrantScope::sign(None, "fp", "/repo").is_reusable());
+        // The key-custody session policy is the request policy only when
+        // every scope can mint a grant — the same rule as `reusable_keys`.
+        let ttl = ReusePolicy::strict_ttl_secs(30);
+        let keyed = GrantScope::sign_workspace(subject, "/repo", "fp");
+        assert_eq!(
+            GrantScope::session_policy(std::slice::from_ref(&keyed), ttl),
+            ttl
+        );
+        assert_eq!(
+            GrantScope::session_policy(&[keyed, GrantScope::fresh(Operation::Sign)], ttl),
+            ReusePolicy::Fresh
+        );
+        assert_eq!(GrantScope::session_policy(&[], ttl), ReusePolicy::Fresh);
     }
 
     /// Pins the exact scope key of every reusable constructor. A digest is
@@ -1442,7 +1530,7 @@ mod tests {
         }
         let subject = (7, 42);
         let salt = [7u8; 16];
-        let cases: [(&str, GrantScope, Operation, ScopeFamily, SubjectId, &str); 9] = [
+        let cases: [(&str, GrantScope, Operation, ScopeFamily, SubjectId, &str); 13] = [
             (
                 "sign",
                 GrantScope::sign(Some(subject), "SHA256:fp", "/repo"),
@@ -1520,7 +1608,49 @@ mod tests {
                 subject,
                 "0edb5650e5dc5c6d84b2096a99d0caf7fb43a5c8d95fa91170e8c2936b075e7d",
             ),
+            (
+                "encrypt_workspace",
+                GrantScope::encrypt(ScopeFamily::Workspace, Some(subject), "/repo", b'0'),
+                Operation::Encrypt,
+                ScopeFamily::Workspace,
+                subject,
+                "7e9b7bb8271b5eb42abe13c30986a1e1cc53e085f0307ca87b9de6f477ee8ea6",
+            ),
+            (
+                "encrypt_cwd",
+                GrantScope::encrypt(ScopeFamily::CwdFallback, Some(subject), "/repo", b'0'),
+                Operation::Encrypt,
+                ScopeFamily::CwdFallback,
+                subject,
+                "bbb0dc379fbbe873fb9eeef6de81b227580766088ba70b41de9111b69a5764d9",
+            ),
+            (
+                "encrypt_app",
+                GrantScope::encrypt(
+                    ScopeFamily::ParentApp,
+                    Some(subject),
+                    "/Applications/A.app/Contents/MacOS/A",
+                    b'0',
+                ),
+                Operation::Encrypt,
+                ScopeFamily::ParentApp,
+                subject,
+                "dd926e731d8c4d89c2ad0a5f83a70e6d47571cfb96f7966451af44f9cb5a94ca",
+            ),
+            (
+                "encrypt_connection",
+                GrantScope::encrypt(ScopeFamily::Connection, Some(subject), "", b'0'),
+                Operation::Encrypt,
+                ScopeFamily::Connection,
+                subject,
+                "a119e1e7f8094c7bcf131ff7b414c7692a96a9d52650a1f39eb2c94b70bb988a",
+            ),
         ];
+        // Encrypt never reuses a destination grant and needs a subject.
+        assert!(
+            !GrantScope::encrypt(ScopeFamily::Destination, Some(subject), "", b'0').is_reusable()
+        );
+        assert!(!GrantScope::encrypt(ScopeFamily::Workspace, None, "/repo", b'0').is_reusable());
         for (name, scope, operation, family, subject, digest) in cases {
             let key = scope.key.expect(name);
             assert_eq!(key.operation, operation, "{name}");
@@ -1776,6 +1906,8 @@ mod tests {
         async fn authenticate(
             &self,
             _prompt: &str,
+            _operation: Operation,
+            _reuse: ReusePolicy,
             revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             match self.calls.fetch_add(1, Ordering::AcqRel) {
@@ -1838,6 +1970,8 @@ mod tests {
         async fn authenticate(
             &self,
             _prompt: &str,
+            _operation: Operation,
+            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
@@ -2080,6 +2214,8 @@ mod tests {
         async fn authenticate(
             &self,
             _prompt: &str,
+            _operation: Operation,
+            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -2545,6 +2681,8 @@ mod tests {
         async fn authenticate(
             &self,
             _prompt: &str,
+            _operation: Operation,
+            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             match self.calls.fetch_add(1, Ordering::AcqRel) {
