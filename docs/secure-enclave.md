@@ -1,9 +1,9 @@
 # Secure Enclave master-key wrap
 
-This document records the verified platform facts for wrapping the local
-master key under a Secure Enclave (SE) key instead of the passcode-derived
-wrap v2 ([app-bundle.md](app-bundle.md#master-key-wrap-v2)). It is design
-input, not a shipped contract: no store writes wrap v3 today.
+This document records the verified platform facts behind wrap v3, the Secure
+Enclave (SE) custody of the local master key. The shipped contract and the
+operator procedure belong to [app-bundle.md](app-bundle.md#master-key-wrap-v3);
+the implementation is [se.rs](../src/server_macos/se.rs).
 
 ## Threat model
 
@@ -20,8 +20,9 @@ input, not a shipped contract: no store writes wrap v3 today.
 
 ## Verified facts
 
-Measured on Apple Silicon macOS, 2026-09-22, with the `#[ignore]` test
-`spike_se_wrap_v3` in [security.rs](../src/server_macos/security.rs).
+Measured on Apple Silicon macOS, 2026-09-22; the hardware-gated `#[ignore]`
+test in [se.rs](../src/server_macos/se.rs) re-checks generation, reload, and
+single-prompt unwrap.
 
 ### Key storage
 
@@ -63,22 +64,20 @@ Measured on Apple Silicon macOS, 2026-09-22, with the `#[ignore]` test
 - A never-evaluated context always prompts: there is no SEP-side grace
   window shared across contexts.
 
-## Design constraints for wrap v3
+## Design constraints
 
-- Store the `toid` blob and the ECIES ciphertext in the existing
-  `rusty.vault.store` item; the passcode half of `passcode_and_auth_token`
-  stops participating in derivation.
-- Bind the engine's approval `LAContext` to the SE handle so one Touch ID is
-  both the vt approval and the unwrap. A reusable grant holds `(LAContext,
+- The `toid` blob and the ECIES ciphertext live in the existing
+  `rusty.vault.store` item; `passcode_and_auth_token` takes no part in v3.
+- The engine's approval `LAContext` is bound to the SE handle so one Touch ID
+  is both the vt approval and the unwrap. A reusable grant holds `(LAContext,
   SecKey)` in memory and revocation drops both; `invalidate()` is advisory,
-  never the boundary.
-- Fresh-approval operations build a new context per operation.
+  never the boundary. Fresh approvals build a new context per operation.
 - No SE (Intel without T2, VMs, CI) fails closed. Wrap v2 stays readable for
   one release as the migration source, then its test becomes a
   rejected-input test.
-- Dependencies already present: `security-framework` with `OSX_10_13`
+- Dependencies: `security-framework` with `OSX_10_13`
   (`kSecUseAuthenticationContext`, `SecKeyCreateWithData`),
-  `security-framework-sys`, `core-foundation`.
+  `security-framework-sys`, `core-foundation`; nothing added.
 
 ## Not verified
 

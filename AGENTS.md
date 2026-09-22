@@ -150,8 +150,9 @@ Usage: [README.md](README.md#inject-command). Recovery mechanics and tests:
 Authorization and scopes: [unified-authorization-engine.md](docs/unified-authorization-engine.md).
 Lifecycle, status token, and Keychain format: [app-bundle.md](docs/app-bundle.md).
 
-- All auth/run/sign/decrypt operations use the unified engine. `auth@vt` / `run@vt`
-  always require fresh approval; non-v2 decrypt envelopes are `BadRequest`.
+- All auth/run/sign/decrypt/encrypt operations use the unified engine. `auth@vt` /
+  `run@vt` / protocol `ssh-add` always require fresh approval; non-v2 decrypt
+  envelopes are `BadRequest`.
   Duration `0` means `Fresh`, never `StrictTtl(0)`. Reusable grants remain scoped
   by operation, subject, and resource.
 - Commit the non-cloneable permit only after operation success AND envelope
@@ -178,9 +179,14 @@ Lifecycle, status token, and Keychain format: [app-bundle.md](docs/app-bundle.md
   `--ui-token-fd` (never env/argv/file; absent/wrong token fails unstructured).
   Only status and revoke-all; never grant/extend/approve, reset idle, or audit-push.
   Display labels stay memory-only.
-- Keychain is wrap v2 only; reject other `wrap_v` values before unwrapping. Never
-  re-add a v1 reader, in-binary upgrade, or rebind command. Preserve the 64-byte
-  `passcode_and_auth_token` blob (second half unread). Migration belongs in the app doc.
+- New stores are wrap v3 (Secure Enclave, `se.rs`); wrap v2 is read only as the
+  `rotate-passcode` migration source this release; reject other `wrap_v` values
+  before unwrapping. Never re-add a v1 reader, in-binary upgrade, or rebind
+  command. The SE session lives only in `SeSessions`: written by a biometric
+  approval, dropped in `invalidation_complete`; `LAContext.invalidate()` is never
+  the boundary. The master is unwrapped inside a handler scope and never held
+  across an await or a prompt. Public SSH keys are plaintext; private keys reload
+  only through an authorized sign. Migration belongs in the app doc.
 
 ## Worker cache and admin
 

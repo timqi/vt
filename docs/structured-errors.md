@@ -49,6 +49,20 @@ Envelope errors fail the request. An otherwise successful batch may contain
 per-record failures; these do not acquire an envelope error kind. Invalid local
 records retain their input position and never become a wire request.
 
+## Secure Enclave
+
+Wrap v3 failures reach the CLI as anyhow errors prefixed with a stable code
+(declared in [se.rs](../src/server_macos/se.rs)); the agent maps them to
+`NotInitialized` with a static detail.
+
+| Code | Meaning |
+|---|---|
+| `se.unavailable` | No usable Secure Enclave: `init`/`import`/`rotate-passcode` refused |
+| `se.blob_rejected` | The stored key blob does not reload on this device |
+| `se.unwrap_failed` | The SE refused the unwrap: no biometric match, enrollment changed, or foreign ciphertext |
+| `se.malformed` | Stored SE fields have the wrong shape |
+| `se.biometry_required` | The approval used the password fallback, which cannot satisfy the key |
+
 ## Backend fallback
 
 | Failure | Automatic fallback eligibility |
