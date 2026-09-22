@@ -198,7 +198,7 @@ pub fn wrap_ok_envelope(inner_body_json: &[u8]) -> Vec<u8> {
 /// client-surface check can also see it.
 pub fn outcome_to_err_strict(outcome: AuthOutcome) -> Option<ErrKind> {
     match outcome {
-        AuthOutcome::Success(_) => None,
+        AuthOutcome::Success => None,
         AuthOutcome::Rejected => Some(ErrKind::AuthRejected),
         AuthOutcome::Unavailable(UnavailableReason::NotInteractive) => Some(ErrKind::SessionLocked),
         AuthOutcome::Unavailable(UnavailableReason::NoGuiSession) => Some(ErrKind::NoGuiSession),
@@ -210,7 +210,6 @@ pub fn outcome_to_err_strict(outcome: AuthOutcome) -> Option<ErrKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::session::AuthMethod;
     use serde_json::{json, Value};
 
     /// Tiny success payload used in round-trip tests.
@@ -308,9 +307,7 @@ mod tests {
     #[test]
     fn outcome_to_err_strict_never_returns_none_for_failure() {
         // Success is the only None.
-        for m in [AuthMethod::Biometric, AuthMethod::Password] {
-            assert_eq!(outcome_to_err_strict(AuthOutcome::Success(m)), None);
-        }
+        assert_eq!(outcome_to_err_strict(AuthOutcome::Success), None);
         // Every non-Success outcome maps to its kind — the fail-closed contract.
         assert_eq!(
             outcome_to_err_strict(AuthOutcome::Rejected),

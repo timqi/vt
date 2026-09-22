@@ -10,25 +10,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Which method satisfied the auth request. All three are physical-presence
-/// factors and treated as equivalent for authorization caching (see
-/// `AuthMethod::is_cacheable`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthMethod {
-    Biometric,
-    Password,
-}
-
-impl AuthMethod {
-    /// True if a successful auth via this method may grant a TTL-bounded
-    /// cache entry. Both methods qualify in the VT model: Touch ID
-    /// biometric and the macOS account password each require explicit
-    /// physical or credentialed action per attempt.
-    pub fn is_cacheable(self) -> bool {
-        matches!(self, AuthMethod::Biometric | AuthMethod::Password)
-    }
-}
-
 /// Why authentication could not even be attempted right now. Distinct from
 /// `Rejected`, which means the user actively declined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +26,8 @@ pub enum UnavailableReason {
 /// Result of an authentication attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthOutcome {
-    /// User successfully authenticated via the indicated method.
-    Success(AuthMethod),
+    /// User passed the local prompt.
+    Success,
     /// User actively declined (terminal — no fallback).
     Rejected,
     /// System cannot prompt right now (locked, no GUI, etc.).
@@ -55,7 +36,7 @@ pub enum AuthOutcome {
 
 impl AuthOutcome {
     pub fn is_success(self) -> bool {
-        matches!(self, AuthOutcome::Success(_))
+        matches!(self, AuthOutcome::Success)
     }
 }
 
@@ -372,8 +353,7 @@ mod tests {
 
     #[test]
     fn auth_outcome_is_success() {
-        assert!(AuthOutcome::Success(AuthMethod::Biometric).is_success());
-        assert!(AuthOutcome::Success(AuthMethod::Password).is_success());
+        assert!(AuthOutcome::Success.is_success());
         assert!(!AuthOutcome::Rejected.is_success());
         assert!(!AuthOutcome::Unavailable(UnavailableReason::NotInteractive).is_success());
         assert!(!AuthOutcome::Unavailable(UnavailableReason::NoGuiSession).is_success());

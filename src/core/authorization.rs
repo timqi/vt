@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 
-use super::session::{AuthMethod, AuthOutcome, UnavailableReason};
+use super::session::{AuthOutcome, UnavailableReason};
 
 /// Kernel-derived caller anchor: `(context_id, context_start_tvsec)`.
 pub type SubjectId = (u64, u64);
@@ -405,7 +405,7 @@ impl ReusePolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Decision {
     CacheHit,
-    Approved(AuthMethod),
+    Approved,
     Rejected,
     Unavailable(UnavailableReason),
     /// The authorization epoch or real-time security state invalidated the
@@ -417,7 +417,7 @@ impl Decision {
     pub fn audit_outcome(self) -> &'static str {
         match self {
             Decision::CacheHit => "cache_hit",
-            Decision::Approved(_) => "approved",
+            Decision::Approved => "approved",
             Decision::Rejected => "rejected",
             Decision::Unavailable(_) | Decision::Invalidated => "unavailable",
         }
@@ -961,8 +961,8 @@ impl AuthorizationEngine {
                 ));
             }
         };
-        let method = match outcome {
-            AuthOutcome::Success(method) => method,
+        match outcome {
+            AuthOutcome::Success => {}
             AuthOutcome::Rejected => return Err(failure(Decision::Rejected, started)),
             AuthOutcome::Unavailable(reason) => {
                 return Err(failure(Decision::Unavailable(reason), started))
@@ -986,19 +986,17 @@ impl AuthorizationEngine {
         let approved_mono = Instant::now();
         let approved_wall = SystemTime::now();
         let pending = match (keys, request.reuse) {
-            (Some(keys), ReusePolicy::StrictTtl(ttl)) if method.is_cacheable() => {
-                Some(PendingGrant {
-                    expected_epoch: epoch,
-                    keys,
-                    ttl,
-                    approved_mono,
-                    approved_wall,
-                })
-            }
+            (Some(keys), ReusePolicy::StrictTtl(ttl)) => Some(PendingGrant {
+                expected_epoch: epoch,
+                keys,
+                ttl,
+                approved_mono,
+                approved_wall,
+            }),
             _ => None,
         };
         Ok(AuthorizationPermit {
-            decision: Decision::Approved(method),
+            decision: Decision::Approved,
             latency_ms: started.elapsed().as_millis() as u64,
             reuse_remaining: None,
             pending,
@@ -1250,7 +1248,7 @@ mod tests {
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             self.calls.fetch_add(1, Ordering::AcqRel);
-            AuthOutcome::Success(AuthMethod::Biometric)
+            AuthOutcome::Success
         }
     }
 
@@ -1739,7 +1737,7 @@ mod tests {
         #[async_trait]
         impl AuthorizationAuthenticator for Custody {
             async fn authenticate(&self, _: &str, _: Operation, _: Arc<AtomicBool>) -> AuthOutcome {
-                AuthOutcome::Success(AuthMethod::Biometric)
+                AuthOutcome::Success
             }
             fn approval_complete(&self, reusable: bool) {
                 self.0.lock().unwrap().push(reusable);
@@ -1770,11 +1768,11 @@ mod tests {
         let auth = SuccessAuthenticator::new();
         let engine = AuthorizationEngine::new(auth.clone(), AllowValidator::allowed());
         let permit = engine.authorize(sign_request((1, 2), "fp")).await.unwrap();
-        assert!(matches!(permit.decision(), Decision::Approved(_)));
+        assert!(matches!(permit.decision(), Decision::Approved));
         drop(permit);
 
         let permit = engine.authorize(sign_request((1, 2), "fp")).await.unwrap();
-        assert!(matches!(permit.decision(), Decision::Approved(_)));
+        assert!(matches!(permit.decision(), Decision::Approved));
         permit.commit().await.unwrap();
 
         let hit = engine.authorize(sign_request((1, 2), "fp")).await.unwrap();
@@ -1803,7 +1801,7 @@ mod tests {
             .await
             .unwrap();
         let tighter = engine.authorize(request(30)).await.unwrap();
-        assert!(matches!(tighter.decision(), Decision::Approved(_)));
+        assert!(matches!(tighter.decision(), Decision::Approved));
         tighter.commit().await.unwrap();
         let hit = engine.authorize(request(30)).await.unwrap();
         assert_eq!(hit.decision(), Decision::CacheHit);
@@ -1931,7 +1929,7 @@ mod tests {
                     revocation_pending.store(true, Ordering::Release);
                     AuthOutcome::Unavailable(UnavailableReason::NotInteractive)
                 }
-                _ => AuthOutcome::Success(AuthMethod::Biometric),
+                _ => AuthOutcome::Success,
             }
         }
     }
@@ -1970,7 +1968,7 @@ mod tests {
             .authorize(sign_request((1, 2), "cached"))
             .await
             .unwrap();
-        assert!(matches!(retry.decision(), Decision::Approved(_)));
+        assert!(matches!(retry.decision(), Decision::Approved));
         drop(retry);
         assert_eq!(auth.calls.load(Ordering::Acquire), 3);
     }
@@ -1990,7 +1988,7 @@ mod tests {
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
-                return AuthOutcome::Success(AuthMethod::Biometric);
+                return AuthOutcome::Success;
             }
             self.entered.notify_one();
             self.release.notified().await;
@@ -2149,7 +2147,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert!(matches!(permit.decision(), Decision::Approved(_)));
+            assert!(matches!(permit.decision(), Decision::Approved));
             drop(permit);
         }
         assert_eq!(auth.calls.load(Ordering::Acquire), 4);
@@ -2212,8 +2210,8 @@ mod tests {
         barrier.wait().await;
         let a = tasks.remove(0).await.unwrap();
         let b = tasks.remove(0).await.unwrap();
-        assert!(matches!(a, Decision::Approved(_) | Decision::CacheHit));
-        assert!(matches!(b, Decision::Approved(_) | Decision::CacheHit));
+        assert!(matches!(a, Decision::Approved | Decision::CacheHit));
+        assert!(matches!(b, Decision::Approved | Decision::CacheHit));
         assert_ne!(a, b);
         assert_eq!(auth.calls.load(Ordering::Acquire), 1);
     }
@@ -2235,7 +2233,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::AcqRel);
             self.entered.notify_one();
             self.release.notified().await;
-            AuthOutcome::Success(AuthMethod::Biometric)
+            AuthOutcome::Success
         }
     }
 
@@ -2258,7 +2256,7 @@ mod tests {
                     ))
                     .await
                     .unwrap();
-                assert!(matches!(permit.decision(), Decision::Approved(_)));
+                assert!(matches!(permit.decision(), Decision::Approved));
                 permit.commit().await.unwrap();
             }));
         }
@@ -2334,7 +2332,7 @@ mod tests {
 
         validator.allowed.store(true, Ordering::Release);
         let retry = engine.authorize(sign_request((1, 2), "fp")).await.unwrap();
-        assert!(matches!(retry.decision(), Decision::Approved(_)));
+        assert!(matches!(retry.decision(), Decision::Approved));
         drop(retry);
         assert_eq!(auth.calls.load(Ordering::Acquire), 2);
     }
@@ -2441,7 +2439,7 @@ mod tests {
             .authorize(sign_request((1, 2), "cached"))
             .await
             .unwrap();
-        assert!(matches!(retry.decision(), Decision::Approved(_)));
+        assert!(matches!(retry.decision(), Decision::Approved));
         drop(retry);
         assert_eq!(auth.calls.load(Ordering::Acquire), 2);
     }
@@ -2585,7 +2583,7 @@ mod tests {
             .authorize(sign_request((1, 2), "cached"))
             .await
             .unwrap();
-        assert!(matches!(retry.decision(), Decision::Approved(_)));
+        assert!(matches!(retry.decision(), Decision::Approved));
         drop(retry);
         assert_eq!(auth.calls.load(Ordering::Acquire), 3);
     }
@@ -2671,7 +2669,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(matches!(partial.decision(), Decision::Approved(_)));
+        assert!(matches!(partial.decision(), Decision::Approved));
         partial.commit().await.unwrap();
         let full = engine
             .authorize(AuthorizationRequest::new(
@@ -2699,7 +2697,7 @@ mod tests {
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             match self.calls.fetch_add(1, Ordering::AcqRel) {
-                0 => AuthOutcome::Success(AuthMethod::Biometric),
+                0 => AuthOutcome::Success,
                 _ => AuthOutcome::Rejected,
             }
         }

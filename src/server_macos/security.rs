@@ -6,8 +6,8 @@ use zeroize::Zeroizing;
 
 use crate::core::crypto::{derive_passphrase_secret_v2, AesGcmCrypto};
 use crate::core::session::{
-    classify_session, lock_cache_check, throttle_check, AuthMethod, AuthOutcome, NotifyKind,
-    SessionState, UnavailableReason,
+    classify_session, lock_cache_check, throttle_check, AuthOutcome, NotifyKind, SessionState,
+    UnavailableReason,
 };
 
 pub fn set_keychain(name: &str, value: &[u8]) -> Result<()> {
@@ -409,7 +409,7 @@ pub fn authenticate_ctx(reason: &str) -> (AuthOutcome, Option<super::se::Biometr
         match outcome {
             EvalOutcome::Success => {
                 return (
-                    AuthOutcome::Success(AuthMethod::Biometric),
+                    AuthOutcome::Success,
                     Some(super::se::BiometricContext::from_evaluated(ctx)),
                 )
             }
@@ -473,7 +473,7 @@ pub fn authenticate_ctx(reason: &str) -> (AuthOutcome, Option<super::se::Biometr
     }
 
     let outcome = match la::evaluate(la::Policy::DeviceOwner, reason).0 {
-        EvalOutcome::Success => AuthOutcome::Success(AuthMethod::Password),
+        EvalOutcome::Success => AuthOutcome::Success,
         EvalOutcome::NotInteractive => AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
         EvalOutcome::Rejected | EvalOutcome::TryFallback => AuthOutcome::Rejected,
     };

@@ -870,7 +870,7 @@ fn authorization_failure_wire(failure: &AuthorizationFailure) -> WireFailure {
             (kind, auth_outcome_detail(kind))
         }
         Decision::Invalidated => (ErrKind::Transient, Some(DETAIL_AUTH_INVALIDATED)),
-        Decision::CacheHit | Decision::Approved(_) => {
+        Decision::CacheHit | Decision::Approved => {
             (ErrKind::Generic, Some(DETAIL_AUTH_INVALIDATED))
         }
     }
@@ -1487,7 +1487,6 @@ mod tests {
         AuthorizationAuthenticator, AuthorizationValidator, GrantScope, Operation, ScopeFamily,
         ValidationError,
     };
-    use crate::core::session::AuthMethod;
     use crate::core::{ContextBasis, UiStatusReq, UiStatusRes};
 
     pub(super) struct TestAuthenticator;
@@ -1500,7 +1499,7 @@ mod tests {
             _operation: Operation,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
-            AuthOutcome::Success(AuthMethod::Biometric)
+            AuthOutcome::Success
         }
     }
 
@@ -2002,13 +2001,5 @@ ZWN0ZWQtdGVzdAEC
         ));
         // Wall stepped backwards (None): not a sleep signal.
         assert!(!watcher_should_clear(true, true, mono, None));
-    }
-
-    // --- AuthMethod::is_cacheable tests ---
-
-    #[test]
-    fn test_auth_method_is_cacheable() {
-        assert!(AuthMethod::Biometric.is_cacheable());
-        assert!(AuthMethod::Password.is_cacheable());
     }
 }

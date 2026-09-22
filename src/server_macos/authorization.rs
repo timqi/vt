@@ -10,7 +10,7 @@ use crate::core::authorization::{
     AuthorizationAuthenticator, AuthorizationEngine, AuthorizationValidator, Decision, Operation,
     ValidationError,
 };
-use crate::core::session::{AuthMethod, AuthOutcome, SessionState, UnavailableReason};
+use crate::core::session::{AuthOutcome, SessionState, UnavailableReason};
 
 use super::se::SeSession;
 use super::security::{authenticate_ctx, screen_state_now};
@@ -161,7 +161,7 @@ impl AuthorizationAuthenticator for MacAuthenticator {
             if matches!(outcome, AuthOutcome::Unavailable(_)) {
                 revocation_pending.store(true, Ordering::Release);
             }
-            if let (AuthOutcome::Success(AuthMethod::Biometric), Some(ctx)) = (outcome, ctx) {
+            if let (AuthOutcome::Success, Some(ctx)) = (outcome, ctx) {
                 if operation.needs_master() {
                     bind_session(&sessions, ctx);
                 }
@@ -274,7 +274,7 @@ mod tests {
     }
 
     const HIT: Decision = Decision::CacheHit;
-    const NEW: Decision = Decision::Approved(AuthMethod::Biometric);
+    const NEW: Decision = Decision::Approved;
 
     /// Every new prompt clears pending custody without disturbing live hits;
     /// pending custody survives only until its approval completes, and is

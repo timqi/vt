@@ -822,7 +822,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    const NEW: Decision = Decision::Approved(crate::core::session::AuthMethod::Biometric);
+    const NEW: Decision = Decision::Approved;
 
     struct RejectingAuthenticator;
 
