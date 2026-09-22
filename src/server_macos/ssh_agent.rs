@@ -975,7 +975,7 @@ impl Session for VtSshSession {
             .map_err(|_| AgentError::Failure)?;
 
         let privkey = self
-            .private_key(&store, &fp_str, permit.session_policy())
+            .private_key(&store, &fp_str, permit.decision())
             .await
             .map_err(|_| AgentError::Failure)?;
         let signature = sign_data_with_privkey(&privkey, &request.data)?;
@@ -1498,7 +1498,6 @@ mod tests {
             &self,
             _prompt: &str,
             _operation: Operation,
-            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             AuthOutcome::Success(AuthMethod::Biometric)

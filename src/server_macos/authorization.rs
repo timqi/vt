@@ -7,8 +7,8 @@ use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 
 use crate::core::authorization::{
-    AuthorizationAuthenticator, AuthorizationEngine, AuthorizationValidator, Operation,
-    ReusePolicy, ValidationError,
+    AuthorizationAuthenticator, AuthorizationEngine, AuthorizationValidator, Decision, Operation,
+    ValidationError,
 };
 use crate::core::session::{AuthMethod, AuthOutcome, SessionState, UnavailableReason};
 
@@ -40,14 +40,14 @@ pub struct SeSessions {
 
 impl SeSessions {
     /// Called before every prompt to discard any unconsumed pending session.
-    fn begin_prompt(&self, _reuse: ReusePolicy) {
+    fn begin_prompt(&self) {
         *self
             .fresh
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
-    fn store(&self, _reuse: ReusePolicy, session: SeSession) {
+    fn store(&self, session: SeSession) {
         *self
             .fresh
             .lock()
@@ -70,27 +70,23 @@ impl SeSessions {
         }
     }
 
-    /// Fresh selects the current approval; StrictTtl is only for cache hits.
-    /// The engine's approval guard owns pending-session cleanup.
+    /// The custody behind a permit: a cache hit reads the committed reusable
+    /// session, a new approval its own pending one. The engine's approval
+    /// guard owns pending-session cleanup.
     pub fn with_session<R>(
         &self,
-        reuse: ReusePolicy,
+        decision: Decision,
         f: impl FnOnce(&SeSession) -> R,
     ) -> Option<R> {
-        match reuse {
-            ReusePolicy::StrictTtl(_) => self
-                .reusable
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .map(f),
-            ReusePolicy::Fresh => self
-                .fresh
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .map(f),
-        }
+        let slot = if decision == Decision::CacheHit {
+            &self.reusable
+        } else {
+            &self.fresh
+        };
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(f)
     }
 
     /// Drop both sessions. Called under the security write gate after grants
@@ -100,7 +96,7 @@ impl SeSessions {
             .reusable
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.begin_prompt(ReusePolicy::Fresh);
+        self.begin_prompt();
     }
 
     #[cfg(test)]
@@ -108,10 +104,11 @@ impl SeSessions {
         self.reusable.lock().unwrap().is_none() && self.fresh.lock().unwrap().is_none()
     }
 
+    /// Test seam: a pending session, or one already promoted to reusable.
     #[cfg(test)]
-    pub(super) fn put(&self, reuse: ReusePolicy, session: SeSession) {
-        self.store(reuse, session);
-        if matches!(reuse, ReusePolicy::StrictTtl(_)) {
+    pub(super) fn put(&self, reusable: bool, session: SeSession) {
+        self.store(session);
+        if reusable {
             self.complete(true);
         }
     }
@@ -125,7 +122,7 @@ struct MacAuthenticator {
 /// store, bind the evaluated context to the SE key. Any failure leaves no
 /// session: the handler then fails closed and drops its permit, so no grant
 /// is written. A password approval never reaches here (no context).
-fn bind_session(sessions: &SeSessions, ctx: super::se::BiometricContext, reuse: ReusePolicy) {
+fn bind_session(sessions: &SeSessions, ctx: super::se::BiometricContext) {
     let store = match KeychainStore::load() {
         Ok(store) if store.wrap_v == WRAP_V3 => store,
         Ok(_) => return,
@@ -139,7 +136,7 @@ fn bind_session(sessions: &SeSessions, ctx: super::se::BiometricContext, reuse: 
         .map_err(|e| e.to_string())
         .and_then(|(blob, _)| SeSession::open(&blob, ctx).map_err(|e| e.to_string()));
     match session {
-        Ok(session) => sessions.store(reuse, session),
+        Ok(session) => sessions.store(session),
         Err(error) => tracing::warn!("Secure Enclave session not opened: {error}"),
     }
 }
@@ -154,20 +151,19 @@ impl AuthorizationAuthenticator for MacAuthenticator {
         &self,
         prompt: &str,
         operation: Operation,
-        reuse: ReusePolicy,
         revocation_pending: Arc<AtomicBool>,
     ) -> AuthOutcome {
         let prompt = prompt.to_string();
         let sessions = Arc::clone(&self.sessions);
         match tokio::task::spawn_blocking(move || {
-            sessions.begin_prompt(reuse);
+            sessions.begin_prompt();
             let (outcome, ctx) = authenticate_ctx(&prompt);
             if matches!(outcome, AuthOutcome::Unavailable(_)) {
                 revocation_pending.store(true, Ordering::Release);
             }
             if let (AuthOutcome::Success(AuthMethod::Biometric), Some(ctx)) = (outcome, ctx) {
                 if operation.needs_master() {
-                    bind_session(&sessions, ctx, reuse);
+                    bind_session(&sessions, ctx);
                 }
             }
             outcome
@@ -270,49 +266,51 @@ mod tests {
     async fn invalidation_drops_se_sessions() {
         use super::super::se::test_support::software_session;
         let (engine, sessions) = new_engine(Arc::new(AtomicBool::new(false)));
-        sessions.put(ReusePolicy::strict_ttl_secs(30), software_session());
-        sessions.put(ReusePolicy::Fresh, software_session());
+        sessions.put(true, software_session());
+        sessions.put(false, software_session());
         assert!(!sessions.is_empty());
         engine.invalidate_all().await;
         assert!(sessions.is_empty());
     }
 
-    /// Every new prompt clears pending custody without disturbing live hits.
-    #[test]
-    fn fresh_prompt_empties_the_fresh_slot_first() {
-        use super::super::se::test_support::software_session;
-        let sessions = SeSessions::default();
-        let ttl = ReusePolicy::strict_ttl_secs(30);
-        sessions.put(ReusePolicy::Fresh, software_session());
-        sessions.put(ttl, software_session());
-        sessions.begin_prompt(ttl);
-        assert!(sessions.with_session(ttl, |_| ()).is_some());
-        sessions.begin_prompt(ReusePolicy::Fresh);
-        assert!(sessions.with_session(ReusePolicy::Fresh, |_| ()).is_none());
-        assert!(sessions.with_session(ttl, |_| ()).is_some());
-        sessions.store(ttl, software_session());
-        assert!(
-            sessions.with_session(ReusePolicy::Fresh, |_| ()).is_some(),
-            "a new approval must use its own pending session"
-        );
-    }
+    const HIT: Decision = Decision::CacheHit;
+    const NEW: Decision = Decision::Approved(AuthMethod::Biometric);
 
-    /// Pending custody survives only until its approval completes.
+    /// Every new prompt clears pending custody without disturbing live hits;
+    /// pending custody survives only until its approval completes, and is
+    /// promoted only by a committed grant.
     #[test]
-    fn pending_session_drops_on_failure_reusable_persists() {
+    fn pending_custody_follows_the_approval() {
         use super::super::se::test_support::software_session;
         let sessions = SeSessions::default();
-        assert!(sessions.with_session(ReusePolicy::Fresh, |_| ()).is_none());
-        sessions.put(ReusePolicy::Fresh, software_session());
-        assert!(sessions.with_session(ReusePolicy::Fresh, |_| ()).is_some());
+        assert!(sessions.with_session(NEW, |_| ()).is_none());
+        sessions.put(false, software_session());
+        sessions.put(true, software_session());
+        assert!(sessions.with_session(HIT, |_| ()).is_some());
+        sessions.begin_prompt();
+        assert!(sessions.with_session(NEW, |_| ()).is_none());
+        assert!(sessions.with_session(HIT, |_| ()).is_some());
+
+        sessions.store(software_session());
         sessions.complete(false);
-        assert!(sessions.with_session(ReusePolicy::Fresh, |_| ()).is_none());
-        let ttl = ReusePolicy::strict_ttl_secs(30);
-        sessions.put(ttl, software_session());
-        assert!(sessions.with_session(ttl, |_| ()).is_some());
-        assert!(sessions.with_session(ttl, |_| ()).is_some());
+        assert!(
+            sessions.with_session(NEW, |_| ()).is_none(),
+            "dropped, not promoted"
+        );
+        assert!(
+            sessions.with_session(HIT, |_| ()).is_some(),
+            "earlier hit custody untouched"
+        );
+
         sessions.clear();
         assert!(sessions.is_empty());
+        sessions.store(software_session());
+        sessions.complete(true);
+        assert!(sessions.with_session(NEW, |_| ()).is_none());
+        assert!(
+            sessions.with_session(HIT, |_| ()).is_some(),
+            "promoted by commit"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 pub fn init() -> Result<()> {
     KeychainStore::require_absent()?;
-    new_store_v3(&Zeroizing::new(AesGcmCrypto::generate_key()))?.create()?;
+    new_store_v3(&Zeroizing::new(AesGcmCrypto::generate_key()))?.save()?;
     tracing::info!("keychain store saved!");
     Ok(())
 }
@@ -73,7 +73,7 @@ pub async fn import_secret() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?,
     );
     new_store_v3(&master)?
-        .create()
+        .save()
         .context("Failed to save the wrap v3 store")?;
     tracing::info!("keychain store saved!");
     Ok(())

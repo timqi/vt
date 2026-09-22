@@ -20,17 +20,6 @@
 
 use anyhow::{anyhow, ensure, Context, Result};
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
-use core_foundation::{
-    base::{CFType, TCFType},
-    boolean::CFBoolean,
-    data::CFData,
-    dictionary::{CFDictionary, CFMutableDictionary},
-    string::CFString,
-};
-use security_framework_sys::{
-    item::*,
-    keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemUpdate},
-};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -145,9 +134,12 @@ impl KeychainStore {
         Ok(store)
     }
 
+    /// `init` / `import` write only where no item exists: an unreadable item
+    /// is never replaced.
     pub fn require_absent() -> Result<()> {
+        use security_framework::passwords::get_generic_password;
         Self::check_absent(
-            security_framework::passwords::get_generic_password("rusty.vault.store", "prod")
+            get_generic_password(&format!("rusty.vault.{STORE_NAME}"), "prod")
                 .map(|_| ())
                 .map_err(|error| error.code()),
         )
@@ -159,29 +151,6 @@ impl KeychainStore {
             Ok(()) => Err(anyhow!("rusty.vault.store already exists")),
             Err(code) => Err(anyhow!("cannot establish store absence ({code})")),
         }
-    }
-
-    /// Add-only creation: a racing initializer or unreadable existing item
-    /// can never be replaced by init/import.
-    pub fn create(&self) -> Result<()> {
-        super::security::require_v3(self)?;
-        let json = serde_json::to_vec(self)?;
-        let status = unsafe {
-            let mut query = item_query(false);
-            query.set(
-                CFString::wrap_under_get_rule(kSecValueData),
-                CFData::from_buffer(&json).as_CFType(),
-            );
-            SecItemAdd(
-                query.to_immutable().as_concrete_TypeRef(),
-                std::ptr::null_mut(),
-            )
-        };
-        ensure!(
-            status == 0,
-            "store creation refused ({status}); existing items are never replaced"
-        );
-        Ok(())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -233,45 +202,15 @@ impl KeychainStore {
         self.encrypted_ssh_keys = Some(BASE64_URL_SAFE_NO_PAD.encode(bytes));
     }
 
-    /// Socket mutations cannot wait for a flock or a Keychain permission UI
-    /// while holding an authorization permit. No task may outlive that permit.
+    /// Socket mutations run while an authorization permit is live, so they
+    /// refuse to wait for the flock instead of holding revocation off. The
+    /// Keychain read itself cannot prompt here: the dispatcher already read
+    /// the item in this process before the approval.
     pub fn try_modify(f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
         let _lock = StoreLock::try_from_file(StoreLock::open_lock_file()?)?;
-        let raw = unsafe {
-            let mut query = item_query(true);
-            query.set(
-                CFString::wrap_under_get_rule(kSecReturnData),
-                CFBoolean::true_value().as_CFType(),
-            );
-            let mut result = std::ptr::null();
-            let status =
-                SecItemCopyMatching(query.to_immutable().as_concrete_TypeRef(), &mut result);
-            ensure!(
-                status == 0 && !result.is_null(),
-                "noninteractive Keychain read failed ({status})"
-            );
-            CFData::wrap_under_create_rule(result.cast()).to_vec()
-        };
-        let mut store = Self::decode(&raw)?;
-        super::security::require_v3(&store)?;
+        let mut store = Self::load()?;
         f(&mut store)?;
-        super::security::require_v3(&store)?;
-        let json = serde_json::to_vec(&store)?;
-        let status = unsafe {
-            let update = CFDictionary::from_CFType_pairs(&[(
-                CFString::wrap_under_get_rule(kSecValueData),
-                CFData::from_buffer(&json).as_CFType(),
-            )]);
-            SecItemUpdate(
-                item_query(true).to_immutable().as_concrete_TypeRef(),
-                update.as_concrete_TypeRef(),
-            )
-        };
-        ensure!(
-            status == 0,
-            "noninteractive Keychain update failed ({status})"
-        );
-        Ok(())
+        store.save()
     }
 
     /// Acquire the cross-process write lock, load the store, run `f`, then
@@ -288,38 +227,6 @@ impl KeychainStore {
         store.save()?;
         Ok(())
     }
-}
-
-// Security.framework constants not exported by security-framework-sys.
-#[link(name = "Security", kind = "framework")]
-extern "C" {
-    static kSecUseAuthenticationUI: core_foundation::string::CFStringRef;
-    static kSecUseAuthenticationUIFail: core_foundation::string::CFStringRef;
-}
-
-fn item_query(no_ui: bool) -> CFMutableDictionary<CFString, CFType> {
-    let mut query = CFMutableDictionary::new();
-    unsafe {
-        query.set(
-            CFString::wrap_under_get_rule(kSecClass),
-            CFString::wrap_under_get_rule(kSecClassGenericPassword).as_CFType(),
-        );
-        query.set(
-            CFString::wrap_under_get_rule(kSecAttrService),
-            CFString::new("rusty.vault.store").as_CFType(),
-        );
-        query.set(
-            CFString::wrap_under_get_rule(kSecAttrAccount),
-            CFString::new("prod").as_CFType(),
-        );
-        if no_ui {
-            query.set(
-                CFString::wrap_under_get_rule(kSecUseAuthenticationUI),
-                CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).as_CFType(),
-            );
-        }
-    }
-    query
 }
 
 fn lock_path() -> PathBuf {

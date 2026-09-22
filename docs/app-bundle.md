@@ -56,8 +56,9 @@ and [se.rs](../src/server_macos/se.rs).
   listing identities never unwraps the master. Private keys stay sealed under
   the master and load on the next authorized sign after a wipe.
 
-Wrap v2 (passcode-derived) is readable this release only as the migration
-source. Migrate once per Mac, then restart the agent:
+Wrap v2 (passcode-derived) is readable this release only by
+`vt secret rotate-passcode`; the agent and every other command refuse it until
+migrated. Migrate once per Mac, then restart the agent:
 
 ```bash
 vt secret rotate-passcode

@@ -97,7 +97,12 @@ pub fn load_private_keys(
     let mut keys = HashMap::new();
     for entry in &decode_ssh_keys(store, master)? {
         let privkey = parse_private(entry)?;
-        require_ed25519(&privkey)?;
+        require_ed25519(&privkey).with_context(|| {
+            format!(
+                "stored SSH key {}: remove it with `vt ssh remove {}`",
+                entry.fingerprint, entry.fingerprint
+            )
+        })?;
         ensure!(
             keys.insert(entry.fingerprint.clone(), privkey).is_none(),
             "duplicate stored SSH key"

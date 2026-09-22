@@ -92,8 +92,8 @@ Prompts must state the scope and duration a successful operation will grant;
   not a substitute for checks on the operation path.
 - Either wall-clock or monotonic expiry ends reuse. Hits never slide expiry;
   a tighter requested policy requires fresh approval before replacing a grant.
-- Socket key-store mutations refuse a busy store lock or required Keychain
-  permission dialog; a cancelled connection cannot leave a detached writer.
+- Socket key-store mutations refuse a busy store lock and run inside the
+  permit; a cancelled connection cannot leave a detached writer.
 - Notifications run after permit commitment releases its guards.
 
 Approval audit records the decision, not successful execution. A failed reply

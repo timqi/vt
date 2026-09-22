@@ -28,7 +28,7 @@ use super::{
     RUN_PROMPT_ARGV_MAX, RUN_REQ_ARGV_MAX_BYTES,
 };
 use crate::core::authorization::{
-    AuthorizationPermit, AuthorizationRequest, GrantScope, Operation, ReusePolicy,
+    AuthorizationPermit, AuthorizationRequest, Decision, GrantScope, Operation, ReusePolicy,
 };
 use crate::core::crypto::derive_dek;
 use crate::core::wire::ErrKind;
@@ -43,13 +43,13 @@ use crate::core::{
 pub(super) fn master_for(
     sessions: &SeSessions,
     store: &KeychainStore,
-    reuse: ReusePolicy,
+    decision: Decision,
 ) -> Result<Zeroizing<[u8; 32]>, WireFailure> {
     let not_initialized = |_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED));
     require_v3(store).map_err(not_initialized)?;
     let (_, wrapped) = store.se_material_bytes().map_err(not_initialized)?;
     sessions
-        .with_session(reuse, |session| session.unwrap_master(&wrapped))
+        .with_session(decision, |session| session.unwrap_master(&wrapped))
         .ok_or((ErrKind::NotInitialized, Some(DETAIL_SE_SESSION)))?
         .map_err(|error| {
             tracing::warn!("{error}");
@@ -149,7 +149,7 @@ impl VtSshSession {
         &self,
         store: &KeychainStore,
         fp: &str,
-        reuse: ReusePolicy,
+        decision: Decision,
     ) -> Result<ssh_key::private::PrivateKey, WireFailure> {
         let mut keys = self.keys.write().await;
         let unsafe_state = || (ErrKind::Generic, Some(DETAIL_SIGN_KEYS_LOAD));
@@ -161,7 +161,7 @@ impl VtSshSession {
         // Even a resident key requires this permit's custody: a password or
         // failed bind must not borrow a key loaded by an earlier approval.
         let loaded = {
-            let master = master_for(&self.se_sessions, store, reuse)?;
+            let master = master_for(&self.se_sessions, store, decision)?;
             if let Some(key) = keys.get(fp) {
                 return Ok(key.clone());
             }
@@ -213,8 +213,9 @@ impl VtSshSession {
             .await
             .map_err(|_| AgentError::Failure)?;
         let sessions = std::sync::Arc::clone(&self.se_sessions);
+        let decision = permit.decision();
         Ok((permit, move |store: &KeychainStore| {
-            master_for(&sessions, store, ReusePolicy::Fresh)
+            master_for(&sessions, store, decision)
                 .map_err(|(kind, detail)| anyhow::anyhow!("{kind:?}: {}", detail.unwrap_or("")))
         }))
     }
@@ -291,7 +292,7 @@ impl VtSshSession {
             )
             .await
             .map_err(|failure| authorization_failure_wire(&failure))?;
-        let mac_key = master_for(&self.se_sessions, store, permit.session_policy())?;
+        let mac_key = master_for(&self.se_sessions, store, permit.decision())?;
         let mut result = Zeroizing::new(Vec::<EncryptResItem>::with_capacity(req.types.len()));
         for _t in &req.types {
             let mut salt = [0u8; SALT_LEN];
@@ -400,7 +401,7 @@ impl VtSshSession {
             )
             .await
             .map_err(|failure| authorization_failure_wire(&failure))?;
-        let mac_key = master_for(&self.se_sessions, store, permit.session_policy())?;
+        let mac_key = master_for(&self.se_sessions, store, permit.decision())?;
         let mut result = Zeroizing::new(Vec::<DecryptResItem>::with_capacity(req.items.len()));
         for DecryptInput::V2 { salt, .. } in req.items {
             result.push(DecryptResItem::V2 {
@@ -794,9 +795,7 @@ impl VtSshSession {
             .await
             .map_err(|failure| authorization_failure_wire(&failure))?;
 
-        let privkey = self
-            .private_key(store, &fp_str, permit.session_policy())
-            .await?;
+        let privkey = self.private_key(store, &fp_str, permit.decision()).await?;
         let sig = sign_data_with_privkey(&privkey, &req.data)
             .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_FAILED)))?;
         let res = SignRes {
@@ -823,6 +822,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
+    const NEW: Decision = Decision::Approved(crate::core::session::AuthMethod::Biometric);
+
     struct RejectingAuthenticator;
 
     #[async_trait::async_trait]
@@ -831,7 +832,6 @@ mod tests {
             &self,
             _prompt: &str,
             _operation: Operation,
-            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             AuthOutcome::Rejected
@@ -881,7 +881,7 @@ mod tests {
         assert_eq!(err, (ErrKind::BadRequest, Some(DETAIL_UNKNOWN_SECRET_TYPE)));
 
         session.authorization = engine(TestAuthenticator);
-        session.se_sessions.put(ReusePolicy::Fresh, custody);
+        session.se_sessions.put(false, custody);
         let ok = session.handle_encrypt(&payload, &store).await.unwrap();
         assert!(
             ok.authorization.is_some(),
@@ -900,20 +900,19 @@ mod tests {
         use crate::server_macos::se::test_support::software_session;
         let sessions = SeSessions::default();
         let store = KeychainStore::new_v3(&[1u8; 8], &[2u8; 113]);
-        let fresh = ReusePolicy::Fresh;
         assert_eq!(
-            master_for(&sessions, &store, fresh).unwrap_err(),
+            master_for(&sessions, &store, NEW).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION))
         );
-        sessions.put(fresh, software_session());
+        sessions.put(false, software_session());
         assert_eq!(
-            master_for(&sessions, &store, fresh).unwrap_err(),
+            master_for(&sessions, &store, NEW).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_UNWRAP))
         );
         // The approval guard owns cleanup; repeated access cannot select a
         // different session while that permit is alive.
         assert_eq!(
-            master_for(&sessions, &store, fresh).unwrap_err(),
+            master_for(&sessions, &store, NEW).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_UNWRAP))
         );
     }
@@ -930,17 +929,11 @@ mod tests {
         session.keys.write().await.insert(fp.clone(), key);
         let store = KeychainStore::new_v3(&[1; 8], &[2; 113]);
         assert!(
-            session
-                .private_key(&store, &fp, ReusePolicy::Fresh)
-                .await
-                .is_err(),
+            session.private_key(&store, &fp, NEW).await.is_err(),
             "cached keys must not bypass a missing biometric session"
         );
         session.locked.store(true, Ordering::Release);
-        assert!(session
-            .private_key(&store, &fp, ReusePolicy::Fresh)
-            .await
-            .is_err());
+        assert!(session.private_key(&store, &fp, NEW).await.is_err());
     }
 
     /// Private keys load on the first authorized sign after a wipe, through
@@ -975,34 +968,25 @@ mod tests {
         .unwrap();
 
         let session = test_session(0, 0);
-        session.se_sessions.put(ReusePolicy::Fresh, custody);
+        session.se_sessions.put(false, custody);
         assert!(session.keys.read().await.is_empty());
-        let loaded = session
-            .private_key(&store, &fp, ReusePolicy::Fresh)
-            .await
-            .unwrap();
+        let loaded = session.private_key(&store, &fp, NEW).await.unwrap();
         assert_eq!(loaded.public_key(), privkey.public_key());
         assert_eq!(session.keys.read().await.len(), 1);
         assert!(session
-            .private_key(&store, "SHA256:unknown", ReusePolicy::Fresh)
+            .private_key(&store, "SHA256:unknown", NEW)
             .await
             .is_err());
 
         assert_eq!(super::super::clear_private_keys(&session.keys).await, 1);
         session.locked.store(true, Ordering::Release);
-        assert!(session
-            .private_key(&store, &fp, ReusePolicy::Fresh)
-            .await
-            .is_err());
+        assert!(session.private_key(&store, &fp, NEW).await.is_err());
         assert!(
             session.keys.read().await.is_empty(),
             "no install under lock"
         );
         session.locked.store(false, Ordering::Release);
-        assert!(session
-            .private_key(&store, &fp, ReusePolicy::Fresh)
-            .await
-            .is_ok());
+        assert!(session.private_key(&store, &fp, NEW).await.is_ok());
     }
 
     // ── Touch-ID prompt helpers ────────────────────────────────────────────

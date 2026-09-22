@@ -450,16 +450,14 @@ pub enum ValidationError {
     Invalidated,
 }
 
-/// `operation` and `reuse` let a platform authenticator bind the approval to
-/// its key custody: a reusable approval of a master-needing operation leaves
-/// a session behind for cache hits, a fresh one only for the permit holder.
+/// `operation` lets a platform authenticator bind a master-needing approval
+/// to its key custody; the pending custody follows the approval guard.
 #[async_trait]
 pub trait AuthorizationAuthenticator: Send + Sync {
     async fn authenticate(
         &self,
         prompt: &str,
         operation: Operation,
-        reuse: ReusePolicy,
         revocation_pending: Arc<AtomicBool>,
     ) -> AuthOutcome;
 
@@ -733,9 +731,6 @@ pub struct AuthorizationPermit {
     /// Tightest remaining grant lifetime when `decision` is `CacheHit`.
     /// Informational only (cache-hit notifications); never a reuse input.
     reuse_remaining: Option<Duration>,
-    /// Fresh for a new approval, otherwise the policy of the live cache hit.
-    /// Handlers use it to select pending versus committed key custody.
-    session_reuse: ReusePolicy,
     pending: Option<PendingGrant>,
     store: Arc<RwLock<GrantStore>>,
     approval: Option<ApprovalGuard>,
@@ -745,10 +740,6 @@ pub struct AuthorizationPermit {
 impl AuthorizationPermit {
     pub fn decision(&self) -> Decision {
         self.decision
-    }
-
-    pub fn session_policy(&self) -> ReusePolicy {
-        self.session_reuse
     }
 
     pub fn reuse_remaining(&self) -> Option<Duration> {
@@ -877,7 +868,6 @@ impl AuthorizationEngine {
                     decision: Decision::CacheHit,
                     latency_ms: 0,
                     reuse_remaining: lookup.remaining,
-                    session_reuse: request.reuse,
                     pending: None,
                     store: Arc::clone(&self.store),
                     approval: None,
@@ -919,7 +909,6 @@ impl AuthorizationEngine {
                         decision: Decision::CacheHit,
                         latency_ms: 0,
                         reuse_remaining: lookup.remaining,
-                        session_reuse: request.reuse,
                         pending: None,
                         store: Arc::clone(&self.store),
                         approval: None,
@@ -939,12 +928,6 @@ impl AuthorizationEngine {
         let authenticator = Arc::clone(&self.authenticator);
         let revocation_pending = Arc::clone(&self.revocation_pending);
         let prompt_engine = Arc::clone(self);
-        // A request without reusable keys can never mint a grant: tell the
-        // authenticator it is effectively fresh; the permit repeats it.
-        let session_reuse = match keys {
-            Some(_) => request.reuse,
-            None => ReusePolicy::Fresh,
-        };
         let prompt_task = tokio::spawn(async move {
             let approval = ApprovalGuard {
                 authenticator: Arc::clone(&authenticator),
@@ -952,12 +935,7 @@ impl AuthorizationEngine {
                 _prompt: prompt,
             };
             let outcome = authenticator
-                .authenticate(
-                    &request.prompt,
-                    operation,
-                    session_reuse,
-                    Arc::clone(&revocation_pending),
-                )
+                .authenticate(&request.prompt, operation, Arc::clone(&revocation_pending))
                 .await;
             if matches!(outcome, AuthOutcome::Unavailable(_)) {
                 // Defensive fallback for authenticators that did not publish
@@ -1023,7 +1001,6 @@ impl AuthorizationEngine {
             decision: Decision::Approved(method),
             latency_ms: started.elapsed().as_millis() as u64,
             reuse_remaining: None,
-            session_reuse: ReusePolicy::Fresh,
             pending,
             store: Arc::clone(&self.store),
             approval: Some(approval),
@@ -1246,7 +1223,6 @@ mod tests {
             &self,
             _prompt: &str,
             _operation: Operation,
-            _reuse: ReusePolicy,
             revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -1271,7 +1247,6 @@ mod tests {
             &self,
             _prompt: &str,
             _operation: Operation,
-            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -1758,52 +1733,12 @@ mod tests {
         assert_eq!(auth.calls.load(Ordering::Acquire), 0);
     }
 
-    /// New approvals always select pending custody; only cache hits select
-    /// the committed reusable session.
-    #[tokio::test]
-    async fn permit_session_policy_distinguishes_approval_from_hit() {
-        let auth = SuccessAuthenticator::new();
-        let engine = AuthorizationEngine::new(auth.clone(), AllowValidator::allowed());
-        let ttl = ReusePolicy::strict_ttl_secs(120);
-        let permit = engine.authorize(sign_request((1, 2), "fp")).await.unwrap();
-        assert_eq!(permit.session_policy(), ReusePolicy::Fresh);
-        permit.commit().await.unwrap();
-        let hit = engine.authorize(sign_request((1, 2), "fp")).await.unwrap();
-        assert_eq!(hit.decision(), Decision::CacheHit);
-        assert_eq!(hit.session_policy(), ttl);
-        drop(hit);
-
-        let mixed = AuthorizationRequest::new(
-            vec![sign_scope((1, 2), "fp"), GrantScope::fresh(Operation::Sign)],
-            ttl,
-            "sign",
-        );
-        let permit = engine.authorize(mixed).await.unwrap();
-        assert_eq!(permit.session_policy(), ReusePolicy::Fresh);
-        // A live permit holds the prompt permit: release it before the next one.
-        drop(permit);
-        let permit = engine
-            .authorize(AuthorizationRequest::fresh(
-                GrantScope::fresh(Operation::Auth),
-                "auth",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(permit.session_policy(), ReusePolicy::Fresh);
-    }
-
     #[tokio::test]
     async fn approval_custody_commits_or_drops_with_permit() {
         struct Custody(std::sync::Mutex<Vec<bool>>);
         #[async_trait]
         impl AuthorizationAuthenticator for Custody {
-            async fn authenticate(
-                &self,
-                _: &str,
-                _: Operation,
-                _: ReusePolicy,
-                _: Arc<AtomicBool>,
-            ) -> AuthOutcome {
+            async fn authenticate(&self, _: &str, _: Operation, _: Arc<AtomicBool>) -> AuthOutcome {
                 AuthOutcome::Success(AuthMethod::Biometric)
             }
             fn approval_complete(&self, reusable: bool) {
@@ -1989,7 +1924,6 @@ mod tests {
             &self,
             _prompt: &str,
             _operation: Operation,
-            _reuse: ReusePolicy,
             revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             match self.calls.fetch_add(1, Ordering::AcqRel) {
@@ -2053,7 +1987,6 @@ mod tests {
             &self,
             _prompt: &str,
             _operation: Operation,
-            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
@@ -2297,7 +2230,6 @@ mod tests {
             &self,
             _prompt: &str,
             _operation: Operation,
-            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -2764,7 +2696,6 @@ mod tests {
             &self,
             _prompt: &str,
             _operation: Operation,
-            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             match self.calls.fetch_add(1, Ordering::AcqRel) {
