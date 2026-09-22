@@ -2,14 +2,19 @@ use anyhow::{Context, Result};
 use ssh_key::private::PrivateKey;
 use ssh_key::HashAlg;
 
-use super::security::local_authentication;
-use super::ssh_agent::{load_ssh_keys, require_ed25519, with_ssh_keys, SshKeyEntry};
-use super::store::KeychainStore;
+use super::security::{local_authentication, MasterAccess};
+use super::ssh_agent::keys::{public_entries, with_ssh_keys};
+use super::ssh_agent::{require_ed25519, SshKeyEntry};
+use super::store::{KeychainStore, SshPublicEntry};
+
+/// One Touch ID that also opens the master for the key-store write.
+fn open_master(reason: &str) -> Result<MasterAccess> {
+    let store = KeychainStore::load().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
+    MasterAccess::open(&store, reason)
+}
 
 pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
-    if !local_authentication("add SSH key") {
-        return Err(anyhow::anyhow!("Authentication failed"));
-    }
+    let access = open_master("add SSH key")?;
 
     let interactive = file.is_none();
     let key_data = match file {
@@ -76,7 +81,7 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
     let algorithm_for_modify = algorithm.clone();
     let comment_for_modify = comment.clone();
     let key_openssh_str = key_openssh.to_string();
-    with_ssh_keys(|entries| {
+    with_ssh_keys(&access, |entries| {
         if entries.iter().any(|e| e.fingerprint == fp_for_modify) {
             return Ok(false);
         }
@@ -93,22 +98,19 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Public halves only: no master, no prompt.
 pub fn ssh_list() -> Result<()> {
     let store = KeychainStore::load().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let entries = load_ssh_keys(&store)?;
+    let entries = public_entries(&store)?;
     if entries.is_empty() {
         println!("No SSH keys stored.");
         return Ok(());
     }
 
     for entry in &entries {
-        let pubkey_line = PrivateKey::from_openssh(entry.key_data.as_bytes())
-            .ok()
-            .and_then(|pk| pk.public_key().to_openssh().ok())
-            .unwrap_or_default();
         println!(
             "{} {} {}\n  {}",
-            entry.algorithm, entry.fingerprint, entry.comment, pubkey_line
+            entry.algorithm, entry.fingerprint, entry.comment, entry.public_key
         );
     }
     Ok(())
@@ -117,9 +119,9 @@ pub fn ssh_list() -> Result<()> {
 /// The one stored entry whose fingerprint contains `needle`. No match and
 /// more than one match are errors (the candidates are listed), so a caller
 /// never mutates on an ambiguous prefix.
-fn select_entry(entries: &[SshKeyEntry], needle: &str) -> Result<usize> {
+fn select_entry<E: Listed>(entries: &[E], needle: &str) -> Result<usize> {
     let matches: Vec<usize> = (0..entries.len())
-        .filter(|&i| entries[i].fingerprint.contains(needle))
+        .filter(|&i| entries[i].fingerprint().contains(needle))
         .collect();
     match matches.as_slice() {
         [] => Err(anyhow::anyhow!("No key found matching '{}'", needle)),
@@ -127,8 +129,7 @@ fn select_entry(entries: &[SshKeyEntry], needle: &str) -> Result<usize> {
         _ => {
             println!("Multiple keys match '{}':", needle);
             for &i in &matches {
-                let m = &entries[i];
-                println!("  {} {} {}", m.algorithm, m.fingerprint, m.comment);
+                println!("  {}", entries[i].line());
             }
             Err(anyhow::anyhow!(
                 "Ambiguous fingerprint, please be more specific"
@@ -137,13 +138,36 @@ fn select_entry(entries: &[SshKeyEntry], needle: &str) -> Result<usize> {
     }
 }
 
-pub fn ssh_remove(fingerprint: &str) -> Result<()> {
-    if !local_authentication("remove SSH key") {
-        return Err(anyhow::anyhow!("Authentication failed"));
+/// `select_entry` runs over private entries (mutations) and public entries
+/// (`ssh show`).
+trait Listed {
+    fn fingerprint(&self) -> &str;
+    fn line(&self) -> String;
+}
+
+impl Listed for SshKeyEntry {
+    fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
+    fn line(&self) -> String {
+        format!("{} {} {}", self.algorithm, self.fingerprint, self.comment)
+    }
+}
+
+impl Listed for SshPublicEntry {
+    fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+    fn line(&self) -> String {
+        format!("{} {} {}", self.algorithm, self.fingerprint, self.comment)
+    }
+}
+
+pub fn ssh_remove(fingerprint: &str) -> Result<()> {
+    let access = open_master("remove SSH key")?;
 
     let mut removed_info: Option<String> = None;
-    with_ssh_keys(|entries| {
+    with_ssh_keys(&access, |entries| {
         let entry = entries.remove(select_entry(entries, fingerprint)?);
         removed_info = Some(format!(
             "{} {} {}",
@@ -159,11 +183,9 @@ pub fn ssh_remove(fingerprint: &str) -> Result<()> {
 }
 
 pub fn ssh_remove_all() -> Result<()> {
-    if !local_authentication("remove all SSH keys") {
-        return Err(anyhow::anyhow!("Authentication failed"));
-    }
+    let access = open_master("remove all SSH keys")?;
 
-    with_ssh_keys(|entries| {
+    with_ssh_keys(&access, |entries| {
         entries.clear();
         Ok(true)
     })?;
@@ -173,13 +195,11 @@ pub fn ssh_remove_all() -> Result<()> {
 }
 
 pub fn ssh_comment(fingerprint: &str, comment: &str) -> Result<()> {
-    if !local_authentication("change SSH key comment") {
-        return Err(anyhow::anyhow!("Authentication failed"));
-    }
+    let access = open_master("change SSH key comment")?;
 
     let new_comment = comment.to_string();
     let mut updated_info: Option<(String, String)> = None;
-    with_ssh_keys(|entries| {
+    with_ssh_keys(&access, |entries| {
         let i = select_entry(entries, fingerprint)?;
         let entry = &mut entries[i];
         let fp = entry.fingerprint.clone();
@@ -212,15 +232,11 @@ pub fn ssh_show(fingerprint: &str) -> Result<()> {
     }
 
     let store = KeychainStore::load().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let entries = load_ssh_keys(&store)?;
-    let entry = &entries[select_entry(&entries, fingerprint)?];
-    let privkey = PrivateKey::from_openssh(entry.key_data.as_bytes())
-        .context("Failed to parse stored key")?;
-    let pubkey_str = privkey
-        .public_key()
-        .to_openssh()
-        .context("Failed to serialize public key")?;
-    println!("{}", pubkey_str);
+    let entries = public_entries(&store)?;
+    println!(
+        "{}",
+        entries[select_entry(&entries, fingerprint)?].public_key
+    );
     Ok(())
 }
 
@@ -250,6 +266,6 @@ mod tests {
         assert_eq!(none, "No key found matching 'zzz'");
         let many = select_entry(&entries, "SHA256:ab").unwrap_err().to_string();
         assert_eq!(many, "Ambiguous fingerprint, please be more specific");
-        assert!(select_entry(&[], "").is_err());
+        assert!(select_entry::<SshKeyEntry>(&[], "").is_err());
     }
 }
