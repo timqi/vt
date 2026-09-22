@@ -764,6 +764,7 @@ const DETAIL_BIOMETRY_UNAVAILABLE: &str =
     "Touch ID unavailable — locked out, not enrolled, or no sensor";
 const DETAIL_AUTH_INVALIDATED: &str = "authorization state changed; retry";
 const DETAIL_AUTH_INVALID_TTL: &str = "authorization cache duration is too large";
+const DETAIL_AUTH_MATERIAL: &str = "cached grant material does not match the request";
 const DETAIL_INTERNAL_SERIALIZE: &str = "agent failed to serialize response";
 // run@vt-specific failure reasons. All strings are static program info
 // (no host/argv/user data) and therefore safe to surface to a remote peer.
@@ -884,6 +885,7 @@ async fn commit_authorization(permit: AuthorizationPermit) -> Result<(), WireFai
     permit.commit().await.map_err(|error| match error {
         CommitError::Invalidated => (ErrKind::Transient, Some(DETAIL_AUTH_INVALIDATED)),
         CommitError::InvalidTtl => (ErrKind::Generic, Some(DETAIL_AUTH_INVALID_TTL)),
+        CommitError::MaterialMismatch => (ErrKind::Generic, Some(DETAIL_AUTH_MATERIAL)),
     })
 }
 

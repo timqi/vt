@@ -151,8 +151,8 @@ Authorization and scopes: [unified-authorization-engine.md](docs/unified-authori
 Lifecycle, status token, and Keychain format: [app-bundle.md](docs/app-bundle.md).
 
 - All auth/run/sign/decrypt/encrypt operations use the unified engine. `auth@vt` /
-  `run@vt` / protocol `ssh-add` always require fresh approval; non-v2 decrypt
-  envelopes are `BadRequest`.
+  `run@vt` / `encrypt@vt` / protocol `ssh-add` always require fresh approval;
+  non-v2 decrypt envelopes are `BadRequest`.
   Duration `0` means `Fresh`, never `StrictTtl(0)`. Reusable grants remain scoped
   by operation, subject, and resource.
 - Commit the non-cloneable permit only after operation success AND envelope
@@ -182,14 +182,17 @@ Lifecycle, status token, and Keychain format: [app-bundle.md](docs/app-bundle.md
 - New stores are wrap v3 (Secure Enclave, `se.rs`, `biometryCurrentSet`); wrap
   v2 is read only by `rotate-passcode` this release; reject other `wrap_v`
   values before unwrapping. Never re-add a v1 reader, in-binary upgrade, or
-  rebind command. SE sessions live only in `SeSessions`: a biometric approval
-  leaves a pending one that is dropped with its permit or promoted by a committed
-  grant; `invalidation_complete` drops both; `LAContext.invalidate()` is never
-  the boundary. The master is unwrapped inside a handler scope and never held
-  across an await or a prompt. Public SSH keys are plaintext; private keys reload
-  only through an authorized sign. `init`/`import` never replace a store they
-  could not read; import over a readable store is a same-master re-wrap proven
-  by its SSH keys. Migration belongs in the app doc.
+  rebind command. SE sessions are one-shot and live only in `SeSessions`: a
+  biometric approval leaves one pending session that its permit drops;
+  `master_for` fails closed on a cache hit; `invalidation_complete` drops it;
+  `LAContext.invalidate()` is never the boundary. Repeat authorization never
+  touches the SE: decrypt hits serve the DEKs cached as grant material (dying
+  with the grant, never in Debug output), sign hits use resident keys and fail
+  closed when wiped. The master is unwrapped inside a handler scope and never
+  held across an await or a prompt. Public SSH keys are plaintext; private keys
+  reload only through a freshly approved sign. `init`/`import` never replace a
+  store they could not read; import over a readable store is a same-master
+  re-wrap proven by its SSH keys. Migration belongs in the app doc.
 
 ## Worker cache and admin
 

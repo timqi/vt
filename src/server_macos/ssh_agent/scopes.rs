@@ -131,18 +131,6 @@ enum ScopedBasis<'a> {
     App(&'a AppIdentity),
 }
 
-impl<'a> ScopedBasis<'a> {
-    /// `(family, kernel subject, anchor)`: the identity every scope built on
-    /// this basis digests (workspace / cwd canonical root, parent exe path).
-    fn parts(self) -> (ScopeFamily, SubjectId, &'a str) {
-        match self {
-            ScopedBasis::Git(ws) => (ScopeFamily::Workspace, ws.subject, ws.root_str()),
-            ScopedBasis::Cwd(ws) => (ScopeFamily::CwdFallback, ws.subject, ws.root_str()),
-            ScopedBasis::App(app) => (ScopeFamily::ParentApp, app.subject, &app.exe),
-        }
-    }
-}
-
 /// How the connection's workspace resolution ended, kept for diag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum WorkspaceResolution {
@@ -848,44 +836,6 @@ impl VtSshSession {
                     .collect(),
                 Some(scoped_label(basis)),
             ),
-            None => (fresh(), None),
-        }
-    }
-
-    /// Scopes for an encrypt batch: one per distinct requested type, under
-    /// the same activity bases and TTL as decrypt. `EncryptReq` carries no
-    /// pwd, so the workspace consistency check has nothing to compare.
-    pub(super) fn encrypt_scopes(
-        &self,
-        types: &[crate::core::SecretType],
-    ) -> (Vec<GrantScope>, Option<String>) {
-        let fresh = || vec![GrantScope::fresh(Operation::Encrypt)];
-        if self.cache_ttls.decrypt_secs == 0 {
-            return (fresh(), None);
-        }
-        let mut distinct: Vec<u8> = types.iter().map(|t| t.as_byte()).collect();
-        distinct.sort_unstable();
-        distinct.dedup();
-        let scoped = |family, subject, anchor: &str| -> Vec<GrantScope> {
-            distinct
-                .iter()
-                .map(|t| GrantScope::encrypt(family, Some(subject), anchor, *t))
-                .collect()
-        };
-        if self.confined_to_connection() {
-            return match self.connection_subject {
-                Some(subject) => (
-                    scoped(ScopeFamily::Connection, subject, ""),
-                    self.connection_label(),
-                ),
-                None => (fresh(), None),
-            };
-        }
-        match self.reusable_scope("") {
-            Some(basis) => {
-                let (family, subject, anchor) = basis.parts();
-                (scoped(family, subject, anchor), Some(scoped_label(basis)))
-            }
             None => (fresh(), None),
         }
     }

@@ -42,11 +42,12 @@ and [se.rs](../src/server_macos/se.rs).
   only; without a Secure Enclave they refuse with `se.unavailable`
   ([structured-errors.md](structured-errors.md#secure-enclave)).
 - Unwrapping requires a Touch ID approval: the approval's `LAContext` is bound
-  to the Secure Enclave key and held in memory as the approval session. The
-  session of a new approval belongs to that operation and is dropped with its
-  permit; it becomes the reusable session only when the operation commits a
-  grant, and every cache hit unwraps through that one. Revocation (lock, idle,
-  screen lock, wake, revoke-all) drops both sessions with the grants.
+  to the Secure Enclave key and held in memory as that operation's session,
+  dropped with its permit. Repeat authorization within a TTL never unwraps:
+  a decrypt hit serves the record DEKs cached with the grant, a sign hit uses
+  the resident private key. Cached DEKs live and die with their grant
+  (expiry, lock, idle, screen lock, wake, revoke-all). Wrap v3 protects the
+  master at rest; TTL reuse is a software boundary inside the vt process.
 - Every approval is Touch ID; with biometry unavailable (sensor absent, lid
   closed, not enrolled, locked out) the agent returns unavailable without
   prompting and only the Worker transport remains.
@@ -58,8 +59,8 @@ and [se.rs](../src/server_macos/se.rs).
   when the imported master opens them; a store without SSH keys must be
   deleted first (`security delete-generic-password -s rusty.vault.store`). The
   Worker transport keeps working throughout.
-- `encrypt@vt` is authorized like `decrypt@vt` because minting a DEK also needs
-  the master ([unified-authorization-engine.md](unified-authorization-engine.md#approval-policy)).
+- `encrypt@vt` is always fresh: minting a DEK needs the master, which only a
+  new approval's session unwraps ([unified-authorization-engine.md](unified-authorization-engine.md#approval-policy)).
 - Public SSH keys, fingerprints, and comments live in plaintext in the store;
   listing identities never unwraps the master. Private keys stay sealed under
   the master and load on the next authorized sign after a wipe.
