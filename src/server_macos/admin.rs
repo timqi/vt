@@ -84,13 +84,7 @@ pub async fn import_secret() -> Result<()> {
 pub async fn rotate_passcode() -> Result<()> {
     let store = KeychainStore::load()?;
     let access = MasterAccess::open_migration(&store)?;
-    let master = access
-        .master(&store)
-        .context("Failed to unwrap the master (docs/app-bundle.md#master-key-wrap-v3)")?;
-    let mut next = new_store_v3(&master)?;
-    carry_ssh_keys(&store, &master, &mut next)?;
-    drop(master);
-    next.save()?;
+    KeychainStore::modify(|current| rewrap(current, &access, new_store_v3))?;
     eprintln!(
         "Store rewritten as wrap v3 under a new Secure Enclave key. If `vt ssh agent` is \
         running, restart it so its approval sessions bind to the new key."
@@ -98,9 +92,59 @@ pub async fn rotate_passcode() -> Result<()> {
     Ok(())
 }
 
+fn rewrap(
+    current: &mut KeychainStore,
+    access: &MasterAccess,
+    wrap: impl FnOnce(&[u8; 32]) -> Result<KeychainStore>,
+) -> Result<()> {
+    let master = access.master(current)?;
+    let mut next = wrap(&master)?;
+    carry_ssh_keys(current, &master, &mut next)?;
+    *current = next;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_uses_current_store_and_rejects_changed_master() {
+        use crate::server_macos::{
+            security::{derive_passcode_cipher, tests::v2_store},
+            ssh_agent::keys,
+        };
+        let master = [7; 32];
+        let mut current = v2_store(&master);
+        let access = MasterAccess::Passcode(Box::new(derive_passcode_cipher(&current).unwrap()));
+        let key = ssh_key::private::PrivateKey::random(
+            &mut rand::rngs::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        keys::modify_ssh_keys(&mut current, &master, |entries| {
+            entries.push(keys::SshKeyEntry {
+                fingerprint: key.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+                algorithm: key.algorithm().to_string(),
+                comment: String::new(),
+                key_data: key.to_openssh(ssh_key::LineEnding::LF).unwrap().to_string(),
+            });
+            Ok(true)
+        })
+        .unwrap();
+        rewrap(&mut current, &access, |_| {
+            Ok(KeychainStore::new_v3(&[1; 8], &[2; 113]))
+        })
+        .unwrap();
+        assert_eq!(keys::load_private_keys(&current, &master).unwrap().len(), 1);
+        let mut changed = v2_store(&[8; 32]);
+        let before = serde_json::to_vec(&changed).unwrap();
+        assert!(rewrap(&mut changed, &access, |_| panic!(
+            "must not replace changed master"
+        ))
+        .is_err());
+        assert_eq!(serde_json::to_vec(&changed).unwrap(), before);
+    }
 
     #[test]
     fn export_prompts_before_unwrapping() {
