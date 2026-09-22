@@ -194,7 +194,7 @@ pub struct EncryptReq {
 /// `encrypt@vt` under an encrypt grant, and decrypt the ciphertext locally —
 /// bypassing the per-record `decrypt@vt` scope. Salt MUST originate inside
 /// the agent.
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, zeroize::Zeroize)]
 pub struct EncryptResItem {
     pub salt: [u8; SALT_LEN],
     pub dek: [u8; 32],
@@ -219,7 +219,7 @@ pub struct DecryptReq {
     pub meta: ClientMeta,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, zeroize::Zeroize)]
 pub enum DecryptResItem {
     /// Per-record DEK; client uses it to decrypt the inner ciphertext locally.
     V2 { dek: [u8; 32], err_message: String },

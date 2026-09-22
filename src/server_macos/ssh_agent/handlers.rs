@@ -8,7 +8,7 @@ use rand::RngCore;
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Extension, Unparsed};
 use ssh_key::public::KeyData;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use super::super::authorization::SeSessions;
 use super::super::security::{require_v3, validate_master_material};
@@ -290,25 +290,19 @@ impl VtSshSession {
             .await
             .map_err(|failure| authorization_failure_wire(&failure))?;
         let mac_key = master_for(&self.se_sessions, store, permit.session_policy())?;
-        let mut result: Vec<EncryptResItem> = Vec::with_capacity(req.types.len());
+        let mut result = Zeroizing::new(Vec::<EncryptResItem>::with_capacity(req.types.len()));
         for _t in &req.types {
             let mut salt = [0u8; SALT_LEN];
             rand::thread_rng().fill_bytes(&mut salt);
-            let dek = derive_dek(&mac_key, &salt);
             result.push(EncryptResItem {
                 salt,
-                dek,
+                dek: derive_dek(&mac_key, &salt),
                 err_message: String::new(),
             });
         }
         drop(mac_key);
-        let bytes = serde_json::to_vec(&result)
+        let bytes = serde_json::to_vec(&*result)
             .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?;
-        // The DEKs now live inside `bytes`; scrub the in-memory
-        // `Vec<EncryptResItem>` copy before it falls out of scope.
-        for item in result.iter_mut() {
-            item.dek.zeroize();
-        }
         let note = cache_hit_note_for(&permit, "encrypt", &reuse_label);
         Ok(HandlerSuccess::authorized(Zeroizing::new(bytes), permit).with_cache_hit_note(note))
     }
@@ -405,7 +399,7 @@ impl VtSshSession {
             .await
             .map_err(|failure| authorization_failure_wire(&failure))?;
         let mac_key = master_for(&self.se_sessions, store, permit.session_policy())?;
-        let mut result: Vec<DecryptResItem> = Vec::with_capacity(req.items.len());
+        let mut result = Zeroizing::new(Vec::<DecryptResItem>::with_capacity(req.items.len()));
         for DecryptInput::V2 { salt, .. } in req.items {
             result.push(DecryptResItem::V2 {
                 dek: derive_dek(&mac_key, &salt),
@@ -414,14 +408,9 @@ impl VtSshSession {
         }
         drop(mac_key);
         let bytes = Zeroizing::new(
-            serde_json::to_vec(&result)
+            serde_json::to_vec(&*result)
                 .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?,
         );
-        // Scrub DEKs inside the response Vec before drop. `bytes` already
-        // carries them (still wiped via `Zeroizing` below).
-        for DecryptResItem::V2 { dek, .. } in result.iter_mut() {
-            dek.zeroize();
-        }
         let note = cache_hit_note_for(&permit, "decrypt", &reuse_label);
         Ok(HandlerSuccess::authorized(bytes, permit).with_cache_hit_note(note))
     }

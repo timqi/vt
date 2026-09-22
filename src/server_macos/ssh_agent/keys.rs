@@ -7,14 +7,14 @@ use std::collections::HashMap;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use ssh_key::private::PrivateKey;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::require_ed25519;
 use crate::core::crypto::AesGcmCrypto;
 use crate::server_macos::security::{require_v3, MasterAccess};
 use crate::server_macos::store::{KeychainStore, SshPublicEntry};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SshKeyEntry {
     pub fingerprint: String,
     pub algorithm: String,
@@ -183,6 +183,15 @@ mod tests {
                 .unwrap()
                 .to_string(),
         }
+    }
+
+    #[test]
+    fn private_entries_scrub_on_drop() {
+        fn requires_drop_wipe<T: ZeroizeOnDrop>() {}
+        requires_drop_wipe::<SshKeyEntry>();
+        let mut entry = real_entry("wipe");
+        entry.zeroize();
+        assert!(entry.key_data.is_empty());
     }
 
     #[test]

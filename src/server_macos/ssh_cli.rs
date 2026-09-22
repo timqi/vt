@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ssh_key::private::PrivateKey;
 use ssh_key::HashAlg;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::security::{local_authentication, MasterAccess};
 use super::ssh_agent::keys::{public_entries, with_ssh_keys};
@@ -17,26 +18,28 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
     let access = open_master("add SSH key")?;
 
     let interactive = file.is_none();
-    let key_data = match file {
+    let key_data = Zeroizing::new(match file {
         Some(path) => {
             std::fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path))?
         }
         None => {
             eprintln!("Paste your private key (end with Ctrl+D):");
             use std::io::Read;
-            let mut buf = String::new();
+            let mut buf = Zeroizing::new(String::new());
             std::io::stdin().read_to_string(&mut buf)?;
             buf.trim().to_string()
         }
-    };
+    });
 
     let mut privkey =
         PrivateKey::from_openssh(key_data.as_bytes()).context("Failed to parse SSH private key")?;
 
     // If encrypted, prompt for passphrase
     if privkey.is_encrypted() {
-        let passphrase = rpassword::prompt_password("Enter key passphrase: ")
-            .context("Failed to read passphrase")?;
+        let passphrase = Zeroizing::new(
+            rpassword::prompt_password("Enter key passphrase: ")
+                .context("Failed to read passphrase")?,
+        );
         privkey = privkey
             .decrypt(passphrase.as_bytes())
             .context("Failed to decrypt key (wrong passphrase?)")?;
@@ -80,7 +83,7 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
     let fp_for_modify = fp_str.clone();
     let algorithm_for_modify = algorithm.clone();
     let comment_for_modify = comment.clone();
-    let key_openssh_str = key_openssh.to_string();
+    let key_openssh_str = key_openssh;
     with_ssh_keys(&access, |entries| {
         if entries.iter().any(|e| e.fingerprint == fp_for_modify) {
             return Ok(false);
@@ -89,7 +92,7 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
             fingerprint: fp_for_modify,
             algorithm: algorithm_for_modify,
             comment: comment_for_modify,
-            key_data: key_openssh_str,
+            key_data: key_openssh_str.to_string(),
         });
         Ok(true)
     })?;
@@ -185,10 +188,11 @@ pub fn ssh_comment(fingerprint: &str, comment: &str) -> Result<()> {
             .context("Failed to parse stored key")?;
         let privkey = PrivateKey::new(privkey.key_data().clone(), &new_comment)
             .context("Failed to set comment on key")?;
-        entry.key_data = privkey
+        let key_data = privkey
             .to_openssh(ssh_key::LineEnding::LF)
-            .context("Failed to serialize key")?
-            .to_string();
+            .context("Failed to serialize key")?;
+        entry.key_data.zeroize();
+        entry.key_data = key_data.to_string();
         entry.comment = new_comment.clone();
         Ok(true)
     })?;

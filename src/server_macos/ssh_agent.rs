@@ -1138,7 +1138,7 @@ impl Session for VtSshSession {
                 let algorithm = pubkey.algorithm().to_string();
                 let fp_for_modify = fp_str.clone();
                 let comment_for_modify = comment.clone();
-                let key_openssh_str = key_openssh.to_string();
+                let key_openssh_str = key_openssh;
                 drop(private_key);
                 let (permit, master) = self
                     .keystore_master(&format!("ssh-add: store key\nkey: {fp_str}"))
@@ -1151,7 +1151,7 @@ impl Session for VtSshSession {
                         fingerprint: fp_for_modify,
                         algorithm,
                         comment: comment_for_modify,
-                        key_data: key_openssh_str,
+                        key_data: key_openssh_str.to_string(),
                     });
                     Ok(true)
                 })
