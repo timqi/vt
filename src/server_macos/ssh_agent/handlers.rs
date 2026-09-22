@@ -247,6 +247,9 @@ impl VtSshSession {
         if req.types.is_empty() {
             return Err((ErrKind::BadRequest, Some(DETAIL_BATCH_EMPTY)));
         }
+        if req.types.contains(&crate::core::SecretType::UNKNOWN) {
+            return Err((ErrKind::BadRequest, Some(DETAIL_UNKNOWN_SECRET_TYPE)));
+        }
         validate_master_material(store)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
 
@@ -869,6 +872,13 @@ mod tests {
             .err()
             .expect("empty batch refused");
         assert_eq!(err, (ErrKind::BadRequest, Some(DETAIL_BATCH_EMPTY)));
+
+        let err = session
+            .handle_encrypt(&encrypt_payload(vec![SecretType::UNKNOWN]), &store)
+            .await
+            .err()
+            .expect("unknown type refused");
+        assert_eq!(err, (ErrKind::BadRequest, Some(DETAIL_UNKNOWN_SECRET_TYPE)));
 
         session.authorization = engine(TestAuthenticator);
         session.se_sessions.put(ReusePolicy::Fresh, custody);
