@@ -33,6 +33,14 @@ an existing vault is migrated once with `vt secret rotate-passcode`. For
 Gatekeeper, an existing agent installation, or the migration, follow the
 [macOS installation and upgrade guide](docs/app-bundle.md).
 
+## Upgrading to wrap v3: Secure Enclave master key
+
+The local master key moves from a Keychain-wrapped passcode to a Secure
+Enclave key gated by Touch ID. The agent refuses an unmigrated vault; run the
+one-time migration in
+[app-bundle.md](docs/app-bundle.md#migrating-a-wrap-v2-store) after installing.
+Macs without a Secure Enclave can use only phone approval.
+
 ## Upgrading to v20260915: breaking change for phone approval
 
 Release `v20260915-b2f3a0e` replaces the Worker's trust model: Passkey-only

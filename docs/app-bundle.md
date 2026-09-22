@@ -67,17 +67,26 @@ and [se.rs](../src/server_macos/se.rs).
 ### Migrating a wrap v2 store
 
 Wrap v2 (passcode-derived) is readable this release only by
-`vt secret rotate-passcode`; the agent and every other command refuse it until
-migrated. Migrate once per Mac (one Touch ID), then restart the agent:
+`vt secret rotate-passcode`; the agent and every other command refuse it with
+`wrap v2 requires vt secret rotate-passcode` until migrated. Once per Mac:
 
 ```bash
-vt secret rotate-passcode
+vt secret export                 # with the OLD binary: recovery copy, keep it off this Mac
+just install-app                 # new CLI + VT.app; the agent now refuses the v2 store
+vt secret rotate-passcode        # new binary: one Touch ID, rewrites the store as v3
+open /Applications/VT.app        # restart the agent; `vt ssh agent` users restart it by hand
+vt read 'vt://0<record>'         # Touch ID, then the value: migration done
 ```
+
+Replace every copy of the old binary (`~/.local/bin/vt`, shims): an old
+full-store writer can put the store back into a format this release refuses.
+SSH keys carry over; `ssh-add -l` lists them without a prompt and the first
+signature reloads them under its own approval. Stored `vt://` records, the
+phone copy, and Worker enrollment are unaffected.
 
 Other `wrap_v` markers fail before unwrap; there is no in-binary upgrade. A v1
 store must first reach v2 with the release that still shipped `vt secret
-rebind`. Remove obsolete binaries: an old full-store writer can put the store
-back into a format the current release refuses.
+rebind`.
 
 ## Notifications
 
