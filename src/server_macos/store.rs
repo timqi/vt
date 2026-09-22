@@ -130,6 +130,60 @@ impl KeychainStore {
         Ok(store)
     }
 
+    pub fn require_absent() -> Result<()> {
+        Self::check_absent(
+            security_framework::passwords::get_generic_password("rusty.vault.store", "prod")
+                .map(|_| ())
+                .map_err(|error| error.code()),
+        )
+    }
+
+    fn check_absent(result: std::result::Result<(), i32>) -> Result<()> {
+        match result {
+            Err(-25300) => Ok(()), // errSecItemNotFound
+            Ok(()) => Err(anyhow!("rusty.vault.store already exists")),
+            Err(code) => Err(anyhow!("cannot establish store absence ({code})")),
+        }
+    }
+
+    /// Add-only creation: a racing initializer or unreadable existing item
+    /// can never be replaced by init/import.
+    pub fn create(&self) -> Result<()> {
+        use core_foundation::{
+            base::TCFType, data::CFData, dictionary::CFDictionary, string::CFString,
+        };
+        use security_framework_sys::item::*;
+        use security_framework_sys::keychain_item::SecItemAdd;
+        super::security::require_v3(self)?;
+        let json = serde_json::to_vec(self)?;
+        let status = unsafe {
+            let query = CFDictionary::from_CFType_pairs(&[
+                (
+                    CFString::wrap_under_get_rule(kSecClass),
+                    CFString::wrap_under_get_rule(kSecClassGenericPassword).as_CFType(),
+                ),
+                (
+                    CFString::wrap_under_get_rule(kSecAttrService),
+                    CFString::new("rusty.vault.store").as_CFType(),
+                ),
+                (
+                    CFString::wrap_under_get_rule(kSecAttrAccount),
+                    CFString::new("prod").as_CFType(),
+                ),
+                (
+                    CFString::wrap_under_get_rule(kSecValueData),
+                    CFData::from_buffer(&json).as_CFType(),
+                ),
+            ]);
+            SecItemAdd(query.as_concrete_TypeRef(), std::ptr::null_mut())
+        };
+        ensure!(
+            status == 0,
+            "store creation refused ({status}); existing items are never replaced"
+        );
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<()> {
         super::security::require_v3(self)?;
         let json = serde_json::to_vec(self)?;
@@ -237,6 +291,14 @@ impl Drop for StoreLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creation_requires_confirmed_absence() {
+        assert!(KeychainStore::check_absent(Err(-25300)).is_ok());
+        for result in [Ok(()), Err(-25293), Err(-25299), Err(-50)] {
+            assert!(KeychainStore::check_absent(result).is_err());
+        }
+    }
 
     #[test]
     fn test_serde_roundtrip_minimal() {

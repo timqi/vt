@@ -13,13 +13,8 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 pub fn init() -> Result<()> {
-    if KeychainStore::load().is_ok() {
-        Err(anyhow::anyhow!(
-            "Error: already initialized? Please delete 'rusty.vault.store' from the keychain first"
-        ))?;
-        std::process::exit(1);
-    }
-    new_store_v3(&Zeroizing::new(AesGcmCrypto::generate_key()))?.save()?;
+    KeychainStore::require_absent()?;
+    new_store_v3(&Zeroizing::new(AesGcmCrypto::generate_key()))?.create()?;
     tracing::info!("keychain store saved!");
     Ok(())
 }
@@ -62,12 +57,7 @@ fn export_master(
 }
 
 pub async fn import_secret() -> Result<()> {
-    if KeychainStore::load().is_ok() {
-        Err(anyhow::anyhow!(
-            "Error: already imported? Please delete 'rusty.vault.store' from the keychain first"
-        ))?;
-        std::process::exit(1);
-    }
+    KeychainStore::require_absent()?;
     let master_secret =
         crate::tty::prompt_input_password("Enter master secret: ", "Master secret entered: ")?;
     let encrypted = BASE64_URL_SAFE_NO_PAD.decode(master_secret)?;
@@ -83,7 +73,7 @@ pub async fn import_secret() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?,
     );
     new_store_v3(&master)?
-        .save()
+        .create()
         .context("Failed to save the wrap v3 store")?;
     tracing::info!("keychain store saved!");
     Ok(())
