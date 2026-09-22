@@ -121,7 +121,7 @@ struct MacAuthenticator {
 /// After a biometric approval of a master-needing operation on a wrap v3
 /// store, bind the evaluated context to the SE key. Any failure leaves no
 /// session: the handler then fails closed and drops its permit, so no grant
-/// is written. A password approval never reaches here (no context).
+/// is written.
 fn bind_session(sessions: &SeSessions, ctx: super::se::BiometricContext) {
     let store = match KeychainStore::load() {
         Ok(store) if store.wrap_v == WRAP_V3 => store,

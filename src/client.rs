@@ -948,6 +948,7 @@ mod tests {
     fn fallback_policy_other_agent_kinds_fall_back() {
         for kind in [
             ErrKind::NoGuiSession,
+            ErrKind::BiometryUnavailable,
             ErrKind::NotInitialized,
             ErrKind::AgentLocked,
             ErrKind::Generic,

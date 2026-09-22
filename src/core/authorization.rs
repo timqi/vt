@@ -1896,6 +1896,7 @@ mod tests {
         for outcome in [
             AuthOutcome::Rejected,
             AuthOutcome::Unavailable(UnavailableReason::NoGuiSession),
+            AuthOutcome::Unavailable(UnavailableReason::BiometryUnavailable),
         ] {
             let auth = Arc::new(FixedAuthenticator {
                 calls: AtomicUsize::new(0),
@@ -1932,6 +1933,69 @@ mod tests {
                 _ => AuthOutcome::Success,
             }
         }
+    }
+
+    /// Touch ID locked out / not enrolled is reported without a prompt and
+    /// without touching the latch itself; the engine still publishes
+    /// revocation, drops standing grants, and writes no new one.
+    struct BiometryUnavailableOnSecondAuthenticator {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AuthorizationAuthenticator for BiometryUnavailableOnSecondAuthenticator {
+        async fn authenticate(
+            &self,
+            _prompt: &str,
+            _operation: Operation,
+            _revocation_pending: Arc<AtomicBool>,
+        ) -> AuthOutcome {
+            match self.calls.fetch_add(1, Ordering::AcqRel) {
+                1 => AuthOutcome::Unavailable(UnavailableReason::BiometryUnavailable),
+                _ => AuthOutcome::Success,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn biometry_unavailable_revokes_grants_and_grants_nothing() {
+        let auth = Arc::new(BiometryUnavailableOnSecondAuthenticator {
+            calls: AtomicUsize::new(0),
+        });
+        let engine = AuthorizationEngine::new(auth.clone(), AllowValidator::allowed());
+        engine
+            .authorize(sign_request((1, 2), "cached"))
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .live_len(Operation::Sign, ScopeFamily::Connection, (1, 2))
+                .await,
+            1
+        );
+
+        let failure = engine
+            .authorize(sign_request((3, 4), "no biometry"))
+            .await
+            .err()
+            .expect("biometry unavailable");
+        assert_eq!(
+            failure.decision(),
+            Decision::Unavailable(UnavailableReason::BiometryUnavailable)
+        );
+        assert_eq!(failure.decision().audit_outcome(), "unavailable");
+        for subject in [(1, 2), (3, 4)] {
+            assert_eq!(
+                engine
+                    .live_len(Operation::Sign, ScopeFamily::Connection, subject)
+                    .await,
+                0
+            );
+        }
+        assert_eq!(auth.calls.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test]

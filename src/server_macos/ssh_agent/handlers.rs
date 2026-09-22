@@ -158,8 +158,8 @@ impl VtSshSession {
         {
             return Err(unsafe_state());
         }
-        // Even a resident key requires this permit's custody: a password or
-        // failed bind must not borrow a key loaded by an earlier approval.
+        // Even a resident key requires this permit's custody: a failed bind
+        // must not borrow a key loaded by an earlier approval.
         let loaded = {
             let master = master_for(&self.se_sessions, store, decision)?;
             if let Some(key) = keys.get(fp) {
@@ -813,11 +813,11 @@ impl VtSshSession {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{test_session, TestAuthenticator, TestValidator};
-    use super::super::RunAllowlist;
+    use super::super::{RunAllowlist, DETAIL_BIOMETRY_UNAVAILABLE};
     use super::*;
     use crate::core::authorization::{AuthorizationAuthenticator, AuthorizationEngine};
     use crate::core::crypto::AesGcmCrypto;
-    use crate::core::session::AuthOutcome;
+    use crate::core::session::{AuthOutcome, UnavailableReason};
     use crate::server_macos::se::test_support::software_store;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -838,10 +838,48 @@ mod tests {
         }
     }
 
+    struct BiometryUnavailableAuthenticator;
+
+    #[async_trait::async_trait]
+    impl AuthorizationAuthenticator for BiometryUnavailableAuthenticator {
+        async fn authenticate(
+            &self,
+            _prompt: &str,
+            _operation: Operation,
+            _revocation_pending: Arc<AtomicBool>,
+        ) -> AuthOutcome {
+            AuthOutcome::Unavailable(UnavailableReason::BiometryUnavailable)
+        }
+    }
+
     fn engine(
         authenticator: impl AuthorizationAuthenticator + 'static,
     ) -> Arc<AuthorizationEngine> {
         AuthorizationEngine::new(Arc::new(authenticator), Arc::new(TestValidator))
+    }
+
+    /// Touch ID unavailable is its own fallback-eligible kind: the handler
+    /// stops at the authorization failure and never consults SE custody, so
+    /// an empty session store does not turn it into `NotInitialized`.
+    #[tokio::test]
+    async fn biometry_unavailable_never_reaches_custody() {
+        use crate::core::SecretType;
+        let (store, _custody) = software_store(&AesGcmCrypto::generate_key());
+        let mut session = test_session(0, 0);
+        session.authorization = engine(BiometryUnavailableAuthenticator);
+        let err = session
+            .handle_encrypt(&encrypt_payload(vec![SecretType::RAW]), &store)
+            .await
+            .err()
+            .expect("unavailable");
+        assert_eq!(
+            err,
+            (
+                ErrKind::BiometryUnavailable,
+                Some(DETAIL_BIOMETRY_UNAVAILABLE)
+            )
+        );
+        assert!(session.se_sessions.is_empty());
     }
 
     fn encrypt_payload(types: Vec<crate::core::SecretType>) -> Vec<u8> {

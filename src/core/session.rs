@@ -15,22 +15,27 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnavailableReason {
     /// Screen is locked, user not on console, or login window has not finished.
-    /// Touch ID dialog cannot display, so no fallback is offered either —
-    /// physical-presence model: locked machine ⇒ no auth.
+    /// Touch ID dialog cannot display — physical-presence model: locked
+    /// machine ⇒ no auth.
     NotInteractive,
     /// `CGSessionCopyCurrentDictionary` returned NULL (e.g. LaunchDaemon
     /// context with no GUI session at all).
     NoGuiSession,
+    /// Biometry cannot be evaluated: locked out after failed attempts, no
+    /// sensor, no enrolled fingers, or the sensor is unreachable (lid closed,
+    /// external sensor disconnected). Touch ID is the only local factor, so
+    /// no prompt is shown; only the Worker transport remains.
+    BiometryUnavailable,
 }
 
 /// Result of an authentication attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthOutcome {
-    /// User passed the local prompt.
+    /// User passed the Touch ID prompt.
     Success,
     /// User actively declined (terminal — no fallback).
     Rejected,
-    /// System cannot prompt right now (locked, no GUI, etc.).
+    /// System cannot prompt right now (locked, no GUI, no biometry).
     Unavailable(UnavailableReason),
 }
 
@@ -357,5 +362,6 @@ mod tests {
         assert!(!AuthOutcome::Rejected.is_success());
         assert!(!AuthOutcome::Unavailable(UnavailableReason::NotInteractive).is_success());
         assert!(!AuthOutcome::Unavailable(UnavailableReason::NoGuiSession).is_success());
+        assert!(!AuthOutcome::Unavailable(UnavailableReason::BiometryUnavailable).is_success());
     }
 }

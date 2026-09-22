@@ -35,6 +35,7 @@ the original failure; scripts must not interpret human-readable messages.
 | 12 | No GUI session |
 | 13 | Handler cannot validate/load master-key material |
 | 14 | Reserved agent-lock kind; not the current `ssh-add -x` response |
+| 15 | Touch ID unavailable (locked out, not enrolled, no sensor); no prompt was shown |
 | 20 | Bad request, including allowlist refusal |
 | 21 | Retired; never reuse |
 | 22 | Protocol version mismatch |
@@ -61,14 +62,13 @@ Wrap v3 failures reach the CLI as anyhow errors prefixed with a stable code
 | `se.blob_rejected` | The stored key blob does not reload on this device |
 | `se.unwrap_failed` | The SE refused the unwrap: no biometric match, enrollment changed, or foreign ciphertext |
 | `se.malformed` | Stored SE fields have the wrong shape |
-| `se.biometry_required` | The approval used the password fallback, which cannot satisfy the key |
 
 ## Backend fallback
 
 | Failure | Automatic fallback eligibility |
 |---|---|
 | `AuthRejected`, `BadRequest` | Never: preserve refusal and reject invalid input |
-| Other typed agent errors, including version mismatch and invalidation | Eligible |
+| Other typed agent errors, including Touch ID unavailable, version mismatch, and invalidation | Eligible |
 | Typed socket/SSH transport failure | Eligible |
 | Unclassified client error | Not eligible |
 

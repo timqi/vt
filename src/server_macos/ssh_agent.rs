@@ -760,6 +760,8 @@ const DETAIL_SE_UNWRAP: &str = "Secure Enclave refused to unwrap the master key"
 const DETAIL_AUTH_REJECTED: &str = "authentication was declined";
 const DETAIL_SCREEN_LOCKED: &str = "screen is locked";
 const DETAIL_NO_GUI: &str = "no active GUI session";
+const DETAIL_BIOMETRY_UNAVAILABLE: &str =
+    "Touch ID unavailable — locked out, not enrolled, or no sensor";
 const DETAIL_AUTH_INVALIDATED: &str = "authorization state changed; retry";
 const DETAIL_AUTH_INVALID_TTL: &str = "authorization cache duration is too large";
 const DETAIL_INTERNAL_SERIALIZE: &str = "agent failed to serialize response";
@@ -786,7 +788,8 @@ const DETAIL_SIGN_FAILED: &str = "sign@vt signing operation failed";
 /// allow-list discipline is enforced in one place.
 ///
 /// Callers must only pass kinds emitted by [`outcome_to_err_strict`]
-/// (`AuthRejected` / `SessionLocked` / `NoGuiSession`). Other kinds
+/// (`AuthRejected` / `SessionLocked` / `NoGuiSession` / `BiometryUnavailable`).
+/// Other kinds
 /// explicitly map to `None`; the enumeration is exhaustive so a newly
 /// added [`ErrKind`] forces a compile error here rather than silently
 /// dropping into a wildcard.
@@ -795,6 +798,7 @@ fn auth_outcome_detail(kind: ErrKind) -> Option<&'static str> {
         ErrKind::AuthRejected => Some(DETAIL_AUTH_REJECTED),
         ErrKind::SessionLocked => Some(DETAIL_SCREEN_LOCKED),
         ErrKind::NoGuiSession => Some(DETAIL_NO_GUI),
+        ErrKind::BiometryUnavailable => Some(DETAIL_BIOMETRY_UNAVAILABLE),
         // These kinds are never produced by `outcome_to_err_strict`; passing one
         // here is a programmer error. Each must be enumerated explicitly
         // so adding a new ErrKind triggers a compile failure (no `_` arm).

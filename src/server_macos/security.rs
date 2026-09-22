@@ -229,12 +229,12 @@ pub enum EvalOutcome {
     /// Policy evaluation succeeded.
     Success,
     /// User actively declined (UserCancel, AuthenticationFailed, AppCancel,
-    /// UserFallback, InvalidContext). Terminal — never falls back to the
-    /// password.
+    /// UserFallback, InvalidContext). Terminal.
     Rejected,
-    /// Biometry was attempted but is locked/unavailable/not-enrolled, or the
-    /// device has no passcode. Caller should fall back to the system password.
-    TryFallback,
+    /// Biometry cannot run: locked out, no sensor, not enrolled, not paired,
+    /// disconnected, or no device passcode. Touch ID is the only local
+    /// factor, so the caller returns `Unavailable(BiometryUnavailable)`.
+    BiometryUnavailable,
     /// System couldn't display dialog (NotInteractive, SystemCancel, etc.).
     /// Caller should return `Unavailable`.
     NotInteractive,
@@ -260,9 +260,9 @@ pub fn classify_la_error(code: i32) -> EvalOutcome {
         {
             EvalOutcome::Rejected
         }
-        // Biometry path is dead — caller should try the next factor.
-        // Includes BiometryNotPaired / BiometryDisconnected: hardware-availability
-        // failures, semantically equivalent to BiometryNotAvailable.
+        // Biometry path is dead. Includes BiometryNotPaired /
+        // BiometryDisconnected: hardware-availability failures, semantically
+        // equivalent to BiometryNotAvailable.
         c if c == kLAErrorBiometryLockout
             || c == kLAErrorBiometryNotAvailable
             || c == kLAErrorBiometryNotEnrolled
@@ -270,14 +270,14 @@ pub fn classify_la_error(code: i32) -> EvalOutcome {
             || c == kLAErrorBiometryNotPaired
             || c == kLAErrorBiometryDisconnected =>
         {
-            EvalOutcome::TryFallback
+            EvalOutcome::BiometryUnavailable
         }
         // System interrupted us; return Unavailable upstream.
         c if c == kLAErrorSystemCancel || c == kLAErrorNotInteractive => {
             EvalOutcome::NotInteractive
         }
-        // Unknown codes: be conservative and treat as Rejected (don't open
-        // a fallback path on uncharted territory).
+        // Unknown codes: be conservative and treat as Rejected (a terminal
+        // failure that revokes nothing and invites no retry elsewhere).
         _ => EvalOutcome::Rejected,
     }
 }
@@ -295,33 +295,19 @@ mod la {
     use objc2_local_authentication::{LAContext, LAPolicy};
     use std::sync::mpsc;
 
-    /// Which LA policy to evaluate. Maps to Apple's `LAPolicy` constants.
-    #[derive(Debug, Clone, Copy)]
-    pub(super) enum Policy {
-        /// `LAPolicyDeviceOwnerAuthenticationWithBiometrics` — Touch ID only.
-        WithBiometrics,
-        /// `LAPolicyDeviceOwnerAuthentication` — biometrics or system passcode.
-        DeviceOwner,
-    }
+    /// `LAPolicyDeviceOwnerAuthenticationWithBiometrics` — Touch ID only, the
+    /// one policy that can satisfy the wrap v3 key's `biometryCurrentSet`.
+    const POLICY: LAPolicy = LAPolicy::DeviceOwnerAuthenticationWithBiometrics;
 
-    impl Policy {
-        fn raw(self) -> LAPolicy {
-            match self {
-                Policy::WithBiometrics => LAPolicy::DeviceOwnerAuthenticationWithBiometrics,
-                Policy::DeviceOwner => LAPolicy::DeviceOwnerAuthentication,
-            }
-        }
-    }
-
-    pub(super) fn can_evaluate(policy: Policy) -> bool {
+    pub(super) fn can_evaluate() -> bool {
         let ctx = unsafe { LAContext::new() };
-        unsafe { ctx.canEvaluatePolicy_error(policy.raw()).is_ok() }
+        unsafe { ctx.canEvaluatePolicy_error(POLICY).is_ok() }
     }
 
-    /// Evaluate `policy` on a fresh context and hand the context back with
+    /// Evaluate Touch ID on a fresh context and hand the context back with
     /// the outcome: on success it is the evaluated context wrap v3 binds to
     /// the Secure Enclave key.
-    pub(super) fn evaluate(policy: Policy, reason: &str) -> (EvalOutcome, Retained<LAContext>) {
+    pub(super) fn evaluate(reason: &str) -> (EvalOutcome, Retained<LAContext>) {
         let ctx = unsafe { LAContext::new() };
         let reason_ns = NSString::from_str(reason);
         let (tx, rx) = mpsc::sync_channel::<(bool, i32)>(1);
@@ -341,7 +327,7 @@ mod la {
             let _ = tx.send((ok, code));
         });
         unsafe {
-            ctx.evaluatePolicy_localizedReason_reply(policy.raw(), &reason_ns, &block);
+            ctx.evaluatePolicy_localizedReason_reply(POLICY, &reason_ns, &block);
         }
         let (ok, code) = match rx.recv() {
             Ok(v) => v,
@@ -354,36 +340,35 @@ mod la {
             return (EvalOutcome::Success, ctx);
         }
         let outcome = classify_la_error(code);
-        if matches!(outcome, EvalOutcome::TryFallback) {
+        if matches!(outcome, EvalOutcome::BiometryUnavailable) {
             tracing::info!(
                 la_error_code = code,
-                "biometry unavailable for evaluatePolicy; falling back to password"
+                "biometry unavailable for evaluatePolicy"
             );
         }
         (outcome, ctx)
     }
 }
 
-/// Authentication chain.
+/// Touch ID authentication, the only local factor.
 ///
 /// **Pre-check**: if `CGSessionCopyCurrentDictionary` says the screen is
 /// locked / off-console / login pending → `Unavailable(NotInteractive)`.
-/// If the dict is NULL → `Unavailable(NoGuiSession)`. No password fallback in
-/// either case (physical-presence model).
+/// If the dict is NULL → `Unavailable(NoGuiSession)`. If `canEvaluatePolicy`
+/// for biometrics fails → `Unavailable(BiometryUnavailable)`. No sheet is
+/// shown in any of these cases.
 ///
-/// **Touch ID** (when `canEvaluatePolicy` for biometrics succeeds): success
-/// → `Biometric`. `EvalOutcome::Rejected` is terminal after a session
-/// re-check disambiguates "user rejected" from "screen locked mid-prompt".
-/// `EvalOutcome::TryFallback` (Lockout / NotAvailable / NotEnrolled /
-/// PasscodeNotSet) **falls through to the system password**
-/// (`DeviceOwnerAuthentication` policy).
+/// **Touch ID**: success → `Success`. `EvalOutcome::Rejected` is terminal
+/// after a session re-check disambiguates "user rejected" from "screen locked
+/// mid-prompt". `EvalOutcome::BiometryUnavailable` (Lockout / NotAvailable /
+/// NotEnrolled / PasscodeNotSet / NotPaired / Disconnected) →
+/// `Unavailable(BiometryUnavailable)`.
 pub fn authenticate(reason: &str) -> AuthOutcome {
     authenticate_ctx(reason).0
 }
 
-/// [`authenticate`] plus, on `Success(Biometric)`, the evaluated context the
-/// Secure Enclave key can be bound to. A password success carries no context:
-/// the wrap v3 key's `biometryCurrentSet` policy cannot be met by it.
+/// [`authenticate`] plus, on `Success`, the evaluated context the Secure
+/// Enclave key is bound to.
 pub fn authenticate_ctx(reason: &str) -> (AuthOutcome, Option<super::se::BiometricContext>) {
     // Pre-check: screen lock state. Cached for 1s to bound CPU under spammy
     // callers (locked-screen + tight-loop client = naturally O(1)).
@@ -404,80 +389,50 @@ pub fn authenticate_ctx(reason: &str) -> (AuthOutcome, Option<super::se::Biometr
         SessionState::Interactive => {}
     }
 
-    if la::can_evaluate(la::Policy::WithBiometrics) {
-        let (outcome, ctx) = la::evaluate(la::Policy::WithBiometrics, reason);
-        match outcome {
-            EvalOutcome::Success => {
-                return (
-                    AuthOutcome::Success,
-                    Some(super::se::BiometricContext::from_evaluated(ctx)),
-                )
-            }
-            EvalOutcome::Rejected => {
-                // Disambiguate: the screen could have locked between the cached
-                // pre-check and now. Re-query uncached so a transient lock is
-                // not misreported as a user rejection.
-                match screen_state_now() {
-                    SessionState::NotInteractive => {
-                        notify_locked_rejected(reason);
-                        return (
-                            AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
-                            None,
-                        );
-                    }
-                    SessionState::NoSession => {
-                        return (
-                            AuthOutcome::Unavailable(UnavailableReason::NoGuiSession),
-                            None,
-                        );
-                    }
-                    SessionState::Interactive => {}
+    if !la::can_evaluate() {
+        return (
+            AuthOutcome::Unavailable(UnavailableReason::BiometryUnavailable),
+            None,
+        );
+    }
+    let (outcome, ctx) = la::evaluate(reason);
+    match outcome {
+        EvalOutcome::Success => (
+            AuthOutcome::Success,
+            Some(super::se::BiometricContext::from_evaluated(ctx)),
+        ),
+        EvalOutcome::Rejected => {
+            // Disambiguate: the screen could have locked between the cached
+            // pre-check and now. Re-query uncached so a transient lock is
+            // not misreported as a user rejection.
+            match screen_state_now() {
+                SessionState::NotInteractive => {
+                    notify_locked_rejected(reason);
+                    return (
+                        AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
+                        None,
+                    );
                 }
-                notify_touch_id_rejected(reason);
-                return (AuthOutcome::Rejected, None);
+                SessionState::NoSession => {
+                    return (
+                        AuthOutcome::Unavailable(UnavailableReason::NoGuiSession),
+                        None,
+                    );
+                }
+                SessionState::Interactive => {}
             }
-            EvalOutcome::NotInteractive => {
-                return (
-                    AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
-                    None,
-                );
-            }
-            EvalOutcome::TryFallback => {
-                // Biometry locked/unavailable: drop into the password fallback.
-            }
+            notify_touch_id_rejected(reason);
+            (AuthOutcome::Rejected, None)
         }
+        EvalOutcome::NotInteractive => (
+            AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
+            None,
+        ),
+        EvalOutcome::BiometryUnavailable => (
+            AuthOutcome::Unavailable(UnavailableReason::BiometryUnavailable),
+            None,
+        ),
     }
-
-    // Re-check session state before the password fallback. We may have
-    // arrived here via two paths:
-    //   1. `can_evaluate(WithBiometrics) == false` upfront (no LAContext call).
-    //   2. `evaluate` returned `TryFallback` (Lockout / NotAvailable / etc.).
-    // In either case, the screen could have locked since the cached pre-check
-    // (1s TTL window). Don't prompt for the password on a locked machine —
-    // physical-presence model says no auth on a locked screen.
-    match screen_state_now() {
-        SessionState::NotInteractive => {
-            notify_locked_rejected(reason);
-            return (
-                AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
-                None,
-            );
-        }
-        SessionState::NoSession => {
-            return (
-                AuthOutcome::Unavailable(UnavailableReason::NoGuiSession),
-                None,
-            );
-        }
-        SessionState::Interactive => {}
-    }
-
-    let outcome = match la::evaluate(la::Policy::DeviceOwner, reason).0 {
-        EvalOutcome::Success => AuthOutcome::Success,
-        EvalOutcome::NotInteractive => AuthOutcome::Unavailable(UnavailableReason::NotInteractive),
-        EvalOutcome::Rejected | EvalOutcome::TryFallback => AuthOutcome::Rejected,
-    };
-    (outcome, None)
 }
 
 pub fn local_authentication(reason: &str) -> bool {
@@ -542,17 +497,10 @@ impl MasterAccess {
     pub fn open(store: &super::store::KeychainStore, reason: &str) -> Result<Self> {
         require_v3(store)?;
         let (blob, _) = store.se_material_bytes()?;
-        let (outcome, ctx) = authenticate_ctx(reason);
-        ensure!(
-            outcome.is_success(),
-            "Local authentication failed for {reason}"
-        );
-        let ctx = ctx.ok_or_else(|| {
-            anyhow::anyhow!(
-                "se.biometry_required: wrap v3 unwraps only after Touch ID; the password \
-                 fallback cannot satisfy the Secure Enclave key"
-            )
-        })?;
+        let ctx = match authenticate_ctx(reason) {
+            (AuthOutcome::Success, Some(ctx)) => ctx,
+            (outcome, _) => anyhow::bail!("Local authentication failed for {reason}: {outcome:?}"),
+        };
         Ok(Self::Enclave(super::se::SeSession::open(&blob, ctx)?))
     }
 
@@ -730,28 +678,28 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_la_biometry_lockout_is_try_fallback() {
+    fn classify_la_biometry_lockout_is_biometry_unavailable() {
         // -8: 3 failures triggered system lockout — must not be treated as
-        // a terminal Rejected.
-        assert_eq!(classify_la_error(-8), EvalOutcome::TryFallback);
+        // a terminal Rejected; the Worker transport is the remaining route.
+        assert_eq!(classify_la_error(-8), EvalOutcome::BiometryUnavailable);
     }
 
     #[test]
-    fn classify_la_biometry_not_available_is_try_fallback() {
+    fn classify_la_biometry_not_available_is_biometry_unavailable() {
         // -6: hardware not present.
-        assert_eq!(classify_la_error(-6), EvalOutcome::TryFallback);
+        assert_eq!(classify_la_error(-6), EvalOutcome::BiometryUnavailable);
     }
 
     #[test]
-    fn classify_la_biometry_not_enrolled_is_try_fallback() {
+    fn classify_la_biometry_not_enrolled_is_biometry_unavailable() {
         // -7: hardware present, no fingers enrolled.
-        assert_eq!(classify_la_error(-7), EvalOutcome::TryFallback);
+        assert_eq!(classify_la_error(-7), EvalOutcome::BiometryUnavailable);
     }
 
     #[test]
-    fn classify_la_passcode_not_set_is_try_fallback() {
+    fn classify_la_passcode_not_set_is_biometry_unavailable() {
         // -5: no system passcode → biometric path can't run.
-        assert_eq!(classify_la_error(-5), EvalOutcome::TryFallback);
+        assert_eq!(classify_la_error(-5), EvalOutcome::BiometryUnavailable);
     }
 
     #[test]
@@ -768,23 +716,21 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_la_biometry_not_paired_is_try_fallback() {
-        // -12: hardware paired state lost. Same family as NotAvailable —
-        // biometry can't run, but the password fallback might.
-        assert_eq!(classify_la_error(-12), EvalOutcome::TryFallback);
+    fn classify_la_biometry_not_paired_is_biometry_unavailable() {
+        // -12: hardware paired state lost. Same family as NotAvailable.
+        assert_eq!(classify_la_error(-12), EvalOutcome::BiometryUnavailable);
     }
 
     #[test]
-    fn classify_la_biometry_disconnected_is_try_fallback() {
+    fn classify_la_biometry_disconnected_is_biometry_unavailable() {
         // -13: sensor temporarily disconnected (e.g. external Touch ID device).
-        // Treat as TryFallback so the user can still auth via password.
-        assert_eq!(classify_la_error(-13), EvalOutcome::TryFallback);
+        assert_eq!(classify_la_error(-13), EvalOutcome::BiometryUnavailable);
     }
 
     #[test]
     fn classify_la_unknown_codes_are_rejected() {
-        // Be conservative on uncharted codes — don't silently open a fallback
-        // path on something we haven't reasoned about. -11 (WatchNotAvailable)
+        // Be conservative on uncharted codes — don't report Unavailable (and
+        // invite Worker fallback) on something we haven't reasoned about. -11 (WatchNotAvailable)
         // and -14 (InvalidDimensions) fall here; if a future Apple OS adds
         // new codes, behavior is fail-closed until they're classified.
         assert_eq!(classify_la_error(-11), EvalOutcome::Rejected);

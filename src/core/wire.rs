@@ -107,7 +107,7 @@ pub enum Status {
 pub enum ErrKind {
     /// Unclassified server error.
     Generic,
-    /// User actively rejected the biometric / password prompt.
+    /// User actively rejected the Touch ID prompt.
     AuthRejected,
     /// Screen is locked or off-console; cannot prompt right now.
     SessionLocked,
@@ -118,6 +118,9 @@ pub enum ErrKind {
     /// Agent is locked via `ssh-add -x`. Reserved for future use; today the
     /// lock check pre-empts envelope generation and surfaces as `Generic`.
     AgentLocked,
+    /// Touch ID cannot be evaluated (locked out, not enrolled, no sensor);
+    /// no prompt was shown.
+    BiometryUnavailable,
     /// Request JSON malformed, unknown `SecretType`, mismatched batch shape.
     BadRequest,
     /// Client and agent disagree on [`WIRE_VERSION`].
@@ -142,6 +145,7 @@ impl ErrKind {
             ErrKind::NoGuiSession => 12,
             ErrKind::NotInitialized => 13,
             ErrKind::AgentLocked => 14,
+            ErrKind::BiometryUnavailable => 15,
             ErrKind::BadRequest => 20,
             ErrKind::ProtocolVersion => 22,
             ErrKind::Transient => 75,
@@ -160,6 +164,9 @@ impl ErrKind {
             ErrKind::NoGuiSession => "vt: no GUI session (cannot prompt for Touch ID)",
             ErrKind::NotInitialized => "vt: agent is not initialized — run `vt init`",
             ErrKind::AgentLocked => "vt: agent is locked — unlock with `ssh-add -X`",
+            ErrKind::BiometryUnavailable => {
+                "vt: Touch ID is unavailable (locked out, not enrolled, or no sensor)"
+            }
             ErrKind::BadRequest => "vt: agent rejected the request as malformed",
             ErrKind::ProtocolVersion => {
                 "vt: client and agent protocol versions do not match — reinstall both"
@@ -202,6 +209,9 @@ pub fn outcome_to_err_strict(outcome: AuthOutcome) -> Option<ErrKind> {
         AuthOutcome::Rejected => Some(ErrKind::AuthRejected),
         AuthOutcome::Unavailable(UnavailableReason::NotInteractive) => Some(ErrKind::SessionLocked),
         AuthOutcome::Unavailable(UnavailableReason::NoGuiSession) => Some(ErrKind::NoGuiSession),
+        AuthOutcome::Unavailable(UnavailableReason::BiometryUnavailable) => {
+            Some(ErrKind::BiometryUnavailable)
+        }
     }
 }
 
@@ -232,6 +242,7 @@ mod tests {
             ErrKind::NoGuiSession,
             ErrKind::NotInitialized,
             ErrKind::AgentLocked,
+            ErrKind::BiometryUnavailable,
             ErrKind::BadRequest,
             ErrKind::ProtocolVersion,
             ErrKind::Transient,
@@ -260,6 +271,7 @@ mod tests {
         assert_eq!(ErrKind::NoGuiSession.exit_code(), 12);
         assert_eq!(ErrKind::NotInitialized.exit_code(), 13);
         assert_eq!(ErrKind::AgentLocked.exit_code(), 14);
+        assert_eq!(ErrKind::BiometryUnavailable.exit_code(), 15);
         assert_eq!(ErrKind::BadRequest.exit_code(), 20);
         // 21 retired (`LegacyDisabled`) — never reuse.
         assert_eq!(ErrKind::ProtocolVersion.exit_code(), 22);
@@ -320,6 +332,12 @@ mod tests {
         assert_eq!(
             outcome_to_err_strict(AuthOutcome::Unavailable(UnavailableReason::NoGuiSession)),
             Some(ErrKind::NoGuiSession)
+        );
+        assert_eq!(
+            outcome_to_err_strict(AuthOutcome::Unavailable(
+                UnavailableReason::BiometryUnavailable
+            )),
+            Some(ErrKind::BiometryUnavailable)
         );
     }
 

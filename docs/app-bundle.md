@@ -47,9 +47,9 @@ and [se.rs](../src/server_macos/se.rs).
   permit; it becomes the reusable session only when the operation commits a
   grant, and every cache hit unwraps through that one. Revocation (lock, idle,
   screen lock, wake, revoke-all) drops both sessions with the grants.
-- Password fallback authenticates but cannot unwrap: with Touch ID
-  unavailable (sensor absent, lid closed, biometry locked out) the local agent
-  fails closed and only the Worker transport remains.
+- Every approval is Touch ID; with biometry unavailable (sensor absent, lid
+  closed, not enrolled, locked out) the agent returns unavailable without
+  prompting and only the Worker transport remains.
 - The blob is bound to this device and the enrolled fingerprint set: adding,
   removing, or re-enrolling any finger makes the Secure Enclave key permanently
   unusable. Run `vt secret export` before changing enrollment. Recover with
