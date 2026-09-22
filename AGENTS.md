@@ -179,14 +179,17 @@ Lifecycle, status token, and Keychain format: [app-bundle.md](docs/app-bundle.md
   `--ui-token-fd` (never env/argv/file; absent/wrong token fails unstructured).
   Only status and revoke-all; never grant/extend/approve, reset idle, or audit-push.
   Display labels stay memory-only.
-- New stores are wrap v3 (Secure Enclave, `se.rs`); wrap v2 is read only as the
-  `rotate-passcode` migration source this release; reject other `wrap_v` values
-  before unwrapping. Never re-add a v1 reader, in-binary upgrade, or rebind
-  command. The SE session lives only in `SeSessions`: written by a biometric
-  approval, dropped in `invalidation_complete`; `LAContext.invalidate()` is never
+- New stores are wrap v3 (Secure Enclave, `se.rs`, `biometryCurrentSet`); wrap
+  v2 is read only by `rotate-passcode` this release; reject other `wrap_v`
+  values before unwrapping. Never re-add a v1 reader, in-binary upgrade, or
+  rebind command. SE sessions live only in `SeSessions`: a biometric approval
+  leaves a pending one that is dropped with its permit or promoted by a committed
+  grant; `invalidation_complete` drops both; `LAContext.invalidate()` is never
   the boundary. The master is unwrapped inside a handler scope and never held
   across an await or a prompt. Public SSH keys are plaintext; private keys reload
-  only through an authorized sign. Migration belongs in the app doc.
+  only through an authorized sign. `init`/`import` never replace a store they
+  could not read; import over a readable store is a same-master re-wrap proven
+  by its SSH keys. Migration belongs in the app doc.
 
 ## Worker cache and admin
 

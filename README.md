@@ -28,8 +28,10 @@ just install-app   # macOS app and CLI
 ```
 
 Release bundles are ad-hoc signed; upgrades may require renewed Keychain
-permission. For Gatekeeper, an existing agent installation, or a pre-v2 vault,
-follow the [macOS installation and upgrade guide](docs/app-bundle.md).
+permission. The local agent needs a Mac with a Secure Enclave and Touch ID;
+an existing vault is migrated once with `vt secret rotate-passcode`. For
+Gatekeeper, an existing agent installation, or the migration, follow the
+[macOS installation and upgrade guide](docs/app-bundle.md).
 
 ## Upgrading to v20260915: breaking change for phone approval
 

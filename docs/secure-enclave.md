@@ -64,22 +64,17 @@ single-prompt unwrap.
 - A never-evaluated context always prompts: there is no SEP-side grace
   window shared across contexts.
 
-## Design constraints
+## How vt uses these facts
+
+The contract built on them is [app-bundle.md](app-bundle.md#master-key-wrap-v3);
+this section records only the platform-side consequences.
 
 - The `toid` blob and the ECIES ciphertext live in the existing
-  `rusty.vault.store` item; `passcode_and_auth_token` takes no part in v3.
-- The engine's approval `LAContext` is bound to the SE handle so one Touch ID
-  is both the vt approval and the unwrap. A reusable grant holds `(LAContext,
-  SecKey)` in memory and revocation drops both; `invalidate()` is advisory,
-  never the boundary. Fresh approvals build a new context per operation.
-- An evaluated custody context disables further interaction; a failed warm
-  unwrap requires a new engine approval and cannot open another system prompt.
-- Pending approval sessions are isolated from cache-hit sessions and become
-  reusable only when the protected operation commits its grant; cancellation,
-  failure, and failed post-prompt validation drop the pending session.
-- No SE (Intel without T2, VMs, CI) fails closed. Wrap v2 stays readable for
-  one release as the migration source, then its test becomes a
-  rejected-input test.
+  `rusty.vault.store` item; nothing is written to any keychain by the SE key.
+- Dropping the `(LAContext, SecKey)` pair is the revocation boundary;
+  `invalidate()` is called on drop as a courtesy only.
+- An evaluated context gets `interactionNotAllowed`: a cold or expired handle
+  fails instead of opening a second system prompt under a live permit.
 - Dependencies: `security-framework` with `OSX_10_13`
   (`kSecUseAuthenticationContext`, `SecKeyCreateWithData`),
   `security-framework-sys`, `core-foundation`; nothing added.
@@ -88,5 +83,6 @@ single-prompt unwrap.
 
 - Intel/T2 hardware and virtual machines.
 - Behavior of `biometryCurrentSet` after fingerprint enrollment changes
-  (expected: blob becomes permanently unusable; recovery is the phone copy).
+  (expected: the blob becomes permanently unusable; recovery is
+  `vt secret import` from an export or the phone copy).
 - Whether ctkd's warm-context cache is per process or per token session.

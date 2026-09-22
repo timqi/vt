@@ -501,7 +501,7 @@ pub fn check_wrap(store: &super::store::KeychainStore) -> Result<()> {
         store.wrap_v == WRAP_V2 || store.wrap_v == WRAP_V3,
         "rusty.vault.store has wrap version {}, this release reads wrap v{WRAP_V2} (migration \
          source) and v{WRAP_V3} — run `vt secret rebind` on the previous vt release first \
-         (docs/app-bundle.md#master-key-wrap-v3)",
+         (docs/app-bundle.md#migrating-a-wrap-v2-store)",
         store.wrap_v
     );
     Ok(())

@@ -36,7 +36,7 @@ pub fn derive_dek(mac_key: &[u8; 32], salt: &[u8; 16]) -> [u8; 32] {
     okm
 }
 
-/// Fixed final derivation term for wrap v2 (docs/app-bundle.md#master-key-wrap-v3). The
+/// Fixed final derivation term for wrap v2 (docs/app-bundle.md#migrating-a-wrap-v2-store). The
 /// retired wrap v1 put the binary path here; the label keeps the store from
 /// locking to an install location and is domain-separated from any real
 /// path by not starting with `/`.

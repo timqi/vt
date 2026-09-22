@@ -640,7 +640,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // Managed agent failed to start (e.g. keychain store still on the
-        // retired wrap v1 — docs/app-bundle.md#master-key-wrap-v3).
+        // wrap v1/v2 — docs/app-bundle.md#migrating-a-wrap-v2-store).
         if !supervisor.isManaged, !agentReachable, let err = supervisor.lastError, !err.isEmpty {
             menu.addItem(disabled("⚠ agent failed to start:"))
             menu.addItem(disabled("   \(String(err.prefix(120)))"))

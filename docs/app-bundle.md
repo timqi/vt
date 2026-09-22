@@ -37,42 +37,47 @@ blob and the ECIES ciphertext. Platform facts: [secure-enclave.md](secure-enclav
 Store and wrap definitions belong to [store.rs](../src/server_macos/store.rs)
 and [se.rs](../src/server_macos/se.rs).
 
-- `vt init`, `vt secret import`, and `vt secret rotate-passcode` write wrap v3
-  only. Without a Secure Enclave they refuse with `se.unavailable`
+- The local agent needs a Secure Enclave (Apple Silicon or T2) and Touch ID.
+  `vt init`, `vt secret import`, and `vt secret rotate-passcode` write wrap v3
+  only; without a Secure Enclave they refuse with `se.unavailable`
   ([structured-errors.md](structured-errors.md#secure-enclave)).
 - Unwrapping requires a Touch ID approval: the approval's `LAContext` is bound
-  to the Secure Enclave key and held in memory as the approval session. A
-  reusable grant keeps its session until revocation (lock, idle, screen lock,
-  wake, revoke-all) drops it; a fresh approval's session ends with its
-  operation. Password fallback authenticates but cannot unwrap: with Touch ID
+  to the Secure Enclave key and held in memory as the approval session. The
+  session of a new approval belongs to that operation and is dropped with its
+  permit; it becomes the reusable session only when the operation commits a
+  grant, and every cache hit unwraps through that one. Revocation (lock, idle,
+  screen lock, wake, revoke-all) drops both sessions with the grants.
+- Password fallback authenticates but cannot unwrap: with Touch ID
   unavailable (sensor absent, lid closed, biometry locked out) the local agent
   fails closed and only the Worker transport remains.
-- A blob is bound to this device and the enrolled fingerprint set
-  (`biometryCurrentSet`): adding, removing, or re-enrolling any finger makes
-  the store's Secure Enclave key permanently unusable. Run `vt secret export`
-  before changing enrollment. Recover with `vt secret import` from the exported
-  master: over an existing store it re-wraps under a new Secure Enclave key and
-  carries the SSH keys, but only when the imported master opens them; a store
-  without SSH keys must be deleted first. The Worker transport keeps working
-  throughout.
+- The blob is bound to this device and the enrolled fingerprint set: adding,
+  removing, or re-enrolling any finger makes the Secure Enclave key permanently
+  unusable. Run `vt secret export` before changing enrollment. Recover with
+  `vt secret import` from the exported master: over an existing store it
+  re-wraps under a new Secure Enclave key and carries the SSH keys, but only
+  when the imported master opens them; a store without SSH keys must be
+  deleted first (`security delete-generic-password -s rusty.vault.store`). The
+  Worker transport keeps working throughout.
 - `encrypt@vt` is authorized like `decrypt@vt` because minting a DEK also needs
   the master ([unified-authorization-engine.md](unified-authorization-engine.md#approval-policy)).
 - Public SSH keys, fingerprints, and comments live in plaintext in the store;
   listing identities never unwraps the master. Private keys stay sealed under
   the master and load on the next authorized sign after a wipe.
 
+### Migrating a wrap v2 store
+
 Wrap v2 (passcode-derived) is readable this release only by
 `vt secret rotate-passcode`; the agent and every other command refuse it until
-migrated. Migrate once per Mac, then restart the agent:
+migrated. Migrate once per Mac (one Touch ID), then restart the agent:
 
 ```bash
 vt secret rotate-passcode
 ```
 
-Non-v2/v3 markers fail before unwrap; there is no in-binary upgrade. Before
-upgrading a v1 store, run `vt secret rebind` with the previous release. Remove
-obsolete binaries: an old full-store writer can put the store back into a
-format the current release refuses.
+Other `wrap_v` markers fail before unwrap; there is no in-binary upgrade. A v1
+store must first reach v2 with the release that still shipped `vt secret
+rebind`. Remove obsolete binaries: an old full-store writer can put the store
+back into a format the current release refuses.
 
 ## Notifications
 
@@ -137,8 +142,8 @@ startup surfaces an error and a Doctor shortcut, without retaining a disk log.
 
 ## Upgrade from a standalone agent
 
-Complete the wrap-v3 migration above if needed, then stop the existing agent and its
-supervisor before installing and opening VT.app. Remove old launch-at-login
+Complete the [wrap v3 migration](#migrating-a-wrap-v2-store) if needed, then
+stop the existing agent and its supervisor before installing and opening VT.app. Remove old launch-at-login
 entries so a second supervisor does not compete for the socket.
 
 Use the installed, signed bundle to verify Keychain and notification permission;
