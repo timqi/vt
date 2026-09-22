@@ -151,21 +151,25 @@ impl VtSshSession {
         fp: &str,
         reuse: ReusePolicy,
     ) -> Result<ssh_key::private::PrivateKey, WireFailure> {
-        if let Some(key) = self.keys.read().await.get(fp) {
-            return Ok(key.clone());
-        }
+        let mut keys = self.keys.write().await;
         let unsafe_state = || (ErrKind::Generic, Some(DETAIL_SIGN_KEYS_LOAD));
-        if !crate::server_macos::security::session_interactive_now() {
+        if self.locked.load(Ordering::Acquire)
+            || !crate::server_macos::security::session_interactive_now()
+        {
             return Err(unsafe_state());
         }
+        // Even a resident key requires this permit's custody: a password or
+        // failed bind must not borrow a key loaded by an earlier approval.
         let loaded = {
             let master = master_for(&self.se_sessions, store, reuse)?;
+            if let Some(key) = keys.get(fp) {
+                return Ok(key.clone());
+            }
             keys::load_private_keys(store, &master).map_err(|error| {
                 tracing::warn!("SSH key reload failed: {error}");
                 unsafe_state()
             })?
         };
-        let mut keys = self.keys.write().await;
         if self.locked.load(Ordering::Acquire)
             || !crate::server_macos::security::session_interactive_now()
         {
@@ -914,6 +918,31 @@ mod tests {
             master_for(&sessions, &store, fresh).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_UNWRAP))
         );
+    }
+
+    #[tokio::test]
+    async fn cached_private_key_requires_current_custody_and_lock_check() {
+        let session = test_session(0, 0);
+        let key = ssh_key::private::PrivateKey::random(
+            &mut rand::rngs::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let fp = fingerprint_str(key.public_key().key_data());
+        session.keys.write().await.insert(fp.clone(), key);
+        let store = KeychainStore::new_v3(&[1; 8], &[2; 113]);
+        assert!(
+            session
+                .private_key(&store, &fp, ReusePolicy::Fresh)
+                .await
+                .is_err(),
+            "cached keys must not bypass a missing biometric session"
+        );
+        session.locked.store(true, Ordering::Release);
+        assert!(session
+            .private_key(&store, &fp, ReusePolicy::Fresh)
+            .await
+            .is_err());
     }
 
     /// Private keys load on the first authorized sign after a wipe, through

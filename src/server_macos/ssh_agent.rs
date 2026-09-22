@@ -968,6 +968,7 @@ impl Session for VtSshSession {
             .await
             .map_err(|_| AgentError::Failure)?;
         let signature = sign_data_with_privkey(&privkey, &request.data)?;
+        drop(privkey);
         let cache_hit_note = cache_hit_note_for(&permit, "sign", &reuse_label);
         let reuse_remaining = permit.reuse_remaining();
         permit.commit().await.map_err(|_| AgentError::Failure)?;
@@ -1138,6 +1139,7 @@ impl Session for VtSshSession {
                 let fp_for_modify = fp_str.clone();
                 let comment_for_modify = comment.clone();
                 let key_openssh_str = key_openssh.to_string();
+                drop(private_key);
                 let (permit, master) = self
                     .keystore_master(&format!("ssh-add: store key\nkey: {fp_str}"))
                     .await?;
@@ -1156,9 +1158,7 @@ impl Session for VtSshSession {
                 .await?;
                 permit.commit().await.map_err(|_| AgentError::Failure)?;
 
-                let mut keys = self.keys.write().await;
-                keys.insert(fp_str.clone(), private_key);
-
+                // Stored keys enter RAM only through a later authorized sign.
                 self.touch_activity().await;
                 tracing::info!("Added SSH key: {}", fp_str);
                 Ok(())
