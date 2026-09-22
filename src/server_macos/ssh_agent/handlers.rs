@@ -825,9 +825,7 @@ mod tests {
     use super::super::tests::{test_session, TestAuthenticator, TestValidator};
     use super::super::{RunAllowlist, DETAIL_BIOMETRY_UNAVAILABLE};
     use super::*;
-    use crate::core::authorization::{
-        AuthorizationAuthenticator, AuthorizationEngine, ScopeFamily,
-    };
+    use crate::core::authorization::{AuthorizationAuthenticator, AuthorizationEngine};
     use crate::core::crypto::AesGcmCrypto;
     use crate::core::session::{AuthOutcome, UnavailableReason};
     use crate::server_macos::se::test_support::software_store;
@@ -937,7 +935,7 @@ mod tests {
         session.peer_is_vt_relay = true;
         session.connection_subject = Some((123, 456));
         session.authorization = engine(TestAuthenticator);
-        session.se_sessions.put(custody);
+        session.se_sessions.store(custody);
         let ok = session.handle_encrypt(&payload, &store).await.unwrap();
         let permit = ok.authorization.expect("permit travels to the dispatcher");
         assert_eq!(permit.decision(), NEW);
@@ -947,16 +945,12 @@ mod tests {
         assert_eq!(items[0].dek, derive_dek(&master, &items[0].salt));
         assert_ne!(items[0].salt, items[1].salt);
         permit.commit().await.unwrap();
+        let again = session.handle_encrypt(&payload, &store).await.unwrap();
         assert_eq!(
-            session
-                .authorization
-                .live_len(Operation::Encrypt, ScopeFamily::Connection, (123, 456))
-                .await,
-            0,
+            again.authorization.unwrap().decision(),
+            NEW,
             "encrypt approvals leave no grant"
         );
-        let again = session.handle_encrypt(&payload, &store).await.unwrap();
-        assert_eq!(again.authorization.unwrap().decision(), NEW);
     }
 
     fn decrypt_payload(salts: &[[u8; SALT_LEN]]) -> Vec<u8> {
@@ -1008,7 +1002,7 @@ mod tests {
             "a new approval without custody fails closed"
         );
 
-        session.se_sessions.put(custody);
+        session.se_sessions.store(custody);
         let ok = session
             .handle_decrypt(&decrypt_payload(&salts), &store)
             .await
@@ -1069,7 +1063,7 @@ mod tests {
             master_for(&sessions, &store, NEW).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION))
         );
-        sessions.put(software_session());
+        sessions.store(software_session());
         assert_eq!(
             master_for(&sessions, &store, NEW).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_UNWRAP))
@@ -1083,7 +1077,7 @@ mod tests {
 
         let master = AesGcmCrypto::generate_key();
         let (store, custody) = software_store(&master);
-        sessions.put(custody);
+        sessions.store(custody);
         assert_eq!(
             master_for(&sessions, &store, Decision::CacheHit).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION)),
@@ -1166,7 +1160,7 @@ mod tests {
         .unwrap();
 
         let session = test_session(0, 0);
-        session.se_sessions.put(custody);
+        session.se_sessions.store(custody);
         assert!(session.keys.read().await.is_empty());
         let loaded = session.private_key(&store, &fp, NEW).await.unwrap();
         assert_eq!(loaded.public_key(), privkey.public_key());

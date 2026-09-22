@@ -71,10 +71,8 @@ this section records only the platform-side consequences.
 
 - The `toid` blob and the ECIES ciphertext live in the existing
   `rusty.vault.store` item; nothing is written to any keychain by the SE key.
-- Each approval's `(LAContext, SecKey)` pair unwraps once, for that
-  operation, and is dropped with its permit; vt never keeps a warm handle for
-  later hits. Dropping the pair is the boundary; `invalidate()` is called on
-  drop as a courtesy only.
+- Dropping the `(LAContext, SecKey)` pair is the boundary; `invalidate()` is
+  called on drop as a courtesy only.
 - An evaluated context gets `interactionNotAllowed`: a handle that has gone
   cold fails instead of opening a second system prompt under a live permit.
 - Dependencies: `security-framework` with `OSX_10_13`

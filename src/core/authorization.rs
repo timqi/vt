@@ -533,7 +533,7 @@ struct KeyedScope {
 /// `display` is the same string the approval prompt showed.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GrantSnapshot {
-    /// Stable operation tag: "sign" | "decrypt" | "auth" | "run".
+    /// `Operation::as_wire` tag.
     pub operation: String,
     /// `ScopeFamily::as_wire` tag.
     pub family: String,
@@ -570,13 +570,10 @@ impl GrantStore {
                 entry.expiry.is_valid_at(now_mono, now_wall) && entry.expiry.ttl <= requested_ttl
             })
             .collect();
-        let epoch = self.epoch;
         if hits.len() != keys.len() {
             return Lookup {
-                epoch,
-                all_hit: false,
-                remaining: None,
-                materials: Vec::new(),
+                epoch: self.epoch,
+                hit: None,
             };
         }
         // Tightest remaining lifetime across the hit set — informational only
@@ -584,7 +581,8 @@ impl GrantStore {
         let remaining = hits
             .iter()
             .map(|entry| entry.expiry.remaining_at(now_mono, now_wall))
-            .min();
+            .min()
+            .unwrap_or(Duration::ZERO);
         // Materials travel only as a complete, scope-aligned set.
         let mut materials: Vec<GrantMaterial> = hits
             .iter()
@@ -594,10 +592,11 @@ impl GrantStore {
             materials.clear();
         }
         Lookup {
-            epoch,
-            all_hit: true,
-            remaining,
-            materials,
+            epoch: self.epoch,
+            hit: Some(Hit {
+                remaining,
+                materials,
+            }),
         }
     }
 
@@ -705,9 +704,13 @@ impl GrantStore {
 
 struct Lookup {
     epoch: u64,
-    all_hit: bool,
-    /// Tightest remaining lifetime across the hit set when `all_hit`.
-    remaining: Option<Duration>,
+    /// `Some` when every key has a live grant within the requested TTL.
+    hit: Option<Hit>,
+}
+
+struct Hit {
+    /// Tightest remaining lifetime across the hit set.
+    remaining: Duration,
     /// Every hit grant's material, aligned with the keys; empty when any
     /// grant carries none.
     materials: Vec<GrantMaterial>,
@@ -892,23 +895,13 @@ impl AuthorizationEngine {
         };
         if let (Some(keys), Some(ttl)) = (keys.as_deref(), reusable_ttl) {
             let security = Arc::clone(&self.security_gate).read_owned().await;
-            let lookup = self.lookup(keys, ttl).await;
-            if lookup.all_hit {
+            if let Some(hit) = self.lookup(keys, ttl).await.hit {
                 if let Err(error) = self.validate_live() {
                     drop(security);
                     self.revoke_after_validation_failure().await;
                     return Err(failure(validation_decision(error), started));
                 }
-                return Ok(AuthorizationPermit {
-                    decision: Decision::CacheHit,
-                    latency_ms: 0,
-                    reuse_remaining: lookup.remaining,
-                    materials: lookup.materials,
-                    pending: None,
-                    store: Arc::clone(&self.store),
-                    _approval: None,
-                    _security: security,
-                });
+                return Ok(self.hit_permit(hit, security));
             }
         }
 
@@ -933,7 +926,7 @@ impl AuthorizationEngine {
             }
             if let (Some(keys), Some(ttl)) = (keys.as_deref(), reusable_ttl) {
                 let lookup = self.lookup(keys, ttl).await;
-                if lookup.all_hit {
+                if let Some(hit) = lookup.hit {
                     if let Err(error) = self.validate_live() {
                         drop(security);
                         drop(prompt);
@@ -941,16 +934,7 @@ impl AuthorizationEngine {
                         return Err(failure(validation_decision(error), started));
                     }
                     drop(prompt);
-                    return Ok(AuthorizationPermit {
-                        decision: Decision::CacheHit,
-                        latency_ms: 0,
-                        reuse_remaining: lookup.remaining,
-                        materials: lookup.materials,
-                        pending: None,
-                        store: Arc::clone(&self.store),
-                        _approval: None,
-                        _security: security,
-                    });
+                    return Ok(self.hit_permit(hit, security));
                 }
                 lookup.epoch
             } else {
@@ -1113,6 +1097,22 @@ impl AuthorizationEngine {
             .read()
             .await
             .snapshot_at(Instant::now(), SystemTime::now())
+    }
+
+    /// A permit served from live grants: no prompt slot, no pending write,
+    /// no custody; it carries the grants' materials and holds the security
+    /// read gate like every permit.
+    fn hit_permit(&self, hit: Hit, security: OwnedRwLockReadGuard<()>) -> AuthorizationPermit {
+        AuthorizationPermit {
+            decision: Decision::CacheHit,
+            latency_ms: 0,
+            reuse_remaining: Some(hit.remaining),
+            materials: hit.materials,
+            pending: None,
+            store: Arc::clone(&self.store),
+            _approval: None,
+            _security: security,
+        }
     }
 
     async fn lookup(&self, keys: &[KeyedScope], requested_ttl: Duration) -> Lookup {
@@ -1326,36 +1326,33 @@ mod tests {
                 w0,
             )
             .unwrap();
-        assert!(
-            store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(120),
-                    m0 + Duration::from_secs(60),
-                    w0 + Duration::from_secs(60)
-                )
-                .all_hit
-        );
-        assert!(
-            !store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(120),
-                    m0 + Duration::from_secs(60),
-                    w0 + Duration::from_secs(121)
-                )
-                .all_hit
-        );
-        assert!(
-            !store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(120),
-                    m0 + Duration::from_secs(121),
-                    w0 + Duration::from_secs(60)
-                )
-                .all_hit
-        );
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(120),
+                m0 + Duration::from_secs(60),
+                w0 + Duration::from_secs(60)
+            )
+            .hit
+            .is_some());
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(120),
+                m0 + Duration::from_secs(60),
+                w0 + Duration::from_secs(121)
+            )
+            .hit
+            .is_none());
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(120),
+                m0 + Duration::from_secs(121),
+                w0 + Duration::from_secs(60)
+            )
+            .hit
+            .is_none());
     }
 
     #[test]
@@ -1384,16 +1381,15 @@ mod tests {
                 w0 + Duration::from_secs(60),
             )
             .unwrap();
-        assert!(
-            !store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(120),
-                    m0 + Duration::from_secs(121),
-                    w0 + Duration::from_secs(121)
-                )
-                .all_hit
-        );
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(120),
+                m0 + Duration::from_secs(121),
+                w0 + Duration::from_secs(121)
+            )
+            .hit
+            .is_none());
     }
 
     #[test]
@@ -1412,16 +1408,15 @@ mod tests {
                 w0,
             )
             .unwrap();
-        assert!(
-            !store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(30),
-                    m0 + Duration::from_secs(1),
-                    w0 + Duration::from_secs(1),
-                )
-                .all_hit
-        );
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(30),
+                m0 + Duration::from_secs(1),
+                w0 + Duration::from_secs(1),
+            )
+            .hit
+            .is_none());
 
         store
             .commit_at(
@@ -1433,26 +1428,24 @@ mod tests {
                 w0 + Duration::from_secs(1),
             )
             .unwrap();
-        assert!(
-            store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(30),
-                    m0 + Duration::from_secs(30),
-                    w0 + Duration::from_secs(30),
-                )
-                .all_hit
-        );
-        assert!(
-            !store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(30),
-                    m0 + Duration::from_secs(32),
-                    w0 + Duration::from_secs(32),
-                )
-                .all_hit
-        );
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(30),
+                m0 + Duration::from_secs(30),
+                w0 + Duration::from_secs(30),
+            )
+            .hit
+            .is_some());
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(30),
+                m0 + Duration::from_secs(32),
+                w0 + Duration::from_secs(32),
+            )
+            .hit
+            .is_none());
     }
 
     #[test]
@@ -1876,8 +1869,12 @@ mod tests {
         let w0 = SystemTime::now();
         let first = [Zeroizing::new([0x5a; 32])];
         store.commit_at(0, keys, &first, ttl, m0, w0).unwrap();
-        let lookup = store.lookup_at(keys, ttl, m0 + ttl / 2, w0 + ttl / 2);
-        assert_eq!(lookup.materials, first.to_vec());
+        let materials =
+            |store: &GrantStore, m, w| store.lookup_at(keys, ttl, m, w).hit.unwrap().materials;
+        assert_eq!(
+            materials(&store, m0 + ttl / 2, w0 + ttl / 2),
+            first.to_vec()
+        );
 
         let rendered = format!("{store:?}");
         assert!(rendered.contains("material: true"), "{rendered}");
@@ -1890,9 +1887,7 @@ mod tests {
             .commit_at(0, keys, &second, ttl, m0 + ttl / 2, w0 + ttl / 2)
             .unwrap();
         assert_eq!(
-            store
-                .lookup_at(keys, ttl, m0 + ttl / 2, w0 + ttl / 2)
-                .materials,
+            materials(&store, m0 + ttl / 2, w0 + ttl / 2),
             first.to_vec()
         );
         // Expired entry: refreshed with the new material.
@@ -1901,14 +1896,11 @@ mod tests {
         store
             .commit_at(0, keys, &second, ttl, later_m, later_w)
             .unwrap();
-        assert_eq!(
-            store.lookup_at(keys, ttl, later_m, later_w).materials,
-            second.to_vec()
-        );
+        assert_eq!(materials(&store, later_m, later_w), second.to_vec());
         assert!(store
             .lookup_at(keys, ttl, later_m + ttl, later_w + ttl)
-            .materials
-            .is_empty());
+            .hit
+            .is_none());
         store.sweep_expired_at(later_m + ttl, later_w + ttl);
         assert!(store.entries.is_empty());
 

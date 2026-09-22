@@ -45,9 +45,9 @@ and [se.rs](../src/server_macos/se.rs).
   to the Secure Enclave key and held in memory as that operation's session,
   dropped with its permit. Repeat authorization within a TTL never unwraps:
   a decrypt hit serves the record DEKs cached with the grant, a sign hit uses
-  the resident private key. Cached DEKs live and die with their grant
-  (expiry, lock, idle, screen lock, wake, revoke-all). Wrap v3 protects the
-  master at rest; TTL reuse is a software boundary inside the vt process.
+  the resident private key. Cached DEKs live and die with their grant. Wrap
+  v3 protects the master at rest; TTL reuse is a software boundary inside the
+  vt process.
 - Every approval is Touch ID; with biometry unavailable (sensor absent, lid
   closed, not enrolled, locked out) the agent returns unavailable without
   prompting and only the Worker transport remains.
@@ -59,11 +59,9 @@ and [se.rs](../src/server_macos/se.rs).
   when the imported master opens them; a store without SSH keys must be
   deleted first (`security delete-generic-password -s rusty.vault.store`). The
   Worker transport keeps working throughout.
-- `encrypt@vt` is always fresh: minting a DEK needs the master, which only a
-  new approval's session unwraps ([unified-authorization-engine.md](unified-authorization-engine.md#approval-policy)).
 - Public SSH keys, fingerprints, and comments live in plaintext in the store;
   listing identities never unwraps the master. Private keys stay sealed under
-  the master and load on the next authorized sign after a wipe.
+  the master ([key wiping](#key-wiping-and-idle-timeout)).
 
 ### Migrating a wrap v2 store
 
@@ -172,8 +170,9 @@ Screen-lock/wake observation and idle timeout revoke grants and clear decrypted
 SSH keys. Background key wiping is not instantaneous at lock; operation-time
 security validation must reject unsafe use independently of the watcher.
 
-Private keys reload on the next authorized sign, through that approval's master
-session: no extra prompt and no silent Keychain unwrap. Reload checks
+Private keys reload on the next freshly approved sign, through that approval's
+master session: a cache hit never reloads, and `ssh-add` removals revoke all
+grants so no sign grant outlives its key. Reload checks
 interactivity before decrypting and before installing keys, including current
 agent lock. Unsafe state leaves the key map empty. Identity listing reads only
 the plaintext public list. `ssh-add -X` unlock is a separate path and loads nothing.

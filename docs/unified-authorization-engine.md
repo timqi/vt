@@ -18,10 +18,8 @@ containing forwarded requests and preventing accidental reuse across activities.
   inside another activity. Reuse deliberately grants authority for its lifetime.
 - The master key, decrypted SSH keys, and authorization grants have separate
   lifetimes; revoking a grant does not erase material already released to a caller.
-- Under wrap v3 a fresh approval opens a one-shot Secure Enclave session that
-  unwraps the master for that operation only. A hit never reaches the Secure
-  Enclave: decrypt grants carry their record DEKs as material, sign hits use
-  resident keys ([app-bundle.md](app-bundle.md#master-key-wrap-v3)).
+- Under wrap v3 reuse never reaches the Secure Enclave
+  ([app-bundle.md](app-bundle.md#master-key-wrap-v3)).
 
 ## Approval policy
 

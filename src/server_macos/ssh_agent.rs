@@ -1198,6 +1198,9 @@ impl Session for VtSshSession {
         keys.remove(&fp_str);
         drop(keys);
         permit.commit().await.map_err(|_| AgentError::Failure)?;
+        // A sign grant for the removed key would otherwise stay live with
+        // nothing to serve until its TTL; hits never reload keys.
+        self.authorization.invalidate_all().await;
 
         tracing::info!("Removed SSH key: {}", fp_str);
         Ok(())
@@ -1213,6 +1216,7 @@ impl Session for VtSshSession {
         keys.clear();
         drop(keys);
         permit.commit().await.map_err(|_| AgentError::Failure)?;
+        self.authorization.invalidate_all().await;
 
         tracing::info!("Removed all SSH keys");
         Ok(())

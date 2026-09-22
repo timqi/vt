@@ -29,14 +29,18 @@ pub(super) fn sleep_diverged(mono_delta: Duration, wall_delta: Option<Duration>)
 /// behind (docs/app-bundle.md#master-key-wrap-v3). Memory-only; it belongs to
 /// the serialized approval and is dropped with that approval's permit.
 /// Handlers unwrap the master through it and never hold the key across an
-/// await; cache hits never reach it.
+/// await. The slot is process-global while only new approvals are serialized:
+/// a cache-hit permit on another connection can be live alongside the owning
+/// approval, so `master_for`'s `Decision::Approved` check is the boundary that
+/// keeps hits away from it.
 #[derive(Default)]
 pub struct SeSessions {
     pending: Mutex<Option<SeSession>>,
 }
 
 impl SeSessions {
-    fn store(&self, session: SeSession) {
+    /// Bind a new approval's session for the permit that follows.
+    pub(super) fn store(&self, session: SeSession) {
         *self
             .pending
             .lock()
@@ -66,12 +70,6 @@ impl SeSessions {
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.pending.lock().unwrap().is_none()
-    }
-
-    /// Test seam: a pending session for the next permit.
-    #[cfg(test)]
-    pub(super) fn put(&self, session: SeSession) {
-        self.store(session);
     }
 }
 
@@ -227,7 +225,7 @@ mod tests {
     async fn invalidation_drops_se_session() {
         use super::super::se::test_support::software_session;
         let (engine, sessions) = new_engine(Arc::new(AtomicBool::new(false)));
-        sessions.put(software_session());
+        sessions.store(software_session());
         assert!(!sessions.is_empty());
         engine.invalidate_all().await;
         assert!(sessions.is_empty());

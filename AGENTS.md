@@ -183,14 +183,12 @@ Lifecycle, status token, and Keychain format: [app-bundle.md](docs/app-bundle.md
   v2 is read only by `rotate-passcode` this release; reject other `wrap_v`
   values before unwrapping. Never re-add a v1 reader, in-binary upgrade, or
   rebind command. SE sessions are one-shot and live only in `SeSessions`: a
-  biometric approval leaves one pending session that its permit drops;
-  `master_for` fails closed on a cache hit; `invalidation_complete` drops it;
-  `LAContext.invalidate()` is never the boundary. Repeat authorization never
-  touches the SE: decrypt hits serve the DEKs cached as grant material (dying
-  with the grant, never in Debug output), sign hits use resident keys and fail
-  closed when wiped. The master is unwrapped inside a handler scope and never
-  held across an await or a prompt. Public SSH keys are plaintext; private keys
-  reload only through a freshly approved sign. `init`/`import` never replace a
+  biometric approval leaves one pending session that its permit drops and
+  `invalidation_complete` clears; `master_for` fails closed on a cache hit.
+  Repeat authorization never touches the SE: decrypt hits serve the DEKs cached
+  as grant material, sign hits use resident keys. The master is unwrapped inside
+  a handler scope and never held across an await or a prompt. Public SSH keys
+  are plaintext; private keys reload only through a freshly approved sign. `init`/`import` never replace a
   store they could not read; import over a readable store is a same-master
   re-wrap proven by its SSH keys. Migration belongs in the app doc.
 
