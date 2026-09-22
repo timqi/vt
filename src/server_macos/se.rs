@@ -91,6 +91,9 @@ unsafe impl Send for BiometricContext {}
 impl BiometricContext {
     /// Caller guarantees the context evaluated the biometric policy successfully.
     pub(super) fn from_evaluated(ctx: Retained<LAContext>) -> Self {
+        // Custody operations run under a live permit. A cold or expired
+        // platform context must fail, never start another system prompt.
+        unsafe { ctx.setInteractionNotAllowed(true) };
         Self(ctx)
     }
 }
@@ -255,6 +258,13 @@ pub(super) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custody_context_cannot_prompt_during_unwrap() {
+        // No policy evaluation: this only tests the context's UI setting.
+        let ctx = BiometricContext::from_evaluated(unsafe { LAContext::new() });
+        assert!(unsafe { ctx.0.interactionNotAllowed() });
+    }
 
     #[test]
     fn check_material_rejects_wrong_shapes() {

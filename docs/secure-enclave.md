@@ -72,6 +72,8 @@ single-prompt unwrap.
   is both the vt approval and the unwrap. A reusable grant holds `(LAContext,
   SecKey)` in memory and revocation drops both; `invalidate()` is advisory,
   never the boundary. Fresh approvals build a new context per operation.
+- An evaluated custody context disables further interaction; a failed warm
+  unwrap requires a new engine approval and cannot open another system prompt.
 - Pending approval sessions are isolated from cache-hit sessions and become
   reusable only when the protected operation commits its grant; cancellation,
   failure, and failed post-prompt validation drop the pending session.
