@@ -222,6 +222,22 @@ impl SeSession {
 pub(super) mod test_support {
     use super::*;
 
+    pub(crate) fn software_store(
+        master: &[u8; 32],
+    ) -> (crate::server_macos::store::KeychainStore, SeSession) {
+        let session = software_session();
+        let wrapped = session
+            .key
+            .public_key()
+            .unwrap()
+            .encrypt_data(ALG, master)
+            .unwrap();
+        (
+            crate::server_macos::store::KeychainStore::new_v3(&[1; 8], &wrapped),
+            session,
+        )
+    }
+
     /// A session over a software EC key and a never-evaluated context: enough
     /// to exercise slot lifecycle without Secure Enclave hardware.
     pub(crate) fn software_session() -> SeSession {

@@ -11,8 +11,8 @@ use zeroize::Zeroizing;
 
 use super::require_ed25519;
 use crate::core::crypto::AesGcmCrypto;
-use crate::server_macos::security::{derive_passcode_cipher, unwrap_master_v2, MasterAccess};
-use crate::server_macos::store::{KeychainStore, SshPublicEntry, WRAP_V2};
+use crate::server_macos::security::{require_v3, MasterAccess};
+use crate::server_macos::store::{KeychainStore, SshPublicEntry};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshKeyEntry {
@@ -63,21 +63,10 @@ fn encode_ssh_keys_into(
     Ok(())
 }
 
-/// Public halves of the stored keys. Prefers the plaintext list; a wrap v2
-/// store written before that list existed derives it from the blob through
-/// its passcode (no prompt). The fallback leaves with wrap v2.
+/// List plaintext public halves without opening the master.
 pub fn public_entries(store: &KeychainStore) -> Result<Vec<SshPublicEntry>> {
-    if !store.ssh_public_keys.is_empty() || store.encrypted_ssh_keys.is_none() {
-        return Ok(store.ssh_public_keys.clone());
-    }
-    if store.wrap_v != WRAP_V2 {
-        return Ok(Vec::new());
-    }
-    let master = unwrap_master_v2(store, &derive_passcode_cipher(store)?)?;
-    decode_ssh_keys(store, &master)?
-        .iter()
-        .map(public_entry)
-        .collect()
+    require_v3(store)?;
+    Ok(store.ssh_public_keys.clone())
 }
 
 /// Decrypt every stored private key. A stored key of another type fails the
@@ -160,7 +149,7 @@ mod tests {
     /// In-memory v2 store and its master; no keychain access.
     fn test_store() -> (KeychainStore, [u8; 32]) {
         let master = AesGcmCrypto::generate_key();
-        (v2_store(&master), master)
+        (KeychainStore::new_v3(&[1; 8], &[2; 113]), master)
     }
 
     fn real_entry(comment: &str) -> SshKeyEntry {
@@ -243,21 +232,18 @@ mod tests {
         assert_eq!(store.encrypted_ssh_keys, blob, "no change, no re-encrypt");
     }
 
-    /// A v2 store from before the public list existed still lists its
-    /// identities, derived through the passcode; a v3 store without the list
-    /// lists nothing rather than prompting.
+    /// V2 cannot list identities by silently unwrapping its private blob.
     #[test]
-    fn test_public_entries_fallback_is_v2_only() {
-        let (mut store, master) = test_store();
+    fn test_public_entries_rejects_v2() {
+        let master = AesGcmCrypto::generate_key();
+        let mut store = v2_store(&master);
         modify_ssh_keys(&mut store, &master, |entries| {
             entries.push(real_entry("old"));
             Ok(true)
         })
         .unwrap();
         store.ssh_public_keys.clear();
-        let listed = public_entries(&store).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].comment, "old");
+        assert!(public_entries(&store).is_err());
 
         let mut v3 = KeychainStore::new_v3(&[1u8; 8], &[2u8; 113]);
         v3.encrypted_ssh_keys = store.encrypted_ssh_keys.clone();
@@ -284,7 +270,8 @@ mod tests {
 
     #[test]
     fn test_carry_ssh_keys_fills_public_list() {
-        let (mut from, master) = test_store();
+        let master = AesGcmCrypto::generate_key();
+        let mut from = v2_store(&master);
         modify_ssh_keys(&mut from, &master, |entries| {
             entries.push(real_entry("carried"));
             Ok(true)

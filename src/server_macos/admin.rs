@@ -83,7 +83,7 @@ pub async fn import_secret() -> Result<()> {
 /// one Touch ID opens the current master, the SSH keys carry over under it.
 pub async fn rotate_passcode() -> Result<()> {
     let store = KeychainStore::load()?;
-    let access = MasterAccess::open(&store, "rotate passcode")?;
+    let access = MasterAccess::open_migration(&store)?;
     let master = access
         .master(&store)
         .context("Failed to unwrap the master (docs/app-bundle.md#master-key-wrap-v3)")?;

@@ -131,6 +131,7 @@ impl KeychainStore {
     }
 
     pub fn save(&self) -> Result<()> {
+        super::security::require_v3(self)?;
         let json = serde_json::to_vec(self)?;
         set_keychain(STORE_NAME, &json)
     }

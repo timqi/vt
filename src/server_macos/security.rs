@@ -507,6 +507,16 @@ pub fn check_wrap(store: &super::store::KeychainStore) -> Result<()> {
     Ok(())
 }
 
+/// Normal operations require v3; v2 is only accepted by migration.
+pub fn require_v3(store: &super::store::KeychainStore) -> Result<()> {
+    check_wrap(store)?;
+    ensure!(
+        store.wrap_v == super::store::WRAP_V3,
+        "wrap v2 requires `vt secret rotate-passcode` before use"
+    );
+    Ok(())
+}
+
 /// One human authorization that can unwrap a store's master: wrap v2 derives
 /// the passcode cipher after the ordinary prompt; wrap v3 binds the evaluated
 /// biometric context to the Secure Enclave key. CLI paths hold one of these
@@ -517,15 +527,20 @@ pub enum MasterAccess {
 }
 
 impl MasterAccess {
-    pub fn open(store: &super::store::KeychainStore, reason: &str) -> Result<Self> {
+    pub fn open_migration(store: &super::store::KeychainStore) -> Result<Self> {
         check_wrap(store)?;
         if store.wrap_v == super::store::WRAP_V2 {
             ensure!(
-                authenticate(reason).is_success(),
-                "Local authentication failed for {reason}"
+                authenticate("rotate passcode").is_success(),
+                "Local authentication failed"
             );
             return Ok(Self::Passcode(Box::new(derive_passcode_cipher(store)?)));
         }
+        Self::open(store, "rotate passcode")
+    }
+
+    pub fn open(store: &super::store::KeychainStore, reason: &str) -> Result<Self> {
+        require_v3(store)?;
         let (blob, _) = store.se_material_bytes()?;
         let (outcome, ctx) = authenticate_ctx(reason);
         ensure!(
@@ -544,9 +559,17 @@ impl MasterAccess {
     /// The raw 32-byte master: the HKDF IKM for every DEK and the SSH-blob
     /// cipher key. Callers derive and drop it in the same scope.
     pub fn master(&self, store: &super::store::KeychainStore) -> Result<Zeroizing<[u8; 32]>> {
+        check_wrap(store)?;
         match self {
-            Self::Passcode(cipher) => unwrap_master_v2(store, cipher),
+            Self::Passcode(cipher) => {
+                ensure!(
+                    store.wrap_v == super::store::WRAP_V2,
+                    "migration source changed"
+                );
+                unwrap_master_v2(store, cipher)
+            }
             Self::Enclave(session) => {
+                require_v3(store)?;
                 let (_, wrapped) = store.se_material_bytes()?;
                 Ok(session.unwrap_master(&wrapped)?)
             }
@@ -567,15 +590,9 @@ pub(super) fn unwrap_master_v2(
     Ok(key)
 }
 
-/// Preflight the stored master before consulting grants or prompting, without
-/// retaining raw key material across a human prompt: v2 unwraps and drops
-/// (deterministic, no prompt); v3 can only check the material's shape.
+/// Preflight the v3 material without unwrapping or prompting.
 pub(crate) fn validate_master_material(store: &super::store::KeychainStore) -> Result<()> {
-    check_wrap(store)?;
-    if store.wrap_v == super::store::WRAP_V2 {
-        drop(unwrap_master_v2(store, &derive_passcode_cipher(store)?)?);
-        return Ok(());
-    }
+    require_v3(store)?;
     let (blob, wrapped) = store.se_material_bytes()?;
     Ok(super::se::check_material(&blob, &wrapped)?)
 }
@@ -651,7 +668,7 @@ pub(super) mod tests {
         let master = AesGcmCrypto::generate_key();
         let store = v2_store(&master);
         check_wrap(&store).unwrap();
-        validate_master_material(&store).unwrap();
+        assert!(validate_master_material(&store).is_err());
         let got = MasterAccess::Passcode(Box::new(derive_passcode_cipher(&store).unwrap()))
             .master(&store)
             .unwrap();
@@ -663,6 +680,14 @@ pub(super) mod tests {
         assert!(derive_passcode_cipher(&v3).is_err());
         let short = KeychainStore::new_v3(&[1u8; 570], &[2u8; 32]);
         assert!(validate_master_material(&short).is_err());
+    }
+
+    #[test]
+    fn v2_is_only_a_migration_source() {
+        let store = v2_store(&[7; 32]);
+        assert!(check_wrap(&store).is_ok());
+        assert!(validate_master_material(&store).is_err());
+        assert!(crate::server_macos::ssh_agent::keys::public_entries(&store).is_err());
     }
 
     #[test]

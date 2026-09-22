@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::audit::{self, AgentAuditContext, AgentAuditEntry, AuditPushConfig};
 use super::authorization::{new_engine, sleep_diverged, SeSessions};
-use super::security::check_wrap;
+use super::security::require_v3;
 use super::store::KeychainStore;
 use crate::core::authorization::{
     AuthorizationEngine, AuthorizationFailure, AuthorizationPermit, AuthorizationRequest,
@@ -1048,7 +1048,7 @@ impl Session for VtSshSession {
         // so no handler has picked an `ErrKind` yet. The client surfaces
         // them as `Transport` via SSH-wire failure.
         let store = KeychainStore::load().map_err(agent_err)?;
-        check_wrap(&store).map_err(agent_err)?;
+        require_v3(&store).map_err(agent_err)?;
         let payload = extension.details.as_ref();
 
         // Dispatch into a per-extension handler that returns either
@@ -1299,7 +1299,7 @@ pub async fn run_ssh_agent(
     // Fail early on an unreadable or foreign store; no key material is
     // loaded until an authorized sign asks for it.
     let store = KeychainStore::load()?;
-    check_wrap(&store)?;
+    require_v3(&store)?;
     tracing::info!(
         "Store wrap v{}, {} SSH identities",
         store.wrap_v,

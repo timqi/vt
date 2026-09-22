@@ -11,8 +11,8 @@ use ssh_key::public::KeyData;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::super::authorization::SeSessions;
-use super::super::security::{derive_passcode_cipher, unwrap_master_v2, validate_master_material};
-use super::super::store::{KeychainStore, WRAP_V2};
+use super::super::security::{require_v3, validate_master_material};
+use super::super::store::KeychainStore;
 use super::scopes::append_reuse_line;
 use super::{
     agent_err, authorization_failure_wire, cache_hit_note_for, fingerprint_str, keys,
@@ -38,21 +38,15 @@ use crate::core::{
     UiStatusRes, SALT_LEN,
 };
 
-/// The master for a permit holder. Wrap v2 unwraps through the passcode
-/// cipher; wrap v3 through the Secure Enclave session the approval left in
-/// `sessions` (`reuse` selects the reusable or the one-shot slot). Callers
-/// derive from the key and drop it in the same scope. A failure here drops
-/// the permit upstream, so no grant is written.
+/// Unwrap for a permit holder through pending or committed SE custody.
+/// A failure drops the permit upstream without creating a grant.
 pub(super) fn master_for(
     sessions: &SeSessions,
     store: &KeychainStore,
     reuse: ReusePolicy,
 ) -> Result<Zeroizing<[u8; 32]>, WireFailure> {
     let not_initialized = |_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED));
-    if store.wrap_v == WRAP_V2 {
-        let cipher = derive_passcode_cipher(store).map_err(not_initialized)?;
-        return unwrap_master_v2(store, &cipher).map_err(not_initialized);
-    }
+    require_v3(store).map_err(not_initialized)?;
     let (_, wrapped) = store.se_material_bytes().map_err(not_initialized)?;
     sessions
         .with_session(reuse, |session| session.unwrap_master(&wrapped))
@@ -351,10 +345,7 @@ impl VtSshSession {
             v2_inputs.push((*t, *salt));
         }
 
-        // Preflight the stored master before consulting reusable authorization
-        // state or prompting (wrap v2 unwraps and drops; wrap v3 checks the
-        // shape). The operation unwraps only after a permit is obtained, so raw
-        // key material is not held across a human prompt.
+        // Preflight the stored shape without unwrapping before authorization.
         validate_master_material(store)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
 
@@ -833,7 +824,7 @@ mod tests {
     use crate::core::authorization::{AuthorizationAuthenticator, AuthorizationEngine};
     use crate::core::crypto::AesGcmCrypto;
     use crate::core::session::AuthOutcome;
-    use crate::server_macos::security::tests::v2_store;
+    use crate::server_macos::se::test_support::software_store;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -869,7 +860,7 @@ mod tests {
     async fn encrypt_requires_authorization() {
         use crate::core::SecretType;
         let master = AesGcmCrypto::generate_key();
-        let store = v2_store(&master);
+        let (store, custody) = software_store(&master);
         let payload = encrypt_payload(vec![SecretType::RAW, SecretType::TOTP]);
 
         let mut session = test_session(0, 0);
@@ -888,6 +879,7 @@ mod tests {
         assert_eq!(err, (ErrKind::BadRequest, Some(DETAIL_BATCH_EMPTY)));
 
         session.authorization = engine(TestAuthenticator);
+        session.se_sessions.put(ReusePolicy::Fresh, custody);
         let ok = session.handle_encrypt(&payload, &store).await.unwrap();
         assert!(
             ok.authorization.is_some(),
@@ -933,7 +925,7 @@ mod tests {
             return;
         }
         let master = AesGcmCrypto::generate_key();
-        let mut store = v2_store(&master);
+        let (mut store, custody) = software_store(&master);
         let privkey = ssh_key::private::PrivateKey::random(
             &mut rand::rngs::OsRng,
             ssh_key::Algorithm::Ed25519,
@@ -956,6 +948,7 @@ mod tests {
         .unwrap();
 
         let session = test_session(0, 0);
+        session.se_sessions.put(ReusePolicy::Fresh, custody);
         assert!(session.keys.read().await.is_empty());
         let loaded = session
             .private_key(&store, &fp, ReusePolicy::Fresh)
