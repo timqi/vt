@@ -95,8 +95,9 @@ backend pin and available portable record.
   still authorizes each request.
 - Forwarded vt grants remain connection-confined; raw forwarding-capable signs
   never cache. Neither can reuse local activity grants.
-- `auth@vt` is always fresh; diagnostics are read-only; encryption needs no
-  operation approval. Direct `ssh -A` of the real agent exposes a broader surface.
+- `auth@vt` is always fresh; diagnostics are read-only; encryption is
+  authorized like decryption. Direct `ssh -A` of the real agent exposes a
+  broader surface.
 - Portable fallback may export a seed into remote memory. Enable forwarding
   only for hosts whose processes should be able to request these operations.
 
