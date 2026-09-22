@@ -26,7 +26,7 @@ pub fn init() -> Result<()> {
 
 /// Export-file cipher: SHA-256(SHA-256(passphrase)).
 fn passphrase_cipher(prompt: &str, echo: &str) -> Result<AesGcmCrypto> {
-    let passphrase = crate::tty::prompt_input_password(prompt, echo)?;
+    let passphrase = Zeroizing::new(crate::tty::prompt_input_password(prompt, echo)?);
     let hash = Sha256::digest(Sha256::digest(passphrase.as_bytes()));
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&hash[..32]);
@@ -36,19 +36,29 @@ fn passphrase_cipher(prompt: &str, echo: &str) -> Result<AesGcmCrypto> {
 pub async fn export_secret() -> Result<()> {
     let store = KeychainStore::load()?;
     let access = MasterAccess::open(&store, "export master secret")?;
-    let master = access.master(&store)?;
-    let export_cipher = passphrase_cipher(
-        "Enter master secret passphrase: ",
-        "Master secret passphrase entered: ",
-    )?;
-    let exported = export_cipher
-        .encrypt(master.as_slice())
-        .context("Failed to encrypt master secret passphrase")?;
+    let exported = export_master(&store, &access, || {
+        passphrase_cipher(
+            "Enter master secret passphrase: ",
+            "Master secret passphrase entered: ",
+        )
+    })?;
     println!(
         "Encrypted master secret passphrase (base64): {}",
         BASE64_URL_SAFE_NO_PAD.encode(exported)
     );
     Ok(())
+}
+
+fn export_master(
+    store: &KeychainStore,
+    access: &MasterAccess,
+    cipher: impl FnOnce() -> Result<AesGcmCrypto>,
+) -> Result<Vec<u8>> {
+    let cipher = cipher()?;
+    let master = access.master(store)?;
+    cipher
+        .encrypt(master.as_slice())
+        .context("Failed to encrypt master secret passphrase")
 }
 
 pub async fn import_secret() -> Result<()> {
@@ -96,4 +106,23 @@ pub async fn rotate_passcode() -> Result<()> {
         running, restart it so its approval sessions bind to the new key."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_prompts_before_unwrapping() {
+        let access =
+            MasterAccess::Enclave(crate::server_macos::se::test_support::software_session());
+        let store = KeychainStore::new_v3(&[1; 8], &[2; 113]);
+        let mut prompted = false;
+        assert!(export_master(&store, &access, || {
+            prompted = true;
+            anyhow::bail!("cancelled passphrase prompt")
+        })
+        .is_err());
+        assert!(prompted, "unwrap must not precede the passphrase prompt");
+    }
 }
