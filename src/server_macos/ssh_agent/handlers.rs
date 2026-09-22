@@ -182,9 +182,8 @@ impl VtSshSession {
             .ok_or((ErrKind::Generic, Some(DETAIL_SIGN_KEY_NOT_IN_AGENT)))
     }
 
-    /// Fresh approval for an `ssh-add` key-store mutation, returning the
-    /// permit and a resolver the blocking store write calls for the master
-    /// (so raw key material is unwrapped only inside that task).
+    /// Fresh approval and the resolver used by the synchronous store update.
+    /// The permit remains alive until both disk and RAM mutations finish.
     pub(super) async fn keystore_master(
         &self,
         prompt: &str,

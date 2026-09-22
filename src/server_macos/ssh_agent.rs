@@ -57,26 +57,16 @@ fn agent_err(e: anyhow::Error) -> AgentError {
 
 // --- Key storage: see `keys.rs` -----------------------------------------------
 
-/// `with_ssh_keys` off the runtime, mapped to an SSH-wire failure. Agent
-/// callers touch their in-memory keys only after this returns Ok, so the
-/// Keychain and the agent never disagree about what is stored. `master`
-/// resolves the store's master inside the blocking task (the SE session or
-/// the v2 passcode), so raw key material never waits on the async side.
-async fn persist_ssh_keys(
-    master: impl FnOnce(&KeychainStore) -> Result<Zeroizing<[u8; 32]>> + Send + 'static,
-    f: impl FnOnce(&mut Vec<SshKeyEntry>) -> Result<bool> + Send + 'static,
+/// Complete the socket mutation synchronously within the permit's lifetime.
+/// Store locking and Keychain access refuse waits for locks or human input.
+fn persist_ssh_keys(
+    master: impl FnOnce(&KeychainStore) -> Result<Zeroizing<[u8; 32]>>,
+    f: impl FnOnce(&mut Vec<SshKeyEntry>) -> Result<bool>,
 ) -> Result<(), AgentError> {
-    tokio::task::spawn_blocking(move || {
-        KeychainStore::modify(|store| {
-            let master = master(store)?;
-            keys::modify_ssh_keys(store, &master, f)
-        })
+    KeychainStore::try_modify(|store| {
+        let master = master(store)?;
+        keys::modify_ssh_keys(store, &master, f)
     })
-    .await
-    .map_err(|e| {
-        tracing::warn!("ssh key store task failed: {e}");
-        AgentError::Failure
-    })?
     .map_err(|e| {
         tracing::warn!("ssh key store update failed: {e}");
         AgentError::Failure
@@ -1154,8 +1144,7 @@ impl Session for VtSshSession {
                         key_data: key_openssh_str.to_string(),
                     });
                     Ok(true)
-                })
-                .await?;
+                })?;
                 permit.commit().await.map_err(|_| AgentError::Failure)?;
 
                 // Stored keys enter RAM only through a later authorized sign.
@@ -1174,15 +1163,14 @@ impl Session for VtSshSession {
         let (permit, master) = self
             .keystore_master(&format!("ssh-add: remove key\nkey: {fp_str}"))
             .await?;
+        let mut keys = self.keys.write().await;
         persist_ssh_keys(master, move |entries| {
             entries.retain(|e| e.fingerprint != fp_for_modify);
             Ok(true)
-        })
-        .await?;
-        permit.commit().await.map_err(|_| AgentError::Failure)?;
-
-        let mut keys = self.keys.write().await;
+        })?;
         keys.remove(&fp_str);
+        drop(keys);
+        permit.commit().await.map_err(|_| AgentError::Failure)?;
 
         tracing::info!("Removed SSH key: {}", fp_str);
         Ok(())
@@ -1190,15 +1178,14 @@ impl Session for VtSshSession {
 
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
         let (permit, master) = self.keystore_master("ssh-add: remove all keys").await?;
+        let mut keys = self.keys.write().await;
         persist_ssh_keys(master, |entries| {
             entries.clear();
             Ok(true)
-        })
-        .await?;
-        permit.commit().await.map_err(|_| AgentError::Failure)?;
-
-        let mut keys = self.keys.write().await;
+        })?;
         keys.clear();
+        drop(keys);
+        permit.commit().await.map_err(|_| AgentError::Failure)?;
 
         tracing::info!("Removed all SSH keys");
         Ok(())

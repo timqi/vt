@@ -20,6 +20,17 @@
 
 use anyhow::{anyhow, ensure, Context, Result};
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
+use core_foundation::{
+    base::{CFType, TCFType},
+    boolean::CFBoolean,
+    data::CFData,
+    dictionary::{CFDictionary, CFMutableDictionary},
+    string::CFString,
+};
+use security_framework_sys::{
+    item::*,
+    keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemUpdate},
+};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -118,7 +129,11 @@ impl KeychainStore {
         let raw = get_keychain(STORE_NAME).context(
             "failed to read rusty.vault.store from keychain (run `vt init` or `vt secret import`)",
         )?;
-        let store: KeychainStore = serde_json::from_slice(&raw).context(
+        Self::decode(&raw)
+    }
+
+    fn decode(raw: &[u8]) -> Result<Self> {
+        let store: KeychainStore = serde_json::from_slice(raw).context(
             "rusty.vault.store payload is not valid JSON — keychain item may be corrupted",
         )?;
         ensure!(
@@ -149,33 +164,18 @@ impl KeychainStore {
     /// Add-only creation: a racing initializer or unreadable existing item
     /// can never be replaced by init/import.
     pub fn create(&self) -> Result<()> {
-        use core_foundation::{
-            base::TCFType, data::CFData, dictionary::CFDictionary, string::CFString,
-        };
-        use security_framework_sys::item::*;
-        use security_framework_sys::keychain_item::SecItemAdd;
         super::security::require_v3(self)?;
         let json = serde_json::to_vec(self)?;
         let status = unsafe {
-            let query = CFDictionary::from_CFType_pairs(&[
-                (
-                    CFString::wrap_under_get_rule(kSecClass),
-                    CFString::wrap_under_get_rule(kSecClassGenericPassword).as_CFType(),
-                ),
-                (
-                    CFString::wrap_under_get_rule(kSecAttrService),
-                    CFString::new("rusty.vault.store").as_CFType(),
-                ),
-                (
-                    CFString::wrap_under_get_rule(kSecAttrAccount),
-                    CFString::new("prod").as_CFType(),
-                ),
-                (
-                    CFString::wrap_under_get_rule(kSecValueData),
-                    CFData::from_buffer(&json).as_CFType(),
-                ),
-            ]);
-            SecItemAdd(query.as_concrete_TypeRef(), std::ptr::null_mut())
+            let mut query = item_query(false);
+            query.set(
+                CFString::wrap_under_get_rule(kSecValueData),
+                CFData::from_buffer(&json).as_CFType(),
+            );
+            SecItemAdd(
+                query.to_immutable().as_concrete_TypeRef(),
+                std::ptr::null_mut(),
+            )
         };
         ensure!(
             status == 0,
@@ -233,6 +233,47 @@ impl KeychainStore {
         self.encrypted_ssh_keys = Some(BASE64_URL_SAFE_NO_PAD.encode(bytes));
     }
 
+    /// Socket mutations cannot wait for a flock or a Keychain permission UI
+    /// while holding an authorization permit. No task may outlive that permit.
+    pub fn try_modify(f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let _lock = StoreLock::try_from_file(StoreLock::open_lock_file()?)?;
+        let raw = unsafe {
+            let mut query = item_query(true);
+            query.set(
+                CFString::wrap_under_get_rule(kSecReturnData),
+                CFBoolean::true_value().as_CFType(),
+            );
+            let mut result = std::ptr::null();
+            let status =
+                SecItemCopyMatching(query.to_immutable().as_concrete_TypeRef(), &mut result);
+            ensure!(
+                status == 0 && !result.is_null(),
+                "noninteractive Keychain read failed ({status})"
+            );
+            CFData::wrap_under_create_rule(result.cast()).to_vec()
+        };
+        let mut store = Self::decode(&raw)?;
+        super::security::require_v3(&store)?;
+        f(&mut store)?;
+        super::security::require_v3(&store)?;
+        let json = serde_json::to_vec(&store)?;
+        let status = unsafe {
+            let update = CFDictionary::from_CFType_pairs(&[(
+                CFString::wrap_under_get_rule(kSecValueData),
+                CFData::from_buffer(&json).as_CFType(),
+            )]);
+            SecItemUpdate(
+                item_query(true).to_immutable().as_concrete_TypeRef(),
+                update.as_concrete_TypeRef(),
+            )
+        };
+        ensure!(
+            status == 0,
+            "noninteractive Keychain update failed ({status})"
+        );
+        Ok(())
+    }
+
     /// Acquire the cross-process write lock, load the store, run `f`, then
     /// save. Used for user-triggered RMW operations (ssh add/remove,
     /// rotate-passcode). Blocks if another vt process
@@ -247,6 +288,38 @@ impl KeychainStore {
         store.save()?;
         Ok(())
     }
+}
+
+// Security.framework constants not exported by security-framework-sys.
+#[link(name = "Security", kind = "framework")]
+extern "C" {
+    static kSecUseAuthenticationUI: core_foundation::string::CFStringRef;
+    static kSecUseAuthenticationUIFail: core_foundation::string::CFStringRef;
+}
+
+fn item_query(no_ui: bool) -> CFMutableDictionary<CFString, CFType> {
+    let mut query = CFMutableDictionary::new();
+    unsafe {
+        query.set(
+            CFString::wrap_under_get_rule(kSecClass),
+            CFString::wrap_under_get_rule(kSecClassGenericPassword).as_CFType(),
+        );
+        query.set(
+            CFString::wrap_under_get_rule(kSecAttrService),
+            CFString::new("rusty.vault.store").as_CFType(),
+        );
+        query.set(
+            CFString::wrap_under_get_rule(kSecAttrAccount),
+            CFString::new("prod").as_CFType(),
+        );
+        if no_ui {
+            query.set(
+                CFString::wrap_under_get_rule(kSecUseAuthenticationUI),
+                CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).as_CFType(),
+            );
+        }
+    }
+    query
 }
 
 fn lock_path() -> PathBuf {
@@ -274,6 +347,12 @@ impl StoreLock {
             .with_context(|| format!("failed to open lock file {}", lock_path().display()))
     }
 
+    fn try_from_file(file: std::fs::File) -> Result<Self> {
+        file.try_lock()
+            .map_err(|_| anyhow!("keychain store is busy"))?;
+        Ok(Self { file })
+    }
+
     fn acquire_blocking() -> Result<Self> {
         let file = Self::open_lock_file()?;
         file.lock()
@@ -291,6 +370,38 @@ impl Drop for StoreLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_mutation_refuses_a_busy_store_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "vt-review-lock-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let first = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        first.lock().unwrap();
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            first.unlock().unwrap();
+        });
+        let result = StoreLock::try_from_file(second);
+        release.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            result.is_err(),
+            "a permit holder must refuse contention, never wait for the flock"
+        );
+    }
 
     #[test]
     fn creation_requires_confirmed_absence() {
