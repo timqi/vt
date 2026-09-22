@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use ssh_key::private::PrivateKey;
 use zeroize::Zeroizing;
@@ -23,10 +23,20 @@ pub struct SshKeyEntry {
     pub key_data: String,
 }
 
+fn parse_private(entry: &SshKeyEntry) -> Result<PrivateKey> {
+    let key = PrivateKey::from_openssh(entry.key_data.as_bytes())
+        .context("stored SSH private key does not parse")?;
+    ensure!(
+        key.fingerprint(ssh_key::HashAlg::Sha256).to_string() == entry.fingerprint
+            && key.algorithm().to_string() == entry.algorithm,
+        "stored SSH private key identity mismatch"
+    );
+    Ok(key)
+}
+
 /// The public half of a private entry, for the plaintext list.
 pub fn public_entry(entry: &SshKeyEntry) -> Result<SshPublicEntry> {
-    let privkey = PrivateKey::from_openssh(entry.key_data.as_bytes())
-        .with_context(|| format!("stored SSH key {} does not parse", entry.fingerprint))?;
+    let privkey = parse_private(entry)?;
     Ok(SshPublicEntry {
         fingerprint: entry.fingerprint.clone(),
         algorithm: entry.algorithm.clone(),
@@ -66,6 +76,14 @@ fn encode_ssh_keys_into(
 /// List plaintext public halves without opening the master.
 pub fn public_entries(store: &KeychainStore) -> Result<Vec<SshPublicEntry>> {
     require_v3(store)?;
+    for entry in &store.ssh_public_keys {
+        let key = ssh_key::PublicKey::from_openssh(&entry.public_key)?;
+        ensure!(
+            key.fingerprint(ssh_key::HashAlg::Sha256).to_string() == entry.fingerprint
+                && key.algorithm().to_string() == entry.algorithm,
+            "stored SSH public key identity mismatch"
+        );
+    }
     Ok(store.ssh_public_keys.clone())
 }
 
@@ -78,23 +96,23 @@ pub fn load_private_keys(
 ) -> Result<HashMap<String, PrivateKey>> {
     let mut keys = HashMap::new();
     for entry in &decode_ssh_keys(store, master)? {
-        match PrivateKey::from_openssh(entry.key_data.as_bytes()) {
-            Ok(privkey) => {
-                require_ed25519(&privkey).map_err(|e| {
-                    anyhow::anyhow!(
-                        "stored SSH key {}: {e}; remove it with `vt ssh remove {}`",
-                        entry.fingerprint,
-                        entry.fingerprint
-                    )
-                })?;
-                tracing::info!("Loaded SSH key: {} ({})", entry.fingerprint, entry.comment);
-                keys.insert(entry.fingerprint.clone(), privkey);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse SSH key {}: {}", entry.fingerprint, e);
-            }
-        }
+        let privkey = parse_private(entry)?;
+        require_ed25519(&privkey)?;
+        ensure!(
+            keys.insert(entry.fingerprint.clone(), privkey).is_none(),
+            "duplicate stored SSH key"
+        );
     }
+    let public = public_entries(store)?;
+    ensure!(
+        public.len() == keys.len()
+            && public.iter().all(|entry| {
+                keys.get(&entry.fingerprint).is_some_and(|key| {
+                    key.public_key().to_openssh().ok().as_deref() == Some(entry.public_key.as_str())
+                })
+            }),
+        "stored SSH public and private lists disagree"
+    );
     Ok(keys)
 }
 
@@ -266,6 +284,38 @@ mod tests {
         assert!(!ran, "mutation must not run on an unreadable blob");
         assert_eq!(store.encrypted_ssh_keys, before);
         assert!(load_private_keys(&store, &master).is_err());
+    }
+
+    #[test]
+    fn fingerprint_mismatch_cannot_select_another_private_key() {
+        let (mut store, master) = test_store();
+        let mut entry = real_entry("mismatch");
+        entry.fingerprint = real_entry("other").fingerprint.clone();
+        let json = serde_json::to_vec(&vec![entry.clone()]).unwrap();
+        store.set_encrypted_ssh_keys(&AesGcmCrypto::new(&master).unwrap().encrypt(&json).unwrap());
+        assert!(public_entry(&entry).is_err());
+        assert!(load_private_keys(&store, &master).is_err());
+    }
+
+    #[test]
+    fn public_list_mismatch_and_failed_write_fail_closed() {
+        let (mut store, master) = test_store();
+        modify_ssh_keys(&mut store, &master, |entries| {
+            entries.push(real_entry("good"));
+            Ok(true)
+        })
+        .unwrap();
+        let before = serde_json::to_vec(&store).unwrap();
+        assert!(modify_ssh_keys(&mut store, &master, |entries| {
+            entries[0].fingerprint = "SHA256:wrong".into();
+            Ok(true)
+        })
+        .is_err());
+        assert_eq!(serde_json::to_vec(&store).unwrap(), before);
+        store.ssh_public_keys[0] = public_entry(&real_entry("foreign")).unwrap();
+        assert!(load_private_keys(&store, &master).is_err());
+        store.ssh_public_keys[0].fingerprint = "SHA256:wrong".into();
+        assert!(public_entries(&store).is_err());
     }
 
     #[test]
