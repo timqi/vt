@@ -891,6 +891,18 @@ fn err_envelope((kind, detail): WireFailure) -> Result<Zeroizing<Vec<u8>>, Agent
         .map_err(|e| agent_err(e.into()))
 }
 
+fn load_extension_store(
+    name: &str,
+    load: impl FnOnce() -> Result<KeychainStore>,
+) -> Result<Option<KeychainStore>, AgentError> {
+    if name == EXT_DIAG {
+        return Ok(None);
+    }
+    let store = load().map_err(agent_err)?;
+    require_v3(&store).map_err(agent_err)?;
+    Ok(Some(store))
+}
+
 #[async_trait]
 impl Session for VtSshSession {
     /// Public keys come from the store's plaintext list: listing never needs
@@ -1040,15 +1052,14 @@ impl Session for VtSshSession {
             self.touch_activity().await;
         }
 
-        // Load the store once and check its wrap version. The master is
-        // unwrapped on demand inside the handlers, after authorization, so it
-        // only lives across that derivation.
+        // Protected operations load the store once and check its wrap version.
+        // Diagnostics skip Keychain access, including permission dialogs.
+        // The master is unwrapped inside handlers after authorization.
         //
         // Both failure modes here stay unstructured: they precede dispatch,
         // so no handler has picked an `ErrKind` yet. The client surfaces
         // them as `Transport` via SSH-wire failure.
-        let store = KeychainStore::load().map_err(agent_err)?;
-        require_v3(&store).map_err(agent_err)?;
+        let store = load_extension_store(&extension.name, KeychainStore::load)?;
         let payload = extension.details.as_ref();
 
         // Dispatch into a per-extension handler that returns either
@@ -1058,15 +1069,16 @@ impl Session for VtSshSession {
         // never returns `AgentError` for vt-level failures; only true
         // transport-layer failures (e.g. an internal serialize call) bubble
         // up as unstructured.
-        let dispatch: Result<HandlerSuccess, WireFailure> = match extension.name.as_str() {
-            EXT_ENCRYPT => self.handle_encrypt(payload, &store).await,
-            EXT_DECRYPT => self.handle_decrypt(payload, &store).await,
-            EXT_AUTH => self.handle_auth(payload).await,
-            EXT_RUN => self.handle_run(payload).await,
-            EXT_SIGN => self.handle_sign_vt(payload, &store).await,
-            EXT_DIAG => self.handle_diag(payload).await,
-            _ => unreachable!(),
-        };
+        let dispatch: Result<HandlerSuccess, WireFailure> =
+            match (extension.name.as_str(), store.as_ref()) {
+                (EXT_ENCRYPT, Some(store)) => self.handle_encrypt(payload, store).await,
+                (EXT_DECRYPT, Some(store)) => self.handle_decrypt(payload, store).await,
+                (EXT_AUTH, _) => self.handle_auth(payload).await,
+                (EXT_RUN, _) => self.handle_run(payload).await,
+                (EXT_SIGN, Some(store)) => self.handle_sign_vt(payload, store).await,
+                (EXT_DIAG, _) => self.handle_diag(payload).await,
+                _ => return Err(AgentError::Failure),
+            };
 
         // Build the envelope. OK responses use a manual concat so the
         // serialized inner body (which carries DEKs for encrypt/decrypt) is
@@ -1650,6 +1662,39 @@ ZWN0ZWQtdGVzdAEC
     }
 
     // --- Activity-scope classification tests (V2) ---
+
+    #[test]
+    fn diagnostics_skip_keychain_even_when_store_is_unavailable() {
+        let mut read = false;
+        let result = load_extension_store(EXT_DIAG, || {
+            read = true;
+            anyhow::bail!("Keychain requires interaction")
+        });
+        assert!(!read, "diagnostics must never invoke the Keychain reader");
+        assert!(result.unwrap().is_none());
+        assert!(
+            load_extension_store(EXT_DECRYPT, || { anyhow::bail!("unavailable store") }).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_dispatch_without_store_or_idle_activity() {
+        let mut session = test_session(0, 0);
+        let before = *session.last_activity.read().await;
+        let reply = session
+            .extension(Extension {
+                name: EXT_DIAG.into(),
+                details: Unparsed::from(b"{}".to_vec()),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let envelope: ExtResponse<crate::core::DiagRes> =
+            serde_json::from_slice(reply.details.as_ref()).unwrap();
+        assert_eq!(envelope.status, crate::core::wire::Status::Ok);
+        assert!(envelope.data.is_some());
+        assert_eq!(*session.last_activity.read().await, before);
+    }
 
     #[test]
     fn identity_listing_rechecks_lock_after_store_io() {

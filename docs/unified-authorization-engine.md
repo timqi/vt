@@ -103,8 +103,8 @@ See [structured-errors.md](structured-errors.md) and [agent-audit.md](agent-audi
 ## Visibility
 
 `diag@vt` exposes configuration and only grants this caller could reuse; an
-uncacheable caller sees zero. It creates no grant, requires no operation approval,
-emits no audit push, and never resets idle. Polling reveals the agent build and
+uncacheable caller sees zero. It reads no Keychain item, creates no grant,
+requires no operation approval, emits no audit push, and never resets idle. Polling reveals the agent build and
 caller-scoped reuse state without an audit trail.
 
 Only the spawn-token-gated `ui-status@vt` exposes the whole grant list; it may
