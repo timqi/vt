@@ -659,13 +659,16 @@ impl VtSshSession {
         if self.cache_ttls.sign_secs == 0 {
             return (GrantScope::fresh(Operation::Sign), None);
         }
-        if self.peer_is_vt_relay {
-            return (
+        match &self.bind_state {
+            // Forwarding-capable or tainted traffic never reuses, including relays.
+            BindState::Bound {
+                forwarding: true, ..
+            }
+            | BindState::Tainted => (GrantScope::fresh(Operation::Sign), None),
+            _ if self.peer_is_vt_relay => (
                 GrantScope::sign(self.connection_subject, fingerprint, ""),
                 self.connection_label(),
-            );
-        }
-        match &self.bind_state {
+            ),
             BindState::Bound {
                 hostkey_wire,
                 hostkey,
@@ -681,10 +684,6 @@ impl VtSshSession {
                     .clone()
                     .or_else(|| Some(destination_label(hostkey))),
             ),
-            // Forwarding-capable: traffic may originate beyond hop one.
-            BindState::Bound { .. } | BindState::Tainted => {
-                (GrantScope::fresh(Operation::Sign), None)
-            }
             // No bind and the peer is ssh: authentication and forwarding are
             // indistinguishable — Fresh.
             BindState::Unbound if self.peer_is_ssh_client => {
@@ -739,15 +738,15 @@ impl VtSshSession {
         if self.cache_ttls.sign_secs == 0 {
             return ContextBasis::Disabled;
         }
-        if self.peer_is_vt_relay {
-            return self.connection_basis();
-        }
         match &self.bind_state {
+            BindState::Bound {
+                forwarding: true, ..
+            } => ContextBasis::Forwarding,
+            BindState::Tainted => ContextBasis::Tainted,
+            _ if self.peer_is_vt_relay => self.connection_basis(),
             BindState::Bound {
                 forwarding: false, ..
             } => ContextBasis::SessionBind,
-            BindState::Bound { .. } => ContextBasis::Forwarding,
-            BindState::Tainted => ContextBasis::Tainted,
             BindState::Unbound if self.peer_is_ssh_client => ContextBasis::UnboundSsh,
             BindState::Unbound => self.workspace_basis(),
         }
@@ -1257,6 +1256,15 @@ mod tests {
             Some("this relay connection")
         );
         assert_eq!(s.sign_basis(), ContextBasis::RelayConnection);
+        s.bind_state = BindState::Tainted;
+        assert!(!s.raw_sign_scope("fp").0.is_reusable());
+        assert_eq!(s.sign_basis(), ContextBasis::Tainted);
+        s.bind_state = BindState::Unbound;
+        s.bind_state
+            .apply(&test_bind(&test_hostkey(), b"forwarded", true))
+            .unwrap();
+        assert!(!s.raw_sign_scope("fp").0.is_reusable());
+        assert_eq!(s.sign_basis(), ContextBasis::Forwarding);
     }
 
     #[test]
