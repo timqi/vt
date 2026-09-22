@@ -28,6 +28,7 @@ Find the document that owns the task; implementation history stays in Git.
 | What makes the phone/admin interface usable? | [PWA interaction](design/ui-ux.md) |
 | How do errors affect exit codes, fallback, and retries? | [Extension errors](structured-errors.md) |
 | What sealed-box format must the three implementations share? | [Sealed box](sealed-box-v1.md) |
+| Can the Secure Enclave wrap the master key, and what did the spike prove? | [Secure Enclave](secure-enclave.md) |
 
 [AGENTS.md](../AGENTS.md) owns editing rules, documentation standards, and
 validation gates.

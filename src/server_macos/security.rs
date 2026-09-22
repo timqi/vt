@@ -686,6 +686,229 @@ mod tests {
         assert_eq!(classify_la_error(-13), EvalOutcome::TryFallback);
     }
 
+    // ---- Secure Enclave wrap-v3 spike ------------------------------------
+    //
+    // Keychain-less SE key: `kSecAttrIsPermanent = false`, the SE-wrapped
+    // private key (`kSecAttrTokenOID`, ~570 bytes, device-bound) is ours to
+    // store, and `SecKeyCreateWithData` with that attribute rebuilds the
+    // handle. No data-protection keychain, so no restricted entitlement:
+    // ad-hoc and self-signed binaries carrying `keychain-access-groups` are
+    // SIGKILLed by AMFI (-424/-413), and a permanent SE key fails -34018.
+    //
+    // Findings (macOS, Apple Silicon, 2026-09-22; docs/secure-enclave.md):
+    //   Q1 blob round-trips; the ACL (biometryCurrentSet | privateKeyUsage)
+    //      travels inside the blob.
+    //   Q2 one evaluated LAContext bound via `kSecUseAuthenticationContext`
+    //      unwraps repeatedly (~5 ms) with no further prompt, for as long as
+    //      the process holds it (40 s+ observed, no expiry). `invalidate()`
+    //      and even dropping the context do NOT close a warm handle: ctkd
+    //      keeps the last context used on the token authorized until another
+    //      context performs a token op; then the invalidated one fails. A
+    //      never-evaluated context always prompts. Grant revocation must
+    //      therefore drop ctx + handle and treat `invalidate()` as advisory.
+    //   Q3 a rebuilt (new ad-hoc cdhash) binary reloads the blob.
+    //
+    //   cargo test spike_se -- --ignored --nocapture                 # Q1 + Q2
+    //   VT_SPIKE=keep  cargo test spike_se -- --ignored --nocapture  # leave blob
+    //   touch src/main.rs && VT_SPIKE=reuse cargo test spike_se -- --ignored --nocapture  # Q3
+    mod spike_se {
+        use core_foundation::base::{CFType, TCFType, ToVoid};
+        use core_foundation::data::CFData;
+        use core_foundation::dictionary::CFMutableDictionary;
+        use core_foundation::error::{CFError, CFErrorRef};
+        use core_foundation::string::CFString;
+        use objc2::rc::Retained;
+        use objc2_foundation::NSString;
+        use objc2_local_authentication::{LAContext, LAPolicy};
+        use security_framework::access_control::{ProtectionMode, SecAccessControl};
+        use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
+        use security_framework_sys::item::{
+            kSecAttrKeyClass, kSecAttrKeyClassPrivate, kSecAttrKeyType,
+            kSecAttrKeyTypeECSECPrimeRandom, kSecAttrTokenID, kSecAttrTokenIDSecureEnclave,
+            kSecUseAuthenticationContext,
+        };
+        use security_framework_sys::key::SecKeyCreateWithData;
+        use std::time::Instant;
+
+        const STATE: &str = "/tmp/vt-spike-se.bin";
+        const ALG: Algorithm = Algorithm::ECIESEncryptionCofactorVariableIVX963SHA256AESGCM;
+        /// `kSecAttrTokenOID`: not in security-framework-sys.
+        const TOKEN_OID: &str = "toid";
+        // security-framework-sys access_control flags (not re-exported).
+        const BIOMETRY_CURRENT_SET: usize = 1 << 3;
+        const PRIVATE_KEY_USAGE: usize = 1 << 30;
+
+        fn generate() -> SecKey {
+            let ac = SecAccessControl::create_with_protection(
+                Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+                BIOMETRY_CURRENT_SET | PRIVATE_KEY_USAGE,
+            )
+            .expect("access control");
+            let mut opts = GenerateKeyOptions::default();
+            // No `set_location` => kSecAttrIsPermanent false: nothing is
+            // written to any keychain.
+            opts.set_key_type(KeyType::ec())
+                .set_size_in_bits(256)
+                .set_token(Token::SecureEnclave)
+                .set_access_control(ac);
+            SecKey::new(&opts).unwrap_or_else(|e| panic!("Q1 FAIL: SE key generation: {e:?}"))
+        }
+
+        /// The SE-wrapped private key (what CryptoKit calls
+        /// `dataRepresentation`): opaque, device-bound, useless off-SE.
+        fn export_blob(key: &SecKey) -> Vec<u8> {
+            let attrs = key.attributes();
+            let v = attrs
+                .find(CFString::from_static_string(TOKEN_OID).to_void())
+                .expect("Q1 FAIL: no kSecAttrTokenOID on SE key");
+            unsafe { CFData::wrap_under_get_rule(v.cast()) }.to_vec()
+        }
+
+        /// Rebuild the private-key handle. The blob travels as
+        /// `kSecAttrTokenOID`; passing it as the key data instead makes the
+        /// token mint a *new* key (verified). `ctx` binds
+        /// `kSecUseAuthenticationContext`.
+        fn import_blob(blob: &[u8], ctx: Option<&Retained<LAContext>>) -> Result<SecKey, String> {
+            let mut attrs = CFMutableDictionary::<CFType, CFType>::new();
+            unsafe {
+                let s = |r| CFString::wrap_under_get_rule(r).as_CFType();
+                attrs.set(
+                    CFString::from_static_string(TOKEN_OID).as_CFType(),
+                    CFData::from_buffer(blob).as_CFType(),
+                );
+                attrs.set(s(kSecAttrKeyType), s(kSecAttrKeyTypeECSECPrimeRandom));
+                attrs.set(s(kSecAttrKeyClass), s(kSecAttrKeyClassPrivate));
+                attrs.set(s(kSecAttrTokenID), s(kSecAttrTokenIDSecureEnclave));
+                if let Some(ctx) = ctx {
+                    let raw = Retained::as_ptr(ctx) as *const std::os::raw::c_void;
+                    attrs.set(
+                        s(kSecUseAuthenticationContext),
+                        CFType::wrap_under_get_rule(raw),
+                    );
+                }
+                let mut err: CFErrorRef = std::ptr::null_mut();
+                let k = SecKeyCreateWithData(
+                    CFData::from_buffer(&[]).as_concrete_TypeRef(),
+                    attrs.to_immutable().as_concrete_TypeRef(),
+                    &mut err,
+                );
+                if k.is_null() {
+                    return Err(format!("{:?}", CFError::wrap_under_create_rule(err)));
+                }
+                Ok(SecKey::wrap_under_create_rule(k))
+            }
+        }
+
+        fn evaluated_ctx() -> Retained<LAContext> {
+            let ctx = unsafe { LAContext::new() };
+            let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+            let block = block2::RcBlock::new(
+                move |ok: objc2::runtime::Bool, _e: *mut objc2_foundation::NSError| {
+                    let _ = tx.send(ok.as_bool());
+                },
+            );
+            unsafe {
+                ctx.evaluatePolicy_localizedReason_reply(
+                    LAPolicy::DeviceOwnerAuthenticationWithBiometrics,
+                    &NSString::from_str("vt SE spike: unwrap master"),
+                    &block,
+                );
+            }
+            assert!(rx.recv().unwrap(), "Touch ID rejected");
+            ctx
+        }
+
+        fn timed_decrypt(key: &SecKey, ct: &[u8], what: &str) -> Result<Vec<u8>, String> {
+            let t = Instant::now();
+            let r = key.decrypt_data(ALG, ct).map_err(|e| format!("{e:?}"));
+            eprintln!(
+                "{what}: {:?} in {:?}",
+                r.as_ref().map(|_| "ok"),
+                t.elapsed()
+            );
+            r
+        }
+
+        #[test]
+        #[ignore]
+        fn spike_se_wrap_v3() {
+            let mode = std::env::var("VT_SPIKE").unwrap_or_default();
+
+            let (blob, master, ct) = if mode == "reuse" {
+                let state = std::fs::read(STATE).expect("run with VT_SPIKE=keep first");
+                let (master, rest) = state.split_at(32);
+                let (ct, blob) = rest.split_at(65 + 32 + 16); // ECIES: epk + pt + tag
+                (blob.to_vec(), master.to_vec(), ct.to_vec())
+            } else {
+                let k = generate();
+                let blob = export_blob(&k);
+                eprintln!("Q1: SE key generated, blob {} bytes", blob.len());
+                let master: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+                let ct = k
+                    .public_key()
+                    .expect("public key")
+                    .encrypt_data(ALG, &master)
+                    .expect("ECIES encrypt");
+                eprintln!("wrapped: {} -> {} bytes", master.len(), ct.len());
+                (blob, master, ct)
+            };
+
+            // Q1: reload without a context — the system prompts on its own.
+            let k0 = import_blob(&blob, None).expect("Q1 FAIL: SecKeyCreateWithData");
+            let pt = timed_decrypt(&k0, &ct, "unwrap via reloaded blob, no ctx (system prompt)")
+                .expect("Q1 FAIL: decrypt via reloaded blob");
+            assert_eq!(pt, master);
+            eprintln!("Q1 OK: blob round-trips through SecKeyCreateWithData");
+            drop(k0);
+
+            // Q2a: one evaluated context, three unwraps, one prompt.
+            let ctx = evaluated_ctx();
+            let key = import_blob(&blob, Some(&ctx)).expect("import with ctx");
+            for i in 1..=3 {
+                let pt = timed_decrypt(&key, &ct, &format!("unwrap #{i} (same ctx)"))
+                    .expect("Q2 FAIL: decrypt with evaluated ctx");
+                assert_eq!(pt, master);
+            }
+            eprintln!("Q2a: 3 unwraps done — count the prompts you saw (expect 1)");
+
+            // Q2b: does `invalidate()` close the grant? Fresh ciphertext per
+            // probe so no cached ECDH result can masquerade as authorization.
+            let pubk = key.public_key().expect("pub");
+            let probe = |label: &str| {
+                let fresh_ct = pubk.encrypt_data(ALG, &master).unwrap();
+                let held = key.decrypt_data(ALG, &fresh_ct).is_ok();
+                let fresh = import_blob(&blob, Some(&ctx))
+                    .ok()
+                    .and_then(|k| k.decrypt_data(ALG, &fresh_ct).ok())
+                    .is_some();
+                eprintln!("Q2b {label}: held handle ok={held}, fresh import ok={fresh}");
+            };
+            probe("before invalidate");
+            unsafe { ctx.invalidate() };
+            probe("right after invalidate");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            probe("3s after invalidate");
+
+            // Q2c: a never-evaluated context must prompt (no SEP-side grace
+            // window); its token op evicts `ctx` from ctkd's warm slot.
+            let fresh = unsafe { LAContext::new() };
+            let k = import_blob(&blob, Some(&fresh)).expect("import with fresh ctx");
+            let r = timed_decrypt(&k, &ct, "unwrap with NEW unevaluated ctx (expect prompt)");
+            eprintln!("Q2c: {:?}", r.as_ref().map(|_| "ok"));
+            probe("after another ctx did a token op");
+
+            if mode == "keep" {
+                let mut state = master.clone();
+                state.extend_from_slice(&ct);
+                state.extend_from_slice(&blob);
+                std::fs::write(STATE, state).unwrap();
+                eprintln!("kept {STATE}; rebuild, then VT_SPIKE=reuse");
+            } else if mode == "reuse" {
+                eprintln!("Q3 OK: rebuilt binary reloaded the blob");
+            }
+        }
+    }
+
     #[test]
     fn classify_la_unknown_codes_are_rejected() {
         // Be conservative on uncharted codes — don't silently open a fallback

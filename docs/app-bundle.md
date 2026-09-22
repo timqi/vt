@@ -39,6 +39,7 @@ then install this release. Remove obsolete binaries: an old full-store writer
 can put the store back into a format the current release refuses. Store and
 wrap definitions belong to [store.rs](../src/server_macos/store.rs) and
 [crypto.rs](../src/core/crypto.rs).
+Verified Secure Enclave facts for a future wrap v3: [secure-enclave.md](secure-enclave.md).
 
 ## Notifications
 
