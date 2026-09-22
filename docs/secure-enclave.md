@@ -72,6 +72,9 @@ single-prompt unwrap.
   is both the vt approval and the unwrap. A reusable grant holds `(LAContext,
   SecKey)` in memory and revocation drops both; `invalidate()` is advisory,
   never the boundary. Fresh approvals build a new context per operation.
+- Pending approval sessions are isolated from cache-hit sessions and become
+  reusable only when the protected operation commits its grant; cancellation,
+  failure, and failed post-prompt validation drop the pending session.
 - No SE (Intel without T2, VMs, CI) fails closed. Wrap v2 stays readable for
   one release as the migration source, then its test becomes a
   rejected-input test.

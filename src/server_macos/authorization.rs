@@ -33,38 +33,45 @@ pub struct SeSessions {
     /// Behind live reusable grants: written by a `StrictTtl` biometric
     /// approval, read by cache hits, dropped with the grants.
     reusable: Mutex<Option<SeSession>>,
-    /// Left by a `Fresh` biometric approval for the handler that holds its
-    /// permit; prompts are serialized while that permit lives, so nothing
-    /// else can write here before it is taken. Every fresh prompt empties the
-    /// slot first, so a session whose handler never consumed it cannot serve
-    /// a later approval — in particular not a password one.
+    /// A pending biometric session belongs to the serialized approval. It is
+    /// dropped on failure/cancellation or promoted only with a committed grant.
     fresh: Mutex<Option<SeSession>>,
 }
 
 impl SeSessions {
-    /// Called before every prompt: a fresh prompt empties the fresh slot so a
-    /// stale session can never be served to the approval that follows.
-    fn begin_prompt(&self, reuse: ReusePolicy) {
-        if matches!(reuse, ReusePolicy::Fresh) {
-            *self
-                .fresh
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        }
+    /// Called before every prompt to discard any unconsumed pending session.
+    fn begin_prompt(&self, _reuse: ReusePolicy) {
+        *self
+            .fresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
-    fn store(&self, reuse: ReusePolicy, session: SeSession) {
-        let slot = match reuse {
-            ReusePolicy::StrictTtl(_) => &self.reusable,
-            ReusePolicy::Fresh => &self.fresh,
-        };
-        *slot
+    fn store(&self, _reuse: ReusePolicy, session: SeSession) {
+        *self
+            .fresh
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
     }
 
-    /// Run `f` over the session matching the permit's policy. A fresh
-    /// session is consumed; the reusable one stays for later hits.
+    fn complete(&self, reusable: bool) {
+        let pending = self
+            .fresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if reusable {
+            if let Some(session) = pending {
+                *self
+                    .reusable
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
+            }
+        }
+    }
+
+    /// Fresh selects the current approval; StrictTtl is only for cache hits.
+    /// The engine's approval guard owns pending-session cleanup.
     pub fn with_session<R>(
         &self,
         reuse: ReusePolicy,
@@ -81,7 +88,6 @@ impl SeSessions {
                 .fresh
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
                 .as_ref()
                 .map(f),
         }
@@ -104,7 +110,10 @@ impl SeSessions {
 
     #[cfg(test)]
     pub(super) fn put(&self, reuse: ReusePolicy, session: SeSession) {
-        self.store(reuse, session)
+        self.store(reuse, session);
+        if matches!(reuse, ReusePolicy::StrictTtl(_)) {
+            self.complete(true);
+        }
     }
 }
 
@@ -137,6 +146,10 @@ fn bind_session(sessions: &SeSessions, ctx: super::se::BiometricContext, reuse: 
 
 #[async_trait]
 impl AuthorizationAuthenticator for MacAuthenticator {
+    fn approval_complete(&self, reusable: bool) {
+        self.sessions.complete(reusable);
+    }
+
     async fn authenticate(
         &self,
         prompt: &str,
@@ -264,9 +277,7 @@ mod tests {
         assert!(sessions.is_empty());
     }
 
-    /// A stale fresh session (its handler never consumed it) does not survive
-    /// the next fresh prompt, whatever that prompt's outcome; a reusable
-    /// prompt leaves both slots alone.
+    /// Every new prompt clears pending custody without disturbing live hits.
     #[test]
     fn fresh_prompt_empties_the_fresh_slot_first() {
         use super::super::se::test_support::software_session;
@@ -279,17 +290,22 @@ mod tests {
         sessions.begin_prompt(ReusePolicy::Fresh);
         assert!(sessions.with_session(ReusePolicy::Fresh, |_| ()).is_none());
         assert!(sessions.with_session(ttl, |_| ()).is_some());
+        sessions.store(ttl, software_session());
+        assert!(
+            sessions.with_session(ReusePolicy::Fresh, |_| ()).is_some(),
+            "a new approval must use its own pending session"
+        );
     }
 
-    /// A fresh session is consumed by its one permit holder; the reusable
-    /// session survives reads.
+    /// Pending custody survives only until its approval completes.
     #[test]
-    fn fresh_session_is_taken_once_reusable_persists() {
+    fn pending_session_drops_on_failure_reusable_persists() {
         use super::super::se::test_support::software_session;
         let sessions = SeSessions::default();
         assert!(sessions.with_session(ReusePolicy::Fresh, |_| ()).is_none());
         sessions.put(ReusePolicy::Fresh, software_session());
         assert!(sessions.with_session(ReusePolicy::Fresh, |_| ()).is_some());
+        sessions.complete(false);
         assert!(sessions.with_session(ReusePolicy::Fresh, |_| ()).is_none());
         let ttl = ReusePolicy::strict_ttl_secs(30);
         sessions.put(ttl, software_session());

@@ -916,10 +916,11 @@ mod tests {
             master_for(&sessions, &store, fresh).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_UNWRAP))
         );
-        // The one-shot session was consumed by the failed attempt.
+        // The approval guard owns cleanup; repeated access cannot select a
+        // different session while that permit is alive.
         assert_eq!(
             master_for(&sessions, &store, fresh).unwrap_err(),
-            (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION))
+            (ErrKind::NotInitialized, Some(DETAIL_SE_UNWRAP))
         );
     }
 
