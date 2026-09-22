@@ -44,7 +44,9 @@ and [se.rs](../src/server_macos/se.rs).
   to the Secure Enclave key and held in memory as the approval session. A
   reusable grant keeps its session until revocation (lock, idle, screen lock,
   wake, revoke-all) drops it; a fresh approval's session ends with its
-  operation. Password fallback authenticates but cannot unwrap.
+  operation. Password fallback authenticates but cannot unwrap: with Touch ID
+  unavailable (sensor absent, lid closed, biometry locked out) the local agent
+  fails closed and only the Worker transport remains.
 - A blob is bound to this device and the enrolled fingerprint set. After
   enrollment changes or on another Mac, recover with `vt secret import` from
   the exported master; there is no other path.
