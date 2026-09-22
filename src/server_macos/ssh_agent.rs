@@ -6,7 +6,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use ssh_agent_lib::agent::{listen, Agent, Session};
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::extension::SessionBind;
@@ -19,21 +18,22 @@ use ssh_key::{Algorithm, HashAlg, Signature};
 use tokio::sync::{Mutex, RwLock};
 
 use super::audit::{self, AgentAuditContext, AgentAuditEntry, AuditPushConfig};
-use super::authorization::{new_engine, sleep_diverged};
-use super::security::{derive_passcode_cipher, load_mac_cipher};
+use super::authorization::{new_engine, sleep_diverged, SeSessions};
+use super::security::check_wrap;
 use super::store::KeychainStore;
 use crate::core::authorization::{
     AuthorizationEngine, AuthorizationFailure, AuthorizationPermit, AuthorizationRequest,
-    CommitError, Decision, ReusePolicy, SubjectId,
+    CommitError, Decision, GrantScope, ReusePolicy, SubjectId,
 };
-use crate::core::crypto::AesGcmCrypto;
 use crate::core::session::AuthOutcome;
 use crate::core::wire::{outcome_to_err_strict, wrap_ok_envelope, ErrKind, ExtResponse};
 use zeroize::Zeroizing;
 
 mod handlers;
+pub mod keys;
 mod scopes;
 
+pub use keys::SshKeyEntry;
 use scopes::{append_reuse_line, destination_label, BindState, WorkspaceResolution};
 
 #[path = "socket_owner.rs"]
@@ -55,91 +55,32 @@ fn agent_err(e: anyhow::Error) -> AgentError {
     AgentError::Other(Box::new(std::io::Error::other(e.to_string())))
 }
 
-// --- Key storage (lives in `encrypted_ssh_keys` field of rusty.vault.store) ---
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SshKeyEntry {
-    pub fingerprint: String,
-    pub algorithm: String,
-    pub comment: String,
-    /// OpenSSH-format private key (plaintext, encrypted at the keychain level)
-    pub key_data: String,
-}
-
-/// Decode the SSH-keys blob from a loaded store. Returns an empty vec when
-/// the store has no SSH keys yet.
-fn decode_ssh_keys(store: &KeychainStore, cipher: &AesGcmCrypto) -> Result<Vec<SshKeyEntry>> {
-    let Some(encrypted) = store.encrypted_ssh_keys_bytes()? else {
-        return Ok(Vec::new());
-    };
-    let decrypted = cipher.decrypt(&encrypted)?;
-    let entries: Vec<SshKeyEntry> = serde_json::from_slice(&decrypted)?;
-    Ok(entries)
-}
-
-/// Re-encrypt SSH key entries and stash them on the in-memory store. Caller
-/// is responsible for `store.save()` (or going through `KeychainStore::modify`).
-fn encode_ssh_keys_into(
-    store: &mut KeychainStore,
-    cipher: &AesGcmCrypto,
-    entries: &[SshKeyEntry],
-) -> Result<()> {
-    let json = serde_json::to_vec(entries)?;
-    let encrypted = cipher.encrypt(&json)?;
-    store.set_encrypted_ssh_keys(&encrypted);
-    Ok(())
-}
-
-/// The cipher over the SSH-keys blob: the master key unwrapped through the
-/// store's own passcode. Callers drop it as soon as the blob is handled.
-fn ssh_keys_cipher(store: &KeychainStore) -> Result<AesGcmCrypto> {
-    load_mac_cipher(store, &derive_passcode_cipher(store)?)
-}
-
-/// Decrypt the SSH keys of a loaded store; empty when none were stored.
-pub fn load_ssh_keys(store: &KeychainStore) -> Result<Vec<SshKeyEntry>> {
-    decode_ssh_keys(store, &ssh_keys_cipher(store)?)
-}
-
-/// Pure read-modify-write over an in-memory store: decode, let `f` mutate,
-/// re-encode when it reports a change. A blob this binary cannot decrypt or
-/// parse aborts before `f` runs, so an unreadable blob is never overwritten
-/// by an empty or partial one.
-fn modify_ssh_keys(
-    store: &mut KeychainStore,
-    f: impl FnOnce(&mut Vec<SshKeyEntry>) -> Result<bool>,
-) -> Result<()> {
-    let mac_cipher = ssh_keys_cipher(store)?;
-    let mut entries = decode_ssh_keys(store, &mac_cipher)?;
-    if f(&mut entries)? {
-        encode_ssh_keys_into(store, &mac_cipher, &entries)?;
-    }
-    Ok(())
-}
-
-/// The one write path for the SSH key store: `modify_ssh_keys` under the
-/// cross-process flock. Authorization (Touch ID in `ssh_cli`) happens before
-/// this call, never inside it.
-pub fn with_ssh_keys(f: impl FnOnce(&mut Vec<SshKeyEntry>) -> Result<bool>) -> Result<()> {
-    KeychainStore::modify(|store| modify_ssh_keys(store, f))
-}
+// --- Key storage: see `keys.rs` -----------------------------------------------
 
 /// `with_ssh_keys` off the runtime, mapped to an SSH-wire failure. Agent
 /// callers touch their in-memory keys only after this returns Ok, so the
-/// Keychain and the agent never disagree about what is stored.
+/// Keychain and the agent never disagree about what is stored. `master`
+/// resolves the store's master inside the blocking task (the SE session or
+/// the v2 passcode), so raw key material never waits on the async side.
 async fn persist_ssh_keys(
+    master: impl FnOnce(&KeychainStore) -> Result<Zeroizing<[u8; 32]>> + Send + 'static,
     f: impl FnOnce(&mut Vec<SshKeyEntry>) -> Result<bool> + Send + 'static,
 ) -> Result<(), AgentError> {
-    tokio::task::spawn_blocking(move || with_ssh_keys(f))
-        .await
-        .map_err(|e| {
-            tracing::warn!("ssh key store task failed: {e}");
-            AgentError::Failure
-        })?
-        .map_err(|e| {
-            tracing::warn!("ssh key store update failed: {e}");
-            AgentError::Failure
+    tokio::task::spawn_blocking(move || {
+        KeychainStore::modify(|store| {
+            let master = master(store)?;
+            keys::modify_ssh_keys(store, &master, f)
         })
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!("ssh key store task failed: {e}");
+        AgentError::Failure
+    })?
+    .map_err(|e| {
+        tracing::warn!("ssh key store update failed: {e}");
+        AgentError::Failure
+    })
 }
 
 // --- Reuse policy -----------------------------------------------------------
@@ -203,25 +144,13 @@ fn watcher_should_clear(
     sleep_diverged(mono_delta, wall_delta)
 }
 
-/// Wipe the decrypted-key map from RAM and mark `idle_cleared` so the next
-/// interactive request silently reloads (docs/app-bundle.md#key-wiping-and-idle-timeout). The single
-/// source of the "wipe → later silent reload" handshake, shared by the idle
-/// sweeper and the screen-lock/wake watcher so the flag can't be forgotten in
-/// one of them. Returns the number of keys cleared. NOTE: the `ssh-add -x`
-/// lock finalizer clears keys WITHOUT this flag on purpose — it relies on the
-/// `locked` gate (not `idle_cleared`) to refuse reload — so it does not use
-/// this helper.
-async fn clear_keys_for_reload(
-    keys: &Arc<RwLock<HashMap<String, PrivateKey>>>,
-    idle_cleared: &Arc<RwLock<bool>>,
-) -> usize {
+/// Wipe the decrypted-key map from RAM (docs/app-bundle.md#key-wiping-and-idle-timeout).
+/// The next authorized sign reloads through its own approval session; there
+/// is no silent reload. Returns the number of keys cleared.
+async fn clear_private_keys(keys: &Arc<RwLock<HashMap<String, PrivateKey>>>) -> usize {
     let mut guard = keys.write().await;
     let count = guard.len();
-    if count > 0 {
-        guard.clear();
-        drop(guard);
-        *idle_cleared.write().await = true;
-    }
+    guard.clear();
     count
 }
 
@@ -445,34 +374,6 @@ pub fn require_ed25519(privkey: &PrivateKey) -> Result<()> {
     }
 }
 
-/// Load all SSH keys from the keychain store into a HashMap. The store and
-/// derived ciphers are dropped after this returns so the master key does not
-/// linger in memory. A stored key of another type fails the whole load, with
-/// its fingerprint and the `vt ssh remove` remedy; it is never skipped.
-fn load_all_keys() -> Result<HashMap<String, PrivateKey>> {
-    let entries = load_ssh_keys(&KeychainStore::load()?)?;
-    let mut keys = HashMap::new();
-    for entry in &entries {
-        match PrivateKey::from_openssh(entry.key_data.as_bytes()) {
-            Ok(privkey) => {
-                require_ed25519(&privkey).map_err(|e| {
-                    anyhow::anyhow!(
-                        "stored SSH key {}: {e}; remove it with `vt ssh remove {}`",
-                        entry.fingerprint,
-                        entry.fingerprint
-                    )
-                })?;
-                tracing::info!("Loaded SSH key: {} ({})", entry.fingerprint, entry.comment);
-                keys.insert(entry.fingerprint.clone(), privkey);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse SSH key {}: {}", entry.fingerprint, e);
-            }
-        }
-    }
-    Ok(keys)
-}
-
 fn fingerprint_str(key_data: &KeyData) -> String {
     let fp = ssh_key::Fingerprint::new(HashAlg::Sha256, key_data);
     fp.to_string()
@@ -508,8 +409,9 @@ pub struct VtSshAgentFactory {
     /// atomic remains the live authorization validator's fast state source.
     lock_transition: Arc<Mutex<()>>,
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
-    idle_cleared: Arc<RwLock<bool>>,
     authorization: Arc<AuthorizationEngine>,
+    /// Secure Enclave sessions left by approvals (wrap v3 stores).
+    se_sessions: Arc<SeSessions>,
     /// 0 = Fresh (always prompt); named fields prevent sign/decrypt
     /// transposition (see [`AuthCacheTtls`]).
     cache_ttls: AuthCacheTtls,
@@ -532,7 +434,6 @@ pub struct VtSshAgentFactory {
 impl VtSshAgentFactory {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        keys: HashMap<String, PrivateKey>,
         cache_ttls: AuthCacheTtls,
         run_allow: RunAllowlist,
         audit_push: Arc<AuditPushConfig>,
@@ -541,15 +442,15 @@ impl VtSshAgentFactory {
         idle_timeout_secs: u64,
     ) -> Self {
         let locked = Arc::new(AtomicBool::new(false));
-        let authorization = new_engine(Arc::clone(&locked));
+        let (authorization, se_sessions) = new_engine(Arc::clone(&locked));
         Self {
-            keys: Arc::new(RwLock::new(keys)),
+            keys: Arc::new(RwLock::new(HashMap::new())),
             last_activity: Arc::new(RwLock::new((Instant::now(), SystemTime::now()))),
             locked,
             lock_transition: Arc::new(Mutex::new(())),
             lock_passphrase: Arc::new(RwLock::new(None)),
-            idle_cleared: Arc::new(RwLock::new(false)),
             authorization,
+            se_sessions,
             cache_ttls,
             run_allow: Arc::new(run_allow),
             audit_push,
@@ -569,8 +470,8 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             locked: Arc::clone(&self.locked),
             lock_transition: Arc::clone(&self.lock_transition),
             lock_passphrase: Arc::clone(&self.lock_passphrase),
-            idle_cleared: Arc::clone(&self.idle_cleared),
             authorization: Arc::clone(&self.authorization),
+            se_sessions: Arc::clone(&self.se_sessions),
             cache_ttls: self.cache_ttls,
             run_allow: Arc::clone(&self.run_allow),
             audit_push: Arc::clone(&self.audit_push),
@@ -597,8 +498,8 @@ struct VtSshSession {
     locked: Arc<AtomicBool>,
     lock_transition: Arc<Mutex<()>>,
     lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
-    idle_cleared: Arc<RwLock<bool>>,
     authorization: Arc<AuthorizationEngine>,
+    se_sessions: Arc<SeSessions>,
     cache_ttls: AuthCacheTtls,
     /// Cloned per session for cheap reads; the underlying allowlist is
     /// constant for the lifetime of the agent process.
@@ -675,53 +576,6 @@ impl VtSshSession {
             agent_ctx,
         );
         audit::spawn_push(Arc::clone(&self.audit_push), entry);
-    }
-
-    /// Ensure keys are loaded. If they were cleared by the idle sweeper or by
-    /// the screen-lock/sleep watcher (docs/app-bundle.md#key-wiping-and-idle-timeout), silently reload
-    /// from keychain. The unified authorization engine still gates every
-    /// operation before a loaded key can be used.
-    async fn ensure_keys_loaded(&self) -> Result<(), AgentError> {
-        let keys = self.keys.read().await;
-        if !keys.is_empty() {
-            return Ok(());
-        }
-        drop(keys);
-
-        // Check if keys were cleared by idle timeout / lock (vs just empty).
-        let idle = *self.idle_cleared.read().await;
-        if !idle {
-            return Ok(());
-        }
-
-        // Do NOT repopulate RAM while the screen is locked. A sign
-        // here is rejected by the validator anyway; reloading would undo the
-        // lock-wipe. Checked before the keychain I/O to skip a pointless read,
-        // and RE-checked after it (below) because the screen can lock during
-        // the read. `idle_cleared` is left set so a later interactive call
-        // reloads.
-        if !super::security::session_interactive_now() {
-            return Ok(());
-        }
-
-        tracing::info!("Keys cleared (idle/lock), reloading from keychain");
-        let loaded = load_all_keys().map_err(agent_err)?;
-        tracing::info!("Reloaded {} SSH keys", loaded.len());
-        let mut keys = self.keys.write().await;
-        // A lock transition (agent lock OR screen lock) may have started while
-        // Keychain I/O was in progress. Re-check both while holding the same
-        // key-map guard used by lock() so loaded private keys can never be
-        // installed after a clear.
-        if self.locked.load(Ordering::Acquire) || !super::security::session_interactive_now() {
-            return Ok(());
-        }
-        *keys = loaded;
-
-        // Reset idle_cleared flag
-        let mut idle_cleared = self.idle_cleared.write().await;
-        *idle_cleared = false;
-
-        Ok(())
     }
 
     async fn touch_activity(&self) {
@@ -853,6 +707,8 @@ fn spawn_detached(exe: &std::path::Path, args: &[String]) -> std::io::Result<u32
 const DETAIL_BAD_REQUEST_JSON: &str = "request body could not be parsed";
 const DETAIL_UNKNOWN_SECRET_TYPE: &str = "v2 request used an unknown SecretType";
 const DETAIL_NOT_INITIALIZED: &str = "agent store could not be unlocked — run `vt init`";
+const DETAIL_SE_SESSION: &str = "no Secure Enclave session for this approval — approve again";
+const DETAIL_SE_UNWRAP: &str = "Secure Enclave refused to unwrap the master key";
 const DETAIL_AUTH_REJECTED: &str = "authentication was declined";
 const DETAIL_SCREEN_LOCKED: &str = "screen is locked";
 const DETAIL_NO_GUI: &str = "no active GUI session";
@@ -989,25 +845,22 @@ fn err_envelope((kind, detail): WireFailure) -> Result<Zeroizing<Vec<u8>>, Agent
 
 #[async_trait]
 impl Session for VtSshSession {
+    /// Public keys come from the store's plaintext list: listing never needs
+    /// the master. Touch ID is enforced on sign/extension requests.
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
         if self.locked.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
-
-        // Reload keys from keychain if cleared by idle timeout.
-        // Listing public keys is not security-sensitive; Touch ID is
-        // enforced on sign/extension requests.
-        self.ensure_keys_loaded().await?;
-        if self.locked.load(Ordering::Acquire) {
-            return Ok(Vec::new());
-        }
-
-        let keys = self.keys.read().await;
-        let identities = keys
-            .values()
-            .map(|privkey| Identity {
-                pubkey: privkey.public_key().key_data().clone(),
-                comment: privkey.comment().to_string(),
+        let store = KeychainStore::load().map_err(agent_err)?;
+        let identities = keys::public_entries(&store)
+            .map_err(agent_err)?
+            .iter()
+            .filter_map(|entry| {
+                let pubkey = ssh_key::PublicKey::from_openssh(&entry.public_key).ok()?;
+                Some(Identity {
+                    pubkey: pubkey.key_data().clone(),
+                    comment: entry.comment.clone(),
+                })
             })
             .collect();
         Ok(identities)
@@ -1017,28 +870,25 @@ impl Session for VtSshSession {
         if self.locked.load(Ordering::Acquire) {
             return Err(AgentError::Failure);
         }
-
-        self.ensure_keys_loaded().await?;
         self.touch_activity().await;
 
         let fp_str = fingerprint_str(&request.pubkey);
-
-        // Clone the key out and drop the read-lock BEFORE the Touch ID prompt.
-        // Holding the `keys` read-guard across authorization (which can
-        // block on a human for up to ~30s) would starve every writer
-        // (add/remove/unlock) for the prompt's duration — any peer can trigger
-        // SIGN_REQUESTs to weaponize this. (Mirrors handle_sign_vt.)
-        let privkey = {
-            let keys = self.keys.read().await;
-            keys.get(&fp_str).ok_or(AgentError::Failure)?.clone()
-        };
-        let comment = privkey.comment();
+        // The prompt label comes from the plaintext public list; the private
+        // key is loaded only after authorization, through that approval's
+        // master session (no key material or prompt-time Keychain unwrap).
+        let store = KeychainStore::load().map_err(agent_err)?;
+        let comment = keys::public_entries(&store)
+            .map_err(agent_err)?
+            .into_iter()
+            .find(|entry| entry.fingerprint == fp_str)
+            .ok_or(AgentError::Failure)?
+            .comment;
         // Sanitized like the sign@vt key line: the comment is user-set at add
         // time, so it may not inject fake prompt lines.
         let key_label = if comment.is_empty() {
             fp_str.clone()
         } else {
-            sanitize_prompt(comment, 80)
+            sanitize_prompt(&comment, 80)
         };
         // Same layout as the sign@vt prompt (header, then key/caller/dest/
         // reuse truth lines) so the two sign paths read as one UI — raw signs
@@ -1064,11 +914,13 @@ impl Session for VtSshSession {
             ctx
         };
 
+        let reuse = ReusePolicy::from_ttl_secs(self.cache_ttls.sign_secs);
+        let session_reuse = GrantScope::session_policy(std::slice::from_ref(&scope), reuse);
         let permit = match self
             .authorization
             .authorize(AuthorizationRequest::new(
                 vec![scope],
-                ReusePolicy::from_ttl_secs(self.cache_ttls.sign_secs),
+                reuse,
                 auth_message.clone(),
             ))
             .await
@@ -1103,6 +955,10 @@ impl Session for VtSshSession {
             }
         };
 
+        let privkey = self
+            .private_key(&store, &fp_str, session_reuse)
+            .await
+            .map_err(|_| AgentError::Failure)?;
         let signature = sign_data_with_privkey(&privkey, &request.data)?;
         let cache_hit_note = cache_hit_note_for(&permit, "sign", &reuse_label);
         let reuse_remaining = permit.reuse_remaining();
@@ -1176,15 +1032,15 @@ impl Session for VtSshSession {
             self.touch_activity().await;
         }
 
-        // Load the store once, derive the passphrase cipher, drop the
-        // store. Mac_cipher is loaded on demand inside the encrypt/decrypt
-        // arms so the decrypted master key only lives across that operation.
+        // Load the store once and check its wrap version. The master is
+        // unwrapped on demand inside the handlers, after authorization, so it
+        // only lives across that derivation.
         //
         // Both failure modes here stay unstructured: they precede dispatch,
         // so no handler has picked an `ErrKind` yet. The client surfaces
         // them as `Transport` via SSH-wire failure.
         let store = KeychainStore::load().map_err(agent_err)?;
-        let passphrase_cipher = derive_passcode_cipher(&store).map_err(agent_err)?;
+        check_wrap(&store).map_err(agent_err)?;
         let payload = extension.details.as_ref();
 
         // Dispatch into a per-extension handler that returns either
@@ -1195,17 +1051,11 @@ impl Session for VtSshSession {
         // transport-layer failures (e.g. an internal serialize call) bubble
         // up as unstructured.
         let dispatch: Result<HandlerSuccess, WireFailure> = match extension.name.as_str() {
-            EXT_ENCRYPT => {
-                self.handle_encrypt(payload, &store, &passphrase_cipher)
-                    .await
-            }
-            EXT_DECRYPT => {
-                self.handle_decrypt(payload, &store, &passphrase_cipher)
-                    .await
-            }
+            EXT_ENCRYPT => self.handle_encrypt(payload, &store).await,
+            EXT_DECRYPT => self.handle_decrypt(payload, &store).await,
             EXT_AUTH => self.handle_auth(payload).await,
             EXT_RUN => self.handle_run(payload).await,
-            EXT_SIGN => self.handle_sign_vt(payload).await,
+            EXT_SIGN => self.handle_sign_vt(payload, &store).await,
             EXT_DIAG => self.handle_diag(payload).await,
             _ => unreachable!(),
         };
@@ -1280,7 +1130,10 @@ impl Session for VtSshSession {
                 let fp_for_modify = fp_str.clone();
                 let comment_for_modify = comment.clone();
                 let key_openssh_str = key_openssh.to_string();
-                persist_ssh_keys(move |entries| {
+                let (permit, master) = self
+                    .keystore_master(&format!("ssh-add: store key\nkey: {fp_str}"))
+                    .await?;
+                persist_ssh_keys(master, move |entries| {
                     if entries.iter().any(|e| e.fingerprint == fp_for_modify) {
                         return Ok(false);
                     }
@@ -1293,6 +1146,7 @@ impl Session for VtSshSession {
                     Ok(true)
                 })
                 .await?;
+                permit.commit().await.map_err(|_| AgentError::Failure)?;
 
                 let mut keys = self.keys.write().await;
                 keys.insert(fp_str.clone(), private_key);
@@ -1309,11 +1163,15 @@ impl Session for VtSshSession {
         let fp_str = fingerprint_str(&identity.pubkey);
 
         let fp_for_modify = fp_str.clone();
-        persist_ssh_keys(move |entries| {
+        let (permit, master) = self
+            .keystore_master(&format!("ssh-add: remove key\nkey: {fp_str}"))
+            .await?;
+        persist_ssh_keys(master, move |entries| {
             entries.retain(|e| e.fingerprint != fp_for_modify);
             Ok(true)
         })
         .await?;
+        permit.commit().await.map_err(|_| AgentError::Failure)?;
 
         let mut keys = self.keys.write().await;
         keys.remove(&fp_str);
@@ -1323,11 +1181,13 @@ impl Session for VtSshSession {
     }
 
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
-        persist_ssh_keys(|entries| {
+        let (permit, master) = self.keystore_master("ssh-add: remove all keys").await?;
+        persist_ssh_keys(master, |entries| {
             entries.clear();
             Ok(true)
         })
         .await?;
+        permit.commit().await.map_err(|_| AgentError::Failure)?;
 
         let mut keys = self.keys.write().await;
         keys.clear();
@@ -1382,16 +1242,7 @@ impl Session for VtSshSession {
         if !matches {
             return Err(AgentError::Failure);
         }
-        // Reload keys after unlock
-        match load_all_keys() {
-            Ok(loaded) => {
-                let mut keys = self.keys.write().await;
-                *keys = loaded;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to reload keys after unlock: {}", e);
-            }
-        }
+        // Private keys stay cleared: the next authorized sign reloads them.
 
         // A cancelled lock request may have published the locked bit before
         // its caller disappeared. Revoke again before unlocking so no grant
@@ -1437,9 +1288,16 @@ pub async fn run_ssh_agent(
     listener.set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
 
-    // Load keys (cipher is loaded and dropped inside load_all_keys)
-    let keys = load_all_keys()?;
-    tracing::info!("Loaded {} SSH keys", keys.len());
+    // Fail early on an unreadable or foreign store; no key material is
+    // loaded until an authorized sign asks for it.
+    let store = KeychainStore::load()?;
+    check_wrap(&store)?;
+    tracing::info!(
+        "Store wrap v{}, {} SSH identities",
+        store.wrap_v,
+        keys::public_entries(&store)?.len()
+    );
+    drop(store);
 
     if print_env {
         println!("export SSH_AUTH_SOCK={};", socket_path.to_string_lossy());
@@ -1449,7 +1307,6 @@ pub async fn run_ssh_agent(
     let run_allow_empty = run_allow.is_empty();
     let audit_enabled = audit_push.enabled;
     let factory = VtSshAgentFactory::new(
-        keys,
         cache_ttls,
         run_allow,
         audit_push,
@@ -1473,7 +1330,6 @@ pub async fn run_ssh_agent(
     // the silent keychain reload that serves the next request.
     let sweeper_keys = Arc::clone(&factory.keys);
     let sweeper_last = Arc::clone(&factory.last_activity);
-    let sweeper_idle_cleared = Arc::clone(&factory.idle_cleared);
     let sweeper_authorization = Arc::clone(&factory.authorization);
     let sweeper_timeout = idle_timeout;
     tokio::spawn(async move {
@@ -1495,7 +1351,7 @@ pub async fn run_ssh_agent(
                 if dropped > 0 {
                     tracing::info!("Idle timeout, dropped {} auth cache grants", dropped);
                 }
-                let cleared = clear_keys_for_reload(&sweeper_keys, &sweeper_idle_cleared).await;
+                let cleared = clear_private_keys(&sweeper_keys).await;
                 if cleared > 0 {
                     tracing::info!(
                         "Idle timeout ({} min), cleared {} keys from memory",
@@ -1513,7 +1369,6 @@ pub async fn run_ssh_agent(
     // that prompt is in flight.
     let watcher_authorization = Arc::clone(&factory.authorization);
     let watcher_keys = Arc::clone(&factory.keys);
-    let watcher_idle_cleared = Arc::clone(&factory.idle_cleared);
     tokio::spawn(async move {
         let mut was_interactive = super::security::session_interactive_now();
         let mut prev_mono = Instant::now();
@@ -1533,9 +1388,8 @@ pub async fn run_ssh_agent(
                 // Lock/sleep must also wipe decrypted SSH keys from
                 // RAM, not just grants — screen lock does not otherwise clear
                 // them and (with a long idle timeout) they would linger.
-                // `ensure_keys_loaded` reloads silently on the next use once
-                // the screen is interactive again.
-                let cleared = clear_keys_for_reload(&watcher_keys, &watcher_idle_cleared).await;
+                // The next authorized sign reloads them through its approval.
+                let cleared = clear_private_keys(&watcher_keys).await;
                 tracing::info!(
                     "Screen lock / wake: {} grants dropped, {} keys cleared from memory",
                     dropped,
@@ -1614,26 +1468,27 @@ pub async fn start_ssh_agent(
 mod tests {
     use super::*;
     use crate::core::authorization::{
-        AuthorizationAuthenticator, AuthorizationValidator, GrantScope, Operation, ScopeFamily,
-        ValidationError,
+        AuthorizationAuthenticator, AuthorizationValidator, Operation, ScopeFamily, ValidationError,
     };
     use crate::core::session::AuthMethod;
     use crate::core::{ContextBasis, UiStatusReq, UiStatusRes};
 
-    struct TestAuthenticator;
+    pub(super) struct TestAuthenticator;
 
     #[async_trait]
     impl AuthorizationAuthenticator for TestAuthenticator {
         async fn authenticate(
             &self,
             _prompt: &str,
+            _operation: Operation,
+            _reuse: ReusePolicy,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
             AuthOutcome::Success(AuthMethod::Biometric)
         }
     }
 
-    struct TestValidator;
+    pub(super) struct TestValidator;
 
     impl AuthorizationValidator for TestValidator {
         fn validate(
@@ -1789,129 +1644,6 @@ ZWN0ZWQtdGVzdAEC
         require_ed25519(&ed).expect("Ed25519 is the accepted type");
     }
 
-    #[test]
-    fn test_ssh_key_entry_serde_roundtrip() {
-        let entries = vec![
-            SshKeyEntry {
-                fingerprint: "SHA256:abcdef123456".to_string(),
-                algorithm: "ssh-ed25519".to_string(),
-                comment: "test@host".to_string(),
-                key_data: "fake-key-data".to_string(),
-            },
-            SshKeyEntry {
-                fingerprint: "SHA256:xyz789".to_string(),
-                algorithm: "ssh-rsa".to_string(),
-                comment: "another@host".to_string(),
-                key_data: "fake-key-data-2".to_string(),
-            },
-        ];
-        let json = serde_json::to_vec(&entries).unwrap();
-        let decoded: Vec<SshKeyEntry> = serde_json::from_slice(&json).unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].fingerprint, "SHA256:abcdef123456");
-        assert_eq!(decoded[0].algorithm, "ssh-ed25519");
-        assert_eq!(decoded[0].comment, "test@host");
-        assert_eq!(decoded[0].key_data, "fake-key-data");
-        assert_eq!(decoded[1].fingerprint, "SHA256:xyz789");
-    }
-
-    #[test]
-    fn test_ssh_keys_encrypt_decrypt_roundtrip() {
-        let key = AesGcmCrypto::generate_key();
-        let cipher = AesGcmCrypto::new(&key).unwrap();
-
-        let entries = vec![SshKeyEntry {
-            fingerprint: "SHA256:test".to_string(),
-            algorithm: "ssh-ed25519".to_string(),
-            comment: "test".to_string(),
-            key_data:
-                "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----"
-                    .to_string(),
-        }];
-
-        let json = serde_json::to_vec(&entries).unwrap();
-        let encrypted = cipher.encrypt(&json).unwrap();
-        let decrypted = cipher.decrypt(&encrypted).unwrap();
-        let decoded: Vec<SshKeyEntry> = serde_json::from_slice(&decrypted).unwrap();
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].fingerprint, "SHA256:test");
-    }
-
-    #[test]
-    fn test_decode_ssh_keys_returns_empty_when_field_missing() {
-        use super::super::store::KeychainStore;
-        let store = KeychainStore::new(&[0u8; 64], &[1u8; 60]);
-        let key = AesGcmCrypto::generate_key();
-        let cipher = AesGcmCrypto::new(&key).unwrap();
-        let entries = decode_ssh_keys(&store, &cipher).unwrap();
-        assert!(entries.is_empty());
-    }
-
-    /// In-memory store whose master key unwraps under its own passcode, so
-    /// `ssh_keys_cipher` works without the keychain.
-    fn test_store() -> KeychainStore {
-        let mut tokens = Vec::new();
-        tokens.extend_from_slice(&AesGcmCrypto::generate_key());
-        tokens.extend_from_slice(&AesGcmCrypto::generate_key());
-        let mut store = KeychainStore::new(&tokens, &[0u8; 60]);
-        let wrapped = derive_passcode_cipher(&store)
-            .unwrap()
-            .encrypt(&AesGcmCrypto::generate_key())
-            .unwrap();
-        store.encrypted_passphrase = {
-            use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
-            BASE64_URL_SAFE_NO_PAD.encode(wrapped)
-        };
-        store
-    }
-
-    fn test_entry(fp: &str) -> SshKeyEntry {
-        SshKeyEntry {
-            fingerprint: fp.to_string(),
-            algorithm: "ssh-ed25519".to_string(),
-            comment: "test".to_string(),
-            key_data: "fake".to_string(),
-        }
-    }
-
-    #[test]
-    fn test_modify_ssh_keys_roundtrip_and_unchanged_skips_write() {
-        let mut store = test_store();
-        modify_ssh_keys(&mut store, |entries| {
-            entries.push(test_entry("SHA256:a"));
-            Ok(true)
-        })
-        .unwrap();
-        let blob = store.encrypted_ssh_keys.clone();
-        assert!(blob.is_some());
-        assert_eq!(load_ssh_keys(&store).unwrap()[0].fingerprint, "SHA256:a");
-
-        modify_ssh_keys(&mut store, |entries| {
-            entries.clear();
-            Ok(false)
-        })
-        .unwrap();
-        assert_eq!(store.encrypted_ssh_keys, blob, "no change, no re-encrypt");
-    }
-
-    /// A blob this binary cannot decrypt must fail before the mutation runs
-    /// and leave the stored bytes as they were, never re-encoded as empty.
-    #[test]
-    fn test_modify_ssh_keys_refuses_corrupt_blob() {
-        let mut store = test_store();
-        store.set_encrypted_ssh_keys(b"not-a-ciphertext");
-        let before = store.encrypted_ssh_keys.clone();
-        let mut ran = false;
-        let err = modify_ssh_keys(&mut store, |_| {
-            ran = true;
-            Ok(true)
-        });
-        assert!(err.is_err());
-        assert!(!ran, "mutation must not run on an unreadable blob");
-        assert_eq!(store.encrypted_ssh_keys, before);
-        assert!(load_ssh_keys(&store).is_err());
-    }
-
     // --- Activity-scope classification tests (V2) ---
 
     pub(super) fn test_session(sign_ttl: u64, decrypt_ttl: u64) -> VtSshSession {
@@ -1922,8 +1654,8 @@ ZWN0ZWQtdGVzdAEC
             locked: Arc::clone(&locked),
             lock_transition: Arc::new(Mutex::new(())),
             lock_passphrase: Arc::new(RwLock::new(None)),
-            idle_cleared: Arc::new(RwLock::new(false)),
-            authorization: new_engine(locked),
+            authorization: new_engine(locked).0,
+            se_sessions: Arc::new(SeSessions::default()),
             cache_ttls: AuthCacheTtls {
                 sign_secs: sign_ttl,
                 decrypt_secs: decrypt_ttl,

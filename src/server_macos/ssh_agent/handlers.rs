@@ -10,29 +10,58 @@ use ssh_agent_lib::proto::{Extension, Unparsed};
 use ssh_key::public::KeyData;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::super::security::{load_mac_key, validate_mac_key_material};
-use super::super::store::KeychainStore;
+use super::super::authorization::SeSessions;
+use super::super::security::{derive_passcode_cipher, unwrap_master_v2, validate_master_material};
+use super::super::store::{KeychainStore, WRAP_V2};
 use super::scopes::append_reuse_line;
 use super::{
-    agent_err, authorization_failure_wire, cache_hit_note_for, fingerprint_str, sanitize_prompt,
-    sanitize_prompt_exact, sanitize_prompt_multiline, sign_data_with_privkey, spawn_detached,
-    HandlerSuccess, VtSshSession, WireFailure, DETAIL_BAD_REQUEST_JSON, DETAIL_BATCH_EMPTY,
-    DETAIL_BATCH_TOO_LARGE, DETAIL_DISPLAY_FIELD_TOO_LARGE, DETAIL_INTERNAL_SERIALIZE,
-    DETAIL_NOT_INITIALIZED, DETAIL_RUN_ARGV_EMPTY, DETAIL_RUN_ARGV_TOO_LARGE,
-    DETAIL_RUN_ARGV_UNDISPLAYABLE, DETAIL_RUN_DISABLED, DETAIL_RUN_NOT_ALLOWLISTED,
-    DETAIL_RUN_SPAWN_FAILED, DETAIL_SIGN_BAD_PUBKEY, DETAIL_SIGN_FAILED, DETAIL_SIGN_KEYS_LOAD,
+    agent_err, authorization_failure_wire, cache_hit_note_for, fingerprint_str, keys,
+    sanitize_prompt, sanitize_prompt_exact, sanitize_prompt_multiline, sign_data_with_privkey,
+    spawn_detached, HandlerSuccess, VtSshSession, WireFailure, DETAIL_BAD_REQUEST_JSON,
+    DETAIL_BATCH_EMPTY, DETAIL_BATCH_TOO_LARGE, DETAIL_DISPLAY_FIELD_TOO_LARGE,
+    DETAIL_INTERNAL_SERIALIZE, DETAIL_NOT_INITIALIZED, DETAIL_RUN_ARGV_EMPTY,
+    DETAIL_RUN_ARGV_TOO_LARGE, DETAIL_RUN_ARGV_UNDISPLAYABLE, DETAIL_RUN_DISABLED,
+    DETAIL_RUN_NOT_ALLOWLISTED, DETAIL_RUN_SPAWN_FAILED, DETAIL_SE_SESSION, DETAIL_SE_UNWRAP,
+    DETAIL_SIGN_BAD_PUBKEY, DETAIL_SIGN_FAILED, DETAIL_SIGN_KEYS_LOAD,
     DETAIL_SIGN_KEY_NOT_IN_AGENT, DETAIL_UNKNOWN_SECRET_TYPE, MAX_CRYPTO_BATCH,
     PROMPT_COMMAND_MAX_LINES, PROMPT_COMMAND_MAX_LINE_LEN, PROMPT_DISPLAY_MAX_BYTES,
     RUN_PROMPT_ARGV_MAX, RUN_REQ_ARGV_MAX_BYTES,
 };
-use crate::core::authorization::{AuthorizationRequest, GrantScope, Operation, ReusePolicy};
-use crate::core::crypto::{derive_dek, AesGcmCrypto};
+use crate::core::authorization::{
+    AuthorizationPermit, AuthorizationRequest, GrantScope, Operation, ReusePolicy,
+};
+use crate::core::crypto::derive_dek;
 use crate::core::wire::ErrKind;
 use crate::core::{
     AuthReq, AuthRes, DecryptInput, DecryptReq, DecryptResItem, DiagCacheReport, DiagPeerReport,
     DiagReq, DiagRes, EncryptReq, EncryptResItem, RunReq, RunRes, SignReq, SignRes, UiStatusReq,
     UiStatusRes, SALT_LEN,
 };
+
+/// The master for a permit holder. Wrap v2 unwraps through the passcode
+/// cipher; wrap v3 through the Secure Enclave session the approval left in
+/// `sessions` (`reuse` selects the reusable or the one-shot slot). Callers
+/// derive from the key and drop it in the same scope. A failure here drops
+/// the permit upstream, so no grant is written.
+pub(super) fn master_for(
+    sessions: &SeSessions,
+    store: &KeychainStore,
+    reuse: ReusePolicy,
+) -> Result<Zeroizing<[u8; 32]>, WireFailure> {
+    let not_initialized = |_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED));
+    if store.wrap_v == WRAP_V2 {
+        let cipher = derive_passcode_cipher(store).map_err(not_initialized)?;
+        return unwrap_master_v2(store, &cipher).map_err(not_initialized);
+    }
+    let (_, wrapped) = store.se_material_bytes().map_err(not_initialized)?;
+    sessions
+        .with_session(reuse, |session| session.unwrap_master(&wrapped))
+        .ok_or((ErrKind::NotInitialized, Some(DETAIL_SE_SESSION)))?
+        .map_err(|error| {
+            tracing::warn!("{error}");
+            (ErrKind::NotInitialized, Some(DETAIL_SE_UNWRAP))
+        })
+}
 
 fn plural_secrets(n: usize) -> &'static str {
     if n == 1 {
@@ -117,6 +146,89 @@ fn append_meta_lines(message: &mut String, meta: &crate::core::ClientMeta) {
 }
 
 impl VtSshSession {
+    /// The private key for `fp`: from RAM, else every stored private key is
+    /// decrypted through the master this permit unlocked and installed
+    /// (docs/app-bundle.md#key-wiping-and-idle-timeout). Interactivity and agent
+    /// lock are re-checked under the key-map write guard so keys are never
+    /// installed after a clear. The master never crosses an await.
+    pub(super) async fn private_key(
+        &self,
+        store: &KeychainStore,
+        fp: &str,
+        reuse: ReusePolicy,
+    ) -> Result<ssh_key::private::PrivateKey, WireFailure> {
+        if let Some(key) = self.keys.read().await.get(fp) {
+            return Ok(key.clone());
+        }
+        let unsafe_state = || (ErrKind::Generic, Some(DETAIL_SIGN_KEYS_LOAD));
+        if !crate::server_macos::security::session_interactive_now() {
+            return Err(unsafe_state());
+        }
+        let loaded = {
+            let master = master_for(&self.se_sessions, store, reuse)?;
+            keys::load_private_keys(store, &master).map_err(|error| {
+                tracing::warn!("SSH key reload failed: {error}");
+                unsafe_state()
+            })?
+        };
+        let mut keys = self.keys.write().await;
+        if self.locked.load(Ordering::Acquire)
+            || !crate::server_macos::security::session_interactive_now()
+        {
+            return Err(unsafe_state());
+        }
+        tracing::info!("Reloaded {} SSH keys after authorization", loaded.len());
+        *keys = loaded;
+        keys.get(fp)
+            .cloned()
+            .ok_or((ErrKind::Generic, Some(DETAIL_SIGN_KEY_NOT_IN_AGENT)))
+    }
+
+    /// Fresh approval for an `ssh-add` key-store mutation, returning the
+    /// permit and a resolver the blocking store write calls for the master
+    /// (so raw key material is unwrapped only inside that task).
+    pub(super) async fn keystore_master(
+        &self,
+        prompt: &str,
+    ) -> Result<
+        (
+            AuthorizationPermit,
+            impl FnOnce(&KeychainStore) -> Result<Zeroizing<[u8; 32]>> + Send + 'static,
+        ),
+        AgentError,
+    > {
+        let mut auth_message = prompt.to_string();
+        self.append_caller_line(&mut auth_message);
+        let outcome = self
+            .authorization
+            .authorize(AuthorizationRequest::fresh(
+                GrantScope::fresh(Operation::KeyStore),
+                auth_message.clone(),
+            ))
+            .await;
+        let (decision, latency_ms) = match &outcome {
+            Ok(permit) => (permit.decision(), permit.latency_ms()),
+            Err(failure) => (failure.decision(), failure.latency_ms()),
+        };
+        self.emit_audit(
+            "keystore",
+            decision.audit_outcome(),
+            "",
+            &crate::core::ClientMeta::default(),
+            &auth_message,
+            "",
+            0,
+            latency_ms,
+            self.audit_ctx(),
+        );
+        let permit = outcome.map_err(|_| AgentError::Failure)?;
+        let sessions = std::sync::Arc::clone(&self.se_sessions);
+        Ok((permit, move |store: &KeychainStore| {
+            master_for(&sessions, store, ReusePolicy::Fresh)
+                .map_err(|(kind, detail)| anyhow::anyhow!("{kind:?}: {}", detail.unwrap_or("")))
+        }))
+    }
+
     // ---- Structured-envelope dispatch helpers --------------------------------
     //
     // Each `handle_*` returns either the inner JSON body (DEKs included for
@@ -130,7 +242,6 @@ impl VtSshSession {
         &self,
         decrypted: &[u8],
         store: &KeychainStore,
-        passphrase_cipher: &AesGcmCrypto,
     ) -> Result<HandlerSuccess, WireFailure> {
         // v2 envelope: agent allocates a fresh per-record (salt, DEK) pair
         // for each requested SecretType. The agent NEVER receives plaintext
@@ -143,8 +254,73 @@ impl VtSshSession {
         if req.types.len() > MAX_CRYPTO_BATCH {
             return Err((ErrKind::BadRequest, Some(DETAIL_BATCH_TOO_LARGE)));
         }
-        let mac_key = load_mac_key(store, passphrase_cipher)
+        if req.types.is_empty() {
+            return Err((ErrKind::BadRequest, Some(DETAIL_BATCH_EMPTY)));
+        }
+        validate_master_material(store)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
+
+        // Minting a DEK releases key material like decrypt does, so it is
+        // authorized under the decrypt TTL with the same scope families; one
+        // scope per requested type. EncryptReq carries no client meta, so the
+        // prompt is agent truth only.
+        let n = req.types.len();
+        let mut auth_message = format!("encrypt {} {}", n, plural_secrets(n));
+        self.append_relay_origin(&mut auth_message);
+        self.append_caller_line(&mut auth_message);
+        let (scopes, reuse_label) = self.encrypt_scopes(&req.types);
+        let display = reuse_label.clone().unwrap_or_default();
+        let scopes: Vec<GrantScope> = scopes
+            .into_iter()
+            .map(|scope| scope.with_display(display.clone()))
+            .collect();
+        append_reuse_line(
+            &mut auth_message,
+            &reuse_label,
+            self.cache_ttls.decrypt_secs,
+        );
+        let reuse = ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs);
+        let session_reuse = GrantScope::session_policy(&scopes, reuse);
+        let audit_ctx = self.audit_ctx_scoped(
+            scopes.first().and_then(GrantScope::family),
+            &reuse_label,
+            self.cache_ttls.decrypt_secs,
+        );
+        let permit = match self
+            .authorization
+            .authorize(AuthorizationRequest::new(scopes, reuse, auth_message))
+            .await
+        {
+            Ok(permit) => {
+                self.emit_audit(
+                    "encrypt",
+                    permit.decision().audit_outcome(),
+                    "",
+                    &crate::core::ClientMeta::default(),
+                    "",
+                    "",
+                    n,
+                    permit.latency_ms(),
+                    audit_ctx,
+                );
+                permit
+            }
+            Err(failure) => {
+                self.emit_audit(
+                    "encrypt",
+                    failure.decision().audit_outcome(),
+                    "",
+                    &crate::core::ClientMeta::default(),
+                    "",
+                    "",
+                    n,
+                    failure.latency_ms(),
+                    audit_ctx,
+                );
+                return Err(authorization_failure_wire(&failure));
+            }
+        };
+        let mac_key = master_for(&self.se_sessions, store, session_reuse)?;
         let mut result: Vec<EncryptResItem> = Vec::with_capacity(req.types.len());
         for _t in &req.types {
             let mut salt = [0u8; SALT_LEN];
@@ -164,28 +340,14 @@ impl VtSshSession {
         for item in result.iter_mut() {
             item.dek.zeroize();
         }
-        // encrypt@vt has no Touch ID gate; record the mint as `approved` so the
-        // audit shows "agent minted N DEKs". EncryptReq carries no client meta,
-        // so host/meta are empty. latency 0 (no prompt).
-        self.emit_audit(
-            "encrypt",
-            "approved",
-            "",
-            &crate::core::ClientMeta::default(),
-            "",
-            "",
-            req.types.len(),
-            0,
-            self.audit_ctx(),
-        );
-        Ok(HandlerSuccess::without_authorization(Zeroizing::new(bytes)))
+        let note = cache_hit_note_for(&permit, "encrypt", &reuse_label);
+        Ok(HandlerSuccess::authorized(Zeroizing::new(bytes), permit).with_cache_hit_note(note))
     }
 
     pub(super) async fn handle_decrypt(
         &self,
         decrypted: &[u8],
         store: &KeychainStore,
-        passphrase_cipher: &AesGcmCrypto,
     ) -> Result<HandlerSuccess, WireFailure> {
         let req: DecryptReq = serde_json::from_slice(decrypted)
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_BAD_REQUEST_JSON)))?;
@@ -218,14 +380,11 @@ impl VtSshSession {
             v2_inputs.push((*t, *salt));
         }
 
-        // Verify that the stored master key is present and decryptable before
-        // consulting reusable authorization state or prompting. Drop this
-        // short-lived copy immediately; the operation reloads it only after a
-        // permit is obtained, so raw key material is not held across a human
-        // prompt. Validation is deterministic over the already-loaded store
-        // and passphrase cipher, making the later load a non-fallible
-        // precondition in normal operation while retaining defensive mapping.
-        validate_mac_key_material(store, passphrase_cipher)
+        // Preflight the stored master before consulting reusable authorization
+        // state or prompting (wrap v2 unwraps and drops; wrap v3 checks the
+        // shape). The operation unwraps only after a permit is obtained, so raw
+        // key material is not held across a human prompt.
+        validate_master_material(store)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
 
         let who = header_who(&req.meta, &req.host);
@@ -251,6 +410,7 @@ impl VtSshSession {
             self.cache_ttls.decrypt_secs,
         );
         let reuse = ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs);
+        let session_reuse = GrantScope::session_policy(&scopes, reuse);
         let audit_ctx = self.audit_ctx_scoped(
             scopes.first().and_then(GrantScope::family),
             &reuse_label,
@@ -300,8 +460,7 @@ impl VtSshSession {
                 return Err(authorization_failure_wire(&failure));
             }
         };
-        let mac_key = load_mac_key(store, passphrase_cipher)
-            .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
+        let mac_key = master_for(&self.se_sessions, store, session_reuse)?;
         let mut result: Vec<DecryptResItem> = Vec::with_capacity(req.items.len());
         for DecryptInput::V2 { salt, .. } in req.items {
             result.push(DecryptResItem::V2 {
@@ -660,6 +819,7 @@ impl VtSshSession {
     pub(super) async fn handle_sign_vt(
         &self,
         decrypted: &[u8],
+        store: &KeychainStore,
     ) -> Result<HandlerSuccess, WireFailure> {
         use ssh_agent_lib::ssh_encoding::Decode;
 
@@ -676,20 +836,16 @@ impl VtSshSession {
             .map_err(|_| (ErrKind::BadRequest, Some(DETAIL_SIGN_BAD_PUBKEY)))?;
         let fp_str = fingerprint_str(&key_data);
 
-        // Look up the key. "Not in this agent" is FALLBACK-ELIGIBLE (Generic),
-        // NOT BadRequest — an agent-less/other-key host must be able to fall
-        // back to decrypt-then-sign. Clone the PrivateKey out so the keys
-        // read-lock is not held across the Touch ID prompt.
-        self.ensure_keys_loaded()
-            .await
-            .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_KEYS_LOAD)))?;
-        let privkey = {
-            let keys = self.keys.read().await;
-            match keys.get(&fp_str) {
-                Some(k) => k.clone(),
-                None => return Err((ErrKind::Generic, Some(DETAIL_SIGN_KEY_NOT_IN_AGENT))),
-            }
-        };
+        // Look up the identity in the plaintext public list. "Not in this
+        // agent" is FALLBACK-ELIGIBLE (Generic), NOT BadRequest — an
+        // agent-less/other-key host must be able to fall back to
+        // decrypt-then-sign. The private key is loaded after authorization.
+        let comment = keys::public_entries(store)
+            .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_KEYS_LOAD)))?
+            .into_iter()
+            .find(|entry| entry.fingerprint == fp_str)
+            .ok_or((ErrKind::Generic, Some(DETAIL_SIGN_KEY_NOT_IN_AGENT)))?
+            .comment;
 
         // Rich prompt from vt context (mirrors handle_decrypt formatting).
         let who = header_who(&req.meta, &req.host);
@@ -704,10 +860,10 @@ impl VtSshSession {
         // other prompt field so a control-char/newline comment cannot inject
         // fake lines.
         auth_message.push_str("\nkey: ");
-        if privkey.comment().is_empty() {
+        if comment.is_empty() {
             auth_message.push_str(&fp_str);
         } else {
-            auth_message.push_str(&sanitize_prompt(privkey.comment(), 80));
+            auth_message.push_str(&sanitize_prompt(&comment, 80));
         }
         // Reuse line before the client-reported body/meta — same padding
         // rationale as the relay origin marker.
@@ -734,13 +890,11 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
+        let reuse = ReusePolicy::from_ttl_secs(self.cache_ttls.sign_secs);
+        let session_reuse = GrantScope::session_policy(std::slice::from_ref(&scope), reuse);
         let permit = match self
             .authorization
-            .authorize(AuthorizationRequest::new(
-                vec![scope],
-                ReusePolicy::from_ttl_secs(self.cache_ttls.sign_secs),
-                auth_message,
-            ))
+            .authorize(AuthorizationRequest::new(vec![scope], reuse, auth_message))
             .await
         {
             Ok(permit) => {
@@ -773,6 +927,7 @@ impl VtSshSession {
             }
         };
 
+        let privkey = self.private_key(store, &fp_str, session_reuse).await?;
         let sig = sign_data_with_privkey(&privkey, &req.data)
             .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_FAILED)))?;
         let res = SignRes {
@@ -789,8 +944,162 @@ impl VtSshSession {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{test_session, TestAuthenticator, TestValidator};
     use super::super::RunAllowlist;
     use super::*;
+    use crate::core::authorization::{AuthorizationAuthenticator, AuthorizationEngine};
+    use crate::core::crypto::AesGcmCrypto;
+    use crate::core::session::AuthOutcome;
+    use crate::server_macos::security::tests::v2_store;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    struct RejectingAuthenticator;
+
+    #[async_trait::async_trait]
+    impl AuthorizationAuthenticator for RejectingAuthenticator {
+        async fn authenticate(
+            &self,
+            _prompt: &str,
+            _operation: Operation,
+            _reuse: ReusePolicy,
+            _revocation_pending: Arc<AtomicBool>,
+        ) -> AuthOutcome {
+            AuthOutcome::Rejected
+        }
+    }
+
+    fn engine(
+        authenticator: impl AuthorizationAuthenticator + 'static,
+    ) -> Arc<AuthorizationEngine> {
+        AuthorizationEngine::new(Arc::new(authenticator), Arc::new(TestValidator))
+    }
+
+    fn encrypt_payload(types: Vec<crate::core::SecretType>) -> Vec<u8> {
+        serde_json::to_vec(&EncryptReq { types }).unwrap()
+    }
+
+    /// encrypt@vt passes the engine: a rejected approval mints nothing, an
+    /// approved one returns DEKs derived from the store's master and hands
+    /// the permit up for commit. An empty batch is refused before any prompt.
+    #[tokio::test]
+    async fn encrypt_requires_authorization() {
+        use crate::core::SecretType;
+        let master = AesGcmCrypto::generate_key();
+        let store = v2_store(&master);
+        let payload = encrypt_payload(vec![SecretType::RAW, SecretType::TOTP]);
+
+        let mut session = test_session(0, 0);
+        session.authorization = engine(RejectingAuthenticator);
+        let err = session
+            .handle_encrypt(&payload, &store)
+            .await
+            .err()
+            .expect("rejected");
+        assert_eq!(err.0, ErrKind::AuthRejected);
+        let err = session
+            .handle_encrypt(&encrypt_payload(vec![]), &store)
+            .await
+            .err()
+            .expect("empty batch refused");
+        assert_eq!(err, (ErrKind::BadRequest, Some(DETAIL_BATCH_EMPTY)));
+
+        session.authorization = engine(TestAuthenticator);
+        let ok = session.handle_encrypt(&payload, &store).await.unwrap();
+        assert!(
+            ok.authorization.is_some(),
+            "permit travels to the dispatcher"
+        );
+        let items: Vec<EncryptResItem> = serde_json::from_slice(&ok.bytes).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].dek, derive_dek(&master, &items[0].salt));
+        assert_ne!(items[0].salt, items[1].salt);
+    }
+
+    /// Wrap v3 fails closed without a Secure Enclave session, and with a
+    /// session whose key cannot unwrap the stored ciphertext.
+    #[test]
+    fn master_for_v3_fails_closed_without_usable_session() {
+        use crate::server_macos::se::test_support::software_session;
+        let sessions = SeSessions::default();
+        let store = KeychainStore::new_v3(&[1u8; 8], &[2u8; 113]);
+        let fresh = ReusePolicy::Fresh;
+        assert_eq!(
+            master_for(&sessions, &store, fresh).unwrap_err(),
+            (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION))
+        );
+        sessions.put(fresh, software_session());
+        assert_eq!(
+            master_for(&sessions, &store, fresh).unwrap_err(),
+            (ErrKind::NotInitialized, Some(DETAIL_SE_UNWRAP))
+        );
+        // The one-shot session was consumed by the failed attempt.
+        assert_eq!(
+            master_for(&sessions, &store, fresh).unwrap_err(),
+            (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION))
+        );
+    }
+
+    /// Private keys load on the first authorized sign after a wipe, through
+    /// the store's master; a locked agent never installs them.
+    #[tokio::test]
+    async fn private_key_reloads_lazily_and_respects_lock() {
+        if !crate::server_macos::security::session_interactive_now() {
+            eprintln!("skipped: no interactive GUI session");
+            return;
+        }
+        let master = AesGcmCrypto::generate_key();
+        let mut store = v2_store(&master);
+        let privkey = ssh_key::private::PrivateKey::random(
+            &mut rand::rngs::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let fp = fingerprint_str(privkey.public_key().key_data());
+        let entry = super::super::SshKeyEntry {
+            fingerprint: fp.clone(),
+            algorithm: "ssh-ed25519".into(),
+            comment: "lazy".into(),
+            key_data: privkey
+                .to_openssh(ssh_key::LineEnding::LF)
+                .unwrap()
+                .to_string(),
+        };
+        keys::modify_ssh_keys(&mut store, &master, |entries| {
+            entries.push(entry);
+            Ok(true)
+        })
+        .unwrap();
+
+        let session = test_session(0, 0);
+        assert!(session.keys.read().await.is_empty());
+        let loaded = session
+            .private_key(&store, &fp, ReusePolicy::Fresh)
+            .await
+            .unwrap();
+        assert_eq!(loaded.public_key(), privkey.public_key());
+        assert_eq!(session.keys.read().await.len(), 1);
+        assert!(session
+            .private_key(&store, "SHA256:unknown", ReusePolicy::Fresh)
+            .await
+            .is_err());
+
+        assert_eq!(super::super::clear_private_keys(&session.keys).await, 1);
+        session.locked.store(true, Ordering::Release);
+        assert!(session
+            .private_key(&store, &fp, ReusePolicy::Fresh)
+            .await
+            .is_err());
+        assert!(
+            session.keys.read().await.is_empty(),
+            "no install under lock"
+        );
+        session.locked.store(false, Ordering::Release);
+        assert!(session
+            .private_key(&store, &fp, ReusePolicy::Fresh)
+            .await
+            .is_ok());
+    }
 
     // ── Touch-ID prompt helpers ────────────────────────────────────────────
 

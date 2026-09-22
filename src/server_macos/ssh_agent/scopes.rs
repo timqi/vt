@@ -841,6 +841,52 @@ impl VtSshSession {
         }
     }
 
+    /// Scopes for an encrypt batch: one per distinct requested type, under
+    /// the same activity bases and TTL as decrypt. `EncryptReq` carries no
+    /// pwd, so the workspace consistency check has nothing to compare.
+    pub(super) fn encrypt_scopes(
+        &self,
+        types: &[crate::core::SecretType],
+    ) -> (Vec<GrantScope>, Option<String>) {
+        let fresh = || vec![GrantScope::fresh(Operation::Encrypt)];
+        if self.cache_ttls.decrypt_secs == 0 {
+            return (fresh(), None);
+        }
+        let mut distinct: Vec<u8> = types.iter().map(|t| t.as_byte()).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let scoped = |family, subject, anchor: &str| -> Vec<GrantScope> {
+            distinct
+                .iter()
+                .map(|t| GrantScope::encrypt(family, Some(subject), anchor, *t))
+                .collect()
+        };
+        if self.confined_to_connection() {
+            return match self.connection_subject {
+                Some(subject) => (
+                    scoped(ScopeFamily::Connection, subject, ""),
+                    self.connection_label(),
+                ),
+                None => (fresh(), None),
+            };
+        }
+        match self.reusable_scope("") {
+            Some(basis @ ScopedBasis::Git(ws)) => (
+                scoped(ScopeFamily::Workspace, ws.subject, ws.root_str()),
+                Some(scoped_label(basis)),
+            ),
+            Some(basis @ ScopedBasis::Cwd(ws)) => (
+                scoped(ScopeFamily::CwdFallback, ws.subject, ws.root_str()),
+                Some(scoped_label(basis)),
+            ),
+            Some(basis @ ScopedBasis::App(app)) => (
+                scoped(ScopeFamily::ParentApp, app.subject, &app.exe),
+                Some(scoped_label(basis)),
+            ),
+            None => (fresh(), None),
+        }
+    }
+
     /// Agent-derived audit context shared by every row: kernel peer identity
     /// and relay provenance. Operation-specific fields (key, destination,
     /// scope) start empty — see `audit_ctx_scoped` and the sign handlers.

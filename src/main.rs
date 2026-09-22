@@ -306,7 +306,7 @@ pub enum SshCommands {
         auth_cache_duration: Option<u64>,
         #[arg(
             long = "decrypt-auth-cache-duration",
-            help = "Decrypt approval reuse duration in seconds; 0 (default) = prompt every time. Grants bind to the caller's git workspace (kernel-derived), or per relay connection when forwarded. Kept separate from the sign duration because a cached decrypt grant releases per-record DEK material. config.toml [agent].decrypt_auth_cache_duration overrides the default."
+            help = "Decrypt (and encrypt) approval reuse duration in seconds; 0 (default) = prompt every time. Grants bind to the caller's git workspace (kernel-derived), or per relay connection when forwarded. Kept separate from the sign duration because a cached decrypt grant releases per-record DEK material. config.toml [agent].decrypt_auth_cache_duration overrides the default."
         )]
         decrypt_auth_cache_duration: Option<u64>,
         #[arg(
