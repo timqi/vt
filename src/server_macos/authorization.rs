@@ -35,13 +35,24 @@ pub struct SeSessions {
     reusable: Mutex<Option<SeSession>>,
     /// Left by a `Fresh` biometric approval for the handler that holds its
     /// permit; prompts are serialized while that permit lives, so nothing
-    /// else can write here before it is taken. One whose permit never
-    /// materialized (post-prompt validation failed) is unusable without a
-    /// permit and goes at the next revocation or fresh approval.
+    /// else can write here before it is taken. Every fresh prompt empties the
+    /// slot first, so a session whose handler never consumed it cannot serve
+    /// a later approval — in particular not a password one.
     fresh: Mutex<Option<SeSession>>,
 }
 
 impl SeSessions {
+    /// Called before every prompt: a fresh prompt empties the fresh slot so a
+    /// stale session can never be served to the approval that follows.
+    fn begin_prompt(&self, reuse: ReusePolicy) {
+        if matches!(reuse, ReusePolicy::Fresh) {
+            *self
+                .fresh
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
     fn store(&self, reuse: ReusePolicy, session: SeSession) {
         let slot = match reuse {
             ReusePolicy::StrictTtl(_) => &self.reusable,
@@ -83,10 +94,7 @@ impl SeSessions {
             .reusable
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *self
-            .fresh
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.begin_prompt(ReusePolicy::Fresh);
     }
 
     #[cfg(test)]
@@ -139,6 +147,7 @@ impl AuthorizationAuthenticator for MacAuthenticator {
         let prompt = prompt.to_string();
         let sessions = Arc::clone(&self.sessions);
         match tokio::task::spawn_blocking(move || {
+            sessions.begin_prompt(reuse);
             let (outcome, ctx) = authenticate_ctx(&prompt);
             if matches!(outcome, AuthOutcome::Unavailable(_)) {
                 revocation_pending.store(true, Ordering::Release);
@@ -253,6 +262,23 @@ mod tests {
         assert!(!sessions.is_empty());
         engine.invalidate_all().await;
         assert!(sessions.is_empty());
+    }
+
+    /// A stale fresh session (its handler never consumed it) does not survive
+    /// the next fresh prompt, whatever that prompt's outcome; a reusable
+    /// prompt leaves both slots alone.
+    #[test]
+    fn fresh_prompt_empties_the_fresh_slot_first() {
+        use super::super::se::test_support::software_session;
+        let sessions = SeSessions::default();
+        let ttl = ReusePolicy::strict_ttl_secs(30);
+        sessions.put(ReusePolicy::Fresh, software_session());
+        sessions.put(ttl, software_session());
+        sessions.begin_prompt(ttl);
+        assert!(sessions.with_session(ttl, |_| ()).is_some());
+        sessions.begin_prompt(ReusePolicy::Fresh);
+        assert!(sessions.with_session(ReusePolicy::Fresh, |_| ()).is_none());
+        assert!(sessions.with_session(ttl, |_| ()).is_some());
     }
 
     /// A fresh session is consumed by its one permit holder; the reusable
