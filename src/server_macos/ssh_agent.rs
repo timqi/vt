@@ -23,7 +23,7 @@ use super::security::check_wrap;
 use super::store::KeychainStore;
 use crate::core::authorization::{
     AuthorizationEngine, AuthorizationFailure, AuthorizationPermit, AuthorizationRequest,
-    CommitError, Decision, GrantScope, ReusePolicy, SubjectId,
+    CommitError, Decision, ReusePolicy, SubjectId,
 };
 use crate::core::session::AuthOutcome;
 use crate::core::wire::{outcome_to_err_strict, wrap_ok_envelope, ErrKind, ExtResponse};
@@ -578,6 +578,40 @@ impl VtSshSession {
         audit::spawn_push(Arc::clone(&self.audit_push), entry);
     }
 
+    /// Authorize `request` and audit the outcome as one row; the caller maps
+    /// the failure onto its wire. Approved rows land at the human tap, before
+    /// the protected operation runs.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn authorize_audited(
+        &self,
+        request: AuthorizationRequest,
+        op_kind: &str,
+        host: &str,
+        meta: &crate::core::ClientMeta,
+        command: &str,
+        reason: &str,
+        salts: usize,
+        agent_ctx: AgentAuditContext,
+    ) -> Result<AuthorizationPermit, AuthorizationFailure> {
+        let outcome = self.authorization.authorize(request).await;
+        let (decision, latency_ms) = match &outcome {
+            Ok(permit) => (permit.decision(), permit.latency_ms()),
+            Err(failure) => (failure.decision(), failure.latency_ms()),
+        };
+        self.emit_audit(
+            op_kind,
+            decision.audit_outcome(),
+            host,
+            meta,
+            command,
+            reason,
+            salts,
+            latency_ms,
+            agent_ctx,
+        );
+        outcome
+    }
+
     async fn touch_activity(&self) {
         let mut last = self.last_activity.write().await;
         *last = (Instant::now(), SystemTime::now());
@@ -915,48 +949,22 @@ impl Session for VtSshSession {
         };
 
         let reuse = ReusePolicy::from_ttl_secs(self.cache_ttls.sign_secs);
-        let session_reuse = GrantScope::session_policy(std::slice::from_ref(&scope), reuse);
-        let permit = match self
-            .authorization
-            .authorize(AuthorizationRequest::new(
-                vec![scope],
-                reuse,
-                auth_message.clone(),
-            ))
+        let permit = self
+            .authorize_audited(
+                AuthorizationRequest::new(vec![scope], reuse, auth_message.clone()),
+                "sign",
+                "",
+                &crate::core::ClientMeta::default(),
+                &auth_message,
+                "",
+                0,
+                audit_ctx,
+            )
             .await
-        {
-            Ok(permit) => {
-                self.emit_audit(
-                    "sign",
-                    permit.decision().audit_outcome(),
-                    "",
-                    &crate::core::ClientMeta::default(),
-                    &auth_message,
-                    "",
-                    0,
-                    permit.latency_ms(),
-                    audit_ctx,
-                );
-                permit
-            }
-            Err(failure) => {
-                self.emit_audit(
-                    "sign",
-                    failure.decision().audit_outcome(),
-                    "",
-                    &crate::core::ClientMeta::default(),
-                    &auth_message,
-                    "",
-                    0,
-                    failure.latency_ms(),
-                    audit_ctx,
-                );
-                return Err(AgentError::Failure);
-            }
-        };
+            .map_err(|_| AgentError::Failure)?;
 
         let privkey = self
-            .private_key(&store, &fp_str, session_reuse)
+            .private_key(&store, &fp_str, permit.session_policy())
             .await
             .map_err(|_| AgentError::Failure)?;
         let signature = sign_data_with_privkey(&privkey, &request.data)?;
@@ -1468,7 +1476,8 @@ pub async fn start_ssh_agent(
 mod tests {
     use super::*;
     use crate::core::authorization::{
-        AuthorizationAuthenticator, AuthorizationValidator, Operation, ScopeFamily, ValidationError,
+        AuthorizationAuthenticator, AuthorizationValidator, GrantScope, Operation, ScopeFamily,
+        ValidationError,
     };
     use crate::core::session::AuthMethod;
     use crate::core::{ContextBasis, UiStatusReq, UiStatusRes};

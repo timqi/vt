@@ -364,17 +364,6 @@ impl GrantScope {
     pub fn family(&self) -> Option<ScopeFamily> {
         self.key.as_ref().map(|k| k.family)
     }
-
-    /// The policy the authenticator was handed for `scopes` under `reuse`:
-    /// `Fresh` unless every scope can mint a grant. Handlers use it to find
-    /// the key-custody session their approval left behind.
-    pub fn session_policy(scopes: &[GrantScope], reuse: ReusePolicy) -> ReusePolicy {
-        if !scopes.is_empty() && scopes.iter().all(|scope| scope.key.is_some()) {
-            reuse
-        } else {
-            ReusePolicy::Fresh
-        }
-    }
 }
 
 /// One digest input. `Field` is length-prefixed so adjacent variable-width
@@ -728,6 +717,10 @@ pub struct AuthorizationPermit {
     /// Tightest remaining grant lifetime when `decision` is `CacheHit`.
     /// Informational only (cache-hit notifications); never a reuse input.
     reuse_remaining: Option<Duration>,
+    /// What the authenticator was told (`AuthorizationAuthenticator`): the
+    /// request policy when every scope could mint a grant, else `Fresh`.
+    /// Handlers use it to find the key-custody session behind this permit.
+    session_reuse: ReusePolicy,
     pending: Option<PendingGrant>,
     store: Arc<RwLock<GrantStore>>,
     _security: OwnedRwLockReadGuard<()>,
@@ -737,6 +730,10 @@ pub struct AuthorizationPermit {
 impl AuthorizationPermit {
     pub fn decision(&self) -> Decision {
         self.decision
+    }
+
+    pub fn session_policy(&self) -> ReusePolicy {
+        self.session_reuse
     }
 
     pub fn reuse_remaining(&self) -> Option<Duration> {
@@ -862,6 +859,7 @@ impl AuthorizationEngine {
                     decision: Decision::CacheHit,
                     latency_ms: 0,
                     reuse_remaining: lookup.remaining,
+                    session_reuse: request.reuse,
                     pending: None,
                     store: Arc::clone(&self.store),
                     _security: security,
@@ -903,6 +901,7 @@ impl AuthorizationEngine {
                         decision: Decision::CacheHit,
                         latency_ms: 0,
                         reuse_remaining: lookup.remaining,
+                        session_reuse: request.reuse,
                         pending: None,
                         store: Arc::clone(&self.store),
                         _security: security,
@@ -923,7 +922,7 @@ impl AuthorizationEngine {
         let revocation_pending = Arc::clone(&self.revocation_pending);
         let prompt_engine = Arc::clone(self);
         // A request without reusable keys can never mint a grant: tell the
-        // authenticator it is effectively fresh (`GrantScope::session_policy`).
+        // authenticator it is effectively fresh; the permit repeats it.
         let session_reuse = match keys {
             Some(_) => request.reuse,
             None => ReusePolicy::Fresh,
@@ -1001,6 +1000,7 @@ impl AuthorizationEngine {
             decision: Decision::Approved(method),
             latency_ms: started.elapsed().as_millis() as u64,
             reuse_remaining: None,
+            session_reuse,
             pending,
             store: Arc::clone(&self.store),
             _security: security,
@@ -1503,19 +1503,6 @@ mod tests {
         assert!(GrantScope::sign_workspace(subject, "/repo", "fp").is_reusable());
         assert!(!GrantScope::fresh(Operation::Sign).is_reusable());
         assert!(!GrantScope::sign(None, "fp", "/repo").is_reusable());
-        // The key-custody session policy is the request policy only when
-        // every scope can mint a grant — the same rule as `reusable_keys`.
-        let ttl = ReusePolicy::strict_ttl_secs(30);
-        let keyed = GrantScope::sign_workspace(subject, "/repo", "fp");
-        assert_eq!(
-            GrantScope::session_policy(std::slice::from_ref(&keyed), ttl),
-            ttl
-        );
-        assert_eq!(
-            GrantScope::session_policy(&[keyed, GrantScope::fresh(Operation::Sign)], ttl),
-            ReusePolicy::Fresh
-        );
-        assert_eq!(GrantScope::session_policy(&[], ttl), ReusePolicy::Fresh);
     }
 
     /// Pins the exact scope key of every reusable constructor. A digest is
@@ -1746,6 +1733,42 @@ mod tests {
             .expect("oversized TTL must fail authorization");
         assert_eq!(failure.decision(), Decision::Invalidated);
         assert_eq!(auth.calls.load(Ordering::Acquire), 0);
+    }
+
+    /// The permit repeats the policy the authenticator was told: the request
+    /// TTL when every scope can mint a grant (approval and cache hit alike),
+    /// `Fresh` when one cannot — so a key-custody session is looked up in the
+    /// slot the approval wrote.
+    #[tokio::test]
+    async fn permit_session_policy_matches_what_authenticator_saw() {
+        let auth = SuccessAuthenticator::new();
+        let engine = AuthorizationEngine::new(auth.clone(), AllowValidator::allowed());
+        let ttl = ReusePolicy::strict_ttl_secs(120);
+        let permit = engine.authorize(sign_request((1, 2), "fp")).await.unwrap();
+        assert_eq!(permit.session_policy(), ttl);
+        permit.commit().await.unwrap();
+        let hit = engine.authorize(sign_request((1, 2), "fp")).await.unwrap();
+        assert_eq!(hit.decision(), Decision::CacheHit);
+        assert_eq!(hit.session_policy(), ttl);
+        drop(hit);
+
+        let mixed = AuthorizationRequest::new(
+            vec![sign_scope((1, 2), "fp"), GrantScope::fresh(Operation::Sign)],
+            ttl,
+            "sign",
+        );
+        let permit = engine.authorize(mixed).await.unwrap();
+        assert_eq!(permit.session_policy(), ReusePolicy::Fresh);
+        // A live permit holds the prompt permit: release it before the next one.
+        drop(permit);
+        let permit = engine
+            .authorize(AuthorizationRequest::fresh(
+                GrantScope::fresh(Operation::Auth),
+                "auth",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(permit.session_policy(), ReusePolicy::Fresh);
     }
 
     #[tokio::test]

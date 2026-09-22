@@ -131,6 +131,18 @@ enum ScopedBasis<'a> {
     App(&'a AppIdentity),
 }
 
+impl<'a> ScopedBasis<'a> {
+    /// `(family, kernel subject, anchor)`: the identity every scope built on
+    /// this basis digests (workspace / cwd canonical root, parent exe path).
+    fn parts(self) -> (ScopeFamily, SubjectId, &'a str) {
+        match self {
+            ScopedBasis::Git(ws) => (ScopeFamily::Workspace, ws.subject, ws.root_str()),
+            ScopedBasis::Cwd(ws) => (ScopeFamily::CwdFallback, ws.subject, ws.root_str()),
+            ScopedBasis::App(app) => (ScopeFamily::ParentApp, app.subject, &app.exe),
+        }
+    }
+}
+
 /// How the connection's workspace resolution ended, kept for diag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum WorkspaceResolution {
@@ -871,18 +883,10 @@ impl VtSshSession {
             };
         }
         match self.reusable_scope("") {
-            Some(basis @ ScopedBasis::Git(ws)) => (
-                scoped(ScopeFamily::Workspace, ws.subject, ws.root_str()),
-                Some(scoped_label(basis)),
-            ),
-            Some(basis @ ScopedBasis::Cwd(ws)) => (
-                scoped(ScopeFamily::CwdFallback, ws.subject, ws.root_str()),
-                Some(scoped_label(basis)),
-            ),
-            Some(basis @ ScopedBasis::App(app)) => (
-                scoped(ScopeFamily::ParentApp, app.subject, &app.exe),
-                Some(scoped_label(basis)),
-            ),
+            Some(basis) => {
+                let (family, subject, anchor) = basis.parts();
+                (scoped(family, subject, anchor), Some(scoped_label(basis)))
+            }
             None => (fresh(), None),
         }
     }

@@ -199,29 +199,22 @@ impl VtSshSession {
     > {
         let mut auth_message = prompt.to_string();
         self.append_caller_line(&mut auth_message);
-        let outcome = self
-            .authorization
-            .authorize(AuthorizationRequest::fresh(
-                GrantScope::fresh(Operation::KeyStore),
-                auth_message.clone(),
-            ))
-            .await;
-        let (decision, latency_ms) = match &outcome {
-            Ok(permit) => (permit.decision(), permit.latency_ms()),
-            Err(failure) => (failure.decision(), failure.latency_ms()),
-        };
-        self.emit_audit(
-            "keystore",
-            decision.audit_outcome(),
-            "",
-            &crate::core::ClientMeta::default(),
-            &auth_message,
-            "",
-            0,
-            latency_ms,
-            self.audit_ctx(),
-        );
-        let permit = outcome.map_err(|_| AgentError::Failure)?;
+        let permit = self
+            .authorize_audited(
+                AuthorizationRequest::fresh(
+                    GrantScope::fresh(Operation::KeyStore),
+                    auth_message.clone(),
+                ),
+                "keystore",
+                "",
+                &crate::core::ClientMeta::default(),
+                &auth_message,
+                "",
+                0,
+                self.audit_ctx(),
+            )
+            .await
+            .map_err(|_| AgentError::Failure)?;
         let sessions = std::sync::Arc::clone(&self.se_sessions);
         Ok((permit, move |store: &KeychainStore| {
             master_for(&sessions, store, ReusePolicy::Fresh)
@@ -280,47 +273,25 @@ impl VtSshSession {
             self.cache_ttls.decrypt_secs,
         );
         let reuse = ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs);
-        let session_reuse = GrantScope::session_policy(&scopes, reuse);
         let audit_ctx = self.audit_ctx_scoped(
             scopes.first().and_then(GrantScope::family),
             &reuse_label,
             self.cache_ttls.decrypt_secs,
         );
-        let permit = match self
-            .authorization
-            .authorize(AuthorizationRequest::new(scopes, reuse, auth_message))
+        let permit = self
+            .authorize_audited(
+                AuthorizationRequest::new(scopes, reuse, auth_message),
+                "encrypt",
+                "",
+                &crate::core::ClientMeta::default(),
+                "",
+                "",
+                n,
+                audit_ctx,
+            )
             .await
-        {
-            Ok(permit) => {
-                self.emit_audit(
-                    "encrypt",
-                    permit.decision().audit_outcome(),
-                    "",
-                    &crate::core::ClientMeta::default(),
-                    "",
-                    "",
-                    n,
-                    permit.latency_ms(),
-                    audit_ctx,
-                );
-                permit
-            }
-            Err(failure) => {
-                self.emit_audit(
-                    "encrypt",
-                    failure.decision().audit_outcome(),
-                    "",
-                    &crate::core::ClientMeta::default(),
-                    "",
-                    "",
-                    n,
-                    failure.latency_ms(),
-                    audit_ctx,
-                );
-                return Err(authorization_failure_wire(&failure));
-            }
-        };
-        let mac_key = master_for(&self.se_sessions, store, session_reuse)?;
+            .map_err(|failure| authorization_failure_wire(&failure))?;
+        let mac_key = master_for(&self.se_sessions, store, permit.session_policy())?;
         let mut result: Vec<EncryptResItem> = Vec::with_capacity(req.types.len());
         for _t in &req.types {
             let mut salt = [0u8; SALT_LEN];
@@ -410,7 +381,6 @@ impl VtSshSession {
             self.cache_ttls.decrypt_secs,
         );
         let reuse = ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs);
-        let session_reuse = GrantScope::session_policy(&scopes, reuse);
         let audit_ctx = self.audit_ctx_scoped(
             scopes.first().and_then(GrantScope::family),
             &reuse_label,
@@ -426,41 +396,20 @@ impl VtSshSession {
             local_auth_message.push_str(&body);
         }
         append_meta_lines(&mut local_auth_message, &req.meta);
-        let permit = match self
-            .authorization
-            .authorize(AuthorizationRequest::new(scopes, reuse, local_auth_message))
+        let permit = self
+            .authorize_audited(
+                AuthorizationRequest::new(scopes, reuse, local_auth_message),
+                "decrypt",
+                &req.host,
+                &req.meta,
+                &req.command,
+                "",
+                req.items.len(),
+                audit_ctx,
+            )
             .await
-        {
-            Ok(permit) => {
-                self.emit_audit(
-                    "decrypt",
-                    permit.decision().audit_outcome(),
-                    &req.host,
-                    &req.meta,
-                    &req.command,
-                    "",
-                    req.items.len(),
-                    permit.latency_ms(),
-                    audit_ctx,
-                );
-                permit
-            }
-            Err(failure) => {
-                self.emit_audit(
-                    "decrypt",
-                    failure.decision().audit_outcome(),
-                    &req.host,
-                    &req.meta,
-                    &req.command,
-                    "",
-                    req.items.len(),
-                    failure.latency_ms(),
-                    audit_ctx,
-                );
-                return Err(authorization_failure_wire(&failure));
-            }
-        };
-        let mac_key = master_for(&self.se_sessions, store, session_reuse)?;
+            .map_err(|failure| authorization_failure_wire(&failure))?;
+        let mac_key = master_for(&self.se_sessions, store, permit.session_policy())?;
         let mut result: Vec<DecryptResItem> = Vec::with_capacity(req.items.len());
         for DecryptInput::V2 { salt, .. } in req.items {
             result.push(DecryptResItem::V2 {
@@ -504,43 +453,19 @@ impl VtSshSession {
         }
         append_meta_lines(&mut auth_message, &req.meta);
 
-        let permit = match self
-            .authorization
-            .authorize(AuthorizationRequest::fresh(
-                GrantScope::fresh(Operation::Auth),
-                auth_message,
-            ))
+        let permit = self
+            .authorize_audited(
+                AuthorizationRequest::fresh(GrantScope::fresh(Operation::Auth), auth_message),
+                "auth",
+                &req.host,
+                &req.meta,
+                "",
+                &req.reason,
+                0,
+                self.audit_ctx(),
+            )
             .await
-        {
-            Ok(permit) => {
-                self.emit_audit(
-                    "auth",
-                    permit.decision().audit_outcome(),
-                    &req.host,
-                    &req.meta,
-                    "",
-                    &req.reason,
-                    0,
-                    permit.latency_ms(),
-                    self.audit_ctx(),
-                );
-                permit
-            }
-            Err(failure) => {
-                self.emit_audit(
-                    "auth",
-                    failure.decision().audit_outcome(),
-                    &req.host,
-                    &req.meta,
-                    "",
-                    &req.reason,
-                    0,
-                    failure.latency_ms(),
-                    self.audit_ctx(),
-                );
-                return Err(authorization_failure_wire(&failure));
-            }
-        };
+            .map_err(|failure| authorization_failure_wire(&failure))?;
 
         let result = AuthRes { approved: true };
         let bytes = Zeroizing::new(
@@ -727,43 +652,21 @@ impl VtSshSession {
         // Fresh policy, so every invocation still requires a human approval.
         let run_command = format!("exe: {}\nargv: {}", exe_display, argv_for_prompt);
         let run_reason = req.reason.as_deref().unwrap_or("");
-        let permit = match self
-            .authorization
-            .authorize(AuthorizationRequest::fresh(
-                GrantScope::fresh(Operation::Run),
-                auth_message,
-            ))
-            .await
-        {
-            Ok(permit) => permit,
-            Err(failure) => {
-                self.emit_audit(
-                    "run",
-                    failure.decision().audit_outcome(),
-                    &req.host,
-                    &req.meta,
-                    &run_command,
-                    run_reason,
-                    0,
-                    failure.latency_ms(),
-                    self.audit_ctx(),
-                );
-                return Err(authorization_failure_wire(&failure));
-            }
-        };
-        // Q5: emit `approved` at the human tap, BEFORE the spawn attempt, so a
+        // Q5: `approved` lands at the human tap, BEFORE the spawn attempt, so a
         // denied launch (below) is distinguishable from a failed one (two rows).
-        self.emit_audit(
-            "run",
-            permit.decision().audit_outcome(),
-            &req.host,
-            &req.meta,
-            &run_command,
-            run_reason,
-            0,
-            permit.latency_ms(),
-            self.audit_ctx(),
-        );
+        let permit = self
+            .authorize_audited(
+                AuthorizationRequest::fresh(GrantScope::fresh(Operation::Run), auth_message),
+                "run",
+                &req.host,
+                &req.meta,
+                &run_command,
+                run_reason,
+                0,
+                self.audit_ctx(),
+            )
+            .await
+            .map_err(|failure| authorization_failure_wire(&failure))?;
 
         // Spawn detached. `setsid` makes the child a new session leader so it
         // survives agent exit; closing fds 3..1024 prevents the child from
@@ -891,43 +794,23 @@ impl VtSshSession {
         append_meta_lines(&mut auth_message, &req.meta);
 
         let reuse = ReusePolicy::from_ttl_secs(self.cache_ttls.sign_secs);
-        let session_reuse = GrantScope::session_policy(std::slice::from_ref(&scope), reuse);
-        let permit = match self
-            .authorization
-            .authorize(AuthorizationRequest::new(vec![scope], reuse, auth_message))
+        let permit = self
+            .authorize_audited(
+                AuthorizationRequest::new(vec![scope], reuse, auth_message),
+                "ssh-sign",
+                &req.host,
+                &req.meta,
+                &req.command,
+                "",
+                0,
+                audit_ctx,
+            )
             .await
-        {
-            Ok(permit) => {
-                self.emit_audit(
-                    "ssh-sign",
-                    permit.decision().audit_outcome(),
-                    &req.host,
-                    &req.meta,
-                    &req.command,
-                    "",
-                    0,
-                    permit.latency_ms(),
-                    audit_ctx,
-                );
-                permit
-            }
-            Err(failure) => {
-                self.emit_audit(
-                    "ssh-sign",
-                    failure.decision().audit_outcome(),
-                    &req.host,
-                    &req.meta,
-                    &req.command,
-                    "",
-                    0,
-                    failure.latency_ms(),
-                    audit_ctx,
-                );
-                return Err(authorization_failure_wire(&failure));
-            }
-        };
+            .map_err(|failure| authorization_failure_wire(&failure))?;
 
-        let privkey = self.private_key(store, &fp_str, session_reuse).await?;
+        let privkey = self
+            .private_key(store, &fp_str, permit.session_policy())
+            .await?;
         let sig = sign_data_with_privkey(&privkey, &req.data)
             .map_err(|_| (ErrKind::Generic, Some(DETAIL_SIGN_FAILED)))?;
         let res = SignRes {
