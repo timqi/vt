@@ -1291,6 +1291,22 @@ impl Session for VtSshSession {
 
 // --- Agent startup ---
 
+/// A core dump would write the unwrapped master, DEKs, and resident SSH keys
+/// to disk. Lower the soft limit only: `run@vt` children inherit it and keep
+/// the hard limit to raise their own.
+fn disable_core_dumps() -> Result<()> {
+    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: `lim` is a valid, writable rlimit for both calls.
+    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut lim) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    lim.rlim_cur = 0;
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &lim) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 /// Run the SSH agent on `~/.ssh/vt.sock`.
 /// Loads the cipher from keychain to decrypt stored keys, then drops it.
 /// When `print_env` is true, prints `export SSH_AUTH_SOCK=...` for eval.
@@ -1304,6 +1320,7 @@ pub async fn run_ssh_agent(
     notify_cache_hits: bool,
     ui_token: Option<[u8; 32]>,
 ) -> Result<()> {
+    disable_core_dumps()?;
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
     let home = std::env::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
     let socket_path = home.join(".ssh").join("vt.sock");
@@ -1569,6 +1586,19 @@ mod tests {
                 .await,
             0
         );
+    }
+
+    #[test]
+    fn disable_core_dumps_zeroes_soft_limit_and_keeps_hard() {
+        let get = || {
+            let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut lim) }, 0);
+            lim
+        };
+        let hard = get().rlim_max;
+        disable_core_dumps().unwrap();
+        assert_eq!(get().rlim_cur, 0);
+        assert_eq!(get().rlim_max, hard);
     }
 
     // sign@vt's signing core: an Ed25519 PrivateKey signs `data` and the

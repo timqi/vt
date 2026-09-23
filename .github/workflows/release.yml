@@ -65,9 +65,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: node .github/scripts/smoke-binary.mjs target/${{ matrix.target }}/release/vt
 
-      - name: Smoke-test shipping binary (macOS)
+      - name: Sign and smoke-test shipping binary (macOS)
         if: matrix.os == 'macos-latest'
         run: |
+          just sign-runtime target/${{ matrix.target }}/release/vt
           target/${{ matrix.target }}/release/vt version
           target/${{ matrix.target }}/release/vt --help
 

@@ -40,10 +40,23 @@ install:
     cp "$BIN" ~/.local/bin/vt
     # The linker's ad-hoc signature carries no Hardened Runtime flag, so a
     # standalone CLI agent would be attachable; re-sign with it here too.
-    if [ "$(uname -s)" = "Darwin" ]; then
-      codesign --force --options runtime -s "${VT_CODESIGN_ID:--}" ~/.local/bin/vt
-    fi
+    if [ "$(uname -s)" = "Darwin" ]; then just sign-runtime ~/.local/bin/vt; fi
     echo "installed: ~/.local/bin/vt ($(du -h ~/.local/bin/vt | cut -f1))"
+
+# Sign macOS code with Hardened Runtime and no entitlements; fail unless both
+# hold (AGENTS.md#process-hardening). VT_CODESIGN_ID as for `app`.
+[positional-arguments]
+sign-runtime +paths:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for P in "$@"; do
+      codesign --force --options runtime -s "${VT_CODESIGN_ID:--}" "$P"
+      INFO="$(codesign -dv "$P" 2>&1)"
+      grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<<"$INFO" \
+        || { echo "error: $P lacks Hardened Runtime" >&2; exit 1; }
+      [ -z "$(codesign -d --entitlements - "$P" 2>/dev/null)" ] \
+        || { echo "error: $P carries entitlements" >&2; exit 1; }
+    done
 
 # Assemble VT.app (macOS): Rust binary + Swift menu-bar shell + icns.
 # Ad-hoc signed by default; export VT_CODESIGN_ID for a stable identity
@@ -83,13 +96,10 @@ app:
     # Hardened Runtime (`--options runtime`) denies task_for_pid attach and
     # DYLD injection, which is what keeps the unwrapped master key in agent
     # memory out of reach of another process of the same user. The flag is a
-    # per-Mach-O property: the agent runs the nested `vt`, not VTApp, so each
-    # executable is signed on its own, inside out (`--deep` is deprecated).
-    SIGN_ID="${VT_CODESIGN_ID:--}"
-    for MACHO in "$APP/Contents/MacOS/vt" "$APP/Contents/MacOS/VTApp"; do
-      codesign --force --options runtime -s "$SIGN_ID" "$MACHO"
-    done
-    codesign --force --options runtime -s "$SIGN_ID" "$APP"
+    # per-Mach-O property: the agent runs the nested `vt`, not VTApp, so it is
+    # signed on its own, then the bundle, whose signature lives in VTApp
+    # (inside out; `--deep` is deprecated).
+    just sign-runtime "$APP/Contents/MacOS/vt" "$APP"
     echo "built: $APP (version ${VERSION:-unknown}, signed: ${VT_CODESIGN_ID:-ad-hoc})"
 
 # Install VT.app to /Applications and symlink the CLI to ~/.local/bin/vt

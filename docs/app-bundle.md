@@ -15,8 +15,12 @@ open /Applications/VT.app
 Release download instructions are in [README.md](../README.md#installation).
 Build inputs and bundle layout are defined in [justfile](../justfile).
 
-Release bundles are ad-hoc signed and not notarized. A new build can require
-renewed Keychain permission; a stable `VT_CODESIGN_ID` reduces repeated prompts.
+Release bundles are ad-hoc signed and not notarized. `just sign-runtime` signs
+every Mach-O with Hardened Runtime, which blocks same-user debugger attach and
+`DYLD_*` injection; verify an installed build with
+`codesign -dv /Applications/VT.app/Contents/MacOS/vt` (`flags` lists `runtime`).
+A new build can require renewed Keychain permission; a stable `VT_CODESIGN_ID`
+reduces repeated prompts.
 Keychain permission is separate from vt operation approval. For a trusted
 bundle blocked solely by quarantine:
 

@@ -192,6 +192,24 @@ Lifecycle, status token, and Keychain format: [app-bundle.md](docs/app-bundle.md
   store they could not read; import over a readable store is a same-master
   re-wrap proven by its SSH keys. Migration belongs in the app doc.
 
+## Process hardening
+
+Signing procedure: [app-bundle.md](docs/app-bundle.md#install-and-signing).
+
+- Every macOS Mach-O vt ships or installs (`vt` in and out of the bundle,
+  `VTApp`, the release tarball) is signed through `just sign-runtime`: Hardened
+  Runtime on, no entitlements, and the recipe fails if either does not hold.
+  Never sign with `--deep` or bypass the recipe.
+- Never add `get-task-allow` or any `com.apple.security.cs.*` exception
+  (library validation, DYLD environment, JIT, unsigned executable memory,
+  executable page protection, debugger); never `dlopen` outside platform libraries.
+- The agent lowers the `RLIMIT_CORE` soft limit to 0 before any Keychain read
+  and fails startup if it cannot.
+- Process confinement means a separate, one-shot Mach-O under App Sandbox
+  (`com.apple.security.app-sandbox`, the only entitlement it may carry),
+  speaking only over inherited pipes, core dumps off, zeroizing before exit.
+  Never use `sandbox-exec`, SBPL profiles, or `sandbox_init`.
+
 ## Worker cache and admin
 
 Root, admin, and host authority: [worker-slim.md](docs/worker-slim.md).
