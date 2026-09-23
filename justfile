@@ -38,6 +38,11 @@ install:
     mkdir -p ~/.local/bin
     rm -f ~/.local/bin/vt
     cp "$BIN" ~/.local/bin/vt
+    # The linker's ad-hoc signature carries no Hardened Runtime flag, so a
+    # standalone CLI agent would be attachable; re-sign with it here too.
+    if [ "$(uname -s)" = "Darwin" ]; then
+      codesign --force --options runtime -s "${VT_CODESIGN_ID:--}" ~/.local/bin/vt
+    fi
     echo "installed: ~/.local/bin/vt ($(du -h ~/.local/bin/vt | cut -f1))"
 
 # Assemble VT.app (macOS): Rust binary + Swift menu-bar shell + icns.
@@ -75,7 +80,16 @@ app:
     done
     iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
     rm -rf "$ICONSET"
-    codesign --force --deep -s "${VT_CODESIGN_ID:--}" "$APP"
+    # Hardened Runtime (`--options runtime`) denies task_for_pid attach and
+    # DYLD injection, which is what keeps the unwrapped master key in agent
+    # memory out of reach of another process of the same user. The flag is a
+    # per-Mach-O property: the agent runs the nested `vt`, not VTApp, so each
+    # executable is signed on its own, inside out (`--deep` is deprecated).
+    SIGN_ID="${VT_CODESIGN_ID:--}"
+    for MACHO in "$APP/Contents/MacOS/vt" "$APP/Contents/MacOS/VTApp"; do
+      codesign --force --options runtime -s "$SIGN_ID" "$MACHO"
+    done
+    codesign --force --options runtime -s "$SIGN_ID" "$APP"
     echo "built: $APP (version ${VERSION:-unknown}, signed: ${VT_CODESIGN_ID:-ad-hoc})"
 
 # Install VT.app to /Applications and symlink the CLI to ~/.local/bin/vt
