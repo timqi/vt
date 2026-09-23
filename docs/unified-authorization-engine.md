@@ -18,8 +18,7 @@ containing forwarded requests and preventing accidental reuse across activities.
   inside another activity. Reuse deliberately grants authority for its lifetime.
 - The master key, decrypted SSH keys, and authorization grants have separate
   lifetimes; revoking a grant does not erase material already released to a caller.
-- Under wrap v3 an approval also opens the Secure Enclave session that unwraps
-  the master; revocation drops it with the grants
+- Under wrap v3 reuse never reaches the Secure Enclave
   ([app-bundle.md](app-bundle.md#master-key-wrap-v3)).
 
 ## Approval policy
@@ -28,7 +27,7 @@ containing forwarded requests and preventing accidental reuse across activities.
 |---|---|
 | Raw SSH signing / `sign@vt` | Sign TTL, when the caller has a reusable scope |
 | `decrypt@vt` | Decrypt TTL, when the caller has a reusable scope |
-| `encrypt@vt` | Decrypt TTL, one scope per requested record type; minting a DEK needs the master like decrypt |
+| `encrypt@vt` | Always fresh: a new salt has no record a grant could name |
 | `auth@vt` | Always fresh: attest human presence now |
 | `run@vt` | Always fresh, after executable allowlist validation; argv that would not fit the prompt is refused, never truncated |
 | `ssh-add` add/remove over the agent protocol | Always fresh: the key store is rewritten under the master |
@@ -47,7 +46,7 @@ a sign grant never authorizes decryption or another signing key.
 | Activity | Reusable scope |
 |---|---|
 | Raw sign with a verified, non-forwarding session bind | Destination host key and signing key; shared across local callers |
-| Local `sign@vt`, decrypt, encrypt, or unbound non-SSH signer in a repository | Kernel-derived workspace and requested key/record (record type for encrypt) |
+| Local `sign@vt`, decrypt, or unbound non-SSH signer in a repository | Kernel-derived workspace and requested key/record |
 | Local caller outside a repository | Exact kernel-derived cwd, in a separate grant family |
 | Caller in a broad shared cwd | Immediate parent application instance and requested key/record |
 | vt extension carried by SSH or the filtering relay | Connection-confined; never a local activity grant |

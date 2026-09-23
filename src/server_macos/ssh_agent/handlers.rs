@@ -17,18 +17,19 @@ use super::scopes::append_reuse_line;
 use super::{
     agent_err, authorization_failure_wire, cache_hit_note_for, fingerprint_str, keys,
     sanitize_prompt, sanitize_prompt_exact, sanitize_prompt_multiline, sign_data_with_privkey,
-    spawn_detached, HandlerSuccess, VtSshSession, WireFailure, DETAIL_BAD_REQUEST_JSON,
-    DETAIL_BATCH_EMPTY, DETAIL_BATCH_TOO_LARGE, DETAIL_DISPLAY_FIELD_TOO_LARGE,
-    DETAIL_INTERNAL_SERIALIZE, DETAIL_NOT_INITIALIZED, DETAIL_RUN_ARGV_EMPTY,
-    DETAIL_RUN_ARGV_TOO_LARGE, DETAIL_RUN_ARGV_UNDISPLAYABLE, DETAIL_RUN_DISABLED,
-    DETAIL_RUN_NOT_ALLOWLISTED, DETAIL_RUN_SPAWN_FAILED, DETAIL_SE_SESSION, DETAIL_SE_UNWRAP,
-    DETAIL_SIGN_BAD_PUBKEY, DETAIL_SIGN_FAILED, DETAIL_SIGN_KEYS_LOAD,
+    spawn_detached, HandlerSuccess, VtSshSession, WireFailure, DETAIL_AUTH_MATERIAL,
+    DETAIL_BAD_REQUEST_JSON, DETAIL_BATCH_EMPTY, DETAIL_BATCH_TOO_LARGE,
+    DETAIL_DISPLAY_FIELD_TOO_LARGE, DETAIL_INTERNAL_SERIALIZE, DETAIL_NOT_INITIALIZED,
+    DETAIL_RUN_ARGV_EMPTY, DETAIL_RUN_ARGV_TOO_LARGE, DETAIL_RUN_ARGV_UNDISPLAYABLE,
+    DETAIL_RUN_DISABLED, DETAIL_RUN_NOT_ALLOWLISTED, DETAIL_RUN_SPAWN_FAILED, DETAIL_SE_SESSION,
+    DETAIL_SE_UNWRAP, DETAIL_SIGN_BAD_PUBKEY, DETAIL_SIGN_FAILED, DETAIL_SIGN_KEYS_LOAD,
     DETAIL_SIGN_KEY_NOT_IN_AGENT, DETAIL_UNKNOWN_SECRET_TYPE, MAX_CRYPTO_BATCH,
     PROMPT_COMMAND_MAX_LINES, PROMPT_COMMAND_MAX_LINE_LEN, PROMPT_DISPLAY_MAX_BYTES,
     RUN_PROMPT_ARGV_MAX, RUN_REQ_ARGV_MAX_BYTES,
 };
 use crate::core::authorization::{
-    AuthorizationPermit, AuthorizationRequest, Decision, GrantScope, Operation, ReusePolicy,
+    AuthorizationPermit, AuthorizationRequest, Decision, GrantMaterial, GrantScope, Operation,
+    ReusePolicy,
 };
 use crate::core::crypto::derive_dek;
 use crate::core::wire::ErrKind;
@@ -38,8 +39,10 @@ use crate::core::{
     UiStatusRes, SALT_LEN,
 };
 
-/// Unwrap for a permit holder through pending or committed SE custody.
-/// A failure drops the permit upstream without creating a grant.
+/// Unwrap for a new approval's permit through its pending SE custody. A
+/// cache hit owns no session and fails closed here: repeat authorization
+/// serves cached DEKs or resident keys instead. A failure drops the permit
+/// upstream without creating a grant.
 pub(super) fn master_for(
     sessions: &SeSessions,
     store: &KeychainStore,
@@ -48,8 +51,9 @@ pub(super) fn master_for(
     let not_initialized = |_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED));
     require_v3(store).map_err(not_initialized)?;
     let (_, wrapped) = store.se_material_bytes().map_err(not_initialized)?;
-    sessions
-        .with_session(decision, |session| session.unwrap_master(&wrapped))
+    (decision == Decision::Approved)
+        .then(|| sessions.with_session(|session| session.unwrap_master(&wrapped)))
+        .flatten()
         .ok_or((ErrKind::NotInitialized, Some(DETAIL_SE_SESSION)))?
         .map_err(|error| {
             tracing::warn!("{error}");
@@ -140,8 +144,10 @@ fn append_meta_lines(message: &mut String, meta: &crate::core::ClientMeta) {
 }
 
 impl VtSshSession {
-    /// The private key for `fp`: from RAM, else every stored private key is
-    /// decrypted through the master this permit unlocked and installed
+    /// The private key for `fp`. A cache hit uses the resident key only —
+    /// a wiped key map fails closed rather than escalating to a prompt or
+    /// the Secure Enclave. A new approval reloads every stored private key
+    /// through the master its pending session unwraps and installs them
     /// (docs/app-bundle.md#key-wiping-and-idle-timeout). Interactivity and agent
     /// lock are re-checked under the key-map write guard so keys are never
     /// installed after a clear. The master never crosses an await.
@@ -157,6 +163,9 @@ impl VtSshSession {
             || !crate::server_macos::security::session_interactive_now()
         {
             return Err(unsafe_state());
+        }
+        if decision == Decision::CacheHit {
+            return keys.get(fp).cloned().ok_or_else(unsafe_state);
         }
         // Even a resident key requires this permit's custody: a failed bind
         // must not borrow a key loaded by an earlier approval.
@@ -254,41 +263,23 @@ impl VtSshSession {
         validate_master_material(store)
             .map_err(|_| (ErrKind::NotInitialized, Some(DETAIL_NOT_INITIALIZED)))?;
 
-        // Minting a DEK releases key material like decrypt does, so it is
-        // authorized under the decrypt TTL with the same scope families; one
-        // scope per requested type. EncryptReq carries no client meta, so the
-        // prompt is agent truth only.
+        // Always fresh: a new salt has no record a grant could name, and the
+        // one-shot SE session is the only way to the master. EncryptReq
+        // carries no client meta, so the prompt is agent truth only.
         let n = req.types.len();
         let mut auth_message = format!("encrypt {} {}", n, plural_secrets(n));
         self.append_relay_origin(&mut auth_message);
         self.append_caller_line(&mut auth_message);
-        let (scopes, reuse_label) = self.encrypt_scopes(&req.types);
-        let display = reuse_label.clone().unwrap_or_default();
-        let scopes: Vec<GrantScope> = scopes
-            .into_iter()
-            .map(|scope| scope.with_display(display.clone()))
-            .collect();
-        append_reuse_line(
-            &mut auth_message,
-            &reuse_label,
-            self.cache_ttls.decrypt_secs,
-        );
-        let reuse = ReusePolicy::from_ttl_secs(self.cache_ttls.decrypt_secs);
-        let audit_ctx = self.audit_ctx_scoped(
-            scopes.first().and_then(GrantScope::family),
-            &reuse_label,
-            self.cache_ttls.decrypt_secs,
-        );
         let permit = self
             .authorize_audited(
-                AuthorizationRequest::new(scopes, reuse, auth_message),
+                AuthorizationRequest::fresh(GrantScope::fresh(Operation::Encrypt), auth_message),
                 "encrypt",
                 "",
                 &crate::core::ClientMeta::default(),
                 "",
                 "",
                 n,
-                audit_ctx,
+                self.audit_ctx(),
             )
             .await
             .map_err(|failure| authorization_failure_wire(&failure))?;
@@ -306,8 +297,7 @@ impl VtSshSession {
         drop(mac_key);
         let bytes = serde_json::to_vec(&*result)
             .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?;
-        let note = cache_hit_note_for(&permit, "encrypt", &reuse_label);
-        Ok(HandlerSuccess::authorized(Zeroizing::new(bytes), permit).with_cache_hit_note(note))
+        Ok(HandlerSuccess::authorized(Zeroizing::new(bytes), permit))
     }
 
     pub(super) async fn handle_decrypt(
@@ -388,7 +378,7 @@ impl VtSshSession {
             local_auth_message.push_str(&body);
         }
         append_meta_lines(&mut local_auth_message, &req.meta);
-        let permit = self
+        let mut permit = self
             .authorize_audited(
                 AuthorizationRequest::new(scopes, reuse, local_auth_message),
                 "decrypt",
@@ -401,15 +391,35 @@ impl VtSshSession {
             )
             .await
             .map_err(|failure| authorization_failure_wire(&failure))?;
-        let mac_key = master_for(&self.se_sessions, store, permit.decision())?;
-        let mut result = Zeroizing::new(Vec::<DecryptResItem>::with_capacity(req.items.len()));
-        for DecryptInput::V2 { salt, .. } in req.items {
-            result.push(DecryptResItem::V2 {
-                dek: derive_dek(&mac_key, &salt),
-                err_message: String::new(),
-            });
+        // A hit serves the DEKs its grants cached (one per record, in request
+        // order) and never reaches the Secure Enclave; a new approval derives
+        // them through its one-shot session and caches them with the grant.
+        let derived: Option<Vec<GrantMaterial>> = if permit.decision() == Decision::CacheHit {
+            None
+        } else {
+            let mac_key = master_for(&self.se_sessions, store, permit.decision())?;
+            Some(
+                req.items
+                    .iter()
+                    .map(|DecryptInput::V2 { salt, .. }| Zeroizing::new(derive_dek(&mac_key, salt)))
+                    .collect(),
+            )
+        };
+        let deks = derived.as_deref().unwrap_or_else(|| permit.materials());
+        if deks.len() != req.items.len() {
+            return Err((ErrKind::Generic, Some(DETAIL_AUTH_MATERIAL)));
         }
-        drop(mac_key);
+        let result: Zeroizing<Vec<DecryptResItem>> = Zeroizing::new(
+            deks.iter()
+                .map(|dek| DecryptResItem::V2 {
+                    dek: **dek,
+                    err_message: String::new(),
+                })
+                .collect(),
+        );
+        if let Some(derived) = derived {
+            permit.attach_materials(derived);
+        }
         let bytes = Zeroizing::new(
             serde_json::to_vec(&*result)
                 .map_err(|_| (ErrKind::Generic, Some(DETAIL_INTERNAL_SERIALIZE)))?,
@@ -886,11 +896,12 @@ mod tests {
         serde_json::to_vec(&EncryptReq { types }).unwrap()
     }
 
-    /// encrypt@vt passes the engine: a rejected approval mints nothing, an
-    /// approved one returns DEKs derived from the store's master and hands
-    /// the permit up for commit. An empty batch is refused before any prompt.
+    /// encrypt@vt passes the engine and is always fresh: a rejected approval
+    /// mints nothing, an approved one returns DEKs derived from the store's
+    /// master through the one-shot session and hands a grant-less permit up.
+    /// An empty batch is refused before any prompt.
     #[tokio::test]
-    async fn encrypt_requires_authorization() {
+    async fn encrypt_requires_fresh_authorization() {
         use crate::core::SecretType;
         let master = AesGcmCrypto::generate_key();
         let (store, custody) = software_store(&master);
@@ -918,21 +929,131 @@ mod tests {
             .expect("unknown type refused");
         assert_eq!(err, (ErrKind::BadRequest, Some(DETAIL_UNKNOWN_SECRET_TYPE)));
 
+        // A relay-confined caller with a decrypt TTL: the decrypt path would
+        // mint a grant here, encrypt never does.
+        let mut session = test_session(0, 300);
+        session.peer_is_vt_relay = true;
+        session.connection_subject = Some((123, 456));
         session.authorization = engine(TestAuthenticator);
-        session.se_sessions.put(false, custody);
+        session.se_sessions.store(custody);
         let ok = session.handle_encrypt(&payload, &store).await.unwrap();
-        assert!(
-            ok.authorization.is_some(),
-            "permit travels to the dispatcher"
-        );
+        let permit = ok.authorization.expect("permit travels to the dispatcher");
+        assert_eq!(permit.decision(), NEW);
+        assert!(ok.cache_hit_note.is_none());
         let items: Vec<EncryptResItem> = serde_json::from_slice(&ok.bytes).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].dek, derive_dek(&master, &items[0].salt));
         assert_ne!(items[0].salt, items[1].salt);
+        permit.commit().await.unwrap();
+        let again = session.handle_encrypt(&payload, &store).await.unwrap();
+        assert_eq!(
+            again.authorization.unwrap().decision(),
+            NEW,
+            "encrypt approvals leave no grant"
+        );
     }
 
-    /// Wrap v3 fails closed without a Secure Enclave session, and with a
-    /// session whose key cannot unwrap the stored ciphertext.
+    fn decrypt_payload(salts: &[[u8; SALT_LEN]]) -> Vec<u8> {
+        use crate::core::SecretType;
+        serde_json::to_vec(&DecryptReq {
+            host: "h".into(),
+            command: String::new(),
+            items: salts
+                .iter()
+                .map(|salt| DecryptInput::V2 {
+                    t: SecretType::RAW,
+                    salt: *salt,
+                })
+                .collect(),
+            meta: crate::core::ClientMeta::default(),
+        })
+        .unwrap()
+    }
+
+    fn deks_of(ok: &HandlerSuccess) -> Vec<[u8; 32]> {
+        let items: Vec<DecryptResItem> = serde_json::from_slice(&ok.bytes).unwrap();
+        items
+            .into_iter()
+            .map(|DecryptResItem::V2 { dek, .. }| dek)
+            .collect()
+    }
+
+    /// A decrypt approval derives DEKs through its one-shot session and
+    /// caches them with the grant; the hit serves the same DEKs (per record,
+    /// in request order) with no Secure Enclave session at all. A record the
+    /// grants do not cover prompts again, and revocation drops the DEKs.
+    #[tokio::test]
+    async fn decrypt_hit_serves_cached_deks_without_se_session() {
+        let master = AesGcmCrypto::generate_key();
+        let (store, custody) = software_store(&master);
+        let salts = [[1u8; SALT_LEN], [2u8; SALT_LEN]];
+        let mut session = test_session(0, 300);
+        session.peer_is_vt_relay = true;
+        session.connection_subject = Some((123, 456));
+        session.authorization = engine(TestAuthenticator);
+
+        assert_eq!(
+            session
+                .handle_decrypt(&decrypt_payload(&salts), &store)
+                .await
+                .err()
+                .expect("no custody"),
+            (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION)),
+            "a new approval without custody fails closed"
+        );
+
+        session.se_sessions.store(custody);
+        let ok = session
+            .handle_decrypt(&decrypt_payload(&salts), &store)
+            .await
+            .unwrap();
+        let deks = deks_of(&ok);
+        assert_eq!(deks[0], derive_dek(&master, &salts[0]));
+        assert_eq!(deks[1], derive_dek(&master, &salts[1]));
+        let permit = ok.authorization.unwrap();
+        assert_eq!(permit.decision(), NEW);
+        permit.commit().await.unwrap();
+
+        // The permit's end drops the session; no SE custody exists any more.
+        session.se_sessions = Arc::new(SeSessions::default());
+        let hit = session
+            .handle_decrypt(&decrypt_payload(&[salts[1], salts[0]]), &store)
+            .await
+            .unwrap();
+        assert_eq!(deks_of(&hit), vec![deks[1], deks[0]]);
+        assert_eq!(
+            hit.authorization.as_ref().unwrap().decision(),
+            Decision::CacheHit
+        );
+        assert!(hit.cache_hit_note.is_some());
+        assert!(session.se_sessions.is_empty());
+        hit.authorization.unwrap().commit().await.unwrap();
+
+        // Partial coverage is a new approval, which needs a session again.
+        assert_eq!(
+            session
+                .handle_decrypt(&decrypt_payload(&[salts[0], [3u8; SALT_LEN]]), &store)
+                .await
+                .err()
+                .expect("partial coverage prompts"),
+            (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION))
+        );
+
+        session.authorization.invalidate_all().await;
+        assert_eq!(
+            session
+                .handle_decrypt(&decrypt_payload(&salts), &store)
+                .await
+                .err()
+                .expect("revoked"),
+            (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION)),
+            "revocation drops the cached DEKs with the grants"
+        );
+    }
+
+    /// Wrap v3 fails closed without a Secure Enclave session, with a session
+    /// whose key cannot unwrap the stored ciphertext, and for a cache hit even
+    /// when a usable pending session exists.
     #[test]
     fn master_for_v3_fails_closed_without_usable_session() {
         use crate::server_macos::se::test_support::software_session;
@@ -942,7 +1063,7 @@ mod tests {
             master_for(&sessions, &store, NEW).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION))
         );
-        sessions.put(false, software_session());
+        sessions.store(software_session());
         assert_eq!(
             master_for(&sessions, &store, NEW).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_UNWRAP))
@@ -953,10 +1074,23 @@ mod tests {
             master_for(&sessions, &store, NEW).unwrap_err(),
             (ErrKind::NotInitialized, Some(DETAIL_SE_UNWRAP))
         );
+
+        let master = AesGcmCrypto::generate_key();
+        let (store, custody) = software_store(&master);
+        sessions.store(custody);
+        assert_eq!(
+            master_for(&sessions, &store, Decision::CacheHit).unwrap_err(),
+            (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION)),
+            "a hit never unwraps, whatever session is pending"
+        );
+        assert_eq!(*master_for(&sessions, &store, NEW).unwrap(), master);
     }
 
+    /// A hit signs with the resident key and never consults SE custody; with
+    /// the key wiped it fails closed instead of reloading. A new approval
+    /// needs its own session even for a resident key.
     #[tokio::test]
-    async fn cached_private_key_requires_current_custody_and_lock_check() {
+    async fn sign_hit_uses_resident_key_only() {
         let session = test_session(0, 0);
         let key = ssh_key::private::PrivateKey::random(
             &mut rand::rngs::OsRng,
@@ -964,12 +1098,32 @@ mod tests {
         )
         .unwrap();
         let fp = fingerprint_str(key.public_key().key_data());
-        session.keys.write().await.insert(fp.clone(), key);
+        session.keys.write().await.insert(fp.clone(), key.clone());
         let store = KeychainStore::new_v3(&[1; 8], &[2; 113]);
         assert!(
             session.private_key(&store, &fp, NEW).await.is_err(),
-            "cached keys must not bypass a missing biometric session"
+            "resident keys must not bypass a missing biometric session"
         );
+        if crate::server_macos::security::session_interactive_now() {
+            let hit = session
+                .private_key(&store, &fp, Decision::CacheHit)
+                .await
+                .unwrap();
+            assert_eq!(hit.public_key(), key.public_key());
+            assert!(session.se_sessions.is_empty());
+        } else {
+            eprintln!("skipped resident-key hit: no interactive GUI session");
+        }
+        assert_eq!(super::super::clear_private_keys(&session.keys).await, 1);
+        assert_eq!(
+            session
+                .private_key(&store, &fp, Decision::CacheHit)
+                .await
+                .unwrap_err(),
+            (ErrKind::Generic, Some(DETAIL_SIGN_KEYS_LOAD)),
+            "a wiped key fails the hit closed"
+        );
+        assert!(session.keys.read().await.is_empty(), "no reload on a hit");
         session.locked.store(true, Ordering::Release);
         assert!(session.private_key(&store, &fp, NEW).await.is_err());
     }
@@ -1006,7 +1160,7 @@ mod tests {
         .unwrap();
 
         let session = test_session(0, 0);
-        session.se_sessions.put(false, custody);
+        session.se_sessions.store(custody);
         assert!(session.keys.read().await.is_empty());
         let loaded = session.private_key(&store, &fp, NEW).await.unwrap();
         assert_eq!(loaded.public_key(), privkey.public_key());

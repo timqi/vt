@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 
 use crate::core::authorization::{
-    AuthorizationAuthenticator, AuthorizationEngine, AuthorizationValidator, Decision, Operation,
+    AuthorizationAuthenticator, AuthorizationEngine, AuthorizationValidator, Operation,
     ValidationError,
 };
 use crate::core::session::{AuthOutcome, SessionState, UnavailableReason};
@@ -25,92 +25,51 @@ pub(super) fn sleep_diverged(mono_delta: Duration, wall_delta: Option<Duration>)
     wall_delta.is_some_and(|wall| wall.saturating_sub(mono_delta) >= SLEEP_DIVERGENCE)
 }
 
-/// Secure Enclave sessions the approvals of a wrap v3 store leave behind
-/// (docs/app-bundle.md#master-key-wrap-v3). Memory-only; handlers unwrap the
-/// master through them and never hold the key across an await.
+/// The one-shot Secure Enclave session a wrap v3 biometric approval leaves
+/// behind (docs/app-bundle.md#master-key-wrap-v3). Memory-only; it belongs to
+/// the serialized approval and is dropped with that approval's permit.
+/// Handlers unwrap the master through it and never hold the key across an
+/// await. The slot is process-global while only new approvals are serialized:
+/// a cache-hit permit on another connection can be live alongside the owning
+/// approval, so `master_for`'s `Decision::Approved` check is the boundary that
+/// keeps hits away from it.
 #[derive(Default)]
 pub struct SeSessions {
-    /// Behind live reusable grants: written by a `StrictTtl` biometric
-    /// approval, read by cache hits, dropped with the grants.
-    reusable: Mutex<Option<SeSession>>,
-    /// A pending biometric session belongs to the serialized approval. It is
-    /// dropped on failure/cancellation or promoted only with a committed grant.
-    fresh: Mutex<Option<SeSession>>,
+    pending: Mutex<Option<SeSession>>,
 }
 
 impl SeSessions {
-    /// Called before every prompt to discard any unconsumed pending session.
-    fn begin_prompt(&self) {
+    /// Bind a new approval's session for the permit that follows.
+    pub(super) fn store(&self, session: SeSession) {
         *self
-            .fresh
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    }
-
-    fn store(&self, session: SeSession) {
-        *self
-            .fresh
+            .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
     }
 
-    fn complete(&self, reusable: bool) {
-        let pending = self
-            .fresh
+    /// The custody behind a new approval's permit. The engine's approval
+    /// guard owns cleanup.
+    pub fn with_session<R>(&self, f: impl FnOnce(&SeSession) -> R) -> Option<R> {
+        self.pending
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if reusable {
-            if let Some(session) = pending {
-                *self
-                    .reusable
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
-            }
-        }
-    }
-
-    /// The custody behind a permit: a cache hit reads the committed reusable
-    /// session, a new approval its own pending one. The engine's approval
-    /// guard owns pending-session cleanup.
-    pub fn with_session<R>(
-        &self,
-        decision: Decision,
-        f: impl FnOnce(&SeSession) -> R,
-    ) -> Option<R> {
-        let slot = if decision == Decision::CacheHit {
-            &self.reusable
-        } else {
-            &self.fresh
-        };
-        slot.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(f)
     }
 
-    /// Drop both sessions. Called under the security write gate after grants
-    /// are cleared; `LAContext.invalidate()` is advisory, this drop is the boundary.
+    /// Drop the session: before every prompt, with every approval's permit,
+    /// and under the security write gate after grants are cleared.
+    /// `LAContext.invalidate()` is advisory; this drop is the boundary.
     fn clear(&self) {
         *self
-            .reusable
+            .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.begin_prompt();
     }
 
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
-        self.reusable.lock().unwrap().is_none() && self.fresh.lock().unwrap().is_none()
-    }
-
-    /// Test seam: a pending session, or one already promoted to reusable.
-    #[cfg(test)]
-    pub(super) fn put(&self, reusable: bool, session: SeSession) {
-        self.store(session);
-        if reusable {
-            self.complete(true);
-        }
+        self.pending.lock().unwrap().is_none()
     }
 }
 
@@ -143,8 +102,8 @@ fn bind_session(sessions: &SeSessions, ctx: super::se::BiometricContext) {
 
 #[async_trait]
 impl AuthorizationAuthenticator for MacAuthenticator {
-    fn approval_complete(&self, reusable: bool) {
-        self.sessions.complete(reusable);
+    fn approval_complete(&self) {
+        self.sessions.clear();
     }
 
     async fn authenticate(
@@ -156,7 +115,7 @@ impl AuthorizationAuthenticator for MacAuthenticator {
         let prompt = prompt.to_string();
         let sessions = Arc::clone(&self.sessions);
         match tokio::task::spawn_blocking(move || {
-            sessions.begin_prompt();
+            sessions.clear();
             let (outcome, ctx) = authenticate_ctx(&prompt);
             if matches!(outcome, AuthOutcome::Unavailable(_)) {
                 revocation_pending.store(true, Ordering::Release);
@@ -261,56 +220,31 @@ pub fn new_engine(locked: Arc<AtomicBool>) -> (Arc<AuthorizationEngine>, Arc<SeS
 mod tests {
     use super::*;
 
-    /// Revocation through the real validator drops both SE sessions.
+    /// Revocation through the real validator drops the pending SE session.
     #[tokio::test]
-    async fn invalidation_drops_se_sessions() {
+    async fn invalidation_drops_se_session() {
         use super::super::se::test_support::software_session;
         let (engine, sessions) = new_engine(Arc::new(AtomicBool::new(false)));
-        sessions.put(true, software_session());
-        sessions.put(false, software_session());
+        sessions.store(software_session());
         assert!(!sessions.is_empty());
         engine.invalidate_all().await;
         assert!(sessions.is_empty());
     }
 
-    const HIT: Decision = Decision::CacheHit;
-    const NEW: Decision = Decision::Approved;
-
-    /// Every new prompt clears pending custody without disturbing live hits;
-    /// pending custody survives only until its approval completes, and is
-    /// promoted only by a committed grant.
+    /// A pending session exists only between its approval and the end of
+    /// that permit: the approval guard's completion drops it unconditionally.
     #[test]
-    fn pending_custody_follows_the_approval() {
+    fn pending_custody_ends_with_the_permit() {
         use super::super::se::test_support::software_session;
-        let sessions = SeSessions::default();
-        assert!(sessions.with_session(NEW, |_| ()).is_none());
-        sessions.put(false, software_session());
-        sessions.put(true, software_session());
-        assert!(sessions.with_session(HIT, |_| ()).is_some());
-        sessions.begin_prompt();
-        assert!(sessions.with_session(NEW, |_| ()).is_none());
-        assert!(sessions.with_session(HIT, |_| ()).is_some());
-
+        let sessions = Arc::new(SeSessions::default());
+        let authenticator = MacAuthenticator {
+            sessions: Arc::clone(&sessions),
+        };
+        assert!(sessions.with_session(|_| ()).is_none());
         sessions.store(software_session());
-        sessions.complete(false);
-        assert!(
-            sessions.with_session(NEW, |_| ()).is_none(),
-            "dropped, not promoted"
-        );
-        assert!(
-            sessions.with_session(HIT, |_| ()).is_some(),
-            "earlier hit custody untouched"
-        );
-
-        sessions.clear();
-        assert!(sessions.is_empty());
-        sessions.store(software_session());
-        sessions.complete(true);
-        assert!(sessions.with_session(NEW, |_| ()).is_none());
-        assert!(
-            sessions.with_session(HIT, |_| ()).is_some(),
-            "promoted by commit"
-        );
+        assert!(sessions.with_session(|_| ()).is_some());
+        authenticator.approval_complete();
+        assert!(sessions.is_empty(), "dropped with the permit, never kept");
     }
 
     #[test]

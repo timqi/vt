@@ -71,10 +71,10 @@ this section records only the platform-side consequences.
 
 - The `toid` blob and the ECIES ciphertext live in the existing
   `rusty.vault.store` item; nothing is written to any keychain by the SE key.
-- Dropping the `(LAContext, SecKey)` pair is the revocation boundary;
-  `invalidate()` is called on drop as a courtesy only.
-- An evaluated context gets `interactionNotAllowed`: a cold or expired handle
-  fails instead of opening a second system prompt under a live permit.
+- Dropping the `(LAContext, SecKey)` pair is the boundary; `invalidate()` is
+  called on drop as a courtesy only.
+- An evaluated context gets `interactionNotAllowed`: a handle that has gone
+  cold fails instead of opening a second system prompt under a live permit.
 - Dependencies: `security-framework` with `OSX_10_13`
   (`kSecUseAuthenticationContext`, `SecKeyCreateWithData`),
   `security-framework-sys`, `core-foundation`; nothing added.

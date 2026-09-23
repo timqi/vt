@@ -5,7 +5,8 @@
 //! non-cloneable [`AuthorizationPermit`]. Reusable grants are written only when
 //! the protected operation succeeds and consumes the permit with `commit()`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -13,11 +14,17 @@ use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
+use zeroize::Zeroizing;
 
 use super::session::{AuthOutcome, UnavailableReason};
 
 /// Kernel-derived caller anchor: `(context_id, context_start_tvsec)`.
 pub type SubjectId = (u64, u64);
+
+/// Secret a grant releases again on a cache hit without the master: the
+/// record DEK of a decrypt grant. Lives and dies with its grant, zeroized on
+/// drop, never printed.
+pub type GrantMaterial = Zeroizing<[u8; 32]>;
 
 /// Security operation authorized by a grant. This discriminator is part of
 /// every reusable key, so grants can never cross operation boundaries.
@@ -252,35 +259,6 @@ impl GrantScope {
         )
     }
 
-    /// Encrypt scope: DEK minting for one record type under a resolved
-    /// activity. `anchor` is the family's kernel-verified identity (workspace
-    /// or cwd canonical root, parent executable path; empty for a
-    /// connection). No salt exists before minting, so the type is the resource.
-    pub fn encrypt(
-        family: ScopeFamily,
-        subject: Option<SubjectId>,
-        anchor: &str,
-        secret_type: u8,
-    ) -> Self {
-        let Some(subject) = subject else {
-            return Self::fresh(Operation::Encrypt);
-        };
-        let label: &[u8] = match family {
-            ScopeFamily::Workspace => b"vt-authz-encrypt-ws-v1",
-            ScopeFamily::CwdFallback => b"vt-authz-encrypt-cwd-v1",
-            ScopeFamily::ParentApp => b"vt-authz-encrypt-app-v1",
-            ScopeFamily::Connection => b"vt-authz-encrypt-conn-v1",
-            ScopeFamily::Destination => return Self::fresh(Operation::Encrypt),
-        };
-        Self::hashed(
-            Operation::Encrypt,
-            family,
-            subject,
-            label,
-            &[Field(anchor.as_bytes()), Tag(secret_type)],
-        )
-    }
-
     /// Relay decrypt scope: type + salt + claimed host/pwd, bounded by the
     /// relay connection's kernel-derived subject.
     pub fn decrypt_v2(
@@ -461,9 +439,9 @@ pub trait AuthorizationAuthenticator: Send + Sync {
         revocation_pending: Arc<AtomicBool>,
     ) -> AuthOutcome;
 
-    /// Release pending custody before the prompt slot, promoting it only when
-    /// the operation committed a reusable grant. Must not block on I/O.
-    fn approval_complete(&self, _reusable: bool) {}
+    /// Drop pending custody with the approval's permit, before the prompt
+    /// slot is released. Must not block on I/O.
+    fn approval_complete(&self) {}
 }
 
 /// Must query current state rather than a TTL-cached snapshot. The engine calls
@@ -522,12 +500,23 @@ impl CacheExpiry {
     }
 }
 
-/// Stored value per live grant: the dual-clock expiry plus the human scope
-/// label (display-only; feeds `ui-status@vt` snapshots).
-#[derive(Clone, Debug)]
+/// Stored value per live grant: the dual-clock expiry, the human scope
+/// label (display-only; feeds `ui-status@vt` snapshots), and the material a
+/// hit serves.
 struct GrantEntry {
     expiry: CacheExpiry,
     display: String,
+    material: Option<GrantMaterial>,
+}
+
+impl fmt::Debug for GrantEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrantEntry")
+            .field("expiry", &self.expiry)
+            .field("display", &self.display)
+            .field("material", &self.material.is_some())
+            .finish()
+    }
 }
 
 /// A reusable key paired with its scope's display label — what `authorize`
@@ -544,7 +533,7 @@ struct KeyedScope {
 /// `display` is the same string the approval prompt showed.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GrantSnapshot {
-    /// Stable operation tag: "sign" | "decrypt" | "auth" | "run".
+    /// `Operation::as_wire` tag.
     pub operation: String,
     /// `ScopeFamily::as_wire` tag.
     pub family: String,
@@ -574,32 +563,51 @@ impl GrantStore {
         now_mono: Instant,
         now_wall: SystemTime,
     ) -> Lookup {
-        let all_hit = keys.iter().all(|scoped| {
-            self.entries.get(&scoped.key).is_some_and(|entry| {
+        let hits: Vec<&GrantEntry> = keys
+            .iter()
+            .filter_map(|scoped| self.entries.get(&scoped.key))
+            .filter(|entry| {
                 entry.expiry.is_valid_at(now_mono, now_wall) && entry.expiry.ttl <= requested_ttl
             })
-        });
+            .collect();
+        if hits.len() != keys.len() {
+            return Lookup {
+                epoch: self.epoch,
+                hit: None,
+            };
+        }
         // Tightest remaining lifetime across the hit set — informational only
         // (cache-hit notifications / ui-status); never feeds a reuse decision.
-        let remaining = if all_hit {
-            keys.iter()
-                .filter_map(|scoped| self.entries.get(&scoped.key))
-                .map(|entry| entry.expiry.remaining_at(now_mono, now_wall))
-                .min()
-        } else {
-            None
-        };
+        let remaining = hits
+            .iter()
+            .map(|entry| entry.expiry.remaining_at(now_mono, now_wall))
+            .min()
+            .unwrap_or(Duration::ZERO);
+        // Materials travel only as a complete, scope-aligned set.
+        let mut materials: Vec<GrantMaterial> = hits
+            .iter()
+            .filter_map(|entry| entry.material.clone())
+            .collect();
+        if materials.len() != keys.len() {
+            materials.clear();
+        }
         Lookup {
             epoch: self.epoch,
-            all_hit,
-            remaining,
+            hit: Some(Hit {
+                remaining,
+                materials,
+            }),
         }
     }
 
+    /// `materials` is empty or aligned one-to-one with `keys`; a refreshed
+    /// entry takes the new material with its new expiry (same resource,
+    /// same material).
     fn commit_at(
         &mut self,
         expected_epoch: u64,
         keys: &[KeyedScope],
+        materials: &[GrantMaterial],
         ttl: Duration,
         approved_mono: Instant,
         approved_wall: SystemTime,
@@ -607,9 +615,13 @@ impl GrantStore {
         if self.epoch != expected_epoch {
             return Err(CommitError::Invalidated);
         }
+        if !materials.is_empty() && materials.len() != keys.len() {
+            return Err(CommitError::MaterialMismatch);
+        }
         let fresh = CacheExpiry::checked(ttl, approved_mono, approved_wall)?;
         let mut inserted = 0;
-        for scoped in keys {
+        for (i, scoped) in keys.iter().enumerate() {
+            let material = materials.get(i).cloned();
             self.entries
                 .entry(scoped.key.clone())
                 .and_modify(|entry| {
@@ -618,6 +630,7 @@ impl GrantStore {
                     {
                         entry.expiry = fresh;
                         entry.display = scoped.display.clone();
+                        entry.material = material.clone();
                         inserted += 1;
                     }
                 })
@@ -626,6 +639,7 @@ impl GrantStore {
                     GrantEntry {
                         expiry: fresh,
                         display: scoped.display.clone(),
+                        material,
                     }
                 });
         }
@@ -688,23 +702,32 @@ impl GrantStore {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
 struct Lookup {
     epoch: u64,
-    all_hit: bool,
-    /// Tightest remaining lifetime across the hit set when `all_hit`.
-    remaining: Option<Duration>,
+    /// `Some` when every key has a live grant within the requested TTL.
+    hit: Option<Hit>,
+}
+
+struct Hit {
+    /// Tightest remaining lifetime across the hit set.
+    remaining: Duration,
+    /// Every hit grant's material, aligned with the keys; empty when any
+    /// grant carries none.
+    materials: Vec<GrantMaterial>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitError {
     Invalidated,
     InvalidTtl,
+    /// Attached materials do not align with the request's scopes.
+    MaterialMismatch,
 }
 
 struct PendingGrant {
     expected_epoch: u64,
     keys: Vec<KeyedScope>,
+    materials: Vec<GrantMaterial>,
     ttl: Duration,
     approved_mono: Instant,
     approved_wall: SystemTime,
@@ -712,13 +735,12 @@ struct PendingGrant {
 
 struct ApprovalGuard {
     authenticator: Arc<dyn AuthorizationAuthenticator>,
-    reusable: bool,
     _prompt: OwnedSemaphorePermit,
 }
 
 impl Drop for ApprovalGuard {
     fn drop(&mut self) {
-        self.authenticator.approval_complete(self.reusable);
+        self.authenticator.approval_complete();
     }
 }
 
@@ -731,9 +753,14 @@ pub struct AuthorizationPermit {
     /// Tightest remaining grant lifetime when `decision` is `CacheHit`.
     /// Informational only (cache-hit notifications); never a reuse input.
     reuse_remaining: Option<Duration>,
+    /// The hit grants' materials, one per request scope in request order;
+    /// empty for a fresh approval or when any grant carried none.
+    materials: Vec<GrantMaterial>,
     pending: Option<PendingGrant>,
     store: Arc<RwLock<GrantStore>>,
-    approval: Option<ApprovalGuard>,
+    /// Holds the prompt slot and the authenticator's pending custody for a
+    /// new approval; both end when the permit does.
+    _approval: Option<ApprovalGuard>,
     _security: OwnedRwLockReadGuard<()>,
 }
 
@@ -750,6 +777,19 @@ impl AuthorizationPermit {
         self.latency_ms
     }
 
+    /// Materials served by a `CacheHit`, aligned with the request scopes.
+    pub fn materials(&self) -> &[GrantMaterial] {
+        &self.materials
+    }
+
+    /// Store `materials` (one per request scope, in request order) with the
+    /// grant this permit will commit. Dropped when nothing is pending.
+    pub fn attach_materials(&mut self, materials: Vec<GrantMaterial>) {
+        if let Some(pending) = &mut self.pending {
+            pending.materials = materials;
+        }
+    }
+
     /// Commit the pending reusable grant after the protected operation has
     /// completed successfully. Cache hits and Fresh policies have no pending
     /// write but still consume the permit to release its gates explicitly.
@@ -758,13 +798,11 @@ impl AuthorizationPermit {
             self.store.write().await.commit_at(
                 pending.expected_epoch,
                 &pending.keys,
+                &pending.materials,
                 pending.ttl,
                 pending.approved_mono,
                 pending.approved_wall,
             )?;
-            if let Some(approval) = &mut self.approval {
-                approval.reusable = true;
-            }
         }
         Ok(())
     }
@@ -857,22 +895,13 @@ impl AuthorizationEngine {
         };
         if let (Some(keys), Some(ttl)) = (keys.as_deref(), reusable_ttl) {
             let security = Arc::clone(&self.security_gate).read_owned().await;
-            let lookup = self.lookup(keys, ttl).await;
-            if lookup.all_hit {
+            if let Some(hit) = self.lookup(keys, ttl).await.hit {
                 if let Err(error) = self.validate_live() {
                     drop(security);
                     self.revoke_after_validation_failure().await;
                     return Err(failure(validation_decision(error), started));
                 }
-                return Ok(AuthorizationPermit {
-                    decision: Decision::CacheHit,
-                    latency_ms: 0,
-                    reuse_remaining: lookup.remaining,
-                    pending: None,
-                    store: Arc::clone(&self.store),
-                    approval: None,
-                    _security: security,
-                });
+                return Ok(self.hit_permit(hit, security));
             }
         }
 
@@ -897,7 +926,7 @@ impl AuthorizationEngine {
             }
             if let (Some(keys), Some(ttl)) = (keys.as_deref(), reusable_ttl) {
                 let lookup = self.lookup(keys, ttl).await;
-                if lookup.all_hit {
+                if let Some(hit) = lookup.hit {
                     if let Err(error) = self.validate_live() {
                         drop(security);
                         drop(prompt);
@@ -905,15 +934,7 @@ impl AuthorizationEngine {
                         return Err(failure(validation_decision(error), started));
                     }
                     drop(prompt);
-                    return Ok(AuthorizationPermit {
-                        decision: Decision::CacheHit,
-                        latency_ms: 0,
-                        reuse_remaining: lookup.remaining,
-                        pending: None,
-                        store: Arc::clone(&self.store),
-                        approval: None,
-                        _security: security,
-                    });
+                    return Ok(self.hit_permit(hit, security));
                 }
                 lookup.epoch
             } else {
@@ -931,7 +952,6 @@ impl AuthorizationEngine {
         let prompt_task = tokio::spawn(async move {
             let approval = ApprovalGuard {
                 authenticator: Arc::clone(&authenticator),
-                reusable: false,
                 _prompt: prompt,
             };
             let outcome = authenticator
@@ -989,6 +1009,7 @@ impl AuthorizationEngine {
             (Some(keys), ReusePolicy::StrictTtl(ttl)) => Some(PendingGrant {
                 expected_epoch: epoch,
                 keys,
+                materials: Vec::new(),
                 ttl,
                 approved_mono,
                 approved_wall,
@@ -999,9 +1020,10 @@ impl AuthorizationEngine {
             decision: Decision::Approved,
             latency_ms: started.elapsed().as_millis() as u64,
             reuse_remaining: None,
+            materials: Vec::new(),
             pending,
             store: Arc::clone(&self.store),
-            approval: Some(approval),
+            _approval: Some(approval),
             _security: security,
         })
     }
@@ -1077,6 +1099,22 @@ impl AuthorizationEngine {
             .snapshot_at(Instant::now(), SystemTime::now())
     }
 
+    /// A permit served from live grants: no prompt slot, no pending write,
+    /// no custody; it carries the grants' materials and holds the security
+    /// read gate like every permit.
+    fn hit_permit(&self, hit: Hit, security: OwnedRwLockReadGuard<()>) -> AuthorizationPermit {
+        AuthorizationPermit {
+            decision: Decision::CacheHit,
+            latency_ms: 0,
+            reuse_remaining: Some(hit.remaining),
+            materials: hit.materials,
+            pending: None,
+            store: Arc::clone(&self.store),
+            _approval: None,
+            _security: security,
+        }
+    }
+
     async fn lookup(&self, keys: &[KeyedScope], requested_ttl: Duration) -> Lookup {
         self.store
             .read()
@@ -1144,20 +1182,19 @@ impl AuthorizationEngine {
     }
 }
 
+/// One key per scope, in request order (duplicates included, so attached
+/// materials stay index-aligned with the scopes); `None` unless every scope
+/// is reusable under a `StrictTtl` policy.
 fn reusable_keys(scopes: &[GrantScope], policy: ReusePolicy) -> Option<Vec<KeyedScope>> {
     if !matches!(policy, ReusePolicy::StrictTtl(_)) {
         return None;
     }
-    let mut unique = HashSet::with_capacity(scopes.len());
     let mut keys = Vec::with_capacity(scopes.len());
     for scope in scopes {
-        let key = scope.key.as_ref()?;
-        if unique.insert(key.clone()) {
-            keys.push(KeyedScope {
-                key: key.clone(),
-                display: scope.display.clone(),
-            });
-        }
+        keys.push(KeyedScope {
+            key: scope.key.as_ref()?.clone(),
+            display: scope.display.clone(),
+        });
     }
     (!keys.is_empty()).then_some(keys)
 }
@@ -1283,41 +1320,39 @@ mod tests {
             .commit_at(
                 0,
                 std::slice::from_ref(&key),
+                &[],
                 Duration::from_secs(120),
                 m0,
                 w0,
             )
             .unwrap();
-        assert!(
-            store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(120),
-                    m0 + Duration::from_secs(60),
-                    w0 + Duration::from_secs(60)
-                )
-                .all_hit
-        );
-        assert!(
-            !store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(120),
-                    m0 + Duration::from_secs(60),
-                    w0 + Duration::from_secs(121)
-                )
-                .all_hit
-        );
-        assert!(
-            !store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(120),
-                    m0 + Duration::from_secs(121),
-                    w0 + Duration::from_secs(60)
-                )
-                .all_hit
-        );
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(120),
+                m0 + Duration::from_secs(60),
+                w0 + Duration::from_secs(60)
+            )
+            .hit
+            .is_some());
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(120),
+                m0 + Duration::from_secs(60),
+                w0 + Duration::from_secs(121)
+            )
+            .hit
+            .is_none());
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(120),
+                m0 + Duration::from_secs(121),
+                w0 + Duration::from_secs(60)
+            )
+            .hit
+            .is_none());
     }
 
     #[test]
@@ -1330,6 +1365,7 @@ mod tests {
             .commit_at(
                 0,
                 std::slice::from_ref(&key),
+                &[],
                 Duration::from_secs(120),
                 m0,
                 w0,
@@ -1339,21 +1375,21 @@ mod tests {
             .commit_at(
                 0,
                 std::slice::from_ref(&key),
+                &[],
                 Duration::from_secs(120),
                 m0 + Duration::from_secs(60),
                 w0 + Duration::from_secs(60),
             )
             .unwrap();
-        assert!(
-            !store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(120),
-                    m0 + Duration::from_secs(121),
-                    w0 + Duration::from_secs(121)
-                )
-                .all_hit
-        );
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(120),
+                m0 + Duration::from_secs(121),
+                w0 + Duration::from_secs(121)
+            )
+            .hit
+            .is_none());
     }
 
     #[test]
@@ -1366,51 +1402,50 @@ mod tests {
             .commit_at(
                 0,
                 std::slice::from_ref(&key),
+                &[],
                 Duration::from_secs(120),
                 m0,
                 w0,
             )
             .unwrap();
-        assert!(
-            !store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(30),
-                    m0 + Duration::from_secs(1),
-                    w0 + Duration::from_secs(1),
-                )
-                .all_hit
-        );
-
-        store
-            .commit_at(
-                0,
+        assert!(store
+            .lookup_at(
                 std::slice::from_ref(&key),
                 Duration::from_secs(30),
                 m0 + Duration::from_secs(1),
                 w0 + Duration::from_secs(1),
             )
+            .hit
+            .is_none());
+
+        store
+            .commit_at(
+                0,
+                std::slice::from_ref(&key),
+                &[],
+                Duration::from_secs(30),
+                m0 + Duration::from_secs(1),
+                w0 + Duration::from_secs(1),
+            )
             .unwrap();
-        assert!(
-            store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(30),
-                    m0 + Duration::from_secs(30),
-                    w0 + Duration::from_secs(30),
-                )
-                .all_hit
-        );
-        assert!(
-            !store
-                .lookup_at(
-                    std::slice::from_ref(&key),
-                    Duration::from_secs(30),
-                    m0 + Duration::from_secs(32),
-                    w0 + Duration::from_secs(32),
-                )
-                .all_hit
-        );
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(30),
+                m0 + Duration::from_secs(30),
+                w0 + Duration::from_secs(30),
+            )
+            .hit
+            .is_some());
+        assert!(store
+            .lookup_at(
+                std::slice::from_ref(&key),
+                Duration::from_secs(30),
+                m0 + Duration::from_secs(32),
+                w0 + Duration::from_secs(32),
+            )
+            .hit
+            .is_none());
     }
 
     #[test]
@@ -1513,7 +1548,7 @@ mod tests {
         }
         let subject = (7, 42);
         let salt = [7u8; 16];
-        let cases: [(&str, GrantScope, Operation, ScopeFamily, SubjectId, &str); 13] = [
+        let cases: [(&str, GrantScope, Operation, ScopeFamily, SubjectId, &str); 9] = [
             (
                 "sign",
                 GrantScope::sign(Some(subject), "SHA256:fp", "/repo"),
@@ -1591,49 +1626,7 @@ mod tests {
                 subject,
                 "0edb5650e5dc5c6d84b2096a99d0caf7fb43a5c8d95fa91170e8c2936b075e7d",
             ),
-            (
-                "encrypt_workspace",
-                GrantScope::encrypt(ScopeFamily::Workspace, Some(subject), "/repo", b'0'),
-                Operation::Encrypt,
-                ScopeFamily::Workspace,
-                subject,
-                "7e9b7bb8271b5eb42abe13c30986a1e1cc53e085f0307ca87b9de6f477ee8ea6",
-            ),
-            (
-                "encrypt_cwd",
-                GrantScope::encrypt(ScopeFamily::CwdFallback, Some(subject), "/repo", b'0'),
-                Operation::Encrypt,
-                ScopeFamily::CwdFallback,
-                subject,
-                "bbb0dc379fbbe873fb9eeef6de81b227580766088ba70b41de9111b69a5764d9",
-            ),
-            (
-                "encrypt_app",
-                GrantScope::encrypt(
-                    ScopeFamily::ParentApp,
-                    Some(subject),
-                    "/Applications/A.app/Contents/MacOS/A",
-                    b'0',
-                ),
-                Operation::Encrypt,
-                ScopeFamily::ParentApp,
-                subject,
-                "dd926e731d8c4d89c2ad0a5f83a70e6d47571cfb96f7966451af44f9cb5a94ca",
-            ),
-            (
-                "encrypt_connection",
-                GrantScope::encrypt(ScopeFamily::Connection, Some(subject), "", b'0'),
-                Operation::Encrypt,
-                ScopeFamily::Connection,
-                subject,
-                "a119e1e7f8094c7bcf131ff7b414c7692a96a9d52650a1f39eb2c94b70bb988a",
-            ),
         ];
-        // Encrypt never reuses a destination grant and needs a subject.
-        assert!(
-            !GrantScope::encrypt(ScopeFamily::Destination, Some(subject), "", b'0').is_reusable()
-        );
-        assert!(!GrantScope::encrypt(ScopeFamily::Workspace, None, "/repo", b'0').is_reusable());
         for (name, scope, operation, family, subject, digest) in cases {
             let key = scope.key.expect(name);
             assert_eq!(key.operation, operation, "{name}");
@@ -1690,6 +1683,7 @@ mod tests {
             store.commit_at(
                 0,
                 &[key],
+                &[],
                 Duration::from_secs(120),
                 Instant::now(),
                 SystemTime::now(),
@@ -1706,6 +1700,7 @@ mod tests {
             store.commit_at(
                 0,
                 &[key],
+                &[],
                 Duration::from_secs(u64::MAX),
                 Instant::now(),
                 SystemTime::now(),
@@ -1731,22 +1726,24 @@ mod tests {
         assert_eq!(auth.calls.load(Ordering::Acquire), 0);
     }
 
+    /// Pending custody ends with every approval's permit — dropped or
+    /// committed alike; a hit owns none.
     #[tokio::test]
-    async fn approval_custody_commits_or_drops_with_permit() {
-        struct Custody(std::sync::Mutex<Vec<bool>>);
+    async fn approval_custody_ends_with_permit() {
+        struct Custody(AtomicUsize);
         #[async_trait]
         impl AuthorizationAuthenticator for Custody {
             async fn authenticate(&self, _: &str, _: Operation, _: Arc<AtomicBool>) -> AuthOutcome {
                 AuthOutcome::Success
             }
-            fn approval_complete(&self, reusable: bool) {
-                self.0.lock().unwrap().push(reusable);
+            fn approval_complete(&self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
             }
         }
-        let auth = Arc::new(Custody(std::sync::Mutex::new(Vec::new())));
+        let auth = Arc::new(Custody(AtomicUsize::new(0)));
         let engine = AuthorizationEngine::new(auth.clone(), AllowValidator::allowed());
         drop(engine.authorize(sign_request((1, 2), "fp")).await.unwrap());
-        assert_eq!(*auth.0.lock().unwrap(), vec![false]);
+        assert_eq!(auth.0.load(Ordering::Acquire), 1);
         engine
             .authorize(sign_request((1, 2), "fp"))
             .await
@@ -1754,13 +1751,164 @@ mod tests {
             .commit()
             .await
             .unwrap();
-        assert_eq!(*auth.0.lock().unwrap(), vec![false, true]);
+        assert_eq!(auth.0.load(Ordering::Acquire), 2);
         drop(engine.authorize(sign_request((1, 2), "fp")).await.unwrap());
         assert_eq!(
-            *auth.0.lock().unwrap(),
-            vec![false, true],
+            auth.0.load(Ordering::Acquire),
+            2,
             "hits own no pending custody"
         );
+    }
+
+    fn decrypt_request(subject: SubjectId, salts: &[[u8; 16]]) -> AuthorizationRequest {
+        AuthorizationRequest::new(
+            salts
+                .iter()
+                .map(|salt| GrantScope::decrypt_v2(Some(subject), b'0', salt, "h", "/repo"))
+                .collect(),
+            ReusePolicy::strict_ttl_secs(120),
+            "decrypt",
+        )
+    }
+
+    /// Material attached to an approval comes back on the hit in scope order,
+    /// including for a repeated scope, and dies with the grants.
+    #[tokio::test]
+    async fn grant_material_travels_with_the_grant() {
+        let auth = SuccessAuthenticator::new();
+        let engine = AuthorizationEngine::new(auth.clone(), AllowValidator::allowed());
+        let salts = [[1u8; 16], [2u8; 16], [1u8; 16]];
+        let deks = vec![
+            Zeroizing::new([0xa1; 32]),
+            Zeroizing::new([0xb2; 32]),
+            Zeroizing::new([0xa1; 32]),
+        ];
+
+        let mut permit = engine
+            .authorize(decrypt_request((1, 2), &salts))
+            .await
+            .unwrap();
+        assert_eq!(permit.decision(), Decision::Approved);
+        assert!(permit.materials().is_empty());
+        permit.attach_materials(deks.clone());
+        permit.commit().await.unwrap();
+
+        let hit = engine
+            .authorize(decrypt_request((1, 2), &salts))
+            .await
+            .unwrap();
+        assert_eq!(hit.decision(), Decision::CacheHit);
+        assert_eq!(hit.materials(), &deks[..]);
+        let subset = engine
+            .authorize(decrypt_request((1, 2), &salts[1..2]))
+            .await
+            .unwrap();
+        assert_eq!(subset.materials(), &deks[1..2]);
+        drop(hit);
+        drop(subset);
+        assert_eq!(auth.calls.load(Ordering::Acquire), 1);
+
+        engine.invalidate_all().await;
+        let fresh = engine
+            .authorize(decrypt_request((1, 2), &salts))
+            .await
+            .unwrap();
+        assert_eq!(fresh.decision(), Decision::Approved);
+        assert!(fresh.materials().is_empty());
+        assert_eq!(auth.calls.load(Ordering::Acquire), 2);
+    }
+
+    /// A hit over grants that carry no material serves none, and a grant
+    /// committed without material never gains one from a later hit.
+    #[tokio::test]
+    async fn grant_without_material_serves_none() {
+        let engine =
+            AuthorizationEngine::new(SuccessAuthenticator::new(), AllowValidator::allowed());
+        let salts = [[1u8; 16], [2u8; 16]];
+        let mut permit = engine
+            .authorize(decrypt_request((1, 2), &salts))
+            .await
+            .unwrap();
+        permit.attach_materials(vec![Zeroizing::new([7; 32])]);
+        assert_eq!(
+            permit.commit().await,
+            Err(CommitError::MaterialMismatch),
+            "partial material never commits"
+        );
+        engine
+            .authorize(decrypt_request((1, 2), &salts))
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        let hit = engine
+            .authorize(decrypt_request((1, 2), &salts))
+            .await
+            .unwrap();
+        assert_eq!(hit.decision(), Decision::CacheHit);
+        assert!(hit.materials().is_empty());
+    }
+
+    /// Direct-store: material follows expiry — an expired entry re-approved
+    /// under the same key takes the new material, a live one keeps its own,
+    /// and a swept entry is gone. Debug output never renders material bytes.
+    #[test]
+    fn store_material_follows_expiry_and_stays_out_of_debug() {
+        let key = keyed(GrantScope::decrypt_v2(
+            Some((1, 2)),
+            b'0',
+            &[7; 16],
+            "h",
+            "/repo",
+        ));
+        let keys = std::slice::from_ref(&key);
+        let ttl = Duration::from_secs(120);
+        let mut store = GrantStore::new();
+        let m0 = Instant::now();
+        let w0 = SystemTime::now();
+        let first = [Zeroizing::new([0x5a; 32])];
+        store.commit_at(0, keys, &first, ttl, m0, w0).unwrap();
+        let materials =
+            |store: &GrantStore, m, w| store.lookup_at(keys, ttl, m, w).hit.unwrap().materials;
+        assert_eq!(
+            materials(&store, m0 + ttl / 2, w0 + ttl / 2),
+            first.to_vec()
+        );
+
+        let rendered = format!("{store:?}");
+        assert!(rendered.contains("material: true"), "{rendered}");
+        assert!(!rendered.contains("90, 90, 90"), "{rendered}");
+        assert!(!rendered.contains("5a5a5a"), "{rendered}");
+
+        // Live entry, equal TTL: untouched.
+        let second = [Zeroizing::new([0x6b; 32])];
+        store
+            .commit_at(0, keys, &second, ttl, m0 + ttl / 2, w0 + ttl / 2)
+            .unwrap();
+        assert_eq!(
+            materials(&store, m0 + ttl / 2, w0 + ttl / 2),
+            first.to_vec()
+        );
+        // Expired entry: refreshed with the new material.
+        let later_m = m0 + ttl * 2;
+        let later_w = w0 + ttl * 2;
+        store
+            .commit_at(0, keys, &second, ttl, later_m, later_w)
+            .unwrap();
+        assert_eq!(materials(&store, later_m, later_w), second.to_vec());
+        assert!(store
+            .lookup_at(keys, ttl, later_m + ttl, later_w + ttl)
+            .hit
+            .is_none());
+        store.sweep_expired_at(later_m + ttl, later_w + ttl);
+        assert!(store.entries.is_empty());
+
+        assert_eq!(
+            store.commit_at(0, keys, &[first[0].clone(), second[0].clone()], ttl, m0, w0),
+            Err(CommitError::MaterialMismatch)
+        );
+        assert!(store.entries.is_empty(), "a mismatch writes nothing");
     }
 
     #[tokio::test]
