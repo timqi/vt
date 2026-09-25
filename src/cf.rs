@@ -976,7 +976,8 @@ mod tests {
         fn drop_field(m: &mut serde_json::Value, field: &str) {
             m.as_object_mut().unwrap().remove(field).unwrap();
         }
-        let cases: [(fn(&mut serde_json::Value), Option<&str>); 8] = [
+        type Mutate = fn(&mut serde_json::Value);
+        let cases: [(Mutate, Option<&str>); 8] = [
             (|_| {}, None),
             (
                 |m| m["status"] = "rejected".into(),

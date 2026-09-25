@@ -576,6 +576,23 @@ impl VTClient {
     }
 }
 
+/// Test client pinned to `backend` over the (fake) agent at `socket`.
+#[cfg(test)]
+pub(crate) fn agent_test_client(backend: &str, socket: &std::path::Path) -> VTClient {
+    let socket = socket.to_string_lossy().into_owned();
+    VTClient::new(ResolvedConfig::resolve(
+        Vec::new(),
+        |key| match key {
+            "VT_BACKEND" => Some(backend.into()),
+            "SSH_AUTH_SOCK" => Some(socket.clone()),
+            _ => None,
+        },
+        None,
+        None,
+    ))
+    .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,19 +737,8 @@ mod tests {
         let socket = dir.join("agent.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(ssh_agent_lib::agent::listen(listener, MixedAgent));
-        let socket_str = socket.to_string_lossy().into_owned();
         for backend in ["auto", "agent"] {
-            let client = VTClient::new(ResolvedConfig::resolve(
-                Vec::new(),
-                |key| match key {
-                    "VT_BACKEND" => Some(backend.into()),
-                    "SSH_AUTH_SOCK" => Some(socket_str.clone()),
-                    _ => None,
-                },
-                None,
-                None,
-            ))
-            .unwrap();
+            let client = agent_test_client(backend, &socket);
             let auth = serde_json::to_vec(&AuthReq {
                 host: "h".into(),
                 reason: "fixture".into(),

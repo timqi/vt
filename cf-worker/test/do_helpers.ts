@@ -93,6 +93,13 @@ export async function daemonAuth(tokenId: string, signed = '{}'): Promise<Daemon
   return { token_id: tokenId, mac_b64u: b64uEnc(await hmacSha256(await hostSecret(tokenId), raw)), signed_b64u: b64uEnc(raw) };
 }
 
+/** Router headers for a daemon body: `VT-HMAC` over the exact `bytes` under
+ *  the token's secret (or `secret`), as src/cf.rs signs them. */
+export async function daemonHeaders(tokenId: string, bytes: Uint8Array, secret?: Uint8Array): Promise<Record<string, string>> {
+  const mac = await hmacSha256(secret ?? await hostSecret(tokenId), bytes);
+  return { Authorization: `VT-HMAC ${b64uEnc(mac)}`, 'VT-Token-Id': tokenId };
+}
+
 // ── Admin session ──────────────────────────────────────────────────────────
 
 /** The entry the test authenticator registers: `p` is the COSE public key of

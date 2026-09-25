@@ -15,7 +15,7 @@ import type { Challenge, HostTokenRow } from '../src/types';
 import { AccountAdmin } from '../src/account_admin';
 import {
   inDO, accountStub, configure, doPost, doGet, approve, reject, makeMeta, auditRow, auditRows, bootstrap, hostSecret, loginAssertion,
-  redeployWithSecret, TEST_ORIGIN, TEST_CREDENTIAL_ENTRY,
+  redeployWithSecret, daemonHeaders, TEST_ORIGIN, TEST_CREDENTIAL_ENTRY,
 } from './do_helpers';
 
 const ORIGIN = 'https://vt.test.invalid';
@@ -41,9 +41,7 @@ async function post(path: string, body: unknown, headers: Record<string, string>
 /** Sign a daemon body the way src/cf.rs does for a `vt1.` token; `secret`
  *  defaults to the one this test's root key derives. */
 async function tokenHeaders(tokenId: string, body: unknown, secret?: Uint8Array) {
-  const raw = new TextEncoder().encode(JSON.stringify(body));
-  const mac = await hmacSha256(secret ?? await hostSecret(tokenId), raw);
-  return { Authorization: `VT-HMAC ${b64uEnc(mac)}`, 'VT-Token-Id': tokenId };
+  return daemonHeaders(tokenId, new TextEncoder().encode(JSON.stringify(body)), secret);
 }
 
 function challengeBody(over: Record<string, unknown> = {}) {

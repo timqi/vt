@@ -10,11 +10,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { env } from 'cloudflare:test';
 import app from '../src/index';
-import { b64uEnc, hmacSha256 } from '../src/crypto';
+import { b64uEnc } from '../src/crypto';
 import * as webpush from '../src/webpush';
 import { AccountNotifications } from '../src/account_notifications';
 import {
-  bootstrap, liveTokenId, hostSecret, makeMeta, makeChallenge, nextSalt, daemonAuth, configure,
+  bootstrap, liveTokenId, daemonHeaders, makeMeta, makeChallenge, nextSalt, daemonAuth, configure,
   approve, signApproval, doPost, doGet, inDO, adminHeaders, sealFakeDek, TEST_ORIGIN,
 } from './do_helpers';
 import type { RecordName, AuditRow, CacheListResponse } from '../src/types';
@@ -29,7 +29,7 @@ async function daemonPost(path: string, body: unknown) {
   const bytes = new TextEncoder().encode(JSON.stringify(body));
   const res = await app.fetch(new Request(`${TEST_ORIGIN}${path}`, {
     method: 'POST', body: bytes,
-    headers: { Authorization: `VT-HMAC ${b64uEnc(await hmacSha256(await hostSecret(tokenId), bytes))}`, 'VT-Token-Id': tokenId },
+    headers: await daemonHeaders(tokenId, bytes),
   }), env);
   const text = await res.text();
   return { status: res.status, text, json: (() => { try { return JSON.parse(text); } catch { return null; } })() };

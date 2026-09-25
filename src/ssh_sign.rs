@@ -1016,7 +1016,6 @@ mod relay_detection_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ResolvedConfig;
     use crate::core::wire::{wrap_ok_envelope, WIRE_VERSION};
     use crate::core::{client_encrypt_v2, DecryptResItem, SecretType};
     use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
@@ -1098,18 +1097,7 @@ mod tests {
         let pubkey = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(
             sk.verifying_key().to_bytes(),
         ));
-        let socket_str = socket.to_string_lossy().into_owned();
-        let client = VTClient::new(ResolvedConfig::resolve(
-            Vec::new(),
-            |key| match key {
-                "VT_BACKEND" => Some("agent".into()),
-                "SSH_AUTH_SOCK" => Some(socket_str.clone()),
-                _ => None,
-            },
-            None,
-            None,
-        ))
-        .unwrap();
+        let client = crate::client::agent_test_client("agent", &socket);
         let mut session = SignerSession {
             inner: Arc::new(SignerInner {
                 client,

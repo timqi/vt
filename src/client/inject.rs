@@ -1962,19 +1962,7 @@ mod tests {
         std::env::set_var(ENV_SECRET, &good);
         // Sidecar lookups stay inside the fixture, never the real state dir.
         std::env::set_var("HOME", &dir);
-        let client = || {
-            let config = crate::config::ResolvedConfig::resolve(
-                Vec::new(),
-                |key| match key {
-                    "VT_BACKEND" => Some("agent".into()),
-                    "SSH_AUTH_SOCK" => Some(socket.to_string_lossy().into_owned()),
-                    _ => None,
-                },
-                None,
-                None,
-            );
-            VTClient::new(config).unwrap()
-        };
+        let client = || crate::client::agent_test_client("agent", &socket);
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

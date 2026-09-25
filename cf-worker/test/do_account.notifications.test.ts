@@ -7,11 +7,11 @@ import { env } from 'cloudflare:test';
 import app from '../src/index';
 import { AccountNotifications } from '../src/account_notifications';
 import { AccountAdmin } from '../src/account_admin';
-import { b64uDec, b64uEnc, hmacSha256 } from '../src/crypto';
+import { b64uDec, b64uEnc } from '../src/crypto';
 import * as webpush from '../src/webpush';
 import type { DoAuditIngestOp } from '../src/types';
 import {
-  inDO, makeChallenge, makeMeta, liveTokenId, bootstrap, doGet, doPost, hostSecret, configure,
+  inDO, makeChallenge, makeMeta, liveTokenId, bootstrap, doGet, doPost, daemonHeaders, configure,
   signApproval, signChallenge, FLAGS_UP_UV,
 } from './do_helpers';
 
@@ -307,9 +307,8 @@ describe('ceremony routes and push', () => {
         daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
         timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta(),
       }));
-      const tag = await hmacSha256(await hostSecret(tokenId), body);
       const route = app.fetch(new Request('https://vt.test.invalid/api/challenge', {
-        method: 'POST', body, headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}`, 'VT-Token-Id': tokenId },
+        method: 'POST', body, headers: await daemonHeaders(tokenId, body),
       }), env);
       const response = await Promise.race([route, new Promise<never>((_, fail) =>
         setTimeout(() => fail(new Error('the route waited on the push')), 2000))]);
