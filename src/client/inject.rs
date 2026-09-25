@@ -1350,6 +1350,44 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A fill failure after the exclusive create (EFBIG under RLIMIT_FSIZE,
+    /// standing in for ENOSPC/EIO) releases the lock this call created.
+    #[test]
+    fn create_exposure_backup_removes_its_backup_when_filling_fails() {
+        const CHILD: &str = "VT_TEST_INJECT_FSIZE_CHILD";
+        let Some(dir) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let dir = std::env::temp_dir().join(format!("vt-inject-fsize-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            // The file-size limit is process-wide: confine it to a child whose
+            // output goes to pipes, which the limit does not cover.
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "client::inject::tests::create_exposure_backup_removes_its_backup_when_filling_fails"])
+                .env(CHILD, &dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(!dir.join(".f.vt-backup").exists());
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        };
+        let backup = dir.join(".f.vt-backup");
+        // SAFETY: plain libc calls on a local, initialized rlimit.
+        unsafe {
+            let mut lim: libc::rlimit = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut lim), 0);
+            lim.rlim_cur = 4;
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &lim), 0);
+        }
+        let err = create_exposure_backup(&backup, b"ciphertext", 0o600).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EFBIG));
+        assert!(!backup.exists());
+    }
+
     #[test]
     fn classify_exposure_conflict_branches() {
         let sc = InjectSidecar {
@@ -1843,11 +1881,15 @@ mod tests {
 
     struct MixedDecryptAgent;
 
+    /// Agent connections accepted, so a refusal can prove no agent contact.
+    static AGENT_SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for MixedDecryptAgent {
         fn new_session(
             &mut self,
             _: &tokio::net::UnixStream,
         ) -> impl ssh_agent_lib::agent::Session {
+            AGENT_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Self
         }
     }
@@ -1890,8 +1932,10 @@ mod tests {
         }
     }
 
+    /// Every failure before exposure leaves env, file, and command untouched;
+    /// the pre-decrypt refusals also spend no agent round trip.
     #[test]
-    fn inject_mixed_failure_does_not_mutate_env_file_or_execute() {
+    fn inject_refusals_and_mixed_failure_do_not_mutate_env_file_or_execute() {
         const CHILD: &str = "VT_TEST_INJECT_MIXED_CHILD";
         const ENV_SECRET: &str = "VT_TEST_INJECT_VALUE";
         let good = mixed_record(GOOD_SALT);
@@ -1904,7 +1948,7 @@ mod tests {
             // Isolate environment mutation and exec(): the unfixed code starts
             // this shell instead of returning to the test harness.
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "client::inject::tests::inject_mixed_failure_does_not_mutate_env_file_or_execute"])
+                .args(["--exact", "client::inject::tests::inject_refusals_and_mixed_failure_do_not_mutate_env_file_or_execute"])
                 .env(CHILD, &dir)
                 .status().unwrap();
             assert!(status.success());
@@ -1916,6 +1960,21 @@ mod tests {
         let socket = dir.join("agent.sock");
         std::env::set_var("SSH_AUTH_SOCK", &socket);
         std::env::set_var(ENV_SECRET, &good);
+        // Sidecar lookups stay inside the fixture, never the real state dir.
+        std::env::set_var("HOME", &dir);
+        let client = || {
+            let config = crate::config::ResolvedConfig::resolve(
+                Vec::new(),
+                |key| match key {
+                    "VT_BACKEND" => Some("agent".into()),
+                    "SSH_AUTH_SOCK" => Some(socket.to_string_lossy().into_owned()),
+                    _ => None,
+                },
+                None,
+                None,
+            );
+            VTClient::new(config).unwrap()
+        };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1924,21 +1983,44 @@ mod tests {
                 let listener = tokio::net::UnixListener::bind(&socket).unwrap();
                 let server =
                     tokio::spawn(ssh_agent_lib::agent::listen(listener, MixedDecryptAgent));
+
+                // Pre-decrypt refusals: another exposure's backup lock, and a
+                // file with no vt:// records. The argv record would reach the
+                // agent if either check fell through to decryption.
+                let locked = dir.join("locked");
+                std::fs::write(&locked, good_line.as_bytes()).unwrap();
+                std::fs::write(dir.join(".locked.vt-backup"), b"foreign lock").unwrap();
+                let plain = dir.join("plain");
+                std::fs::write(&plain, b"key: plaintext").unwrap();
+                for (target, refusal) in [
+                    (&locked, "found leftover backup"),
+                    (&plain, "contains no vt:// records"),
+                ] {
+                    let err = inject(
+                        client(),
+                        Some(target.to_string_lossy().into_owned()),
+                        2,
+                        None,
+                        Some(Vec::new()),
+                        vec![mixed_record([2; 16])],
+                    )
+                    .await
+                    .unwrap_err();
+                    assert!(err.to_string().contains(refusal), "got: {err}");
+                }
+                assert_eq!(AGENT_SESSIONS.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(std::fs::read(&locked).unwrap(), good_line.as_bytes());
+                assert_eq!(
+                    std::fs::read(dir.join(".locked.vt-backup")).unwrap(),
+                    b"foreign lock"
+                );
+                assert_eq!(std::fs::read(&plain).unwrap(), b"key: plaintext");
+                assert!(!dir.join(".plain.vt-backup").exists());
+
                 for replace_file in [
                     None,
                     Some(dir.join("config").to_string_lossy().into_owned()),
                 ] {
-                    let config = crate::config::ResolvedConfig::resolve(
-                        Vec::new(),
-                        |key| match key {
-                            "VT_BACKEND" => Some("agent".into()),
-                            "SSH_AUTH_SOCK" => Some(socket.to_string_lossy().into_owned()),
-                            _ => None,
-                        },
-                        None,
-                        None,
-                    );
-                    let client = VTClient::new(config).unwrap();
                     let args = vec![
                         "/bin/sh".into(),
                         "-c".into(),
@@ -1948,7 +2030,7 @@ mod tests {
                         mixed_record([2; 16]),
                     ];
                     let err = inject(
-                        client,
+                        client(),
                         replace_file,
                         2,
                         None,
@@ -1966,6 +2048,8 @@ mod tests {
                     assert!(!dir.join(".config.vt-backup").exists());
                     assert!(!dir.join("command-started").exists());
                 }
+                // The same counter sees the decrypting path reach the agent.
+                assert!(AGENT_SESSIONS.load(std::sync::atomic::Ordering::SeqCst) > 0);
                 server.abort();
                 let _ = server.await;
             });
@@ -2232,15 +2316,5 @@ mod tests {
         assert!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC != 0);
         drop(fd);
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn no_vt_records_means_nothing_to_decrypt() {
-        // The -r guard: zero vt:// records refuses the exposure protocol
-        // (either the wrong file, or plaintext left by a broken exposure).
-        assert!(iter_vt_urls("plain: text\nno records here")
-            .next()
-            .is_none());
-        assert!(iter_vt_urls("key: vt://0abc").next().is_some());
     }
 }
