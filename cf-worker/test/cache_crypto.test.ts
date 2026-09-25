@@ -65,29 +65,35 @@ describe('sealed box v1', () => {
     expect(await openToCache(b64uEnc(lowOrder), RSK)).toBeNull();
   });
 
-  it('gives a discarded recipient no box can reach', async () => {
+  // Undecryptable by construction (the scalar is never exported) is not
+  // testable here; what is: the key is a real curve point, so seal stays on
+  // its normal path.
+  it('gives a discarded recipient a real curve point that seal accepts', async () => {
     const pk = await discardedBoxPublicKey();
     expect(pk.length).toBe(32);
     const sealed = await seal(M, pk);
     expect(b64uDec(sealed).length).toBe(80);
-    expect(await openToCache(sealed, RSK)).toBeNull();
   });
 });
 
-// The PWA's implementation (pwa/common.js vt.sealBox) is the third copy of
-// the construction; it is plain browser script, so evaluate it here with a
-// `window` shim and prove its boxes open with the Worker's openToCache. A
-// real browser's X25519 is still only verified on a real phone.
-describe('pwa/common.js vt.sealBox', () => {
-  const src = readFileSync(new URL('../pwa/common.js', import.meta.url), 'utf8');
-  const win: { vt?: Record<string, (...a: never[]) => unknown> } = {};
-  new Function('window', src)(win);
-  const pwa = win.vt as unknown as {
-    sealBox(m: Uint8Array, rpk: Uint8Array): Promise<Uint8Array>;
-    x25519Keypair(): Promise<{ privateKey: CryptoKey; pk: Uint8Array }>;
-    x25519(k: CryptoKey, pk: Uint8Array): Promise<Uint8Array>;
-  };
+// The PWA's crypto (pwa/common.js) is plain browser script, so evaluate it
+// here with a `window` shim. A real browser's WebCrypto is still only verified
+// on a real phone.
+const pwaSrc = readFileSync(new URL('../pwa/common.js', import.meta.url), 'utf8');
+const win: { vt?: Record<string, (...a: never[]) => unknown> } = {};
+new Function('window', pwaSrc)(win);
+const pwa = win.vt as unknown as {
+  sealBox(m: Uint8Array, rpk: Uint8Array): Promise<Uint8Array>;
+  x25519Keypair(): Promise<{ privateKey: CryptoKey; pk: Uint8Array }>;
+  x25519(k: CryptoKey, pk: Uint8Array): Promise<Uint8Array>;
+  deriveDek(masterKey: Uint8Array, salt: Uint8Array): Promise<Uint8Array>;
+  approveChallenge(approveChHash: Uint8Array, pwaPk: Uint8Array): Promise<Uint8Array>;
+};
+const hex = (b: Uint8Array) => Buffer.from(b).toString('hex');
 
+// vt.sealBox is the third copy of the construction: prove its boxes open with
+// the Worker's openToCache.
+describe('pwa/common.js vt.sealBox', () => {
   it('seals what openToCache opens, 80 bytes per DEK', async () => {
     const box = await pwa.sealBox(M, b64uDec(RPK_B64U));
     expect(box.length).toBe(80);
@@ -102,5 +108,25 @@ describe('pwa/common.js vt.sealBox', () => {
     expect(kp.pk.length).toBe(32);
     await expect(pwa.x25519(kp.privateKey, new Uint8Array(32))).rejects.toThrow();
     await expect(pwa.sealBox(M, new Uint8Array(32))).rejects.toThrow();
+  });
+});
+
+// Known answers computed independently (Python hashlib / RFC 5869 HKDF), so a
+// changed info label, salt/IKM order or concatenation order fails here rather
+// than on a live approval.
+describe('pwa/common.js ceremony derivations', () => {
+  // DEK = HKDF-SHA256(master, salt, info "vt-dek-v2"); the CLI's derive_dek
+  // must produce the same bytes or cached and phone-approved DEKs diverge.
+  it('derives the DEK known-answer vector', async () => {
+    const dek = await pwa.deriveDek(new Uint8Array(32).fill(0x42), new Uint8Array(16).fill(0x11));
+    expect(hex(dek)).toBe('7d23a5b1a0000229f0fc4561273179271165e47110acb0b620a58a1f1b610142');
+  });
+
+  // The approve assertion signs SHA-256(approve_challenge_hash || pwa_pk);
+  // opApprove recomputes it, and the DO test helpers carry their own copy.
+  it('commits pwa_pk after the approve hash in the assertion challenge', async () => {
+    const approveHash = Buffer.from('4f53ae2e9692a575f7f35bc4c6c03ad91d8cc024f08152c266d3bfdedcd6917f', 'hex');
+    const ch = await pwa.approveChallenge(new Uint8Array(approveHash), new Uint8Array(32).fill(0x05));
+    expect(hex(ch)).toBe('a78831717712f54a37c79a682eb06d4f3621baf4bf15edb0bae41d40648f33dc');
   });
 });

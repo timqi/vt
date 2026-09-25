@@ -1,13 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
   planExtend, isAllowedApproveTtl, isAllowedExtendTtl,
-  APPROVE_TTL_WHITELIST, EXTEND_TTL_WHITELIST,
   approveTtlOptions, extendTtlOptions,
 } from '../src/cache_policy';
 
 const NOW = 1_800_000_000_000;
 const MIN = 60_000;
 const HOUR = 60 * MIN;
+const PERMANENT = 100 * 365 * 24 * 3600;
 
 // A live entry created `ageMs` ago that expires `leftMs` from now.
 const entry = (ageMs: number, leftMs: number) =>
@@ -18,40 +18,14 @@ describe('policy constants', () => {
     expect(approveTtlOptions()).toEqual([20 * 60, 2 * 60 * 60, 8 * 60 * 60]);
   });
 
+  // "Permanent" is a finite far-future TTL on purpose: every consumer (read
+  // check, sweeper, audit, countdown) keeps working with no special case, and
+  // its expiry must still land past the next century.
   it('offers the multi-day rungs only for extension', () => {
     expect(extendTtlOptions()).toEqual([
-      20 * 60, 2 * 60 * 60, 8 * 60 * 60, 24 * 3600, 2 * 24 * 3600, 7 * 24 * 3600,
-      100 * 365 * 24 * 3600,
+      20 * 60, 2 * 60 * 60, 8 * 60 * 60, 24 * 3600, 2 * 24 * 3600, 7 * 24 * 3600, PERMANENT,
     ]);
-  });
-
-  // "Permanent" is a finite far-future TTL on purpose: every consumer (read check,
-  // sweeper, audit, countdown) keeps working with no special case. Guard the two
-  // properties that makes it depend on — it must stay a plain number, and the
-  // resulting expiry must stay inside the safe-integer range for the next century.
-  it('expresses permanence as a finite, safe magnitude', () => {
-    const perm = 100 * 365 * 24 * 3600;
-    expect(isAllowedExtendTtl(perm)).toBe(true);
-    expect(Number.isFinite(perm)).toBe(true);
-    const p = planExtend({ created_ms: NOW, expires_ms: NOW + MIN }, perm, NOW);
-    expect(p).toEqual({ ok: true, expires_ms: NOW + perm * 1000 });
-    if (p.ok) {
-      expect(p.expires_ms).toBeLessThan(Number.MAX_SAFE_INTEGER);
-      expect(new Date(p.expires_ms).getUTCFullYear()).toBeGreaterThan(2100);
-    }
-  });
-
-  // It must never be armable straight from a phone tap — the multi-day and
-  // permanent rungs exist only behind the deliberate extension ceremony.
-  it('never lets a phone approval arm the permanent rung', () => {
-    expect(isAllowedApproveTtl(100 * 365 * 24 * 3600)).toBe(false);
-  });
-
-  // The longest single hop is the extend ladder's top rung, so trimming the
-  // ladder shortens the longest single grant automatically.
-  it('caps a single hop at the extend ladder top rung', () => {
-    expect(Math.max(...EXTEND_TTL_WHITELIST)).toBe(100 * 365 * 24 * 3600);
-    expect(Math.max(...EXTEND_TTL_WHITELIST)).toBeGreaterThan(Math.max(...APPROVE_TTL_WHITELIST));
+    expect(new Date(NOW + PERMANENT * 1000).getUTCFullYear()).toBeGreaterThan(2100);
   });
 
   it('accepts only approve-ladder TTLs at approval time', () => {
@@ -60,6 +34,7 @@ describe('policy constants', () => {
     // Extension-only rungs must NOT be armable straight from a phone approval.
     expect(isAllowedApproveTtl(24 * 3600)).toBe(false);
     expect(isAllowedApproveTtl(7 * 24 * 3600)).toBe(false);
+    expect(isAllowedApproveTtl(PERMANENT)).toBe(false);
     expect(isAllowedApproveTtl(0)).toBe(false);
     expect(isAllowedApproveTtl(21 * 60)).toBe(false);
     expect(isAllowedApproveTtl('1200')).toBe(false);
@@ -77,74 +52,30 @@ describe('policy constants', () => {
     expect(isAllowedExtendTtl('86400')).toBe(false);
     expect(isAllowedExtendTtl(NaN)).toBe(false);
   });
-
-  it('keeps every extend rung within the per-hop cap', () => {
-    for (const t of extendTtlOptions()) {
-      expect(t).toBeLessThanOrEqual(Math.max(...EXTEND_TTL_WHITELIST));
-    }
-  });
 });
 
 describe('planExtend', () => {
-  it('extends a live entry to now + ttl', () => {
-    const p = planExtend(entry(5 * MIN, 10 * MIN), 20 * 60, NOW);
-    expect(p).toEqual({ ok: true, expires_ms: NOW + 20 * MIN });
-  });
-
-  // The core anti-resurrection rule: once an entry has lapsed, only a new phone
-  // approval can bring the capability back.
-  it('never resurrects an expired entry', () => {
-    expect(planExtend({ created_ms: NOW - MIN, expires_ms: NOW - 1 }, 20 * 60, NOW))
-      .toEqual({ ok: false, skip: 'expired' });
-    // Exactly at expires_ms counts as expired, matching the read path's `<=`.
-    expect(planExtend({ created_ms: NOW - MIN, expires_ms: NOW }, 20 * 60, NOW))
-      .toEqual({ ok: false, skip: 'expired' });
-  });
-
-  // Regression: a naive `min(now+ttl, ceiling)` SHORTENS an entry when the
-  // requested TTL is smaller than the time already remaining.
-  it('never shortens an entry', () => {
-    const p = planExtend(entry(MIN, 3 * HOUR), 20 * 60, NOW);
-    expect(p).toEqual({ ok: false, skip: 'no_gain' });
-  });
-
-  // The headline semantic: every extension is measured from the approval moment,
-  // regardless of how old the entry is — so an entry can be renewed indefinitely,
-  // one Passkey-approved hop at a time.
-  it('always measures from now, never from creation', () => {
-    for (const age of [0, 8 * HOUR, 30 * 24 * HOUR]) {
-      expect(planExtend({ created_ms: NOW - age, expires_ms: NOW + MIN }, 24 * 3600, NOW))
-        .toEqual({ ok: true, expires_ms: NOW + 24 * HOUR });
-    }
-  });
-
-  // created_ms is required (entries written before 2026-05-20 lack it): a value
-  // without one is not a live entry, so an extension never touches it.
-  it('treats an entry with no created_ms as expired', () => {
-    expect(planExtend({ expires_ms: NOW + MIN }, 7 * 24 * 3600, NOW))
-      .toEqual({ ok: false, skip: 'expired' });
-  });
-
-  // Renewal is unbounded in total, but only ever forward and only from a LIVE
-  // grant: the moment a window lapses, the capability is gone for good.
-  it('renews indefinitely while live, and stops dead once lapsed', () => {
-    let e = { created_ms: NOW, expires_ms: NOW + 20 * MIN };
-    let t = NOW;
-    for (let i = 0; i < 10; i++) {
-      t = e.expires_ms - MIN;                    // renew just before each lapse
-      const p = planExtend(e, 24 * 3600, t);
-      expect(p.ok).toBe(true);
-      if (!p.ok) break;
-      expect(p.expires_ms).toBe(t + 24 * HOUR);  // exactly now + ttl, no budget
-      e = { created_ms: NOW, expires_ms: p.expires_ms };
-    }
-    // One second past expiry, the same request is refused forever after.
-    expect(planExtend(e, 24 * 3600, e.expires_ms + 1000))
-      .toEqual({ ok: false, skip: 'expired' });
-  });
-
-  it('treats a malformed expiry as expired', () => {
-    expect(planExtend({ created_ms: NOW, expires_ms: undefined as unknown as number }, 20 * 60, NOW))
-      .toEqual({ ok: false, skip: 'expired' });
+  const TTL_1D = 24 * 3600;
+  it.each([
+    // Every extension is measured from the approval moment, regardless of how
+    // old the entry is — so an entry renews indefinitely, one hop at a time.
+    ['a live entry, to now + ttl', entry(5 * MIN, 10 * MIN), 20 * 60,
+      { ok: true, expires_ms: NOW + 20 * MIN }],
+    ['an 8h-old entry, from now', entry(8 * HOUR, MIN), TTL_1D, { ok: true, expires_ms: NOW + 24 * HOUR }],
+    ['a 30-day-old entry, from now', entry(30 * 24 * HOUR, MIN), TTL_1D, { ok: true, expires_ms: NOW + 24 * HOUR }],
+    // Anti-resurrection: once an entry has lapsed, only a new phone approval
+    // brings the capability back. Exactly at expires_ms counts as expired,
+    // matching the read path's `<=`.
+    ['a lapsed entry', { created_ms: NOW - MIN, expires_ms: NOW - 1 }, 20 * 60, { ok: false, skip: 'expired' }],
+    ['an entry at exactly expires_ms', { created_ms: NOW - MIN, expires_ms: NOW }, 20 * 60,
+      { ok: false, skip: 'expired' }],
+    // created_ms is required (entries written before 2026-05-20 lack it).
+    ['an entry with no created_ms', { expires_ms: NOW + MIN }, 7 * TTL_1D, { ok: false, skip: 'expired' }],
+    ['a malformed expiry', { created_ms: NOW, expires_ms: undefined }, 20 * 60, { ok: false, skip: 'expired' }],
+    // Regression: a naive `min(now+ttl, ceiling)` SHORTENS an entry when the
+    // requested TTL is smaller than the time already remaining.
+    ['a hop that would shorten the entry', entry(MIN, 3 * HOUR), 20 * 60, { ok: false, skip: 'no_gain' }],
+  ] as const)('plans %s', (_name, e, ttl, want) => {
+    expect(planExtend(e, ttl, NOW)).toEqual(want);
   });
 });

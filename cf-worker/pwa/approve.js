@@ -305,15 +305,11 @@
                 var PRF_INPUT = await prfInputReady;
 
                 // Ephemeral X25519 keypair (non-extractable; docs/sealed-box-v1.md),
-                // then commit pwa_pk into the WebAuthn challenge:
-                // effective_challenge = SHA-256(approve_challenge_hash || pwa_pk).
+                // then commit pwa_pk into the WebAuthn challenge (vt.approveChallenge).
                 var kp = await vt.x25519Keypair();
                 var pwaPk = kp.pk;
                 var approveChHash = b64uDec(data.approve_challenge_b64u);
-                var concat = new Uint8Array(approveChHash.length + pwaPk.length);
-                concat.set(approveChHash, 0);
-                concat.set(pwaPk, approveChHash.length);
-                var effectiveChallenge = await vt.sha256(concat);
+                var effectiveChallenge = await vt.approveChallenge(approveChHash, pwaPk);
 
                 var assertion = await getAssertion({
                     challenge: effectiveChallenge,

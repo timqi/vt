@@ -75,11 +75,12 @@ describe('challengeHash', () => {
   const nonce = new Uint8Array(16).fill(2);
   const salts = [new Uint8Array(16).fill(3), new Uint8Array(16).fill(4)];
 
-  it('is deterministic for identical inputs', async () => {
-    const a = await challengeHash(pk, nonce, 12345, salts, 'approve');
-    const b = await challengeHash(pk, nonce, 12345, salts, 'approve');
-    expect(ctEq(a, b)).toBe(true);
-    expect(a.length).toBe(32);
+  // The CLI recomputes this hash; src/cf.rs approve_challenge_hash_golden_vector
+  // pins the same inputs to the same bytes.
+  it('matches the Rust approve golden vector', async () => {
+    const h = await challengeHash(pk, nonce, 1_700_000_000_000, salts, 'approve');
+    expect(Buffer.from(h).toString('hex'))
+      .toBe('4f53ae2e9692a575f7f35bc4c6c03ad91d8cc024f08152c266d3bfdedcd6917f');
   });
 
   it('domain-separates approve from reject (replay guard)', async () => {

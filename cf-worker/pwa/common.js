@@ -121,6 +121,15 @@
         return vt.hkdfSha256(masterKey, DEK_INFO_BYTES, 32, saltBytes);
     };
 
+    // Approve assertion challenge = SHA-256(approve_challenge_hash || pwa_pk):
+    // commits pwa_pk into the signature (do_account.ts opApprove verifies it).
+    vt.approveChallenge = function (approveChHash, pwaPk) {
+        var m = new Uint8Array(approveChHash.length + pwaPk.length);
+        m.set(approveChHash, 0);
+        m.set(pwaPk, approveChHash.length);
+        return vt.sha256(m);
+    };
+
     vt.hmacSha256 = async function (keyBytes, data) {
         var key = await crypto.subtle.importKey(
             'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
