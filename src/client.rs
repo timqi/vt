@@ -563,8 +563,12 @@ impl VTClient {
 
         match result {
             Some(bytes) => {
-                let _res: AuthRes =
+                let res: AuthRes =
                     serde_json::from_slice(&bytes).context("Failed to parse auth response")?;
+                // Only an explicit approval passes; anything else fails closed.
+                if !res.approved {
+                    return Err(VtClientError::Agent(ErrKind::AuthRejected, None).into());
+                }
                 Ok(())
             }
             None => self.cf_auth(reason).await,
@@ -665,7 +669,8 @@ mod tests {
         }
     }
 
-    /// Fake agent: `auth@vt` answers a plain OK envelope, `encrypt@vt` an
+    /// Fake agent: `auth@vt` answers a plain OK envelope (`approved:false` for
+    /// reason `declined`), `encrypt@vt` an
     /// `SSH_AGENT_FAILURE` (what a non-vt agent sends), `decrypt@vt` bytes
     /// that are not an envelope, `sign@vt` a structured rejection.
     struct MixedAgent;
@@ -690,8 +695,11 @@ mod tests {
                     // The request is the plain JSON the client serialized.
                     let req: AuthReq = serde_json::from_slice(extension.details.as_ref())
                         .expect("plain JSON request");
-                    assert_eq!(req.reason, "fixture");
-                    wrap_ok_envelope(br#"{"approved":true}"#)
+                    match req.reason.as_str() {
+                        "fixture" => wrap_ok_envelope(br#"{"approved":true}"#),
+                        "declined" => wrap_ok_envelope(br#"{"approved":false}"#),
+                        other => panic!("unexpected auth reason {other}"),
+                    }
                 }
                 "encrypt@vt" => return Err(ssh_agent_lib::error::AgentError::Failure),
                 "decrypt@vt" => b"not an envelope".to_vec(),
@@ -737,6 +745,13 @@ mod tests {
                 .unwrap()
                 .expect("plain OK envelope is the agent answer");
             assert_eq!(&body[..], br#"{"approved":true}"#);
+            client.auth("fixture").await.unwrap();
+            // An OK envelope that does not approve fails closed, never Ok.
+            let declined = client.auth("declined").await.unwrap_err();
+            assert!(matches!(
+                declined.downcast_ref::<VtClientError>(),
+                Some(VtClientError::Agent(ErrKind::AuthRejected, None))
+            ));
             // Non-vt answers are recoverable in `auto` only.
             let failure = client.agent_call_or_fallback("encrypt@vt", vec![]).await;
             let garbage = client.agent_call_or_fallback("decrypt@vt", vec![]).await;
