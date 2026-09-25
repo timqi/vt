@@ -890,10 +890,12 @@ mod tests {
         .await
     }
 
+    const TEST_TOKEN: &str = "vt1.AAAAAAAAAAAAAAAA.iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI";
+
     fn config(url: &str) -> CfConfig<'_> {
         CfConfig {
             worker_url: url,
-            worker_auth: "vt1.AAAAAAAAAAAAAAAA.iaR45SwFl4C19e0hLGVnh32aBZlyjE4i47Jp_FbuKAI",
+            worker_auth: TEST_TOKEN,
             uv: None,
         }
     }
@@ -907,6 +909,164 @@ mod tests {
             "{}/api/dek?poll_token=test_token",
             http_url.replacen("http", "ws", 1)
         )
+    }
+
+    /// A fake Worker for one ceremony: answers the POST with `post_response`,
+    /// then upgrades the poll socket and sends `waiting` followed by the
+    /// terminal message `terminal` builds from the POSTed request.
+    async fn fake_worker(
+        post_response: serde_json::Value,
+        terminal: impl FnOnce(serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use futures_util::SinkExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let (_, body) = read_request(&mut stream).await;
+            let response = serde_json::to_vec(&post_response).unwrap();
+            write_response(stream.get_mut(), 200, &response).await;
+            let (poll, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(poll).await.unwrap();
+            let request = serde_json::from_slice(&body).unwrap();
+            for msg in [serde_json::json!({"status": "waiting"}), terminal(request)] {
+                ws.send(Message::Text(msg.to_string())).await.unwrap();
+            }
+        });
+        (url, task)
+    }
+
+    const WORKER_NONCE: [u8; 16] = [2; 16];
+
+    /// The PWA's approval of a challenge `request`: `dek` sealed to the
+    /// daemon key, bound to the challenge under a fresh PWA key.
+    fn approved(request: &serde_json::Value, dek: [u8; 32]) -> serde_json::Value {
+        let b64u = |v: &serde_json::Value| URL_SAFE_NO_PAD.decode(v.as_str().unwrap()).unwrap();
+        let daemon_pk =
+            PublicKey::from(<[u8; 32]>::try_from(b64u(&request["daemon_pubkey_b64u"])).unwrap());
+        let salts: Vec<[u8; 16]> = request["salts_b64u"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| b64u(s).try_into().unwrap())
+            .collect();
+        let hash = compute_approve_challenge_hash(
+            daemon_pk.as_bytes(),
+            &WORKER_NONCE,
+            request["timestamp_ms"].as_u64().unwrap(),
+            &salts,
+        );
+        let sealed = seal_with(&keypair().1, &dek, &daemon_pk);
+        let (pwa_pk, pwa_sk) = keypair();
+        let tag = pwa_build_tag(&daemon_pk, &pwa_sk, pwa_pk.as_bytes(), &hash, &sealed);
+        serde_json::json!({
+            "status": "approved",
+            "sealed_deks_b64u": URL_SAFE_NO_PAD.encode(sealed),
+            "pwa_pk_b64u": URL_SAFE_NO_PAD.encode(pwa_pk.as_bytes()),
+            "binding_tag_b64u": URL_SAFE_NO_PAD.encode(tag),
+        })
+    }
+
+    /// The full ceremony opens only a bound approval: terminal failures and
+    /// approvals missing a binding field refuse, and a sealed box substituted
+    /// after binding fails the binding before any open is attempted.
+    #[tokio::test]
+    async fn ceremony_opens_only_bound_approvals() {
+        fn drop_field(m: &mut serde_json::Value, field: &str) {
+            m.as_object_mut().unwrap().remove(field).unwrap();
+        }
+        let cases: [(fn(&mut serde_json::Value), Option<&str>); 8] = [
+            (|_| {}, None),
+            (
+                |m| m["status"] = "rejected".into(),
+                Some("approval rejected by user"),
+            ),
+            (
+                |m| m["status"] = "expired".into(),
+                Some("approval request expired"),
+            ),
+            (
+                |m| m["status"] = "revoked".into(),
+                Some("unexpected WS status: revoked"),
+            ),
+            (
+                |m| drop_field(m, "sealed_deks_b64u"),
+                Some("fields: sealed_deks_b64u"),
+            ),
+            (
+                |m| drop_field(m, "pwa_pk_b64u"),
+                Some("fields: pwa_pk_b64u"),
+            ),
+            (
+                |m| drop_field(m, "binding_tag_b64u"),
+                Some("fields: binding_tag_b64u"),
+            ),
+            // A substituted box would also fail to open; the binding error
+            // proves the tag was checked first.
+            (
+                |m| {
+                    let mut sealed = URL_SAFE_NO_PAD
+                        .decode(m["sealed_deks_b64u"].as_str().unwrap())
+                        .unwrap();
+                    sealed[40] ^= 1;
+                    m["sealed_deks_b64u"] = URL_SAFE_NO_PAD.encode(sealed).into();
+                },
+                Some("binding: tag mismatch"),
+            ),
+        ];
+        let challenge = serde_json::json!({
+            "poll_token": "test_token",
+            "approve_url": "https://worker.test/approve",
+            "worker_nonce_b64u": URL_SAFE_NO_PAD.encode(WORKER_NONCE),
+        });
+        for (mutate, refusal) in cases {
+            let (url, server) = fake_worker(challenge.clone(), move |request| {
+                let mut msg = approved(&request, [0x42; 32]);
+                mutate(&mut msg);
+                msg
+            })
+            .await;
+            match (
+                get_deks(&config(&url), &[[1; 16]], ChallengeMeta::default()).await,
+                refusal,
+            ) {
+                (Ok(deks), None) => assert!(deks.len() == 1 && *deks[0] == [0x42; 32]),
+                (Err(err), Some(refusal)) => {
+                    assert!(format!("{err:#}").contains(refusal), "got: {err:#}")
+                }
+                (result, _) => panic!("expected {refusal:?}, got ok={}", result.is_ok()),
+            }
+            join(server).await;
+        }
+    }
+
+    /// `vt enroll` hands back only a parseable host token from the approval.
+    #[tokio::test]
+    async fn enroll_returns_only_a_host_token() {
+        for (host_token, refusal) in [
+            (Some(TEST_TOKEN), None),
+            (Some("vt1.short.xx"), Some("non-host token")),
+            (None, Some("carries no host token")),
+        ] {
+            let (url, server) = fake_worker(
+                serde_json::json!({
+                    "approve_url": "https://worker.test/approve",
+                    "poll_token": "test_token",
+                    "pair_code": "1234",
+                }),
+                move |_| serde_json::json!({"status": "approved", "host_token": host_token}),
+            )
+            .await;
+            match (enroll(&url, "h", "u").await, refusal) {
+                (Ok(token), None) => assert_eq!(token.as_str(), TEST_TOKEN),
+                (Err(err), Some(refusal)) => {
+                    assert!(format!("{err:#}").contains(refusal), "got: {err:#}")
+                }
+                (result, _) => panic!("expected {refusal:?}, got ok={}", result.is_ok()),
+            }
+            join(server).await;
+        }
     }
 
     #[tokio::test]
