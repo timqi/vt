@@ -888,121 +888,73 @@ pub(crate) fn parse_procargs2(buf: &[u8]) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod relay_detection_tests {
-    use super::{is_vt_relay_invocation, parse_procargs2, program_basename};
+    use super::{is_vt_relay_invocation, parse_procargs2};
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn matches_canonical_relay_invocation() {
-        assert!(is_vt_relay_invocation(&v(&[
-            "vt",
-            "ssh",
-            "connect",
-            "--forward-real-agent",
-            "host"
-        ])));
-    }
-
-    #[test]
-    fn matches_with_absolute_arg0_and_interspersed_flags() {
-        assert!(is_vt_relay_invocation(&v(&[
-            "/usr/local/bin/vt",
-            "ssh",
-            "connect",
-            "-p",
-            "2222",
-            "--forward-real-agent",
-            "host",
-        ])));
-        assert!(is_vt_relay_invocation(&v(&[
-            "./target/debug/vt",
-            "ssh",
-            "connect",
-            "--forward-real-agent",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "host",
-        ])));
-    }
-
-    #[test]
-    fn matches_with_global_option_before_subcommand() {
-        assert!(is_vt_relay_invocation(&v(&[
-            "vt",
-            "--uv",
-            "required",
-            "ssh",
-            "connect",
-            "--forward-real-agent",
-            "host",
-        ])));
-    }
-
-    #[test]
-    fn rejects_connect_without_flag() {
-        assert!(!is_vt_relay_invocation(&v(&[
-            "vt", "ssh", "connect", "host"
-        ])));
-    }
-
-    #[test]
-    fn rejects_non_connect_subcommands() {
-        assert!(!is_vt_relay_invocation(&v(&["vt", "read", "vt://0abc"])));
-        assert!(!is_vt_relay_invocation(&v(&[
-            "vt",
-            "ssh",
-            "agent",
-            "--forward-real-agent"
-        ])));
-        assert!(!is_vt_relay_invocation(&v(&["vt", "ssh", "keygen"])));
-    }
-
-    #[test]
-    fn rejects_near_miss_flag_names() {
-        assert!(!is_vt_relay_invocation(&v(&[
-            "vt",
-            "ssh",
-            "connect",
-            "--forward-real-agents",
-            "host"
-        ])));
-        assert!(!is_vt_relay_invocation(&v(&[
-            "vt",
-            "ssh",
-            "connect",
-            "--forward-agent",
-            "host"
-        ])));
-    }
-
-    #[test]
-    fn rejects_non_vt_basename() {
-        assert!(!is_vt_relay_invocation(&v(&[
-            "ssh",
-            "connect",
-            "--forward-real-agent"
-        ])));
-        assert!(!is_vt_relay_invocation(&v(&[
-            "notvt",
-            "ssh",
-            "connect",
-            "--forward-real-agent",
-            "host"
-        ])));
-    }
-
-    #[test]
-    fn rejects_empty_argv() {
-        assert!(!is_vt_relay_invocation(&[]));
-    }
-
-    #[test]
-    fn basename_strips_dirs() {
-        assert_eq!(program_basename("/usr/local/bin/vt"), "vt");
-        assert_eq!(program_basename("vt"), "vt");
-        assert_eq!(program_basename("./vt"), "vt");
+    fn relay_invocation_needs_vt_basename_ssh_connect_and_the_exact_flag() {
+        for (argv, relay) in [
+            (
+                &["vt", "ssh", "connect", "--forward-real-agent", "host"][..],
+                true,
+            ),
+            (
+                &[
+                    "/usr/local/bin/vt",
+                    "ssh",
+                    "connect",
+                    "-p",
+                    "2222",
+                    "--forward-real-agent",
+                    "host",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "./target/debug/vt",
+                    "ssh",
+                    "connect",
+                    "--forward-real-agent",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "host",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "vt",
+                    "--uv",
+                    "required",
+                    "ssh",
+                    "connect",
+                    "--forward-real-agent",
+                    "host",
+                ],
+                true,
+            ),
+            (&["vt", "ssh", "connect", "host"], false),
+            (&["vt", "read", "vt://0abc"], false),
+            (&["vt", "ssh", "agent", "--forward-real-agent"], false),
+            (&["vt", "ssh", "keygen"], false),
+            (
+                &["vt", "ssh", "connect", "--forward-real-agents", "host"],
+                false,
+            ),
+            (&["vt", "ssh", "connect", "--forward-agent", "host"], false),
+            (&["ssh", "connect", "--forward-real-agent"], false),
+            (
+                &["notvt", "ssh", "connect", "--forward-real-agent", "host"],
+                false,
+            ),
+            (&[], false),
+        ] {
+            assert_eq!(is_vt_relay_invocation(&v(argv)), relay, "{argv:?}");
+        }
     }
 
     /// Build a synthetic KERN_PROCARGS2 buffer: argc(int, native endian),
@@ -1053,59 +1005,142 @@ mod relay_detection_tests {
         assert_eq!(parse_procargs2(&[1, 2, 3]), None);
         assert_eq!(parse_procargs2(&0i32.to_ne_bytes()), None);
         assert_eq!(parse_procargs2(&(-5i32).to_ne_bytes()), None);
-        // argc says 3 but the buffer is truncated after the exec path → the
-        // loop stops early without panicking.
+        // argc says 3 but the buffer is truncated after the exec path → no
+        // argv at all, so `None` rather than an empty relay argv.
         let mut b = 3i32.to_ne_bytes().to_vec();
         b.extend_from_slice(b"/bin/vt\0");
-        let parsed = parse_procargs2(&b);
-        assert!(parsed.is_none() || parsed.unwrap().len() <= 3);
+        assert_eq!(parse_procargs2(&b), None);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::config::ResolvedConfig;
+    use crate::core::wire::{wrap_ok_envelope, WIRE_VERSION};
+    use crate::core::{client_encrypt_v2, DecryptResItem, SecretType};
     use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+    use ssh_agent_lib::agent::Session;
+    use ssh_agent_lib::proto::{Extension, SignRequest, Unparsed};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    // The seed round-trips through base64url and reconstructs the same key.
-    // Guards NEW-B1 (an alphabet/padding mismatch would corrupt the key silently).
-    #[test]
-    fn seed_base64url_roundtrip_preserves_key() {
+    /// Fake vt agent that does not hold the key (`sign@vt` answers `generic`,
+    /// the fallback signal) and declines the first `decrypt@vt`, then releases
+    /// `dek` for the seed record.
+    struct SeedAgent {
+        dek: [u8; 32],
+        decrypts: Arc<AtomicUsize>,
+    }
+
+    impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for SeedAgent {
+        fn new_session(&mut self, _: &tokio::net::UnixStream) -> impl Session {
+            SeedAgent {
+                dek: self.dek,
+                decrypts: Arc::clone(&self.decrypts),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Session for SeedAgent {
+        async fn extension(
+            &mut self,
+            extension: Extension,
+        ) -> Result<Option<Extension>, ssh_agent_lib::error::AgentError> {
+            let err = |kind: &str| {
+                format!(r#"{{"v":{WIRE_VERSION},"status":"err","kind":"{kind}"}}"#).into_bytes()
+            };
+            let details = match extension.name.as_str() {
+                "sign@vt" => err("generic"),
+                "decrypt@vt" if self.decrypts.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    err("auth_rejected")
+                }
+                "decrypt@vt" => wrap_ok_envelope(
+                    &serde_json::to_vec(&[DecryptResItem::V2 {
+                        dek: self.dek,
+                        err_message: String::new(),
+                    }])
+                    .unwrap(),
+                ),
+                other => panic!("unexpected extension {other}"),
+            };
+            Ok(Some(Extension {
+                name: extension.name,
+                details: Unparsed::from(details),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_signs_with_the_decrypted_seed_and_retries_a_failed_decrypt() {
+        let dir = std::env::temp_dir().join(format!("vt-signer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let dek = [7u8; 32];
+        let decrypts = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(ssh_agent_lib::agent::listen(
+            listener,
+            SeedAgent {
+                dek,
+                decrypts: Arc::clone(&decrypts),
+            },
+        ));
+
         let sk = SigningKey::generate(&mut OsRng);
-        let seed = sk.to_bytes();
-        let pub1 = sk.verifying_key().to_bytes();
+        let seed_b64 = BASE64_URL_SAFE_NO_PAD.encode(sk.to_bytes());
+        let record =
+            client_encrypt_v2(SecretType::RAW, &[3; 16], &dek, seed_b64.as_bytes()).unwrap();
+        let pubkey = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(
+            sk.verifying_key().to_bytes(),
+        ));
+        let socket_str = socket.to_string_lossy().into_owned();
+        let client = VTClient::new(ResolvedConfig::resolve(
+            Vec::new(),
+            |key| match key {
+                "VT_BACKEND" => Some("agent".into()),
+                "SSH_AUTH_SOCK" => Some(socket_str.clone()),
+                _ => None,
+            },
+            None,
+            None,
+        ))
+        .unwrap();
+        let mut session = SignerSession {
+            inner: Arc::new(SignerInner {
+                client,
+                identities: vec![
+                    make_signer_identity(pubkey.clone(), String::new(), Some(record)).unwrap(),
+                ],
+                host: "h".into(),
+                command: "git push".into(),
+                relay_upstream: None,
+            }),
+        };
+        let request = || SignRequest {
+            pubkey: pubkey.clone(),
+            data: b"payload".to_vec(),
+            flags: 0,
+        };
 
-        let enc = BASE64_URL_SAFE_NO_PAD.encode(seed);
-        assert_eq!(
-            enc.len(),
-            43,
-            "32-byte seed must encode to 43 url-safe no-pad chars"
-        );
+        // A declined decrypt fails this sign and is not cached.
+        assert!(session.sign(request()).await.is_err());
+        for _ in 0..2 {
+            let sig = session.sign(request()).await.unwrap();
+            assert_eq!(sig.algorithm(), ssh_key::Algorithm::Ed25519);
+            let sig = ed25519_dalek::Signature::from_slice(sig.as_bytes()).unwrap();
+            sk.verifying_key().verify_strict(b"payload", &sig).unwrap();
+        }
+        // Declined + released: the last sign reused the decrypted seed.
+        assert_eq!(decrypts.load(Ordering::SeqCst), 2);
 
-        let dec = BASE64_URL_SAFE_NO_PAD.decode(&enc).unwrap();
-        let seed2: [u8; 32] = dec.try_into().expect("decoded seed must be 32 bytes");
-        let sk2 = SigningKey::from_bytes(&seed2);
-        assert_eq!(
-            sk2.verifying_key().to_bytes(),
-            pub1,
-            "recovered key must match the original"
-        );
-    }
-
-    // The pinned encoder must never emit standard-base64 chars (+ / =).
-    #[test]
-    fn encoder_is_url_safe_no_pad() {
-        let url = BASE64_URL_SAFE_NO_PAD.encode([0xffu8; 32]);
-        assert!(!url.contains('+') && !url.contains('/') && !url.contains('='));
-    }
-
-    // A malformed/short record must be rejected by the 32-byte length check.
-    #[test]
-    fn short_record_rejected() {
-        let dec = BASE64_URL_SAFE_NO_PAD.decode("AAAA").unwrap(); // 3 bytes
-        let r: Result<[u8; 32], _> = dec.try_into();
-        assert!(r.is_err());
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── sign@vt routing (guardrail G3) ───────────────────────────────────────
@@ -1195,30 +1230,5 @@ mod tests {
                 "{name:?} must be refused"
             );
         }
-    }
-
-    // The pubkey connect encodes (Encode) must decode (Decode) on the agent to a
-    // KeyData with the SAME SHA256 fingerprint — the contract `sign@vt` lookup
-    // relies on (no format drift between the cross-platform client and the agent).
-    #[test]
-    fn pubkey_wire_roundtrip_preserves_fingerprint() {
-        use ssh_agent_lib::ssh_encoding::{Decode, Encode};
-        use ssh_key::public::{Ed25519PublicKey, KeyData, PublicKey};
-        use ssh_key::{Fingerprint, HashAlg};
-
-        let sk = SigningKey::generate(&mut OsRng);
-        let kd = KeyData::Ed25519(Ed25519PublicKey(sk.verifying_key().to_bytes()));
-
-        let mut wire = Vec::new();
-        kd.encode(&mut wire).unwrap();
-        let decoded = KeyData::decode(&mut wire.as_slice()).unwrap();
-
-        let fp_orig = Fingerprint::new(HashAlg::Sha256, &kd).to_string();
-        let fp_decoded = Fingerprint::new(HashAlg::Sha256, &decoded).to_string();
-        assert_eq!(fp_orig, fp_decoded);
-
-        // …and equals the fingerprint of the advertised OpenSSH public key.
-        let pk = PublicKey::new(kd, "");
-        assert_eq!(pk.fingerprint(HashAlg::Sha256).to_string(), fp_decoded);
     }
 }

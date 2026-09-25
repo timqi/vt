@@ -563,8 +563,12 @@ impl VTClient {
 
         match result {
             Some(bytes) => {
-                let _res: AuthRes =
+                let res: AuthRes =
                     serde_json::from_slice(&bytes).context("Failed to parse auth response")?;
+                // Only an explicit approval passes; anything else fails closed.
+                if !res.approved {
+                    return Err(VtClientError::Agent(ErrKind::AuthRejected, None).into());
+                }
                 Ok(())
             }
             None => self.cf_auth(reason).await,
@@ -665,7 +669,8 @@ mod tests {
         }
     }
 
-    /// Fake agent: `auth@vt` answers a plain OK envelope, `encrypt@vt` an
+    /// Fake agent: `auth@vt` answers a plain OK envelope (`approved:false` for
+    /// reason `declined`), `encrypt@vt` an
     /// `SSH_AGENT_FAILURE` (what a non-vt agent sends), `decrypt@vt` bytes
     /// that are not an envelope, `sign@vt` a structured rejection.
     struct MixedAgent;
@@ -690,8 +695,11 @@ mod tests {
                     // The request is the plain JSON the client serialized.
                     let req: AuthReq = serde_json::from_slice(extension.details.as_ref())
                         .expect("plain JSON request");
-                    assert_eq!(req.reason, "fixture");
-                    wrap_ok_envelope(br#"{"approved":true}"#)
+                    match req.reason.as_str() {
+                        "fixture" => wrap_ok_envelope(br#"{"approved":true}"#),
+                        "declined" => wrap_ok_envelope(br#"{"approved":false}"#),
+                        other => panic!("unexpected auth reason {other}"),
+                    }
                 }
                 "encrypt@vt" => return Err(ssh_agent_lib::error::AgentError::Failure),
                 "decrypt@vt" => b"not an envelope".to_vec(),
@@ -737,6 +745,13 @@ mod tests {
                 .unwrap()
                 .expect("plain OK envelope is the agent answer");
             assert_eq!(&body[..], br#"{"approved":true}"#);
+            client.auth("fixture").await.unwrap();
+            // An OK envelope that does not approve fails closed, never Ok.
+            let declined = client.auth("declined").await.unwrap_err();
+            assert!(matches!(
+                declined.downcast_ref::<VtClientError>(),
+                Some(VtClientError::Agent(ErrKind::AuthRejected, None))
+            ));
             // Non-vt answers are recoverable in `auto` only.
             let failure = client.agent_call_or_fallback("encrypt@vt", vec![]).await;
             let garbage = client.agent_call_or_fallback("decrypt@vt", vec![]).await;
@@ -834,14 +849,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_envelope_ok_with_object_data() {
-        let inner = br#"{"approved":true}"#;
-        let envelope = wrap_ok_envelope(inner);
-        let data = parse_envelope(&envelope).expect("envelope should parse");
-        assert_eq!(&data[..], &inner[..]);
-    }
-
-    #[test]
     fn parse_envelope_err_auth_rejected_maps_to_exit_10() {
         let envelope = fake_err_envelope("auth_rejected", Some("authentication was declined"));
         let err = parse_envelope(&envelope).expect_err("should be Err");
@@ -927,46 +934,23 @@ mod tests {
     }
 
     #[test]
-    fn fallback_policy_auth_rejected_does_not_fall_back() {
-        let e: anyhow::Error = VtClientError::Agent(ErrKind::AuthRejected, None).into();
-        assert!(!should_fallback_to_cf(&e));
-    }
-
-    #[test]
-    fn fallback_policy_bad_request_does_not_fall_back() {
-        let e: anyhow::Error = VtClientError::Agent(ErrKind::BadRequest, None).into();
-        assert!(!should_fallback_to_cf(&e));
-    }
-
-    #[test]
-    fn fallback_policy_session_locked_falls_back() {
-        let e: anyhow::Error = VtClientError::Agent(ErrKind::SessionLocked, None).into();
-        assert!(should_fallback_to_cf(&e));
-    }
-
-    #[test]
-    fn fallback_policy_other_agent_kinds_fall_back() {
-        for kind in [
-            ErrKind::NoGuiSession,
-            ErrKind::BiometryUnavailable,
-            ErrKind::NotInitialized,
-            ErrKind::AgentLocked,
-            ErrKind::Generic,
-            ErrKind::Transient,
-            ErrKind::Unknown,
-            ErrKind::ProtocolVersion,
+    fn fallback_policy_refuses_only_rejection_and_bad_request() {
+        for (kind, falls_back) in [
+            (ErrKind::AuthRejected, false),
+            (ErrKind::BadRequest, false),
+            (ErrKind::SessionLocked, true),
+            (ErrKind::NoGuiSession, true),
+            (ErrKind::BiometryUnavailable, true),
+            (ErrKind::NotInitialized, true),
+            (ErrKind::AgentLocked, true),
+            (ErrKind::Generic, true),
+            (ErrKind::Transient, true),
+            (ErrKind::Unknown, true),
+            (ErrKind::ProtocolVersion, true),
         ] {
             let e: anyhow::Error = VtClientError::Agent(kind, None).into();
-            assert!(
-                should_fallback_to_cf(&e),
-                "expected {:?} to fall back",
-                kind
-            );
+            assert_eq!(should_fallback_to_cf(&e), falls_back, "{kind:?}");
         }
-    }
-
-    #[test]
-    fn fallback_policy_transport_falls_back() {
         let e: anyhow::Error = VtClientError::Transport(anyhow::anyhow!("socket closed")).into();
         assert!(should_fallback_to_cf(&e));
     }

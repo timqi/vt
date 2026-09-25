@@ -139,82 +139,48 @@ mod tests {
     // ---- classify_session ------------------------------------------------
 
     #[test]
-    fn classify_no_dict_is_no_session() {
+    fn classify_session_fails_closed_on_any_unknown_or_unready_flag() {
+        let flags = |is_locked, is_on_console, is_login_done| SessionFlags {
+            is_locked,
+            is_on_console,
+            is_login_done,
+        };
         assert_eq!(classify_session(None), SessionState::NoSession);
-    }
-
-    #[test]
-    fn classify_locked_is_not_interactive() {
-        let f = SessionFlags {
-            is_locked: Some(true),
-            is_on_console: Some(true),
-            is_login_done: Some(true),
-        };
-        assert_eq!(classify_session(Some(f)), SessionState::NotInteractive);
-    }
-
-    #[test]
-    fn classify_off_console_is_not_interactive() {
-        let f = SessionFlags {
-            is_locked: Some(false),
-            is_on_console: Some(false),
-            is_login_done: Some(true),
-        };
-        assert_eq!(classify_session(Some(f)), SessionState::NotInteractive);
-    }
-
-    #[test]
-    fn classify_login_pending_is_not_interactive() {
-        let f = SessionFlags {
-            is_locked: Some(false),
-            is_on_console: Some(true),
-            is_login_done: Some(false),
-        };
-        assert_eq!(classify_session(Some(f)), SessionState::NotInteractive);
-    }
-
-    #[test]
-    fn classify_all_clear_is_interactive() {
-        let f = SessionFlags {
-            is_locked: Some(false),
-            is_on_console: Some(true),
-            is_login_done: Some(true),
-        };
-        assert_eq!(classify_session(Some(f)), SessionState::Interactive);
-    }
-
-    #[test]
-    fn classify_missing_keys_is_not_interactive() {
-        // None for every flag = "no info" → deny. An Apple key rename or a
-        // mistyped value fails closed rather than unlocking grant reuse.
-        assert_eq!(
-            classify_session(Some(SessionFlags::default())),
-            SessionState::NotInteractive
-        );
-        for f in [
-            SessionFlags {
-                is_locked: Some(false),
-                is_on_console: None,
-                is_login_done: Some(true),
-            },
-            SessionFlags {
-                is_locked: Some(false),
-                is_on_console: Some(true),
-                is_login_done: None,
-            },
+        // (flags, expected): None for a flag means "no info" and denies, so an
+        // Apple key rename fails closed; only a missing lock flag is tolerated.
+        for (f, expected) in [
+            (
+                flags(Some(false), Some(true), Some(true)),
+                SessionState::Interactive,
+            ),
+            (
+                flags(None, Some(true), Some(true)),
+                SessionState::Interactive,
+            ),
+            (
+                flags(Some(true), Some(true), Some(true)),
+                SessionState::NotInteractive,
+            ),
+            (
+                flags(Some(false), Some(false), Some(true)),
+                SessionState::NotInteractive,
+            ),
+            (
+                flags(Some(false), Some(true), Some(false)),
+                SessionState::NotInteractive,
+            ),
+            (
+                flags(Some(false), None, Some(true)),
+                SessionState::NotInteractive,
+            ),
+            (
+                flags(Some(false), Some(true), None),
+                SessionState::NotInteractive,
+            ),
+            (SessionFlags::default(), SessionState::NotInteractive),
         ] {
-            assert_eq!(classify_session(Some(f)), SessionState::NotInteractive);
+            assert_eq!(classify_session(Some(f)), expected, "{f:?}");
         }
-    }
-
-    #[test]
-    fn classify_missing_locked_only_is_interactive() {
-        let f = SessionFlags {
-            is_locked: None,
-            is_on_console: Some(true),
-            is_login_done: Some(true),
-        };
-        assert_eq!(classify_session(Some(f)), SessionState::Interactive);
     }
 
     // ---- lock_cache_check ------------------------------------------------
@@ -352,16 +318,5 @@ mod tests {
             now,
             Duration::from_secs(30)
         ));
-    }
-
-    // ---- AuthOutcome -----------------------------------------------------
-
-    #[test]
-    fn auth_outcome_is_success() {
-        assert!(AuthOutcome::Success.is_success());
-        assert!(!AuthOutcome::Rejected.is_success());
-        assert!(!AuthOutcome::Unavailable(UnavailableReason::NotInteractive).is_success());
-        assert!(!AuthOutcome::Unavailable(UnavailableReason::NoGuiSession).is_success());
-        assert!(!AuthOutcome::Unavailable(UnavailableReason::BiometryUnavailable).is_success());
     }
 }

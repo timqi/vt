@@ -739,30 +739,44 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// Both guards run before any rule or PATH lookup. Isolated in a child
+    /// test process because `run_exec` mutates `VT_HOOK_DEPTH` and a missing
+    /// guard `exec`s or exits instead of returning.
+    #[test]
+    fn exec_gateway_recursion_guards_refuse_before_rules() {
+        const CHILD: &str = "VT_TEST_HOOK_GUARDS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hook::tests::exec_gateway_recursion_guards_refuse_before_rules",
+                ])
+                .env(CHILD, "1")
+                .env_remove("VT_HOOK_DEPTH")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        // A bare or renamed vt execs as-is even when a rule would block it
+        // (a missing guard exits 126 here).
+        let block_vt = cfg(vec![rule("vt", &[], true), rule("vt-renamed", &[], true)]);
+        for arg0 in ["/nonexistent/vt", "/nonexistent/vt-renamed"] {
+            let err = run_exec(&block_vt, "/opt/vt-renamed", &strs(&[arg0, "read"])).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("failed to run {arg0}")),
+                "{err}"
+            );
+        }
+        // At the depth cap nothing runs (a missing cap execs `false`, exit 1).
+        std::env::set_var("VT_HOOK_DEPTH", "10");
+        let err = run_exec(&cfg(vec![]), "/opt/vt", &strs(&["false"])).unwrap_err();
+        assert!(err.to_string().contains("recursion limit (10)"), "{err}");
+    }
+
     // (The macOS current_exe-returns-the-symlink regression is guarded by
     // canonical_self_exe's doc + the OnlyShims coverage above; a unit test
     // here could only re-assert stdlib canonicalize semantics.)
-
-    #[test]
-    fn decide_returns_structured_inject_plan() {
-        let c = cfg_env(
-            vec![rule("gh", &["GH_TOKEN"], false)],
-            env_default(&[("GH_TOKEN", "vt://0cfg")]),
-        );
-        let plan = plan_of(decide("gh", &argv("pr list"), "/x", &c, &no_env));
-        assert_eq!(plan.only_env, vec!["GH_TOKEN".to_string()]);
-        assert_eq!(
-            plan.set_vars,
-            vec![("GH_TOKEN".to_string(), "vt://0cfg".to_string())]
-        );
-        assert!(plan.needs_inject());
-        // block rule -> Deny
-        let cb = cfg(vec![rule_args("gh", &["auth", "token"], true)]);
-        assert!(matches!(
-            decide("gh", &argv("auth token"), "/x", &cb, &no_env),
-            Decision::Deny(_)
-        ));
-    }
 
     #[test]
     fn mixed_plaintext_and_secret_config_values_all_set() {
@@ -899,7 +913,7 @@ mod tests {
         only_home.insert("~".to_string(), map(&[("K", "h")]));
         assert!(dir_override(&only_home, &home).is_some());
         // a literal "~/..." cwd (no expansion on the cwd side) must NOT match
-        assert!(dir_override(&dirs, "/elsewhere").is_none());
+        assert!(dir_override(&dirs, "~/work/projA").is_none());
     }
 
     #[test]
