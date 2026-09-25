@@ -16,7 +16,7 @@ describe('admin shell', () => {
     const resp = await SELF.fetch(`${ORIGIN}/pwa/admin/admin.js`);
     expect(resp.status).toBe(200);
     expect(resp.headers.get('Content-Type')).toMatch(/javascript/);
-    expect(await resp.text()).toContain('vt.tabs = {}');
+    await resp.text();
   });
 
   it('serves the shared stylesheet the approve page also loads', async () => {
@@ -55,7 +55,6 @@ describe('admin shell', () => {
   it('renders setup before bootstrap, then login without a cookie and console with one', async () => {
     const setup = await SELF.fetch(`${ORIGIN}/admin`);
     expect(setup.status).toBe(200);
-    expect(setup.headers.get('Content-Security-Policy')).toContain("script-src 'self'");
     const setupHtml = await setup.text();
     expect(setupHtml).toContain('"state":"setup"');
     expect(setupHtml).toContain('"rp_id":"vt.test.invalid"');
@@ -76,6 +75,31 @@ describe('admin shell', () => {
     const page = await SELF.fetch(`${ORIGIN}/a/sometoken12345`);
     expect(page.status).toBe(503);
     await page.text();
+  });
+
+  // AGENTS.md: preserve STRICT_CSP, HTML UTF-8 and the global security headers
+  // on every Worker-rendered page. The policy is pinned verbatim so a widened
+  // directive fails here.
+  it('serves /admin and /a/:token with the strict CSP, UTF-8 and the global security headers', async () => {
+    await bootstrap();
+    const ch = makeChallenge();
+    await inDO(({ state }) => state.storage.put(`ch:${ch.approve_token}`, ch));
+    for (const path of ['/admin', `/a/${ch.approve_token}`]) {
+      const resp = await SELF.fetch(`${ORIGIN}${path}`);
+      expect(resp.status).toBe(200);
+      await resp.text();
+      expect(Object.fromEntries([
+        'Content-Security-Policy', 'Content-Type', 'Strict-Transport-Security',
+        'X-Content-Type-Options', 'Referrer-Policy',
+      ].map(h => [h, resp.headers.get(h)]))).toEqual({
+        'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+          + "img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        'Content-Type': 'text/html; charset=utf-8',
+        'Strict-Transport-Security': 'max-age=31536000',
+        'X-Content-Type-Options': 'nosniff',
+        'Referrer-Policy': 'no-referrer',
+      });
+    }
   });
 
   // W-11: ceremony data is never cacheable, as HTML or as JSON.

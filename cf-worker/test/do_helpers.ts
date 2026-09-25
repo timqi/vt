@@ -26,7 +26,7 @@ import type { CacheEntry, CacheEntryRef, Challenge, ChallengeMeta, DaemonAuth } 
 
 // ── DO access ──────────────────────────────────────────────────────────────
 
-export const testEnv = env as unknown as { ACCOUNT: DurableObjectNamespace };
+const testEnv = env as unknown as { ACCOUNT: DurableObjectNamespace };
 
 /** The origin `bootstrap()` registers: WebAuthn origin, RP id source and
  *  approve-URL base for every test. */

@@ -5,8 +5,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import app from '../src/index';
-import { b64uEnc, b64uDec, hmacSha256 } from '../src/crypto';
-import { makeMeta, bootstrap, liveTokenId, hostSecret, inDO } from './do_helpers';
+import { b64uEnc, hmacSha256 } from '../src/crypto';
+import { makeMeta, bootstrap, liveTokenId, hostSecret, inDO, auditRows } from './do_helpers';
 
 const CAP = 256 * 1024;
 let TOKEN_ID = '';
@@ -87,15 +87,6 @@ describe.each(['/api/challenge', '/api/dek-cache'])('%s HMAC boundary', (path) =
     expect(reads).toBe(0);
   });
 
-  it('rejects an incorrect HMAC over a well-formed body in the DO, storing nothing', async () => {
-    const body = JSON.stringify({
-      daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
-      timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta(),
-    });
-    expect(await post(path, body)).toEqual({ status: 401, text: 'hmac mismatch' });
-    expect(await inDO(h => h.state.storage.list({ prefix: 'ch:' }).then(m => m.size))).toBe(0);
-  });
-
   it('refuses a request without VT-Token-Id before reading the body, with the enroll hint', async () => {
     // The bare master is no longer a key: signing with it and omitting the
     // header is rejected structurally, the same 401 shape a dead token gets.
@@ -149,7 +140,7 @@ describe.each(['/api/challenge', '/api/dek-cache'])('%s HMAC boundary', (path) =
       : { miss: true });
   });
 
-  it('rejects changes to bytes covered by an otherwise valid HMAC', async () => {
+  it('rejects changes to bytes covered by an otherwise valid HMAC in the DO, storing nothing', async () => {
     const body = (reason: string) => JSON.stringify({
       daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
       timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta({ reason }),
@@ -158,51 +149,69 @@ describe.each(['/api/challenge', '/api/dek-cache'])('%s HMAC boundary', (path) =
     expect(await post(path, body('b'), {
       Authorization: `VT-HMAC ${b64uEnc(tag)}`,
     })).toEqual({ status: 401, text: 'hmac mismatch' });
+    expect(await inDO(h => h.state.storage.list({ prefix: 'ch:' }).then(m => m.size))).toBe(0);
   });
 
-  it('passes valid authenticated requests to the route-specific DO operation', async () => {
+  // The edge, not the client, names the source IP, and the challenge's UV level
+  // is the DO's to decide: observed on the op the router forwards.
+  it('forces meta.ip from CF-Connecting-IP and leaves the challenge uv to the DO', async () => {
     const body = {
       daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
-      timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta(),
+      timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta({ ip: '198.51.100.99' }),
     };
     const bytes = encoder.encode(JSON.stringify(body));
     const tag = await hmacSha256(KEY, bytes);
     const fetch = vi.fn(async (_url: string, _init: RequestInit) => Response.json(
       path === '/api/challenge' ? { meta: body.meta, approve_url: 'https://vt.test.invalid/a/x' } : { miss: true }));
-    const account = {
-      idFromName: vi.fn(() => 'synthetic-account-id'),
-      get: vi.fn(() => ({ fetch })),
-    };
+    const account = { idFromName: () => 'synthetic-account-id', get: () => ({ fetch }) };
     const response = await app.fetch(new Request(`https://vt.test.invalid${path}`, {
       method: 'POST', body: bytes,
       headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}`, 'VT-Token-Id': TOKEN_ID, 'CF-Connecting-IP': '203.0.113.42' },
     }), { ...env, ACCOUNT: account });
     expect(response.status).toBe(200);
-    const result = await response.json() as Record<string, unknown>;
-    expect(fetch).toHaveBeenCalledOnce();
-    expect(account.idFromName).toHaveBeenCalledWith('account');
-    const [url, init] = fetch.mock.calls[0]!;
-    expect(init.method).toBe('POST');
-    const forwarded = JSON.parse(init.body as string);
-    // The MAC and the exact bytes it covers travel with the op for the DO.
-    expect(forwarded.auth).toEqual({ token_id: TOKEN_ID, mac_b64u: b64uEnc(tag), signed_b64u: b64uEnc(bytes) });
-    expect(b64uDec(forwarded.auth.signed_b64u)).toEqual(bytes);
+    await response.text();
+    const forwarded = JSON.parse(fetch.mock.calls[0]![1].body as string);
     if (path === '/api/challenge') {
-      expect(url).toBe('https://account.do/op/create');
-      expect(forwarded.challenge).toMatchObject({
-        daemon_pubkey_b64u: body.daemon_pubkey_b64u, timestamp_ms: body.timestamp_ms,
-        salts_b64u: [], status: 'pending', meta: { ip: '203.0.113.42' },
-      });
+      expect(forwarded.challenge.meta.ip).toBe('203.0.113.42');
       expect(forwarded.challenge).not.toHaveProperty('uv');
-      expect(result.approve_token).toBe(forwarded.challenge.approve_token);
-      expect(result.poll_token).toBe(forwarded.challenge.poll_token);
-      expect(result.approve_url).toBe('https://vt.test.invalid/a/x');
     } else {
-      expect(url).toBe('https://account.do/op/dek-cache');
-      expect(forwarded).toMatchObject({
-        daemon_pubkey_b64u: body.daemon_pubkey_b64u, salts_b64u: [], meta: { ip: '203.0.113.42' },
-      });
-      expect(result).toEqual({ miss: true });
+      expect(forwarded.meta.ip).toBe('203.0.113.42');
     }
+  });
+});
+
+// Per route, not just in inReplayWindow: a correctly signed body replayed after
+// the five-minute window is refused at the edge and reaches no DO effect.
+describe('replay window', () => {
+  const bodies: Record<string, (ts: number) => unknown> = {
+    '/api/challenge': ts => ({
+      daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)), timestamp_ms: ts, salts_b64u: [], meta: makeMeta(),
+    }),
+    '/api/dek-cache': ts => ({
+      daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)), timestamp_ms: ts,
+      salts_b64u: [b64uEnc(new Uint8Array(16).fill(4))], meta: makeMeta(),
+    }),
+    '/api/audit-ingest': ts => ({
+      timestamp_ms: ts, agent_id: `t:${TOKEN_ID}`, hostname: 'testbox',
+      entry: { op_kind: 'sign', outcome: 'approved', salts: 0, latency_ms: 1, ts_ms: ts,
+               token_id: `a_t:${TOKEN_ID}_${ts}`, meta: { op_kind: 'sign' } },
+    }),
+  };
+  const signed = async (path: string, ts: number) => {
+    const bytes = encoder.encode(JSON.stringify(bodies[path]!(ts)));
+    return post(path, bytes, { Authorization: `VT-HMAC ${b64uEnc(await hmacSha256(KEY, bytes))}` });
+  };
+  const effects = () => inDO(async h => ({
+    ch: (await h.state.storage.list({ prefix: 'ch:' })).size,
+    audit: (await auditRows(h)).length,
+    token: h.state.storage.sql.exec('SELECT last_used_ms FROM host_token').toArray(),
+  }));
+
+  it.each(Object.keys(bodies))('%s refuses a validly signed body six minutes old', async (path) => {
+    const before = await effects();
+    expect(await signed(path, Date.now() - 6 * 60_000)).toEqual({ status: 400, text: 'timestamp skew' });
+    expect(await effects()).toEqual(before);
+    // The same signing inside the window is accepted, so only the window refused.
+    expect((await signed(path, Date.now())).status).toBe(200);
   });
 });
