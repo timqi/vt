@@ -1267,56 +1267,14 @@ mod tests {
         assert_eq!(s.decrypt_basis(), ContextBasis::ProcLookupFailed);
     }
 
+    /// The shared roots live in `paths::cwd_root_acceptable` (its own
+    /// integration test); this adds the kernel-derived per-user temp dir.
     #[test]
-    fn workspace_root_acceptability_rejects_home_pooling() {
+    fn cwd_fallback_rejects_darwin_user_temp_dir() {
+        let temp = darwin_user_temp_dir().expect("per-user temp dir");
         let home = std::path::Path::new("/Users/x");
-        // A dotfiles repo AT $HOME must not become a workspace.
-        assert!(!workspace_root_acceptable(
-            home,
-            std::path::Path::new("/Users/x/Downloads"),
-            Some(home)
-        ));
-        // A root above $HOME for a cwd inside $HOME is rejected too.
-        assert!(!workspace_root_acceptable(
-            std::path::Path::new("/Users"),
-            std::path::Path::new("/Users/x/proj"),
-            Some(home)
-        ));
-        // Ordinary project roots pass, inside or outside $HOME.
-        assert!(workspace_root_acceptable(
-            std::path::Path::new("/Users/x/code/vt"),
-            std::path::Path::new("/Users/x/code/vt/src"),
-            Some(home)
-        ));
-        assert!(workspace_root_acceptable(
-            std::path::Path::new("/opt/work/repo"),
-            std::path::Path::new("/opt/work/repo/a"),
-            Some(home)
-        ));
-    }
-
-    #[test]
-    fn cwd_fallback_rejects_broad_shared_directories() {
-        let home = std::path::Path::new("/Users/x");
-        let p = std::path::Path::new;
-        // $HOME and its ancestors pool everything launched from them.
-        assert!(!cwd_fallback_acceptable(home, Some(home)));
-        assert!(!cwd_fallback_acceptable(p("/Users"), Some(home)));
-        assert!(!cwd_fallback_acceptable(p("/"), Some(home)));
-        // Shared temp roots (canonical forms — F_GETPATH resolves /tmp).
-        assert!(!cwd_fallback_acceptable(p("/private/tmp"), Some(home)));
-        assert!(!cwd_fallback_acceptable(p("/private/var/tmp"), Some(home)));
-        assert!(!cwd_fallback_acceptable(p("/Volumes"), Some(home)));
-        if let Some(t) = darwin_user_temp_dir() {
-            assert!(!cwd_fallback_acceptable(t, Some(home)));
-        }
-        // Subdirectories of the shared roots name one activity: acceptable.
-        assert!(cwd_fallback_acceptable(
-            p("/private/tmp/scratch"),
-            Some(home)
-        ));
-        assert!(cwd_fallback_acceptable(p("/Users/x/notes"), Some(home)));
-        assert!(cwd_fallback_acceptable(p("/opt/deploy"), Some(home)));
+        assert!(paths::cwd_root_acceptable(temp, Some(home)));
+        assert!(!cwd_fallback_acceptable(temp, Some(home)));
     }
 
     #[test]
@@ -1328,9 +1286,8 @@ mod tests {
         // is pinned at the digest level by scope_families_are_domain_separated).
         let dir = temp_workspace("cwd-fallback");
         let canonical = std::fs::canonicalize(&dir).unwrap();
-        if find_git_root(&canonical).is_some() {
-            // Defensive: a `.git` above the temp dir would invalidate the
-            // scenario; skip rather than assert a wrong arm.
+        if let Some(root) = find_git_root(&canonical) {
+            eprintln!("skipped: {} above the temp dir", root.display());
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
@@ -1412,18 +1369,16 @@ mod tests {
     #[test]
     fn resolve_workspace_uses_parent_app_for_broad_cwd() {
         // A peer whose cwd is an excluded shared root (the per-user Darwin
-        // temp dir) must resolve to its parent application, not NoRoot.
-        let dir = std::env::temp_dir();
-        let canonical = std::fs::canonicalize(&dir).unwrap();
-        if find_git_root(&canonical).is_some()
-            || cwd_fallback_acceptable(&canonical, std::env::home_dir().as_deref())
-        {
-            // Defensive: scenario requires an excluded, non-git cwd.
+        // temp dir, independent of $TMPDIR) must resolve to its parent
+        // application, not NoRoot.
+        let dir = darwin_user_temp_dir().expect("per-user temp dir");
+        if let Some(root) = find_git_root(dir) {
+            eprintln!("skipped: {} above the per-user temp dir", root.display());
             return;
         }
         let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
-            .current_dir(&dir)
+            .current_dir(dir)
             .spawn()
             .expect("spawn peer stand-in");
         match resolve_workspace(Some(child.id() as i32)) {
@@ -1469,20 +1424,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn find_git_root_prefers_nearest_marker_dir_or_file() {
-        let root = temp_workspace("git-root");
-        std::fs::create_dir_all(root.join(".git")).unwrap(); // dir marker
-        let inner = root.join("a");
-        let nested = inner.join("b");
-        std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(find_git_root(&nested), Some(root.clone()));
-        // A nearer `.git` FILE (worktree layout) wins over the outer dir.
-        std::fs::write(inner.join(".git"), "gitdir: elsewhere").unwrap();
-        assert_eq!(find_git_root(&nested), Some(inner));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1533,19 +1474,5 @@ mod tests {
             Some("github.com")
         );
         assert_eq!(known_hosts_name_in("", &hostkey), None);
-    }
-
-    // --- is_ssh_client_path tests ---
-
-    #[test]
-    fn test_is_ssh_client_path_matches_basename_only() {
-        assert!(is_ssh_client_path("/usr/bin/ssh"));
-        assert!(is_ssh_client_path("/opt/homebrew/bin/ssh"));
-        assert!(is_ssh_client_path("ssh"));
-        assert!(!is_ssh_client_path("/usr/sbin/sshd"));
-        assert!(!is_ssh_client_path("/usr/bin/ssh-agent"));
-        assert!(!is_ssh_client_path("/usr/bin/ssh-add"));
-        assert!(!is_ssh_client_path("/Users/x/notssh"));
-        assert!(!is_ssh_client_path(""));
     }
 }

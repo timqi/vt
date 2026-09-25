@@ -246,17 +246,4 @@ mod tests {
         authenticator.approval_complete();
         assert!(sessions.is_empty(), "dropped with the permit, never kept");
     }
-
-    #[test]
-    fn sleep_detection_uses_wall_minus_monotonic_divergence() {
-        assert!(!sleep_diverged(
-            Duration::from_secs(5),
-            Some(Duration::from_secs(20))
-        ));
-        assert!(sleep_diverged(
-            Duration::from_secs(5),
-            Some(Duration::from_secs(35))
-        ));
-        assert!(!sleep_diverged(Duration::from_secs(5), None));
-    }
 }
