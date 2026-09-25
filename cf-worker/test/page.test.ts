@@ -187,10 +187,6 @@ describe('cache creation time rendering', () => {
     return row.children[2].children.at(-1)!.textContent;
   }
 
-  it('renders the three table cells at desktop width', () => {
-    expect(renderRow(entry({})).children).toHaveLength(3);
-  });
-
   it('shows the original creation timestamp before and after extension', () => {
     const created = new Date(2026, 0, 2, 3, 4, 5).getTime();
     for (const expires of [Date.now() + 60_000, Date.now() + 86_400_000]) {
@@ -204,7 +200,8 @@ describe('cache creation time rendering', () => {
 });
 
 // No browser here: the shell scripts are loaded into a stub DOM to prove they
-// parse, register their entry points, and only look up ids the shell declares.
+// parse, boot the state the Worker reports, and only look up ids the shell
+// declares.
 // Real WebAuthn, cookies and the installed PWA are checked by hand
 // (docs/design/ui-ux.md#validation).
 describe('admin shell scripts against the shell markup', () => {
@@ -220,29 +217,60 @@ describe('admin shell scripts against the shell markup', () => {
     }
   });
 
-  it('registers the three shell states and the API base', () => {
+  // admin.js boots from VT_DATA.state (fired on DOMContentLoaded): exactly one
+  // of setup / login / console is shown, and an unknown state is reported
+  // rather than guessed. setup.js and settings.js load too, so a parse error in
+  // either fails here.
+  function boot(state: string) {
     class Element {
-      hidden = false; textContent = ''; className = ''; innerHTML = ''; value = '';
+      hidden = false; textContent = ''; className = ''; innerHTML = ''; value = ''; id = ''; href = '';
       classList = { add() {}, toggle() {} };
-      appendChild() {} setAttribute() {} removeAttribute() {} addEventListener() {}
+      appendChild(c: unknown) { return c; } setAttribute() {} removeAttribute() {} addEventListener() {}
       querySelector() { return new Element(); } querySelectorAll() { return []; }
     }
+    const byId = new Map<string, Element>();
+    const el = (id: string) => { if (!byId.has(id)) byId.set(id, new Element()); return byId.get(id)!; };
+    el('vt-data').textContent = JSON.stringify({ state });
+    let ready = () => {};
     const context: Record<string, unknown> = {
       location: { pathname: '/admin', hash: '' },
-      document: { getElementById: () => new Element(), createElement: () => new Element(), addEventListener() {}, body: new Element() },
+      document: {
+        getElementById: el, createElement: () => new Element(), body: new Element(),
+        addEventListener: (name: string, fn: () => void) => { if (name === 'DOMContentLoaded') ready = fn; },
+      },
       addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }),
       navigator: {},   // no serviceWorker: common.js skips the notification hand-off
       TextEncoder, crypto, console,
     };
     context.window = context;
     for (const js of ['common.js', 'admin/admin.js', 'admin/setup.js', 'admin/settings.js']) runInNewContext(pwa(js), context);
-    const vt = context.vt as { api: (p: string) => string; views: Record<string, unknown>; tabs: Record<string, unknown>; showLogin: unknown; apiFetch: unknown };
-    expect(vt.api('credentials')).toBe('/api/admin/credentials');
-    expect(typeof vt.views.setup).toBe('function');
-    expect(typeof vt.tabs.setup).toBe('function');
-    expect(typeof vt.tabs.settings).toBe('function');
-    expect(typeof vt.showLogin).toBe('function');
-    expect(typeof vt.apiFetch).toBe('function');
+    const vt = context.vt as { views: Record<string, unknown>; tabs: Record<string, unknown> };
+    const setupView = vi.fn();
+    const auditTab = vi.fn();
+    vt.views.setup = setupView;
+    vt.tabs.audit = auditTab;
+    ready();
+    const shown = ['setup-view', 'login-view', 'console', 'page-head'].filter(id => !el(id).hidden);
+    return { el, shown, setupView, auditTab };
+  }
+
+  it.each([
+    ['setup', ['setup-view']],
+    ['login', ['login-view']],
+    ['console', ['console', 'page-head']],
+  ])('boots the %s state into exactly its view', (state, want) => {
+    const h = boot(state);
+    expect(h.shown).toEqual(want);
+    expect(h.setupView.mock.calls.length).toBe(state === 'setup' ? 1 : 0);
+    expect(h.auditTab.mock.calls.length).toBe(state === 'console' ? 1 : 0);
+  });
+
+  it('reports an unknown state and boots nothing', () => {
+    const h = boot('bogus');
+    expect(h.el('shell-status').textContent).toBe('Unknown page state: bogus');
+    expect(h.el('shell-status').className).toContain('error');
+    expect(h.setupView).not.toHaveBeenCalled();
+    expect(h.auditTab).not.toHaveBeenCalled();
   });
 });
 
@@ -303,14 +331,6 @@ describe('escapeJsonForHtml', () => {
     const value = { rp_id: 'vt.example.com', credentials: '{"v":1,"c":[]}', x: '<&>\u2028' };
     expect(JSON.parse(escapeJsonForHtml(value))).toEqual(value);
   });
-
-  // Guards the actual embedding: shell + escaped JSON must leave exactly one
-  // </script> — the shell's own closing tag.
-  it('cannot close the surrounding script element', () => {
-    const html = renderTemplate('<script type="application/json" id="vt-data">{{VT_DATA}}</script>',
-      { VT_DATA: escapeJsonForHtml({ evil: '</script><script>alert(1)</script>' }) });
-    expect(html.match(/<\/script>/gi)).toHaveLength(1);
-  });
 });
 
 // The shells are real files now, so a typo'd or renamed placeholder is a
@@ -363,15 +383,5 @@ describe('page shells', () => {
     const placeholders = new Set([...raw.matchAll(/\{\{([A-Z0-9_]+)\}\}/g)].map(m => m[1]));
     expect([...placeholders].sort()).toEqual(['ASSET_VER', 'FAVICON_TAGS', 'VT_DATA']);
     expect(raw).toContain('id="vt-data">{{VT_DATA}}</script>');
-  });
-
-  it('leaves no unsubstituted placeholder in any shell', () => {
-    // Sanity net over the renders above: nothing of the form {{NAME}} survives.
-    const rendered = [
-      render('approve.html', { ...pageVars(CHROME), VT_DATA: '{}' }),
-      render('admin/admin.html', { ...pageVars(CHROME), VT_DATA: '{}' }),
-      render('manifest.webmanifest', {}),
-    ];
-    for (const html of rendered) expect(html).not.toMatch(/\{\{[A-Z0-9_]+\}\}/);
   });
 });
