@@ -1718,7 +1718,7 @@ ZWN0ZWQtdGVzdAEC
     #[tokio::test]
     async fn diagnostics_dispatch_without_store_or_idle_activity() {
         let mut session = test_session(0, 0);
-        let before = *session.last_activity.read().await;
+        let before = backdate_activity(&session).await;
         let reply = session
             .extension(Extension {
                 name: EXT_DIAG.into(),
@@ -1791,6 +1791,17 @@ ZWN0ZWQtdGVzdAEC
         }
     }
 
+    /// Move the idle clock into the past so a request that touches it is
+    /// observable regardless of clock resolution.
+    async fn backdate_activity(session: &VtSshSession) -> (Instant, SystemTime) {
+        let idle_since = (
+            Instant::now() - Duration::from_secs(60),
+            SystemTime::now() - Duration::from_secs(60),
+        );
+        *session.last_activity.write().await = idle_since;
+        idle_since
+    }
+
     pub(super) fn test_bind(
         privkey: &PrivateKey,
         session_id: &[u8],
@@ -1812,18 +1823,22 @@ ZWN0ZWQtdGVzdAEC
     #[tokio::test]
     async fn extension_intercepts_session_bind_before_keychain() {
         // The seam most likely to regress: session-bind is plain SSH wire
-        // bytes and must be handled before the keychain path —
-        // this test passes precisely because no keychain access happens.
+        // bytes and must be handled before the lock check and the keychain
+        // path, without idle activity — this test passes precisely because
+        // no keychain access happens.
         let mut session = test_session(300, 0);
         session.peer_is_ssh_client = true;
+        session.locked.store(true, Ordering::Release);
+        let idle_since = backdate_activity(&session).await;
         let host = test_hostkey();
         let ext =
             Extension::new_message(test_bind(&host, b"sid-1", false)).expect("encode session-bind");
         let reply = session
             .extension(ext)
             .await
-            .expect("bind must succeed without keychain");
+            .expect("bind must succeed while locked and without keychain");
         assert!(reply.is_none(), "plain SSH_AGENT_SUCCESS, no envelope");
+        assert_eq!(*session.last_activity.read().await, idle_since);
         assert!(session.bind_state.destination().is_some());
         assert!(
             session.destination_label.is_some(),
@@ -1878,6 +1893,7 @@ ZWN0ZWQtdGVzdAEC
         session.ui_token = Some(token);
         session.authorization =
             AuthorizationEngine::new(Arc::new(TestAuthenticator), Arc::new(TestValidator));
+        let idle_since = backdate_activity(&session).await;
         let wrong = BASE64_URL_SAFE_NO_PAD.encode([8u8; 32]);
         assert!(session
             .extension(ui_status_req(&wrong, "status"))
@@ -1952,6 +1968,8 @@ ZWN0ZWQtdGVzdAEC
         let res: UiStatusRes = serde_json::from_slice(reply.details.as_ref()).unwrap();
         assert_eq!(res.revoked, Some(1));
         assert!(res.grants.is_empty());
+        // Polled status and revoke never count as idle activity.
+        assert_eq!(*session.last_activity.read().await, idle_since);
     }
 
     // --- idle_exceeded tests ---

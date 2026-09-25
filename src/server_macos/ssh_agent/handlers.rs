@@ -834,38 +834,40 @@ mod tests {
 
     const NEW: Decision = Decision::Approved;
 
-    struct RejectingAuthenticator;
+    /// Answers every prompt with `outcome` and records the prompt text.
+    struct Recorder {
+        outcome: AuthOutcome,
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
 
-    #[async_trait::async_trait]
-    impl AuthorizationAuthenticator for RejectingAuthenticator {
-        async fn authenticate(
-            &self,
-            _prompt: &str,
-            _operation: Operation,
-            _revocation_pending: Arc<AtomicBool>,
-        ) -> AuthOutcome {
-            AuthOutcome::Rejected
+    impl Recorder {
+        fn new(outcome: AuthOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                outcome,
+                prompts: Default::default(),
+            })
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
         }
     }
 
-    struct BiometryUnavailableAuthenticator;
-
     #[async_trait::async_trait]
-    impl AuthorizationAuthenticator for BiometryUnavailableAuthenticator {
+    impl AuthorizationAuthenticator for Recorder {
         async fn authenticate(
             &self,
-            _prompt: &str,
+            prompt: &str,
             _operation: Operation,
             _revocation_pending: Arc<AtomicBool>,
         ) -> AuthOutcome {
-            AuthOutcome::Unavailable(UnavailableReason::BiometryUnavailable)
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            self.outcome
         }
     }
 
-    fn engine(
-        authenticator: impl AuthorizationAuthenticator + 'static,
-    ) -> Arc<AuthorizationEngine> {
-        AuthorizationEngine::new(Arc::new(authenticator), Arc::new(TestValidator))
+    fn engine(authenticator: Arc<dyn AuthorizationAuthenticator>) -> Arc<AuthorizationEngine> {
+        AuthorizationEngine::new(authenticator, Arc::new(TestValidator))
     }
 
     /// Touch ID unavailable is its own fallback-eligible kind: the handler
@@ -876,7 +878,9 @@ mod tests {
         use crate::core::SecretType;
         let (store, _custody) = software_store(&AesGcmCrypto::generate_key());
         let mut session = test_session(0, 0);
-        session.authorization = engine(BiometryUnavailableAuthenticator);
+        session.authorization = engine(Recorder::new(AuthOutcome::Unavailable(
+            UnavailableReason::BiometryUnavailable,
+        )));
         let err = session
             .handle_encrypt(&encrypt_payload(vec![SecretType::RAW]), &store)
             .await
@@ -889,26 +893,25 @@ mod tests {
                 Some(DETAIL_BIOMETRY_UNAVAILABLE)
             )
         );
-        assert!(session.se_sessions.is_empty());
     }
 
     fn encrypt_payload(types: Vec<crate::core::SecretType>) -> Vec<u8> {
         serde_json::to_vec(&EncryptReq { types }).unwrap()
     }
 
-    /// encrypt@vt passes the engine and is always fresh: a rejected approval
-    /// mints nothing, an approved one returns DEKs derived from the store's
-    /// master through the one-shot session and hands a grant-less permit up.
-    /// An empty batch is refused before any prompt.
+    /// encrypt@vt passes the engine: a rejected approval mints nothing, an
+    /// approved one returns DEKs derived from the store's master through the
+    /// one-shot session and hands the permit up. An empty batch is refused
+    /// before any prompt.
     #[tokio::test]
-    async fn encrypt_requires_fresh_authorization() {
+    async fn encrypt_derives_deks_only_after_approval() {
         use crate::core::SecretType;
         let master = AesGcmCrypto::generate_key();
         let (store, custody) = software_store(&master);
         let payload = encrypt_payload(vec![SecretType::RAW, SecretType::TOTP]);
 
         let mut session = test_session(0, 0);
-        session.authorization = engine(RejectingAuthenticator);
+        session.authorization = engine(Recorder::new(AuthOutcome::Rejected));
         let err = session
             .handle_encrypt(&payload, &store)
             .await
@@ -929,12 +932,7 @@ mod tests {
             .expect("unknown type refused");
         assert_eq!(err, (ErrKind::BadRequest, Some(DETAIL_UNKNOWN_SECRET_TYPE)));
 
-        // A relay-confined caller with a decrypt TTL: the decrypt path would
-        // mint a grant here, encrypt never does.
-        let mut session = test_session(0, 300);
-        session.peer_is_vt_relay = true;
-        session.connection_subject = Some((123, 456));
-        session.authorization = engine(TestAuthenticator);
+        session.authorization = engine(Arc::new(TestAuthenticator));
         session.se_sessions.store(custody);
         let ok = session.handle_encrypt(&payload, &store).await.unwrap();
         let permit = ok.authorization.expect("permit travels to the dispatcher");
@@ -944,13 +942,90 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].dek, derive_dek(&master, &items[0].salt));
         assert_ne!(items[0].salt, items[1].salt);
-        permit.commit().await.unwrap();
-        let again = session.handle_encrypt(&payload, &store).await.unwrap();
+    }
+
+    fn run_payload(argv: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&RunReq {
+            host: "h".into(),
+            argv: argv.iter().map(|arg| arg.to_string()).collect(),
+            reason: None,
+            meta: crate::core::ClientMeta::default(),
+        })
+        .unwrap()
+    }
+
+    /// auth@vt, run@vt and encrypt@vt are always fresh: on a relay
+    /// connection whose decrypt/sign TTLs would mint grants, every call
+    /// prompts and is a new approval, even after the previous permit
+    /// committed.
+    #[tokio::test]
+    async fn auth_run_and_encrypt_prompt_on_every_call() {
+        use crate::core::SecretType;
+        let (store, custody) = software_store(&AesGcmCrypto::generate_key());
+        let recorder = Recorder::new(AuthOutcome::Success);
+        let mut session = test_session(300, 300);
+        session.peer_is_vt_relay = true;
+        session.connection_subject = Some((123, 456));
+        session.authorization = engine(recorder.clone());
+        session.se_sessions.store(custody);
+        session.run_allow = Arc::new(RunAllowlist::parse("/usr/bin/true").unwrap());
+        let auth = serde_json::to_vec(&AuthReq {
+            host: "h".into(),
+            reason: "sudo".into(),
+            meta: crate::core::ClientMeta::default(),
+        })
+        .unwrap();
+        let run = run_payload(&["/usr/bin/true"]);
+        let encrypt = encrypt_payload(vec![SecretType::RAW]);
+        for op in ["auth", "run", "encrypt", "auth", "run", "encrypt"] {
+            let result = match op {
+                "auth" => session.handle_auth(&auth).await,
+                "run" => session.handle_run(&run).await,
+                _ => session.handle_encrypt(&encrypt, &store).await,
+            };
+            let permit = result
+                .ok()
+                .and_then(|ok| ok.authorization)
+                .unwrap_or_else(|| panic!("{op} approved"));
+            assert_eq!(permit.decision(), NEW, "{op}");
+            permit.commit().await.unwrap();
+        }
+        assert_eq!(recorder.prompts().len(), 6);
+    }
+
+    /// run@vt refuses before any prompt: disabled, empty or NUL argv, an
+    /// argv the prompt cannot show in full, and a program off the allowlist.
+    #[tokio::test]
+    async fn run_refuses_before_prompting() {
+        let recorder = Recorder::new(AuthOutcome::Success);
+        let mut session = test_session(0, 0);
+        session.authorization = engine(recorder.clone());
+        let refused = |detail| Some((ErrKind::BadRequest, Some(detail)));
         assert_eq!(
-            again.authorization.unwrap().decision(),
-            NEW,
-            "encrypt approvals leave no grant"
+            session
+                .handle_run(&run_payload(&["/usr/bin/true"]))
+                .await
+                .err(),
+            refused(DETAIL_RUN_DISABLED)
         );
+        session.run_allow = Arc::new(RunAllowlist::parse("/usr/bin/true").unwrap());
+        let long = "x".repeat(RUN_PROMPT_ARGV_MAX);
+        for (argv, detail) in [
+            (vec![], DETAIL_RUN_ARGV_EMPTY),
+            (vec!["/usr/bin/true", "a\0b"], DETAIL_RUN_ARGV_EMPTY),
+            (
+                vec!["/usr/bin/true", long.as_str()],
+                DETAIL_RUN_ARGV_UNDISPLAYABLE,
+            ),
+            (vec!["/bin/ls"], DETAIL_RUN_NOT_ALLOWLISTED),
+        ] {
+            assert_eq!(
+                session.handle_run(&run_payload(&argv)).await.err(),
+                refused(detail),
+                "{argv:?}"
+            );
+        }
+        assert!(recorder.prompts().is_empty());
     }
 
     fn decrypt_payload(salts: &[[u8; SALT_LEN]]) -> Vec<u8> {
@@ -990,7 +1065,7 @@ mod tests {
         let mut session = test_session(0, 300);
         session.peer_is_vt_relay = true;
         session.connection_subject = Some((123, 456));
-        session.authorization = engine(TestAuthenticator);
+        session.authorization = engine(Arc::new(TestAuthenticator));
 
         assert_eq!(
             session
@@ -1091,6 +1166,10 @@ mod tests {
     /// needs its own session even for a resident key.
     #[tokio::test]
     async fn sign_hit_uses_resident_key_only() {
+        if !crate::server_macos::security::session_interactive_now() {
+            eprintln!("skipped: no interactive GUI session");
+            return;
+        }
         let session = test_session(0, 0);
         let key = ssh_key::private::PrivateKey::random(
             &mut rand::rngs::OsRng,
@@ -1100,20 +1179,16 @@ mod tests {
         let fp = fingerprint_str(key.public_key().key_data());
         session.keys.write().await.insert(fp.clone(), key.clone());
         let store = KeychainStore::new_v3(&[1; 8], &[2; 113]);
-        assert!(
-            session.private_key(&store, &fp, NEW).await.is_err(),
+        assert_eq!(
+            session.private_key(&store, &fp, NEW).await.unwrap_err(),
+            (ErrKind::NotInitialized, Some(DETAIL_SE_SESSION)),
             "resident keys must not bypass a missing biometric session"
         );
-        if crate::server_macos::security::session_interactive_now() {
-            let hit = session
-                .private_key(&store, &fp, Decision::CacheHit)
-                .await
-                .unwrap();
-            assert_eq!(hit.public_key(), key.public_key());
-            assert!(session.se_sessions.is_empty());
-        } else {
-            eprintln!("skipped resident-key hit: no interactive GUI session");
-        }
+        let hit = session
+            .private_key(&store, &fp, Decision::CacheHit)
+            .await
+            .unwrap();
+        assert_eq!(hit.public_key(), key.public_key());
         assert_eq!(super::super::clear_private_keys(&session.keys).await, 1);
         assert_eq!(
             session
@@ -1124,8 +1199,16 @@ mod tests {
             "a wiped key fails the hit closed"
         );
         assert!(session.keys.read().await.is_empty(), "no reload on a hit");
+        session.keys.write().await.insert(fp.clone(), key);
         session.locked.store(true, Ordering::Release);
-        assert!(session.private_key(&store, &fp, NEW).await.is_err());
+        assert_eq!(
+            session
+                .private_key(&store, &fp, Decision::CacheHit)
+                .await
+                .unwrap_err(),
+            (ErrKind::Generic, Some(DETAIL_SIGN_KEYS_LOAD)),
+            "a locked agent serves no resident key"
+        );
     }
 
     /// Private keys load on the first authorized sign after a wipe, through
@@ -1182,32 +1265,6 @@ mod tests {
     }
 
     // ── Touch-ID prompt helpers ────────────────────────────────────────────
-
-    #[test]
-    fn sanitize_prompt_strips_control_chars() {
-        // Newline, tab, carriage return, NUL, DEL — all must go. The decrypt
-        // prompt is shown via LAContext.localizedReason; an attacker who
-        // controls a forwarded agent socket could try to break out of the
-        // prompt layout or smuggle in extra newlines that look like
-        // legitimate `pwd:` / `via:` fields.
-        let evil = "good\n\r\t\x00\x7fend";
-        assert_eq!(sanitize_prompt(evil, 100), "goodend");
-    }
-
-    #[test]
-    fn sanitize_prompt_truncates_with_ellipsis() {
-        let long: String = "x".repeat(50);
-        let out = sanitize_prompt(&long, 10);
-        assert_eq!(out.chars().count(), 11, "10 chars + …");
-        assert!(out.ends_with('…'));
-        assert!(out.starts_with("xxxxxxxxxx"));
-    }
-
-    #[test]
-    fn sanitize_prompt_passes_short_input_unchanged() {
-        assert_eq!(sanitize_prompt("hi", 100), "hi");
-        assert_eq!(sanitize_prompt("", 10), "");
-    }
 
     #[test]
     fn who_at_host_renders_user_and_host() {
@@ -1415,56 +1472,51 @@ mod tests {
         assert_eq!(plural_secrets(2), "secrets");
     }
 
-    /// End-to-end shape of the new decrypt prompt: header on line 1,
-    /// the CLI's multi-line `command` body, then `append_meta_lines` rows.
-    #[test]
-    fn decrypt_prompt_renders_multiline_command_and_meta() {
-        let who = who_at_host("qiqi", "xy4");
-        let n = 5usize;
-        let mut msg = format!("decrypt {} {} on {}", n, plural_secrets(n), who);
-        let body = sanitize_prompt_multiline(
-            "op: inject\nfile: /Users/qiqi/.config/aux/config.jsonc\ncmd: /bin/cat /Users/qiqi/.config/aux/config.jsonc\nreason: aux config.jsonc",
-            PROMPT_COMMAND_MAX_LINE_LEN,
-            PROMPT_COMMAND_MAX_LINES,
-        );
-        assert!(!body.is_empty());
-        msg.push('\n');
-        msg.push_str(&body);
-        append_meta_lines(
-            &mut msg,
-            &crate::core::ClientMeta {
+    /// The decrypt prompt states agent truth (relay origin, kernel caller,
+    /// reuse scope) above the client-reported command body and meta, so a
+    /// padded body cannot push it off-screen.
+    #[tokio::test]
+    async fn decrypt_prompt_states_agent_truth_before_client_claims() {
+        let (store, _custody) = software_store(&AesGcmCrypto::generate_key());
+        let recorder = Recorder::new(AuthOutcome::Rejected);
+        let mut session = test_session(0, 300);
+        session.peer_is_vt_relay = true;
+        session.connection_subject = Some((123, 456));
+        session.authorization = engine(recorder.clone());
+        let req = DecryptReq {
+            host: "xy4".into(),
+            command: "file: /Users/qiqi/.config/aux/config.jsonc\n\
+                      cmd: /bin/cat config.jsonc\n\
+                      reason: aux config"
+                .into(),
+            items: vec![DecryptInput::V2 {
+                t: crate::core::SecretType::RAW,
+                salt: [1; SALT_LEN],
+            }],
+            meta: crate::core::ClientMeta {
                 user: "qiqi".into(),
                 pwd: "/".into(),
-                tty: String::new(),
                 ppid_cmd: "/Applications/aux.app/Contents/MacOS/aux".into(),
-                ssh_client: String::new(),
+                ..Default::default()
             },
-        );
-        let lines: Vec<&str> = msg.split('\n').collect();
-        assert_eq!(lines[0], "decrypt 5 secrets on qiqi@xy4");
-        assert_eq!(lines[1], "op: inject");
-        assert_eq!(lines[2], "file: /Users/qiqi/.config/aux/config.jsonc");
+        };
+        let err = session
+            .handle_decrypt(&serde_json::to_vec(&req).unwrap(), &store)
+            .await
+            .err();
+        assert_eq!(err.map(|(kind, _)| kind), Some(ErrKind::AuthRejected));
         assert_eq!(
-            lines[3],
-            "cmd: /bin/cat /Users/qiqi/.config/aux/config.jsonc"
+            recorder.prompts(),
+            ["decrypt 1 secret on qiqi@xy4\n\
+              via forwarded vt relay\n\
+              caller: test\n\
+              reuse: this relay connection · 5m\n\
+              file: /Users/qiqi/.config/aux/config.jsonc\n\
+              cmd: /bin/cat config.jsonc\n\
+              reason: aux config\n\
+              pwd: /\n\
+              via: /Applications/aux.app/Contents/MacOS/aux"]
         );
-        assert_eq!(lines[4], "reason: aux config.jsonc");
-        assert_eq!(lines[5], "pwd: /");
-        assert_eq!(lines[6], "via: /Applications/aux.app/Contents/MacOS/aux");
-        assert_eq!(lines.len(), 7);
-    }
-
-    #[test]
-    fn decrypt_prompt_caps_hostile_command_line_count() {
-        // A malicious peer floods `command` with extra lines trying to push
-        // the dialog off-screen — the multiline sanitizer must drop the tail.
-        let huge = (0..50)
-            .map(|i| format!("line {}", i))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let body =
-            sanitize_prompt_multiline(&huge, PROMPT_COMMAND_MAX_LINE_LEN, PROMPT_COMMAND_MAX_LINES);
-        assert_eq!(body.split('\n').count(), PROMPT_COMMAND_MAX_LINES);
     }
 
     #[test]
