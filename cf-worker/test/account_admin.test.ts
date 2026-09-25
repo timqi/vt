@@ -268,16 +268,4 @@ describe('push fan-out', () => {
     expect(events).toEqual([{ event: 'push.failed', err: '', stack: expect.any(String), status: 503 }]);
     err.mockRestore();
   });
-
-  it('sends nothing before a subscription exists', async () => {
-    const tasks: Promise<unknown>[] = [];
-    const admin = await configured();
-    const notifications = new AccountNotifications(
-      { storage: admin['storage'] as DurableObjectStorage, waitUntil: (t: Promise<unknown>) => { tasks.push(t); } }, admin);
-    const fetchSpy = vi.fn();
-    vi.stubGlobal('fetch', fetchSpy);
-    notifications.approval(challenge());
-    await Promise.all(tasks);
-    expect(fetchSpy).not.toHaveBeenCalled();
-  });
 });

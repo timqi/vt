@@ -30,7 +30,7 @@ export type UvLevel = 'discouraged' | 'preferred' | 'required';
 const RANK: Record<UvLevel, number> = { discouraged: 0, preferred: 1, required: 2 };
 
 /** Level an approval ceremony gets when nothing raises it. */
-export const DEFAULT_APPROVAL_UV: UvLevel = 'discouraged';
+const DEFAULT_APPROVAL_UV: UvLevel = 'discouraged';
 
 /** Accept only the three spec levels. Anything else — absent, misspelled, a
  *  non-string from a client body, an inherited name like `constructor` — is
@@ -41,7 +41,7 @@ export function parseUvLevel(v: unknown): UvLevel | null {
 
 /** The stricter of two levels. The single operation the whole policy is built
  *  from: every input can only RAISE the effective level. */
-export function maxUvLevel(a: UvLevel, b: UvLevel): UvLevel {
+function maxUvLevel(a: UvLevel, b: UvLevel): UvLevel {
   return RANK[b] > RANK[a] ? b : a;
 }
 

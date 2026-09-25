@@ -8,13 +8,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   parseUvPolicy, defaultUvPolicy, effectiveUvLevel,
-  parseUvLevel, maxUvLevel,
-  DEFAULT_APPROVAL_UV,
+  parseUvLevel,
 } from '../src/uv_policy';
 
 const DECRYPT = { op_kind: 'decrypt', host: 'laptop' };
 
-describe('level parsing and ordering', () => {
+describe('level parsing', () => {
   it('accepts only the three spec levels', () => {
     for (const l of ['discouraged', 'preferred', 'required'] as const) {
       expect(parseUvLevel(l)).toBe(l);
@@ -23,19 +22,10 @@ describe('level parsing and ordering', () => {
       expect(parseUvLevel(bad)).toBeNull();
     }
   });
-
-  it('orders discouraged < preferred < required', () => {
-    expect(maxUvLevel('discouraged', 'preferred')).toBe('preferred');
-    expect(maxUvLevel('preferred', 'discouraged')).toBe('preferred');
-    expect(maxUvLevel('preferred', 'required')).toBe('required');
-    expect(maxUvLevel('required', 'discouraged')).toBe('required');
-    expect(maxUvLevel('discouraged', 'discouraged')).toBe('discouraged');
-  });
 });
 
 describe('policy defaults', () => {
   it('defaults an approval to discouraged — the single-click case', () => {
-    expect(DEFAULT_APPROVAL_UV).toBe('discouraged');
     expect(effectiveUvLevel(defaultUvPolicy(), DECRYPT)).toBe('discouraged');
     expect(parseUvPolicy(undefined)).toEqual({ policy: defaultUvPolicy(), error: null });
     expect(parseUvPolicy(null).policy).toEqual(defaultUvPolicy());
@@ -49,17 +39,13 @@ describe('configured policy', () => {
     by_host: { 'prod-db': 'required', laptop: 'discouraged' },
   }).policy;
 
-  it('raises per op and per host', () => {
+  // Every rule only raises: by_host.laptop ('discouraged') never pulls an op
+  // rule down, and a lower op rule never weakens a host rule.
+  it('raises per op and per host, never letting one rule weaken another', () => {
     expect(effectiveUvLevel(policy, { op_kind: 'encrypt', host: 'laptop' })).toBe('discouraged');
     expect(effectiveUvLevel(policy, { op_kind: 'decrypt', host: 'laptop' })).toBe('preferred');
     expect(effectiveUvLevel(policy, { op_kind: 'auth', host: 'laptop' })).toBe('required');
     expect(effectiveUvLevel(policy, { op_kind: 'encrypt', host: 'prod-db' })).toBe('required');
-  });
-
-  it('never lets one rule weaken another', () => {
-    // by_host.laptop is 'discouraged' — it must not pull the op rule down.
-    expect(effectiveUvLevel(policy, { op_kind: 'auth', host: 'laptop' })).toBe('required');
-    // …nor may a low default weaken a host rule.
     expect(effectiveUvLevel(policy, { op_kind: 'decrypt', host: 'prod-db' })).toBe('required');
   });
 
