@@ -2255,17 +2255,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn different_reusable_scopes_do_not_coalesce() {
+    async fn zero_ttl_is_fresh_and_never_writes_a_grant() {
+        assert_eq!(ReusePolicy::from_ttl_secs(0), ReusePolicy::Fresh);
+        assert_eq!(
+            ReusePolicy::from_ttl_secs(30),
+            ReusePolicy::strict_ttl_secs(30)
+        );
         let auth = SuccessAuthenticator::new();
         let engine = AuthorizationEngine::new(auth.clone(), AllowValidator::allowed());
-        for fingerprint in ["fp-a", "fp-b"] {
+        for _ in 0..2 {
             let permit = engine
-                .authorize(sign_request((1, 2), fingerprint))
+                .authorize(AuthorizationRequest::new(
+                    vec![sign_scope((1, 2), "fp")],
+                    ReusePolicy::from_ttl_secs(0),
+                    "sign",
+                ))
                 .await
                 .unwrap();
+            assert_eq!(permit.decision(), Decision::Approved);
             permit.commit().await.unwrap();
         }
         assert_eq!(auth.calls.load(Ordering::Acquire), 2);
+        // Not even an already-expired `StrictTtl(0)` entry is stored.
+        assert!(engine.store.read().await.entries.is_empty());
     }
 
     #[tokio::test]

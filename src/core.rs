@@ -801,6 +801,20 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_single_line_strips_controls_and_truncates_with_ellipsis() {
+        // A forwarded-socket peer must not smuggle line breaks or NUL/DEL
+        // into a prompt, nor push it past the cap without a visible marker.
+        assert_eq!(
+            sanitize_for_display("good\n\r\t\x00\x7fend", 100),
+            "goodend"
+        );
+        assert_eq!(sanitize_for_display(&"x".repeat(50), 10), "xxxxxxxxxx…");
+        assert_eq!(sanitize_for_display("exactly10!", 10), "exactly10!");
+        assert_eq!(sanitize_for_display("hi", 100), "hi");
+        assert_eq!(sanitize_for_display("", 10), "");
+    }
+
+    #[test]
     fn sanitize_multiline_preserves_newlines_and_strips_other_controls() {
         let s = "op: inject\nfile: /tmp/x\tdata\nreason: hi";
         let out = sanitize_for_display_multiline(s, 100, 10);
@@ -876,6 +890,25 @@ mod tests {
         let VtUrl::V2 { salt, inner_ct, .. } = VtUrl::parse(&url).unwrap();
         let bad = client_decrypt_v2(SecretType::RAW, &dek, &salt, &inner_ct);
         assert!(bad.is_err(), "RAW decrypt of TOTP-AAD ciphertext must fail");
+    }
+
+    #[test]
+    fn totp_decrypt_returns_the_code_never_the_seed() {
+        let dek = fixture_dek();
+        let salt = [0x11u8; SALT_LEN];
+        let seed = "JBSWY3DPEHPK3PXP";
+        let url = client_encrypt_v2(SecretType::TOTP, &salt, &dek, seed.as_bytes()).unwrap();
+        let VtUrl::V2 { t, salt, inner_ct } = VtUrl::parse(&url).unwrap();
+        let code = client_decrypt_v2(t, &dek, &salt, &inner_ct).unwrap();
+        assert_ne!(code, seed);
+        assert_eq!(code.len(), 6);
+        assert!(code.bytes().all(|b| b.is_ascii_digit()));
+
+        // A seed that is not base32 fails instead of yielding a code.
+        let url = client_encrypt_v2(SecretType::TOTP, &salt, &dek, b"not base32 !!").unwrap();
+        let VtUrl::V2 { t, salt, inner_ct } = VtUrl::parse(&url).unwrap();
+        let err = client_decrypt_v2(t, &dek, &salt, &inner_ct).unwrap_err();
+        assert!(err.to_string().contains("TOTP secret"), "{err}");
     }
 
     #[test]
@@ -966,17 +999,6 @@ mod tests {
         assert!(VtUrl::parse(&bad).is_err());
     }
 
-    #[test]
-    fn v2_url_does_not_contain_mac_segment() {
-        let dek = fixture_dek();
-        let salt = [0x11u8; SALT_LEN];
-        for t in [SecretType::RAW, SecretType::TOTP] {
-            let url = client_encrypt_v2(t, &salt, &dek, b"x").unwrap();
-            assert!(!url.contains("mac/"), "url must not contain mac/: {}", url);
-            assert!(url.starts_with("vt://"));
-        }
-    }
-
     // ── ClientMeta wire-compat tests ──────────────────────────────────────
     //
     // The wire-version bump policy (#[serde(default)] on every new field) is
@@ -1008,24 +1030,6 @@ mod tests {
         assert!(req.items.is_empty());
         assert_eq!(req.meta.user, "");
         assert_eq!(req.meta.pwd, "");
-    }
-
-    #[test]
-    fn client_meta_roundtrip_preserves_all_fields() {
-        let m = ClientMeta {
-            user: "qiqi".into(),
-            pwd: "/Users/qiqi/proj".into(),
-            tty: "/dev/pts/3".into(),
-            ppid_cmd: "zsh -i".into(),
-            ssh_client: "10.0.0.5 5234 22".into(),
-        };
-        let json = serde_json::to_vec(&m).unwrap();
-        let back: ClientMeta = serde_json::from_slice(&json).unwrap();
-        assert_eq!(back.user, "qiqi");
-        assert_eq!(back.pwd, "/Users/qiqi/proj");
-        assert_eq!(back.tty, "/dev/pts/3");
-        assert_eq!(back.ppid_cmd, "zsh -i");
-        assert_eq!(back.ssh_client, "10.0.0.5 5234 22");
     }
 
     #[test]

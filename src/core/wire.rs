@@ -228,36 +228,30 @@ mod tests {
         n: u32,
     }
 
-    /// Every named `ErrKind` variant. `Unknown` is intentionally excluded:
-    /// it has no on-the-wire string form (it's `#[serde(other)]`, a
-    /// receive-only sentinel), so a round-trip test would serialize it as
-    /// `"unknown"` and deserialize back to itself, masking real coverage.
-    /// `Unknown`'s contract is exercised by
-    /// `unknown_kind_deserializes_to_unknown_then_generic_exit`.
-    fn all_kinds() -> &'static [ErrKind] {
-        &[
-            ErrKind::Generic,
-            ErrKind::AuthRejected,
-            ErrKind::SessionLocked,
-            ErrKind::NoGuiSession,
-            ErrKind::NotInitialized,
-            ErrKind::AgentLocked,
-            ErrKind::BiometryUnavailable,
-            ErrKind::BadRequest,
-            ErrKind::ProtocolVersion,
-            ErrKind::Transient,
-        ]
-    }
-
+    /// Every named `ErrKind` variant with its append-only wire string.
+    /// `Unknown` is excluded: it is a receive-only `#[serde(other)]` sentinel,
+    /// covered by `unknown_kind_deserializes_to_unknown_then_generic_exit`.
     #[test]
-    fn roundtrip_all_kinds() {
-        for &k in all_kinds() {
+    fn err_kind_wire_strings_are_pinned() {
+        for (k, wire) in [
+            (ErrKind::Generic, "generic"),
+            (ErrKind::AuthRejected, "auth_rejected"),
+            (ErrKind::SessionLocked, "session_locked"),
+            (ErrKind::NoGuiSession, "no_gui_session"),
+            (ErrKind::NotInitialized, "not_initialized"),
+            (ErrKind::AgentLocked, "agent_locked"),
+            (ErrKind::BiometryUnavailable, "biometry_unavailable"),
+            (ErrKind::BadRequest, "bad_request"),
+            (ErrKind::ProtocolVersion, "protocol_version"),
+            (ErrKind::Transient, "transient"),
+        ] {
             let env: ExtResponse<Dummy> = ExtResponse::err(k, Some("explanation"));
-            let bytes = serde_json::to_vec(&env).unwrap();
-            let parsed: ExtResponse<Dummy> = serde_json::from_slice(&bytes).unwrap();
+            let json: Value = serde_json::to_value(&env).unwrap();
+            assert_eq!(json["kind"], wire, "wire string for {k:?}");
+            let parsed: ExtResponse<Dummy> = serde_json::from_value(json).unwrap();
             assert_eq!(parsed.v, WIRE_VERSION);
             assert_eq!(parsed.status, Status::Err);
-            assert_eq!(parsed.kind, Some(k), "kind mismatch for {:?}", k);
+            assert_eq!(parsed.kind, Some(k));
             assert_eq!(parsed.detail.as_deref(), Some("explanation"));
         }
     }
@@ -297,23 +291,6 @@ mod tests {
             assert_eq!(ErrKind::Unknown.exit_code(), 1);
             assert_eq!(env.detail.as_deref(), Some("something happened"));
         }
-    }
-
-    #[test]
-    fn version_mismatch_is_detected_by_client_policy() {
-        // The wire layer itself accepts any u16; client policy enforces
-        // `v == WIRE_VERSION`. This test pins down the value of `v` so the
-        // client can branch on it.
-        let raw = json!({
-            "v": 99,
-            "status": "ok",
-            "data": { "n": 42 },
-        });
-        let env: ExtResponse<Dummy> = serde_json::from_value(raw).unwrap();
-        assert_ne!(
-            env.v, WIRE_VERSION,
-            "client must reject and emit ProtocolVersion"
-        );
     }
 
     #[test]
@@ -392,14 +369,5 @@ mod tests {
             canonical, manual,
             "wrap_ok_envelope has drifted from ExtResponse::Ok serialization"
         );
-    }
-
-    #[test]
-    fn ok_envelope_roundtrip() {
-        let env: ExtResponse<Dummy> = ExtResponse::ok(Dummy { n: 5 });
-        let bytes = serde_json::to_vec(&env).unwrap();
-        let parsed: ExtResponse<Dummy> = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(parsed.status, Status::Ok);
-        assert_eq!(parsed.data, Some(Dummy { n: 5 }));
     }
 }

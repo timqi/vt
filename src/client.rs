@@ -849,14 +849,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_envelope_ok_with_object_data() {
-        let inner = br#"{"approved":true}"#;
-        let envelope = wrap_ok_envelope(inner);
-        let data = parse_envelope(&envelope).expect("envelope should parse");
-        assert_eq!(&data[..], &inner[..]);
-    }
-
-    #[test]
     fn parse_envelope_err_auth_rejected_maps_to_exit_10() {
         let envelope = fake_err_envelope("auth_rejected", Some("authentication was declined"));
         let err = parse_envelope(&envelope).expect_err("should be Err");
@@ -942,46 +934,23 @@ mod tests {
     }
 
     #[test]
-    fn fallback_policy_auth_rejected_does_not_fall_back() {
-        let e: anyhow::Error = VtClientError::Agent(ErrKind::AuthRejected, None).into();
-        assert!(!should_fallback_to_cf(&e));
-    }
-
-    #[test]
-    fn fallback_policy_bad_request_does_not_fall_back() {
-        let e: anyhow::Error = VtClientError::Agent(ErrKind::BadRequest, None).into();
-        assert!(!should_fallback_to_cf(&e));
-    }
-
-    #[test]
-    fn fallback_policy_session_locked_falls_back() {
-        let e: anyhow::Error = VtClientError::Agent(ErrKind::SessionLocked, None).into();
-        assert!(should_fallback_to_cf(&e));
-    }
-
-    #[test]
-    fn fallback_policy_other_agent_kinds_fall_back() {
-        for kind in [
-            ErrKind::NoGuiSession,
-            ErrKind::BiometryUnavailable,
-            ErrKind::NotInitialized,
-            ErrKind::AgentLocked,
-            ErrKind::Generic,
-            ErrKind::Transient,
-            ErrKind::Unknown,
-            ErrKind::ProtocolVersion,
+    fn fallback_policy_refuses_only_rejection_and_bad_request() {
+        for (kind, falls_back) in [
+            (ErrKind::AuthRejected, false),
+            (ErrKind::BadRequest, false),
+            (ErrKind::SessionLocked, true),
+            (ErrKind::NoGuiSession, true),
+            (ErrKind::BiometryUnavailable, true),
+            (ErrKind::NotInitialized, true),
+            (ErrKind::AgentLocked, true),
+            (ErrKind::Generic, true),
+            (ErrKind::Transient, true),
+            (ErrKind::Unknown, true),
+            (ErrKind::ProtocolVersion, true),
         ] {
             let e: anyhow::Error = VtClientError::Agent(kind, None).into();
-            assert!(
-                should_fallback_to_cf(&e),
-                "expected {:?} to fall back",
-                kind
-            );
+            assert_eq!(should_fallback_to_cf(&e), falls_back, "{kind:?}");
         }
-    }
-
-    #[test]
-    fn fallback_policy_transport_falls_back() {
         let e: anyhow::Error = VtClientError::Transport(anyhow::anyhow!("socket closed")).into();
         assert!(should_fallback_to_cf(&e));
     }

@@ -568,14 +568,48 @@ GH_TOKEN = "vt://0projA"
     }
 
     #[test]
-    fn unquoted_value_is_a_parse_error() {
-        // Documents the footgun: a shell-style unquoted value breaks the file.
-        // `load_agent_config` catches this and returns default (fail-open).
-        assert!(toml::from_str::<HookConfig>("[env.default]\nGH_TOKEN=vt://x\n").is_err());
+    fn malformed_shim_rules_load_as_default_and_warn_without_source_text() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("vt-agent-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.toml");
+        // A valid rule, then the shell-style unquoted-value footgun.
+        std::fs::write(
+            &path,
+            "[[rules]]\ncommand = \"gh\"\nenv_vars = [\"GH_TOKEN\"]\n\n[env.default]\nGH_TOKEN=vt://0leaked\n",
+        )
+        .unwrap();
+        let log = Captured(Arc::new(Mutex::new(Vec::new())));
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        std::env::set_var("VT_AGENT_CONFIG", &path);
+        let cfg = tracing::subscriber::with_default(subscriber, load_agent_config);
+        std::env::remove_var("VT_AGENT_CONFIG");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(cfg.rules.is_empty() && cfg.env.default.is_empty());
+        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("ignoring malformed shim rules"), "{log}");
+        assert!(!log.contains("vt://0leaked"), "{log}");
+        assert!(!log.contains("GH_TOKEN"), "{log}");
     }
 
     #[test]
-    fn hydrate_skips_structured_sections_and_loads_vt_keys() {
+    fn hydrate_loads_vt_keys_skips_sections_and_keeps_env_values() {
         use std::io::Write;
         // Unique dir/keys so this parallel test doesn't collide with others.
         let dir = std::env::temp_dir().join(format!("vt-cfg-hydrate-{}", std::process::id()));
@@ -585,23 +619,31 @@ GH_TOKEN = "vt://0projA"
         // A VT_* string key alongside a structured [agent]/[[rules]] section.
         write!(
             f,
-            "VT_HYDRATE_TEST_KEY = \"value1\"\n\n[agent]\nx = 1\n\n[[rules]]\ncommand = \"gh\"\n"
+            "VT_HYDRATE_TEST_KEY = \"value1\"\nVT_HYDRATE_TEST_ENV = \"from-file\"\n\n[agent]\nx = 1\n\n[[rules]]\ncommand = \"gh\"\n"
         )
         .unwrap();
         drop(f);
 
         let _guard = VT_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("VT_HYDRATE_TEST_KEY");
+        std::env::set_var("VT_HYDRATE_TEST_ENV", "from-env");
         std::env::set_var("VT_CONFIG", &path);
-        hydrate_env_from_file();
+        let populated = hydrate_env_from_file();
         // The flat VT_ key loads; the tables are silently skipped (no panic/spam).
         assert_eq!(
             std::env::var("VT_HYDRATE_TEST_KEY").ok().as_deref(),
             Some("value1")
         );
+        // Environment overrides config and is not attributed to the file.
+        assert_eq!(
+            std::env::var("VT_HYDRATE_TEST_ENV").ok().as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(populated, vec!["VT_HYDRATE_TEST_KEY".to_string()]);
 
         std::env::remove_var("VT_CONFIG");
         std::env::remove_var("VT_HYDRATE_TEST_KEY");
+        std::env::remove_var("VT_HYDRATE_TEST_ENV");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

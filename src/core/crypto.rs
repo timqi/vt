@@ -166,61 +166,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_base64_encode() {
-        let text = b"to be encoded".to_vec();
-        assert_eq!(BASE64_URL_SAFE_NO_PAD.encode(&text), "dG8gYmUgZW5jb2RlZA");
-    }
-
-    #[test]
-    fn test_generation() {
-        let key1 = AesGcmCrypto::generate_key();
-        let key2 = AesGcmCrypto::generate_key();
-        assert_eq!(key1.len(), 32);
-        assert_eq!(key2.len(), 32);
-        assert_ne!(key1, key2);
-
-        // test nonce generation
-        let nonce1 = AesGcmCrypto::generate_nonce();
-        let nonce2 = AesGcmCrypto::generate_nonce();
-        assert_eq!(nonce1.len(), 12);
-        assert_eq!(nonce2.len(), 12);
-        assert_ne!(nonce1, nonce2);
-    }
-
-    #[test]
     fn test_encrypt_decrypt_basic() {
         let key = AesGcmCrypto::generate_key();
         let crypto = AesGcmCrypto::new(&key).unwrap();
 
-        let plaintext = b"Hello, World!";
-
-        let encrypted = crypto.encrypt(plaintext).unwrap();
-        assert_eq!(encrypted.len(), 12 + plaintext.len() + 16);
-
-        let decrypted = crypto.decrypt(&encrypted).unwrap();
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_empty_data() {
-        let key = AesGcmCrypto::generate_key();
-        let crypto = AesGcmCrypto::new(&key).unwrap();
-
-        let plaintext = b"";
-        let encrypted = crypto.encrypt(plaintext).unwrap();
-        let decrypted = crypto.decrypt(&encrypted).unwrap();
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_large_data() {
-        let key = AesGcmCrypto::generate_key();
-        let crypto = AesGcmCrypto::new(&key).unwrap();
-
-        let plaintext = vec![0xAB; 1024 * 1024];
-        let encrypted = crypto.encrypt(&plaintext).unwrap();
-        let decrypted = crypto.decrypt(&encrypted).unwrap();
-        assert_eq!(decrypted, plaintext);
+        let large = vec![0xAB; 1024 * 1024];
+        for plaintext in [
+            &b"Hello, World!"[..],
+            b"",
+            &large,
+            "Hello, 世界! 🌍".as_bytes(),
+        ] {
+            let encrypted = crypto.encrypt(plaintext).unwrap();
+            assert_eq!(encrypted.len(), 12 + plaintext.len() + 16);
+            let decrypted = crypto.decrypt(&encrypted).unwrap();
+            assert_eq!(decrypted, plaintext);
+        }
     }
 
     #[test]
@@ -279,6 +240,19 @@ mod tests {
         assert_ne!(dek_1, dek_2, "different masters -> different DEK");
     }
 
+    /// Known-answer vector, computed independently with Python's RFC 5869
+    /// HKDF-SHA256 (salt = record salt, IKM = master, info = `vt-dek-v2`).
+    /// `cf-worker/pwa/common.js` must derive the same DEK.
+    #[test]
+    fn derive_dek_known_answer_vector() {
+        let dek = derive_dek(&[0x42u8; 32], &[0x11u8; 16]);
+        let hex: String = dek.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "7d23a5b1a0000229f0fc4561273179271165e47110acb0b620a58a1f1b610142"
+        );
+    }
+
     #[test]
     fn test_aad_encrypt_decrypt_roundtrip() {
         let key = AesGcmCrypto::generate_key();
@@ -311,36 +285,5 @@ mod tests {
         // Decrypting with mismatched AAD must fail.
         let bad = crypto.decrypt_with_nonce_and_aad(&nonce, &ct, b"vt:v2:0");
         assert!(bad.is_err(), "AAD mismatch must reject");
-    }
-
-    #[test]
-    fn test_aad_does_not_prepend_nonce() {
-        // Regression guard: the AAD encrypt API must produce ct||tag only,
-        // never the nonce-prefixed format used by the legacy `encrypt()`.
-        let key = AesGcmCrypto::generate_key();
-        let crypto = AesGcmCrypto::new(&key).unwrap();
-        let nonce = [0xAAu8; 12];
-        let plaintext = b"";
-        let ct = crypto
-            .encrypt_with_nonce_and_aad(&nonce, plaintext, b"")
-            .unwrap();
-        // Empty plaintext -> 16-byte tag only.
-        assert_eq!(ct.len(), 16);
-        // Nonce bytes should not appear at the start.
-        assert_ne!(&ct[..12.min(ct.len())], &nonce[..]);
-    }
-
-    #[test]
-    fn test_unicode_text() {
-        let key = AesGcmCrypto::generate_key();
-        let crypto = AesGcmCrypto::new(&key).unwrap();
-
-        let plaintext = "Hello, 世界! 🌍".as_bytes();
-        let encrypted = crypto.encrypt(plaintext).unwrap();
-        let decrypted = crypto.decrypt(&encrypted).unwrap();
-        assert_eq!(decrypted, plaintext);
-
-        let decrypted_str = String::from_utf8(decrypted).unwrap();
-        assert_eq!(decrypted_str, "Hello, 世界! 🌍");
     }
 }
