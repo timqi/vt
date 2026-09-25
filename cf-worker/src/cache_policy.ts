@@ -14,7 +14,7 @@ import { CacheEntry } from './types';
 // silently widens the no-phone-approval window for the whole batch. 0 ("do not
 // cache") is not a member — it is the absence of a write. The PWA's radios are
 // [0, ...this] (see opPageData).
-export const APPROVE_TTL_WHITELIST = new Set([20 * 60, 2 * 60 * 60, 8 * 60 * 60]);
+const APPROVE_TTL_WHITELIST = new Set([20 * 60, 2 * 60 * 60, 8 * 60 * 60]);
 
 // EXTEND — what the admin cache tab may REQUEST, still settled by a Passkey
 // ceremony. A superset: extension is a deliberate, desk-bound act on a named set
@@ -26,7 +26,7 @@ export const APPROVE_TTL_WHITELIST = new Set([20 * 60, 2 * 60 * 60, 8 * 60 * 60]
 // birth, so every extension of it was a no-op. Long-running CI and attended
 // desktop sessions need a window longer than one workday or the feature is
 // decoration.
-export const EXTEND_TTL_WHITELIST = new Set([
+const EXTEND_TTL_WHITELIST = new Set([
   20 * 60, 2 * 60 * 60, 8 * 60 * 60,
   24 * 60 * 60,          // 1d
   2 * 24 * 60 * 60,      // 2d
