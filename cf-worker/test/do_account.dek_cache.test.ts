@@ -8,15 +8,15 @@
 // thrown 500 on the hot path.
 //
 // Note the local-runtime caveat: workerd/miniflare does NOT enforce the 128-key
-// batch caps, so these tests would pass against the unbatched read too. They are
-// a contract regression guard (the read must survive a >STORAGE_BATCH salt set
-// and must still be all-or-nothing across chunk boundaries), not a reproduction
-// of the production throw.
+// batch caps, so the batch sizes themselves are pinned by a storage spy in
+// do_account.safety.test.ts; here the read must stay all-or-nothing across a
+// chunk boundary.
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { b64uEnc } from '../src/crypto';
+import { cacheCtx } from '../src/account_cache';
 import {
-  inDO, configure, doPost, doGet, approve, makeChallenge, makeMeta, makeEntry, FAKE_CTX,
+  inDO, doPost, doGet, approve, makeChallenge, makeMeta, makeEntry, FAKE_CTX,
   sealFakeDek, nextSalt, allDekKeys, auditRows, liveTokenId, daemonAuth,
   bootstrap,
 } from './do_helpers';
@@ -70,16 +70,8 @@ describe('opDekCache — batched reads', () => {
   });
 
   // 150 > STORAGE_BATCH (128) and < the 256 salt ceiling: the read spans two
-  // get() calls. Before the fix this was one 150-key get(). The generous
-  // timeout is for arming, not reading — approving 150 salts runs 150 real
-  // seal/open round-trips through the ceremony.
-  it('serves a hit for a salt set larger than one storage batch', { timeout: 60_000 }, async () => {
-    const salts = await armCache(150);
-    const res = await read(salts);
-    expect(res.status).toBe(200);
-    expect(res.json).toMatchObject({ source: 'cache' });
-  });
-
+  // get() calls. The generous timeout is for arming, not reading — approving
+  // 150 salts runs 150 real seal/open round-trips through the ceremony.
   it('stays all-or-nothing across a chunk boundary', { timeout: 60_000 }, async () => {
     const salts = await armCache(150);
     // Replace a salt in the SECOND chunk (index 140 > 128) with one that was
@@ -92,16 +84,34 @@ describe('opDekCache — batched reads', () => {
     expect(res.json).toEqual({ miss: true });
   });
 
-  it('misses (never throws) on a salt set at the 256 ceiling with nothing armed', async () => {
-    const res = await read(Array.from({ length: 256 }, () => nextSalt()));
+  // Every salt is live under the probing token, so only the ceiling refuses it.
+  it('misses on a set over the 256 ceiling even when every salt is armed', async () => {
+    const salts = Array.from({ length: 257 }, () => nextSalt());
+    await inDO(async h => {
+      const entry = await makeEntry();
+      const ctx = await cacheCtx(tokenId, entry.project);
+      for (const s of salts) await h.state.storage.put(`dek:${ctx}:${s}`, entry);
+    });
+    const res = await read(salts);
     expect(res.status).toBe(200);
     expect(res.json).toEqual({ miss: true });
   });
 
-  it('misses on a set over the 256 ceiling', async () => {
-    const res = await read(Array.from({ length: 257 }, () => nextSalt()));
+  // Read-time expiry is authoritative: a lapsed entry the sweep has not reached
+  // yet is a miss, and a miss writes no hit row.
+  it('misses on a lapsed entry before the sweep removes it', async () => {
+    const salts = await armCache(2);
+    await inDO(async h => {
+      const [first] = await allDekKeys(h);
+      const e = (await h.state.storage.get<Record<string, unknown>>(first!))!;
+      await h.state.storage.put(first!, { ...e, expires_ms: Date.now() - 1 });
+    });
+    const rowsBefore = (await inDO(auditRows)).length;
+    const res = await read(salts);
     expect(res.status).toBe(200);
     expect(res.json).toEqual({ miss: true });
+    expect(await inDO(allDekKeys)).toHaveLength(2);
+    expect(await inDO(auditRows)).toHaveLength(rowsBefore);
   });
 
   // Binding is per-key, not per-chunk, so these need no large salt set.

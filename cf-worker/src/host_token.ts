@@ -17,8 +17,8 @@
 
 import { b64uEnc, hkdfSha256, randomBytes } from './crypto';
 
-export const HOST_TOKEN_PREFIX = 'vt1.';
-export const HOST_TOKEN_INFO = 'vt-host-token-v1';
+const HOST_TOKEN_PREFIX = 'vt1.';
+const HOST_TOKEN_INFO = 'vt-host-token-v1';
 /** Sliding validity window: every authenticated use moves expiry to now + 7 d. */
 export const HOST_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 

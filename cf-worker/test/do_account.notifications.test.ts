@@ -7,10 +7,13 @@ import { env } from 'cloudflare:test';
 import app from '../src/index';
 import { AccountNotifications } from '../src/account_notifications';
 import { AccountAdmin } from '../src/account_admin';
-import { b64uEnc, hmacSha256 } from '../src/crypto';
+import { b64uDec, b64uEnc, hmacSha256 } from '../src/crypto';
 import * as webpush from '../src/webpush';
 import type { DoAuditIngestOp } from '../src/types';
-import { accountStub, inDO, makeChallenge, makeMeta, liveTokenId, bootstrap, doGet, doPost, hostSecret } from './do_helpers';
+import {
+  inDO, makeChallenge, makeMeta, liveTokenId, bootstrap, doGet, doPost, hostSecret, configure,
+  signApproval, signChallenge, FLAGS_UP_UV,
+} from './do_helpers';
 
 beforeEach(bootstrap);
 
@@ -98,18 +101,16 @@ describe('AccountNotifications push contract', () => {
     });
   });
 
-  it('drops a subscription on 410, keeps it on 5xx and network failure', async () => {
+  // 410 / 5xx against the real sendPush: account_admin.test.ts. sendPush's
+  // own network failure (status 0) is a transient miss, never a dead endpoint.
+  it('keeps a subscription whose push failed at the network', async () => {
     await withPush(async ({ notifications, admin, tasks, send }) => {
-      send.mockImplementation(async (sub) => ({ status: sub.endpoint.endsWith('/1') ? 410 : 503, error: 'x' }));
+      send.mockResolvedValue({ status: 0, error: 'timeout' });
       const err = vi.spyOn(console, 'error').mockImplementation(() => {});
       notifications.approval(makeChallenge());
       await Promise.all(tasks);
-      expect(await labels(admin)).toEqual(['dev2']);
-      expect(err.mock.calls.map(c => (JSON.parse(String(c[0])) as { event: string }).event)).toEqual(['push.failed']);
-      send.mockResolvedValue({ status: 0, error: 'timeout' });
-      notifications.approval(makeChallenge());
-      await Promise.all(tasks);
-      expect(await labels(admin)).toEqual(['dev2']);
+      expect((await labels(admin)).sort()).toEqual(['dev1', 'dev2']);
+      expect(err.mock.calls.map(c => (JSON.parse(String(c[0])) as { event: string }).event)).toEqual(['push.failed', 'push.failed']);
     });
   });
 
@@ -238,6 +239,41 @@ describe('AccountNotifications slack channel', () => {
     });
   });
 
+  // The send task may write the handle while the decision's assertion is
+  // verifying; the decision must carry it forward, or the edit never happens.
+  it.each(['approve', 'reject'] as const)('%s keeps a handle written mid-verify and edits that message', async (op) => {
+    await configure({ slack: { bot_token: 'xoxb-test', channel: 'C123', mention: ['U1'] } });
+    const calls = stubSlack(() => ({ ok: true }));
+    const ch = makeChallenge();
+    const handle = { channel: 'C999', ts: '1.2' };
+    const decision = op === 'approve'
+      ? { sealed_deks_b64u: b64uEnc(new Uint8Array(48).fill(5)), binding_tag_b64u: b64uEnc(new Uint8Array(32).fill(6)),
+          ...(await signApproval(ch.approve_challenge_hash_b64u)) }
+      : await signChallenge(b64uDec(ch.reject_challenge_hash_b64u), FLAGS_UP_UV);
+    await inDO(async ({ inst, state }) => {
+      await state.storage.put({ [`ch:${ch.approve_token}`]: ch, [`pt:${ch.poll_token}`]: ch.approve_token });
+      inst.audit.create(ch);
+      const verify = crypto.subtle.verify.bind(crypto.subtle);
+      const verifying = vi.spyOn(crypto.subtle, 'verify').mockImplementation(async (...args) => {
+        await state.storage.put(`ch:${ch.approve_token}`, { ...ch, slack: handle });
+        return verify(...args);
+      });
+      try {
+        const res = await inst.fetch(new Request(`https://account.do/op/${op}`, {
+          method: 'POST', body: JSON.stringify({ approve_token: ch.approve_token, ...decision }),
+        }));
+        await res.text();
+        expect(res.status).toBe(200);
+        expect(verifying).toHaveBeenCalledOnce();
+      } finally {
+        verifying.mockRestore();
+      }
+      expect((await state.storage.get<typeof ch>(`ch:${ch.approve_token}`))!.slack).toEqual(handle);
+    });
+    await vi.waitFor(() => expect(calls.map(c => c.method)).toEqual(['chat.update']));
+    expect(calls[0]!.body).toMatchObject(handle);
+  });
+
   it('posts cache hits only when hit notify is on, with no mention or button', async () => {
     await withPush(async ({ notifications, admin, hitNotify, tasks }) => {
       await slackOn(admin);
@@ -259,31 +295,35 @@ describe('AccountNotifications slack channel', () => {
 describe('ceremony routes and push', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('/api/challenge returns before any push settles and carries no push_warning', async () => {
+  it('/api/challenge returns while its push is still in flight and carries no push_warning', async () => {
     const tokenId = await liveTokenId();
-    const body = new TextEncoder().encode(JSON.stringify({
-      daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
-      timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta(),
-    }));
-    const tag = await hmacSha256(await hostSecret(tokenId), body);
-    // Drain the internal create response so workerd's isolated storage stack
-    // does not retain an open DO response stream after the public route returns.
-    const account = {
-      idFromName: () => 'account',
-      get: () => ({ fetch: async (url: string, init: RequestInit) => {
-        const response = await accountStub().fetch(url, init);
-        return new Response(await response.text(), { status: response.status });
-      } }),
-    };
-    const response = await app.fetch(new Request('https://vt.test.invalid/api/challenge', {
-      method: 'POST', body, headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}`, 'VT-Token-Id': tokenId },
-    }), { ...env, ACCOUNT: account });
-    expect(response.status).toBe(200);
-    const result = await response.json() as Record<string, unknown>;
-    expect(result).not.toHaveProperty('push_warning');
-    await inDO(async ({ state }) => {
-      expect(await state.storage.get(`ch:${result.approve_token as string}`)).toMatchObject({ status: 'pending' });
-    });
+    expect((await doPost('push-subscribe', await browserSub(1))).status).toBe(200);
+    expect((await doGet('push-vapid')).status).toBe(200);
+    let settle!: () => void;
+    const inFlight = new Promise<void>(resolve => { settle = resolve; });
+    const send = vi.spyOn(webpush, 'sendPush').mockImplementation(async () => { await inFlight; return { status: 201 }; });
+    try {
+      const body = new TextEncoder().encode(JSON.stringify({
+        daemon_pubkey_b64u: b64uEnc(new Uint8Array(32).fill(11)),
+        timestamp_ms: Date.now(), salts_b64u: [], meta: makeMeta(),
+      }));
+      const tag = await hmacSha256(await hostSecret(tokenId), body);
+      const route = app.fetch(new Request('https://vt.test.invalid/api/challenge', {
+        method: 'POST', body, headers: { Authorization: `VT-HMAC ${b64uEnc(tag)}`, 'VT-Token-Id': tokenId },
+      }), env);
+      const response = await Promise.race([route, new Promise<never>((_, fail) =>
+        setTimeout(() => fail(new Error('the route waited on the push')), 2000))]);
+      expect(response.status).toBe(200);
+      const result = await response.json() as Record<string, unknown>;
+      expect(result).not.toHaveProperty('push_warning');
+      // The push this ceremony fanned out really is pending, not skipped.
+      await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+      await inDO(async ({ state }) => {
+        expect(await state.storage.get(`ch:${result.approve_token as string}`)).toMatchObject({ status: 'pending' });
+      });
+    } finally {
+      settle();
+    }
   });
 
   it('push ops reach the console-owned blob through the DO; unknown ops are refused', async () => {

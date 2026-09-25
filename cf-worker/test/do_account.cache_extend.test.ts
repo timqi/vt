@@ -182,19 +182,6 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
 // ── expires_ms moves only after a verified assertion ───────────────────────
 
 describe('opApprove → commitExtend — the only path that moves expires_ms', () => {
-  it('moves expiry to now + ttl on a verified assertion', async () => {
-    const { keys, ch } = await armCeremony({ leftMs: HOUR, ttlS: TTL_1D });
-    expect((await approve(ch)).status).toBe(200);
-
-    const after = Date.now();
-    const entries = await inDO(h => readEntries(h, keys));
-    for (const e of entries) {
-      // Measured from the APPROVAL: now + ttl, not created + ttl, and not
-      // additive with the hour that was left.
-      expect(Math.abs(e.expires_ms - (after + TTL_1D * 1000))).toBeLessThan(10_000);
-    }
-  });
-
   it('moves nothing when the assertion does not verify', async () => {
     const { keys, ch } = await armCeremony({ leftMs: HOUR, ttlS: TTL_1W });
     const before = await inDO(h => readEntries(h, keys));
@@ -308,6 +295,8 @@ describe('extension has no total-lifetime ceiling', () => {
     const first = await armCeremony({ entries: 1, leftMs: HOUR, ttlS: TTL_1D });
     expect((await approve(first.ch)).status).toBe(200);
     const afterFirst = (await inDO(h => readEntries(h, first.keys)))[0]!;
+    // Measured from the APPROVAL: now + ttl, not created + ttl, and not
+    // additive with the hour that was left.
     expect(Math.abs(afterFirst.expires_ms - (Date.now() + TTL_1D * 1000))).toBeLessThan(10_000);
 
     // Second hop on the SAME entry — no budget is consumed, only liveness matters.

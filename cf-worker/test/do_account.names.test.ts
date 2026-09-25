@@ -232,8 +232,3 @@ describe('names on the audit, cache and push surfaces', () => {
     send.mockRestore();
   });
 });
-function accountStubPut(body: unknown) {
-  return app.fetch(new Request(`${TEST_ORIGIN}/api/admin/config`, {
-    method: 'PUT', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json', ...adminHeaders() },
-  }), env).then(async r => ({ status: r.status, text: await r.text() }));
-}

@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { env, SELF } from 'cloudflare:test';
 import app from '../src/index';
 import { b64uDec, b64uEnc } from '../src/crypto';
-import { SESSION_COOKIE, sessionCookieValue } from '../src/admin_auth';
+import { SESSION_COOKIE, mintSession, sessionCookieValue } from '../src/admin_auth';
 import {
   accountStub, inDO, doGet, doPost, bootstrap, adminHeaders, signChallenge, loginAssertion,
   TEST_ORIGIN, TEST_CREDENTIAL_ENTRY,
@@ -146,10 +146,18 @@ describe('session verification in the DO', () => {
     const [v, exp, epoch, nonce, mac] = value.split('.');
     // Flip the FIRST char: the last one carries padding bits a decoder drops.
     const flipped = (mac!.startsWith('A') ? 'B' : 'A') + mac!.slice(1);
+    // The expired and stale-epoch cookies carry a VALID MAC under this root's
+    // session key, so each is refused by its own check, not by the MAC.
+    const { ksess, current } = await inDO(async ({ inst }) => {
+      const cur = await inst.admin.load();
+      return { ksess: cur.ksess as Uint8Array, current: cur.cfg.epoch as number };
+    });
+    const minted = async (ep: number, nowMs: number) => (await mintSession(ksess, ep, nowMs)).value;
+    expect((await doGet('tokens-list', cookieHeader(await minted(current, Date.now())))).status).toBe(200);
     for (const bad of [
       `${v}.${exp}.${epoch}.${nonce}.${flipped}`,
-      `${v}.${Math.floor(Date.now() / 1000) - 1}.${epoch}.${nonce}.${mac}`,
-      `${v}.${exp}.${Number(epoch) + 1}.${nonce}.${mac}`,
+      await minted(current, Date.now() - 365 * 24 * 3600_000),
+      await minted(current - 1, Date.now()),
       'garbage',
     ]) {
       const res = await doGet('tokens-list', cookieHeader(bad));

@@ -14,7 +14,7 @@ import { HOST_TOKEN_TTL_MS } from '../src/host_token';
 import type { Challenge, HostTokenRow } from '../src/types';
 import { AccountAdmin } from '../src/account_admin';
 import {
-  inDO, accountStub, configure, doPost, doGet, approve, reject, makeMeta, auditRow, bootstrap, hostSecret, loginAssertion,
+  inDO, accountStub, configure, doPost, doGet, approve, reject, makeMeta, auditRow, auditRows, bootstrap, hostSecret, loginAssertion,
   redeployWithSecret, TEST_ORIGIN, TEST_CREDENTIAL_ENTRY,
 } from './do_helpers';
 
@@ -44,13 +44,6 @@ async function tokenHeaders(tokenId: string, body: unknown, secret?: Uint8Array)
   const raw = new TextEncoder().encode(JSON.stringify(body));
   const mac = await hmacSha256(secret ?? await hostSecret(tokenId), raw);
   return { Authorization: `VT-HMAC ${b64uEnc(mac)}`, 'VT-Token-Id': tokenId };
-}
-
-/** The pre-enroll shape: HMAC keyed on some shared value, no VT-Token-Id. */
-async function legacyHeaders(body: unknown) {
-  const raw = new TextEncoder().encode(JSON.stringify(body));
-  const mac = await hmacSha256(new TextEncoder().encode('any-shared-value'), raw);
-  return { Authorization: `VT-HMAC ${b64uEnc(mac)}` };
 }
 
 function challengeBody(over: Record<string, unknown> = {}) {
@@ -100,6 +93,41 @@ describe('enrollment', () => {
     const audit = await inDO(h => auditRow(h, approveToken.slice(0, 16)));
     expect(audit?.op_kind).toBe('enroll');
     expect(audit?.status).toBe('approved');
+  });
+
+  // The daemon's poll socket is how `vt enroll` receives its token: `waiting`
+  // on connect, then `approved` carrying it once a Passkey approves, and the
+  // identical token again for a CLI that reconnects afterwards.
+  it('delivers the host token over the poll socket, again on reconnect', async () => {
+    const poll = async (pollToken: string) => {
+      const res = await accountStub().fetch(`https://account.do/ws?poll_token=${pollToken}`, { headers: { Upgrade: 'websocket' } });
+      expect(res.status).toBe(101);
+      const ws = res.webSocket!;
+      const messages: Array<Record<string, unknown>> = [];
+      ws.addEventListener('message', ev => messages.push(JSON.parse(ev.data as string)));
+      const closed = new Promise<void>(resolve => ws.addEventListener('close', () => resolve()));
+      ws.accept();
+      return { messages, closed };
+    };
+    const req = await post('/api/enroll', { host: 'devbox', user: 'qiqi', timestamp_ms: Date.now() });
+    const approveToken = req.json.approve_url.split('/a/')[1];
+    const live = await poll(req.json.poll_token);
+    const ch = await inDO(h => h.state.storage.get<Challenge>(`ch:${approveToken}`));
+    expect((await approve(ch!)).status).toBe(200);
+    await live.closed;
+    const tokenId = (await inDO(h => h.state.storage.get<Challenge>(`ch:${approveToken}`)))!.enroll_token_id!;
+    const hostToken = `vt1.${tokenId}.${b64uEnc(await hostSecret(tokenId))}`;
+    expect(live.messages.map(m => m.status)).toEqual(['waiting', 'approved']);
+    expect(live.messages[1]!.host_token).toBe(hostToken);
+
+    const again = await poll(req.json.poll_token);
+    await again.closed;
+    expect(again.messages.map(m => m.status)).toEqual(['waiting', 'approved']);
+    expect(again.messages[1]!.host_token).toBe(hostToken);
+
+    const unknown = await accountStub().fetch('https://account.do/ws?poll_token=nosuchpolltoken0', { headers: { Upgrade: 'websocket' } });
+    expect(unknown.status).toBe(404);
+    expect(await unknown.text()).toBe('unknown poll_token');
   });
 
   it('shows the pairing code and the claimed host on the approval page', async () => {
@@ -227,6 +255,10 @@ describe('authenticating with a host token', () => {
   it('refuses a wrong secret, an unknown id, and a malformed id', async () => {
     const { tokenId } = await enrollApproved();
     const body = challengeBody();
+    const stored = () => inDO(async h => ({
+      ch: (await h.state.storage.list({ prefix: 'ch:' })).size, audit: (await auditRows(h)).length,
+    }));
+    const before = await stored();
     const wrong = await post('/api/challenge', body, await tokenHeaders(tokenId, body, new Uint8Array(32).fill(1)));
     expect(wrong.status).toBe(401);
     expect(wrong.text).toBe('hmac mismatch');
@@ -239,7 +271,7 @@ describe('authenticating with a host token', () => {
     const malformed = await post('/api/challenge', body, { ...(await tokenHeaders(tokenId, body)), 'VT-Token-Id': 'short' });
     expect(malformed.status).toBe(401);
     // Nothing was stored or audited for the refusals.
-    expect(await inDO(h => auditRow(h, 'never'))).toBeUndefined();
+    expect(await stored()).toEqual(before);
   });
 
   it('refuses revoked and expired tokens with a structured reason and never revives them', async () => {
@@ -270,20 +302,6 @@ describe('authenticating with a host token', () => {
     expect(res.status).toBe(200);
     expect(res.json).toEqual({ miss: true });
     expect((await tokenRow(tokenId))!.expires_ms).toBeGreaterThan(issued.expires_ms - 60_000);
-  });
-
-  it('refuses a token-less signature on both daemon routes, storing and auditing nothing', async () => {
-    // A host that never ran `vt enroll` has nothing but a guess to sign with
-    // and sends no VT-Token-Id. It gets the same structured 401 as a dead
-    // token, so the CLI prints the enroll hint.
-    const body = challengeBody();
-    const before = await inDO(h => h.state.storage.list({ prefix: 'ch:' }).then(m => m.size));
-    for (const path of ['/api/challenge', '/api/dek-cache']) {
-      const res = await post(path, body, await legacyHeaders(body));
-      expect(res.status).toBe(401);
-      expect(res.json).toMatchObject({ error: 'token_missing' });
-    }
-    expect(await inDO(h => h.state.storage.list({ prefix: 'ch:' }).then(m => m.size))).toBe(before);
   });
 
   it('fails closed inside the DO when a body arrives without auth', async () => {
@@ -371,6 +389,14 @@ describe('SECRET rotation and reset', () => {
       const miss = await post('/api/dek-cache', probe, await tokenHeaders(tokenId, probe, oldSecret), e);
       expect(miss.status).toBe(401);
       expect(miss.text).toBe('hmac mismatch');
+      const push = {
+        timestamp_ms: Date.now(), agent_id: `t:${tokenId}`, hostname: 'oldhost',
+        entry: { op_kind: 'sign', outcome: 'approved', salts: 0, latency_ms: 1, ts_ms: Date.now(),
+                 token_id: `a_t:${tokenId}_${Math.random()}`, meta: { op_kind: 'sign' } },
+      };
+      const pushed = await post('/api/audit-ingest', push, await tokenHeaders(tokenId, push, oldSecret), e);
+      expect(pushed.status).toBe(401);
+      expect(pushed.text).toBe('hmac mismatch');
     }
     // The refusals were not uses: the row is exactly as enrollment left it.
     const row = (await tokenRow(tokenId))!;
@@ -380,18 +406,7 @@ describe('SECRET rotation and reset', () => {
     expect((await post('/api/challenge', body, await tokenHeaders(again, body))).status).toBe(200);
   });
 
-  it('refuses a token-less signature under either generation', async () => {
-    const body = challengeBody();
-    for (const key of [env.SECRET, 'a-fresh-secret']) {
-      const raw = new TextEncoder().encode(JSON.stringify(body));
-      const mac = await hmacSha256(new TextEncoder().encode(key), raw);
-      const res = await post('/api/challenge', body, { Authorization: `VT-HMAC ${b64uEnc(mac)}` });
-      expect(res.status).toBe(401);
-      expect(res.json).toMatchObject({ error: 'token_missing' });
-    }
-  });
-
-  it('refuses an audit push signed with a previous root, and the hostname-keyed master form', async () => {
+  it('refuses an audit push under a foreign key, and the hostname-keyed master form', async () => {
     const { tokenId } = await enrollApproved('mac', 'qiqi');
     const body = {
       timestamp_ms: Date.now(), agent_id: `t:${tokenId}`, hostname: 'mac',

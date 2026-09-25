@@ -8,11 +8,11 @@ import type { HostTokenRow } from './types';
 import { HOST_TOKEN_TTL_MS } from './host_token';
 import { logErr } from './log';
 
-export type TokenTouchResult =
+type TokenTouchResult =
   | { ok: true; host: string; user: string; prev_ip: string }
   | { ok: false; reason: 'token_unknown' | 'token_revoked' | 'token_expired' };
 
-export interface NewHostToken {
+interface NewHostToken {
   token_id: string;
   host: string;
   user: string;
