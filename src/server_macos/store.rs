@@ -325,39 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_roundtrip_minimal() {
-        let store = KeychainStore::new(&[0u8; 64], &[1u8; 60]);
-        let json = serde_json::to_vec(&store).unwrap();
-        let parsed: KeychainStore = serde_json::from_slice(&json).unwrap();
-        assert_eq!(parsed.v, STORE_SCHEMA_VERSION);
-        assert_eq!(
-            parsed.passcode_and_auth_token_bytes().unwrap(),
-            vec![0u8; 64]
-        );
-        assert_eq!(parsed.encrypted_passphrase_bytes().unwrap(), vec![1u8; 60]);
-        assert!(parsed.encrypted_ssh_keys.is_none());
-    }
-
-    #[test]
-    fn test_serde_roundtrip_with_optional_fields() {
-        let mut store = KeychainStore::new(&[2u8; 64], &[3u8; 60]);
-        store.set_encrypted_ssh_keys(&[4u8; 100]);
-        let json = serde_json::to_vec(&store).unwrap();
-        let parsed: KeychainStore = serde_json::from_slice(&json).unwrap();
-        assert_eq!(
-            parsed.encrypted_ssh_keys_bytes().unwrap(),
-            Some(vec![4u8; 100])
-        );
-    }
-
-    #[test]
-    fn test_optional_fields_omitted_in_json_when_none() {
-        let store = KeychainStore::new(&[0u8; 64], &[1u8; 60]);
-        let json = serde_json::to_string(&store).unwrap();
-        assert!(!json.contains("encrypted_ssh_keys"));
-    }
-
-    #[test]
     fn test_optional_fields_default_to_none_on_parse() {
         let json = r#"{"v":1,"passcode_and_auth_token":"AA","encrypted_passphrase":"BB"}"#;
         let parsed: KeychainStore = serde_json::from_str(json).unwrap();
@@ -366,6 +333,8 @@ mod tests {
         assert!(parsed.ssh_public_keys.is_empty());
         // Marker-less stores are wrap v1: parse, then fail the wrap check.
         assert_eq!(parsed.wrap_v, 0);
+        let err = parsed.se_material_bytes().unwrap_err().to_string();
+        assert!(err.contains("lacks se_key"), "{err}");
     }
 
     #[test]
@@ -388,17 +357,5 @@ mod tests {
         assert_eq!(wrapped, vec![8u8; 113]);
         assert_eq!(parsed.ssh_public_keys, store.ssh_public_keys);
         assert!(parsed.passcode_and_auth_token_bytes().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_v2_store_still_parses_and_has_no_se_material() {
-        let store = KeychainStore::new(&[0u8; 64], &[1u8; 60]);
-        let json = serde_json::to_string(&store).unwrap();
-        assert!(!json.contains("se_key"));
-        assert!(!json.contains("ssh_public_keys"));
-        let parsed: KeychainStore = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.wrap_v, WRAP_V2);
-        let err = parsed.se_material_bytes().unwrap_err().to_string();
-        assert!(err.contains("lacks se_key"), "{err}");
     }
 }

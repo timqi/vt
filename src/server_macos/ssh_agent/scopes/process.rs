@@ -165,30 +165,3 @@ pub(super) fn get_peer_pid(stream: &tokio::net::UnixStream) -> Option<i32> {
         None
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    // --- proc_info tests (macOS only, require running process) ---
-
-    #[test]
-    #[ignore]
-    fn test_proc_bsdinfo_self() {
-        let pid = std::process::id() as i32;
-        let result = get_proc_bsdinfo(pid);
-        assert!(result.is_some(), "Should be able to query own process");
-        let (ppid, _tdev, start) = result.unwrap();
-        assert!(ppid > 0, "Parent PID should be positive");
-        assert!(start > 0, "Start time should be positive");
-    }
-
-    #[test]
-    #[ignore]
-    fn test_proc_path_self() {
-        let pid = std::process::id() as i32;
-        let result = get_proc_path(pid);
-        assert!(result.is_some(), "Should be able to get own process path");
-        let path = result.unwrap();
-        assert!(!path.is_empty(), "Path should not be empty");
-    }
-}

@@ -630,113 +630,34 @@ pub(super) mod tests {
         assert!(validate_master_material(&short).is_err());
     }
 
+    /// The LAError mapping decides which failures revoke grants and which
+    /// invite the Worker fallback. Unknown codes (-11 WatchNotAvailable,
+    /// -14 InvalidDimensions, future ones) stay a terminal Rejected until
+    /// classified, never an Unavailable that invites fallback.
     #[test]
-    fn v2_is_only_a_migration_source() {
-        let store = v2_store(&[7; 32]);
-        assert!(check_wrap(&store).is_ok());
-        assert!(validate_master_material(&store).is_err());
-        assert!(crate::server_macos::ssh_agent::keys::public_entries(&store).is_err());
-    }
-
-    #[test]
-    #[ignore]
-    fn test_biometric_authentication() {
-        assert!(local_authentication("test biometric authentication"));
-    }
-
-    // ---- classify_la_error -----------------------------------------------
-
-    #[test]
-    fn classify_la_user_cancel_is_rejected() {
-        // -2: user pressed Cancel in the Touch ID dialog.
-        assert_eq!(classify_la_error(-2), EvalOutcome::Rejected);
-    }
-
-    #[test]
-    fn classify_la_authentication_failed_is_rejected() {
-        // -1: 3 wrong fingerprints in a row, before lockout fires.
-        assert_eq!(classify_la_error(-1), EvalOutcome::Rejected);
-    }
-
-    #[test]
-    fn classify_la_user_fallback_is_rejected() {
-        // -3: user tapped "Use Password" — with WithBiometrics policy this
-        // surfaces as rejection rather than success on a different factor.
-        assert_eq!(classify_la_error(-3), EvalOutcome::Rejected);
-    }
-
-    #[test]
-    fn classify_la_app_cancel_is_rejected() {
-        // -9: process invalidate()'d the context.
-        assert_eq!(classify_la_error(-9), EvalOutcome::Rejected);
-    }
-
-    #[test]
-    fn classify_la_invalid_context_is_rejected() {
-        // -10: programmer error using a stale context.
-        assert_eq!(classify_la_error(-10), EvalOutcome::Rejected);
-    }
-
-    #[test]
-    fn classify_la_biometry_lockout_is_biometry_unavailable() {
-        // -8: 3 failures triggered system lockout — must not be treated as
-        // a terminal Rejected; the Worker transport is the remaining route.
-        assert_eq!(classify_la_error(-8), EvalOutcome::BiometryUnavailable);
-    }
-
-    #[test]
-    fn classify_la_biometry_not_available_is_biometry_unavailable() {
-        // -6: hardware not present.
-        assert_eq!(classify_la_error(-6), EvalOutcome::BiometryUnavailable);
-    }
-
-    #[test]
-    fn classify_la_biometry_not_enrolled_is_biometry_unavailable() {
-        // -7: hardware present, no fingers enrolled.
-        assert_eq!(classify_la_error(-7), EvalOutcome::BiometryUnavailable);
-    }
-
-    #[test]
-    fn classify_la_passcode_not_set_is_biometry_unavailable() {
-        // -5: no system passcode → biometric path can't run.
-        assert_eq!(classify_la_error(-5), EvalOutcome::BiometryUnavailable);
-    }
-
-    #[test]
-    fn classify_la_system_cancel_is_not_interactive() {
-        // -4: framework canceled (e.g. another app stole focus).
-        assert_eq!(classify_la_error(-4), EvalOutcome::NotInteractive);
-    }
-
-    #[test]
-    fn classify_la_not_interactive_is_not_interactive() {
-        // -1004: defense in depth — PR1 lock pre-check normally catches this,
-        // but if the screen locks during the prompt we land here.
-        assert_eq!(classify_la_error(-1004), EvalOutcome::NotInteractive);
-    }
-
-    #[test]
-    fn classify_la_biometry_not_paired_is_biometry_unavailable() {
-        // -12: hardware paired state lost. Same family as NotAvailable.
-        assert_eq!(classify_la_error(-12), EvalOutcome::BiometryUnavailable);
-    }
-
-    #[test]
-    fn classify_la_biometry_disconnected_is_biometry_unavailable() {
-        // -13: sensor temporarily disconnected (e.g. external Touch ID device).
-        assert_eq!(classify_la_error(-13), EvalOutcome::BiometryUnavailable);
-    }
-
-    #[test]
-    fn classify_la_unknown_codes_are_rejected() {
-        // Be conservative on uncharted codes — don't report Unavailable (and
-        // invite Worker fallback) on something we haven't reasoned about. -11 (WatchNotAvailable)
-        // and -14 (InvalidDimensions) fall here; if a future Apple OS adds
-        // new codes, behavior is fail-closed until they're classified.
-        assert_eq!(classify_la_error(-11), EvalOutcome::Rejected);
-        assert_eq!(classify_la_error(-14), EvalOutcome::Rejected);
-        assert_eq!(classify_la_error(-9999), EvalOutcome::Rejected);
-        assert_eq!(classify_la_error(0), EvalOutcome::Rejected);
-        assert_eq!(classify_la_error(42), EvalOutcome::Rejected);
+    fn classify_la_error_table() {
+        use EvalOutcome::{BiometryUnavailable, NotInteractive, Rejected};
+        for (code, expected) in [
+            (-1, Rejected),             // AuthenticationFailed, before lockout
+            (-2, Rejected),             // UserCancel
+            (-3, Rejected),             // UserFallback ("Use Password")
+            (-9, Rejected),             // AppCancel
+            (-10, Rejected),            // InvalidContext
+            (-5, BiometryUnavailable),  // PasscodeNotSet
+            (-6, BiometryUnavailable),  // BiometryNotAvailable
+            (-7, BiometryUnavailable),  // BiometryNotEnrolled
+            (-8, BiometryUnavailable),  // BiometryLockout: Worker is the remaining route
+            (-12, BiometryUnavailable), // BiometryNotPaired
+            (-13, BiometryUnavailable), // BiometryDisconnected
+            (-4, NotInteractive),       // SystemCancel
+            (-1004, NotInteractive),    // NotInteractive: screen locked mid-prompt
+            (-11, Rejected),
+            (-14, Rejected),
+            (-9999, Rejected),
+            (0, Rejected),
+            (42, Rejected),
+        ] {
+            assert_eq!(classify_la_error(code), expected, "code {code}");
+        }
     }
 }

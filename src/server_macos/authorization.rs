@@ -247,16 +247,23 @@ mod tests {
         assert!(sessions.is_empty(), "dropped with the permit, never kept");
     }
 
+    /// A locked agent and a detected wake both fail validation before the
+    /// screen-state query, and both leave revocation pending so the engine
+    /// drops standing grants and advances the epoch.
     #[test]
-    fn sleep_detection_uses_wall_minus_monotonic_divergence() {
-        assert!(!sleep_diverged(
-            Duration::from_secs(5),
-            Some(Duration::from_secs(20))
-        ));
-        assert!(sleep_diverged(
-            Duration::from_secs(5),
-            Some(Duration::from_secs(35))
-        ));
-        assert!(!sleep_diverged(Duration::from_secs(5), None));
+    fn validate_invalidates_on_lock_and_on_wake() {
+        let validator = |locked: bool, wall_behind: Duration| MacValidator {
+            locked: Arc::new(AtomicBool::new(locked)),
+            last_clock: Mutex::new((Instant::now(), SystemTime::now() - wall_behind)),
+            sessions: Arc::new(SeSessions::default()),
+        };
+        for (locked, wall_behind) in [(true, Duration::ZERO), (false, Duration::from_secs(60))] {
+            let pending = AtomicBool::new(false);
+            assert!(matches!(
+                validator(locked, wall_behind).validate(&pending),
+                Err(ValidationError::Invalidated)
+            ));
+            assert!(pending.load(Ordering::Acquire), "locked={locked}");
+        }
     }
 }

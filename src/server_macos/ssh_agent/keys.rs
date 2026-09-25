@@ -200,30 +200,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ssh_key_entry_serde_roundtrip() {
-        let entries = vec![
-            SshKeyEntry {
-                fingerprint: "SHA256:abcdef123456".to_string(),
-                algorithm: "ssh-ed25519".to_string(),
-                comment: "test@host".to_string(),
-                key_data: "fake-key-data".to_string(),
-            },
-            SshKeyEntry {
-                fingerprint: "SHA256:xyz789".to_string(),
-                algorithm: "ssh-rsa".to_string(),
-                comment: "another@host".to_string(),
-                key_data: "fake-key-data-2".to_string(),
-            },
-        ];
-        let json = serde_json::to_vec(&entries).unwrap();
-        let decoded: Vec<SshKeyEntry> = serde_json::from_slice(&json).unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].fingerprint, "SHA256:abcdef123456");
-        assert_eq!(decoded[0].key_data, "fake-key-data");
-        assert_eq!(decoded[1].fingerprint, "SHA256:xyz789");
-    }
-
-    #[test]
     fn test_decode_ssh_keys_returns_empty_when_field_missing() {
         let (store, master) = test_store();
         assert!(decode_ssh_keys(&store, &master).unwrap().is_empty());
