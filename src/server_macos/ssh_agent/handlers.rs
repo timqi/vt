@@ -157,6 +157,21 @@ impl VtSshSession {
         fp: &str,
         decision: Decision,
     ) -> Result<ssh_key::private::PrivateKey, WireFailure> {
+        self.private_key_with(store, fp, decision, keys::load_private_keys)
+            .await
+    }
+
+    async fn private_key_with(
+        &self,
+        store: &KeychainStore,
+        fp: &str,
+        decision: Decision,
+        load: impl FnOnce(
+            &KeychainStore,
+            &[u8; 32],
+        )
+            -> Result<std::collections::HashMap<String, ssh_key::private::PrivateKey>>,
+    ) -> Result<ssh_key::private::PrivateKey, WireFailure> {
         let mut keys = self.keys.write().await;
         let unsafe_state = || (ErrKind::Generic, Some(DETAIL_SIGN_KEYS_LOAD));
         if self.locked.load(Ordering::Acquire)
@@ -174,7 +189,7 @@ impl VtSshSession {
             if let Some(key) = keys.get(fp) {
                 return Ok(key.clone());
             }
-            keys::load_private_keys(store, &master).map_err(|error| {
+            load(store, &master).map_err(|error| {
                 tracing::warn!("SSH key reload failed: {error}");
                 unsafe_state()
             })?
@@ -1259,6 +1274,22 @@ mod tests {
         assert!(
             session.keys.read().await.is_empty(),
             "no install under lock"
+        );
+        session.locked.store(false, Ordering::Release);
+        // A lock that lands during the reload is caught by the re-check.
+        let during_load = session
+            .private_key_with(&store, &fp, NEW, |store, master| {
+                session.locked.store(true, Ordering::Release);
+                keys::load_private_keys(store, master)
+            })
+            .await;
+        assert_eq!(
+            during_load.unwrap_err(),
+            (ErrKind::Generic, Some(DETAIL_SIGN_KEYS_LOAD))
+        );
+        assert!(
+            session.keys.read().await.is_empty(),
+            "no install after a lock during the load"
         );
         session.locked.store(false, Ordering::Release);
         assert!(session.private_key(&store, &fp, NEW).await.is_ok());
