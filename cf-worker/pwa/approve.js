@@ -25,6 +25,7 @@
     ).then(function (buf) { return new Uint8Array(buf); });
 
     var el = vt.el, ttlLabel = vt.ttlLabel;
+    var mountSeq = 0;
 
     // Both ceremonies run the assertion through here. No `allowCredentials`:
     // registration requires resident keys (setup.js), so the provider discovers
@@ -75,28 +76,40 @@
             root.appendChild(metaSec);
         }
 
-        var cacheSec = el('section', 'vt-ap-cache-section');
+        // Action bar: the cache duration, then the status line over Approve
+        // (2fr) / Reject (1fr) — one reach, so the duration is picked where it
+        // is approved. Sticks to the card's / sheet's bottom (admin.css).
+        var bar = el('div', 'vt-ap-bar glass');
+        var cacheSec = el('div', 'vt-ap-cache');
         cacheSec.hidden = true;
-        cacheSec.appendChild(el('h2', null, 'Cache decrypt authorization'));
-        // The reuse scope this approval would arm, in one line: what the cache
-        // key binds — host token (verified) + project (client-reported, its
-        // repository's common git dir, so every worktree shares one cache) — and
-        // what that buys, a decrypt with no phone approval. No cache is the
-        // duration control's own default, so it needs no sentence.
-        refs.cacheScope = el('p', 'hint cache-scope');
+        // One line over the control: its visible label, then — only while a
+        // duration is picked, since No cache arms nothing to describe — the
+        // reuse scope that duration would arm: what the cache key binds, host
+        // token (verified) + project (client-reported, its repository's common
+        // git dir, so every worktree shares one cache), and what that buys, a
+        // decrypt with no phone approval. Clamped (admin.css): Details holds
+        // the full paths. Above the control, so revealing it grows the bar
+        // upward and nothing under the finger moves. Ids name the pair for the
+        // radiogroup (the scope only while shown, or a screen reader would
+        // announce reuse for No cache); the per-mount suffix keeps two mounts
+        // from colliding.
+        var idBase = 'vt-ap-cache-' + (++mountSeq);
+        var head = el('p', 'vt-ap-cache-head');
+        var caption = el('span', 'vt-ap-cache-label', 'Cache decrypt authorization');
+        caption.id = idBase + '-label';
+        head.appendChild(caption);
+        refs.cacheScope = el('span', 'cache-scope');
+        refs.cacheScope.id = idBase + '-scope';
         refs.cacheScope.hidden = true;
-        cacheSec.appendChild(refs.cacheScope);
-        // Duration control: a glass segmented control, No cache first and default.
-        refs.cacheOpts = el('div', 'seg glass');
+        head.appendChild(refs.cacheScope);
+        cacheSec.appendChild(head);
+        // Duration control: a segmented control, No cache first and default.
+        refs.cacheOpts = el('div', 'seg');
         refs.cacheOpts.setAttribute('role', 'radiogroup');
-        refs.cacheOpts.setAttribute('aria-label', 'Cache duration');
+        refs.cacheOpts.setAttribute('aria-labelledby', caption.id);
         cacheSec.appendChild(refs.cacheOpts);
         refs.cacheSection = cacheSec;
-        root.appendChild(cacheSec);
-
-        // Action bar: the status line over Approve (2fr) / Reject (1fr). Floats over
-        // the standalone card; sticks to the sheet's bottom inline (admin.css).
-        var bar = el('div', 'vt-ap-bar glass');
+        bar.appendChild(cacheSec);
         refs.status = el('p', 'vt-ap-status');
         refs.status.setAttribute('role', 'status');
         refs.status.setAttribute('aria-live', 'polite');
@@ -246,25 +259,29 @@
         }
 
         // ── DEK-cache duration selector ──────────────────────────────────
-        // Shown when this ceremony has DEKs to cache. Default = 0 ("No cache"),
-        // which writes nothing.
+        // Shown when this ceremony has DEKs to cache, in the action bar. Default
+        // = 0 ("No cache"), which writes nothing.
         (function renderCacheOptions() {
             var optsList = data.cache_options_s || [];
             var pk = data.cache_pubkey_b64u || '';
             if (!pk || optsList.length <= 1) return;
+            // An empty project is still a scope: the key binds the host token
+            // and '', which every request reporting no project shares. The
+            // literal directory is Details' (and the audit row's): the bar
+            // keeps room for the scope itself, path first since the clamp
+            // (admin.css) cuts the tail on a short bar.
             var scope = (data.metadata && data.metadata.project) || '';
+            refs.cacheScope.innerHTML = '';
             if (scope) {
-                refs.cacheScope.innerHTML = '';
-                refs.cacheScope.appendChild(document.createTextNode('Skips phone approval for the '));
-                refs.cacheScope.appendChild(el('strong', null, 'same host token (verified)'));
-                refs.cacheScope.appendChild(document.createTextNode(' and project (client-reported) '));
+                refs.cacheScope.appendChild(document.createTextNode(' · project (client-reported) '));
                 refs.cacheScope.appendChild(el('strong', 'cache-path', scope));
-                var literal = (data.metadata && data.metadata.pwd) || '';
-                if (literal && literal !== scope) {
-                    refs.cacheScope.appendChild(
-                        document.createTextNode(' — this directory: ' + literal + ', other directories of the project hit too'));
-                }
-                refs.cacheScope.hidden = false;
+                refs.cacheScope.appendChild(document.createTextNode(' on the '));
+                refs.cacheScope.appendChild(el('strong', null, 'same host token (verified)'));
+                refs.cacheScope.appendChild(document.createTextNode(': skips phone approval'));
+            } else {
+                refs.cacheScope.appendChild(document.createTextNode(' · Skips phone approval for the '));
+                refs.cacheScope.appendChild(el('strong', null, 'same host token (verified)'));
+                refs.cacheScope.appendChild(document.createTextNode(', requests reporting no project'));
             }
             refs.cacheOpts.innerHTML = '';
             optsList.forEach(function (s, i) {
@@ -279,6 +296,12 @@
                 refs.cacheOpts.appendChild(label);
             });
             vt.seg(refs.cacheOpts);
+            refs.cacheOpts.addEventListener('change', function () {
+                var armed = selectedTtl() > 0;
+                refs.cacheScope.hidden = !armed;
+                if (armed) refs.cacheOpts.setAttribute('aria-describedby', refs.cacheScope.id);
+                else refs.cacheOpts.removeAttribute('aria-describedby');
+            });
             refs.cacheSection.hidden = false;
         })();
 

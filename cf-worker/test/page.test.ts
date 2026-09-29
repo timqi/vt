@@ -138,6 +138,126 @@ describe('notification hand-off', () => {
   });
 });
 
+// The ceremony builds its DOM through a handful of calls; a tree stub is enough
+// to check where the duration control lands and what it reveals.
+describe('approval ceremony layout', () => {
+  class Node_ {
+    children: Node_[] = []; parentNode: Node_ | null = null;
+    className = ''; hidden = false; textContent = ''; id = ''; type = ''; name = ''; value = ''; checked = false;
+    attrs: Record<string, string> = {};
+    listeners: Record<string, Array<() => void>> = {};
+    classList = { add: (c: string) => { this.className += ' ' + c; } };
+    style = { setProperty() {} };
+    constructor(public tag: string) {}
+    set innerHTML(_: string) { this.children = []; }
+    get firstChild() { return this.children[0] ?? null; }
+    appendChild(c: Node_) { c.parentNode = this; this.children.push(c); return c; }
+    insertBefore(c: Node_, ref: Node_ | null) {
+      c.parentNode = this;
+      const i = ref ? this.children.indexOf(ref) : -1;
+      if (i < 0) this.children.push(c); else this.children.splice(i, 0, c);
+      return c;
+    }
+    setAttribute(k: string, v: string) { this.attrs[k] = v; }
+    removeAttribute(k: string) { delete this.attrs[k]; }
+    addEventListener(n: string, fn: () => void) { (this.listeners[n] ??= []).push(fn); }
+    all(): Node_[] { return this.children.flatMap(c => [c, ...c.all()]); }
+    querySelectorAll(sel: string) { return sel === 'input' ? this.all().filter(n => n.tag === 'input') : []; }
+    querySelector(sel: string) {
+      return sel === 'input[name="cache-ttl"]:checked'
+        ? this.all().find(n => n.name === 'cache-ttl' && n.checked) ?? null : null;
+    }
+    has(cls: string) { return this.className.split(/\s+/).includes(cls); }
+    find(cls: string) { return this.all().find(n => n.has(cls))!; }
+  }
+
+  function mount(opts: { project?: string; showMeta?: boolean; data?: Record<string, unknown> } = {}) {
+    const context: Record<string, unknown> = {
+      document: {
+        createElement: (t: string) => new Node_(t), createTextNode: (t: string) => { const n = new Node_('#text'); n.textContent = t; return n; },
+        getElementById: () => null, addEventListener() {},
+      },
+      location: { pathname: '/admin', hash: '' }, addEventListener() {},
+      navigator: {}, TextEncoder, crypto, console,
+    };
+    context.window = context;
+    runInNewContext(pwa('common.js'), context);
+    runInNewContext(pwa('approve.js'), context);
+    const root = new Node_('div');
+    (context.vt as { mountApprove: (o: unknown) => void }).mountApprove({
+      root, showMeta: opts.showMeta ?? true,
+      data: {
+        metadata: { op_kind: 'decrypt', project: opts.project ?? '/srv/app/.git', pwd: '/srv/app/sub' }, records: [],
+        cache_options_s: [0, 1200, 7200], cache_pubkey_b64u: 'AA',
+        ...opts.data,
+      },
+    });
+    const radios = root.all().filter(n => n.name === 'cache-ttl');
+    const group = root.find('seg');
+    const pick = (i: number) => {
+      radios.forEach((r, k) => { r.checked = k === i; });
+      group.listeners.change.forEach(fn => fn());
+    };
+    const text = (n: Node_) => n.all().map(c => c.textContent).join('');
+    return { root, radios, group, pick, text };
+  }
+
+  it('puts the labelled duration control in the action bar, above Approve / Reject', () => {
+    const { root, radios, group } = mount();
+    const bar = root.find('vt-ap-bar');
+    const cache = root.find('vt-ap-cache');
+    expect(cache.parentNode).toBe(bar);
+    expect(cache.hidden).toBe(false);
+    expect(bar.children.indexOf(cache)).toBeLessThan(bar.children.indexOf(root.find('vt-ap-actions')));
+    expect(radios.map(r => [r.value, r.checked])).toEqual([['0', true], ['1200', false], ['7200', false]]);
+    const label = root.find('vt-ap-cache-label');
+    expect(label.textContent).toBe('Cache decrypt authorization');
+    expect(label.hidden).toBe(false);
+    expect(group.attrs['aria-labelledby']).toBe(label.id);
+  });
+
+  it('states and describes the reuse scope only while a duration is picked', () => {
+    const { root, group, pick, text } = mount();
+    const scope = root.find('cache-scope');
+    expect(scope.hidden).toBe(true);
+    expect(group.attrs['aria-describedby']).toBeUndefined();
+    expect(text(scope)).toContain('/srv/app/.git');
+    pick(1);
+    expect(scope.hidden).toBe(false);
+    expect(group.attrs['aria-describedby']).toBe(scope.id);
+    pick(0);
+    expect(scope.hidden).toBe(true);
+    expect(group.attrs['aria-describedby']).toBeUndefined();
+  });
+
+  it('states the host-token scope a picked duration arms without a project', () => {
+    const { root, pick, text } = mount({ project: '' });
+    const scope = root.find('cache-scope');
+    pick(2);
+    expect(scope.hidden).toBe(false);
+    expect(text(scope)).toContain('same host token (verified), requests reporting no project');
+  });
+
+  it('keeps the duration control in the bar when the host shows the request itself', () => {
+    const { root, pick } = mount({ showMeta: false });
+    expect(root.all().some(n => n.has('vt-ap-meta-section'))).toBe(false);
+    expect(root.find('vt-ap-cache').parentNode).toBe(root.find('vt-ap-bar'));
+    expect(root.find('vt-ap-cache').hidden).toBe(false);
+    pick(1);
+    expect(root.find('cache-scope').hidden).toBe(false);
+  });
+
+  it.each([
+    ['no cache key', { cache_pubkey_b64u: '' }],
+    ['only No cache', { cache_options_s: [0] }],
+    ['no options', { cache_options_s: undefined }],
+  ])('hides the duration control with %s', (_, data) => {
+    const { root, radios } = mount({ data });
+    expect(root.find('vt-ap-cache').hidden).toBe(true);
+    expect(radios).toEqual([]);
+  });
+});
+
 describe('cache creation time rendering', () => {
   class Element {
     children: Element[] = [];

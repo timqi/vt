@@ -383,20 +383,18 @@ th.col-pick input, td.col-pick input, .row-lead input { accent-color: var(--acce
   border-top: 1px solid var(--border);
   padding: 12px 20px calc(12px + env(safe-area-inset-bottom));
 }
-#detail-approve .vt-ap-cache-section { margin-top: 0; }
 /* A request opened from a notification has no row above it (admin.js
    vt.openApprovalSheet): the ceremony carries its own request details and is
    the whole sheet, so it takes the height the empty detail list leaves instead
    of the 55vh cap a row's details need. Inside it only the request details
-   scroll — the duration control and the action bar are the decision, and on a
-   short window they would otherwise start below the fold, half-covered by the
-   bar pinned over them. */
+   scroll — the action bar, duration control included, is the decision, and on
+   a short window it would otherwise start below the fold. */
 #detail.ceremony-only #detail-approve {
   display: flex; flex-direction: column;
   flex: 1 1 auto; min-height: 0; max-height: none; overflow: hidden;
 }
 #detail.ceremony-only .vt-ap-meta-section { flex: 1 1 auto; min-height: 0; overflow: auto; }
-#detail.ceremony-only .vt-ap-cache-section, #detail.ceremony-only .vt-ap-bar { flex: none; }
+#detail.ceremony-only .vt-ap-bar { flex: none; }
 @media (min-width: 640px) {
   #detail-dl { grid-template-columns: max-content 1fr; gap: 6px 16px; }
   #detail-dl dt { margin-top: 0; }
@@ -446,23 +444,48 @@ dd.vt-ap-pair { font-size: 28px; font-weight: 700; letter-spacing: 2px; }
   font-size: var(--sec); font-weight: 500; text-align: left; overflow-wrap: anywhere;
 }
 .chip:hover { opacity: 1; background: var(--tint); }
-.vt-ap-cache-section { margin: 18px 0 0; }
-/* The one line above the duration control: what reuse this approval arms, and
-   the path it binds — so it wraps. */
-.vt-ap-cache-section .cache-scope { margin: 0 0 8px; font-size: var(--cap); color: var(--muted); overflow-wrap: anywhere; }
-.vt-ap-cache-section .cache-scope strong { color: var(--err); }
-.vt-ap-cache-section .cache-scope .cache-path { color: var(--fg); font-family: var(--mono); }
-/* Action bar: Approve 2fr / Reject 1fr at 50px with the status line above them.
-   Standalone it floats over the card's bottom; in the sheet it sticks to the
-   sheet's bottom. The card pads for it. */
-.vt-ap-bar { padding: 8px 12px 12px; border-radius: var(--r-bar); }
-main.approve .vt-ap-bar { position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); max-width: 396px; margin: 0 auto; z-index: 5; }
-main.approve .vt-approve { padding-bottom: 104px; }
+/* Action bar: the duration control, the status line, then Approve 2fr /
+   Reject 1fr at 50px. It sticks to the bottom of the card (standalone) or the
+   sheet, and rests at the card's end once scrolled there — so it never covers
+   the request and the card needs no padding for it. Standalone it bleeds into
+   the card's side padding: four duration labels need the width. */
+.vt-ap-bar { padding: 10px; border-radius: var(--r-bar); }
+main.approve { padding-bottom: calc(16px + env(safe-area-inset-bottom)); }
+main.approve .vt-ap-bar { position: sticky; bottom: calc(12px + env(safe-area-inset-bottom)); z-index: 5; margin: 16px -8px 0; }
 #detail .vt-ap-bar { position: sticky; bottom: 0; margin-top: 12px; }
+/* The duration control sits on the bar as its lighter inset track, not a
+   second glass layer; its gap to the buttons is theirs to each other. */
+.vt-ap-cache { margin-bottom: 10px; }
+.vt-ap-cache .seg { background: var(--panel-2); border-radius: var(--r-ctl); }
+.vt-ap-cache .seg-thumb { border-radius: calc(var(--r-ctl) - 3px); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+.vt-ap-cache .seg label { min-height: 36px; padding: 0 2px; border-radius: calc(var(--r-ctl) - 3px); font-size: var(--cap); }
+/* The one line above the duration control: its label, then while a duration is
+   picked the reuse it arms. Clamped so the bar never grows over the decision;
+   Details holds the full paths. */
+.vt-ap-cache-head {
+  margin: 0 2px 8px; font-size: var(--cap); line-height: 1.35; color: var(--muted); overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden;
+}
+.vt-ap-cache-label { color: var(--fg); font-weight: 600; }
+.vt-ap-cache .cache-scope strong { color: var(--err); }
+.vt-ap-cache .cache-scope .cache-path { color: var(--fg); font-family: var(--mono); }
 .vt-ap-actions { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; }
 .vt-ap-actions button { min-height: 50px; margin: 0; border-radius: var(--r-ctl); }
 .vt-ap-approve { background: var(--accent); color: #fff; }
 .vt-ap-reject { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); }
+/* A narrow phone: four duration labels at 13px would touch. */
+@media (max-width: 359px) { .vt-ap-cache .seg label { font-size: 12px; } }
+/* A short viewport (a phone on its side) keeps the bar compact; too short for
+   even that not to cover most of the request, the bar stops sticking and rests
+   at the card's end, the duration control still beside Approve, unclamped. */
+@media (max-height: 500px) {
+  .vt-ap-cache-head { -webkit-line-clamp: 2; line-clamp: 2; }
+  .vt-ap-actions button { min-height: 44px; }
+}
+@media (max-height: 420px) {
+  main.approve .vt-ap-bar { position: static; }
+  main.approve .vt-ap-cache-head { display: block; }
+}
 .vt-ap-status { min-height: 20px; font-size: var(--cap); margin: 0 0 6px; overflow-wrap: anywhere; }
 .vt-ap-status:empty { display: none; }
 .vt-ap-status.ok { color: var(--ok); }
