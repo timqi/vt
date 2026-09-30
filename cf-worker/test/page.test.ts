@@ -256,6 +256,57 @@ describe('approval ceremony layout', () => {
     expect(root.find('vt-ap-cache').hidden).toBe(true);
     expect(radios).toEqual([]);
   });
+
+  // The standalone page (/a/:token) auto-mounts and leaves after a decision.
+  // Reject drives it: both decisions share the one onSettled, and it needs no
+  // PRF. `closes` says whether window.close() takes effect.
+  async function decideStandalone(closes: boolean) {
+    const root = new Node_('div');
+    const dataBlock = new Node_('script');
+    dataBlock.textContent = JSON.stringify({
+      approve_token: 't', rp_id: 'vt.test', reject_challenge_b64u: 'AA', allow_credentials: [],
+    });
+    const timers: Array<[() => void, number]> = [];
+    const replace = vi.fn();
+    const buf = () => new Uint8Array(1).buffer;
+    const context: Record<string, unknown> = {
+      document: {
+        createElement: (t: string) => new Node_(t), createTextNode: () => new Node_('#text'),
+        getElementById: (id: string) => ({ 'vt-approve-root': root, 'vt-data': dataBlock })[id] ?? null,
+        addEventListener() {},
+      },
+      location: { pathname: '/a/t', hash: '', replace }, addEventListener() {},
+      navigator: { credentials: { get: async () => ({
+        rawId: buf(), response: { clientDataJSON: buf(), authenticatorData: buf(), signature: buf() },
+      }) } },
+      fetch: async () => ({ ok: true, status: 200 }),
+      setTimeout: (fn: () => void, ms: number) => { timers.push([fn, ms]); },
+      closed: false,
+      close: vi.fn(() => { if (closes) context.closed = true; }),
+      TextEncoder, crypto, console, atob, btoa, performance,
+    };
+    context.window = context;
+    runInNewContext(pwa('common.js'), context);
+    runInNewContext(pwa('approve.js'), context);
+    root.find('vt-ap-reject').listeners.click[0]();
+    await vi.waitFor(() => expect(timers).toHaveLength(1));
+    expect(timers[0][1]).toBe(800);   // the outcome stays on screen first
+    timers.shift()![0]();
+    expect(context.close).toHaveBeenCalledTimes(1);
+    expect(replace).not.toHaveBeenCalled();
+    timers.forEach(([fn]) => fn());
+    return { replace };
+  }
+
+  it('closes the standalone tab after a decision', async () => {
+    const { replace } = await decideStandalone(true);
+    expect(replace).not.toHaveBeenCalled();
+  });
+
+  it('lands on the console when the tab silently stays open', async () => {
+    const { replace } = await decideStandalone(false);
+    expect(replace).toHaveBeenCalledWith('/admin');
+  });
 });
 
 describe('cache creation time rendering', () => {

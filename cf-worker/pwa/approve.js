@@ -508,10 +508,17 @@
     vt.mountApprove = mountApprove;
 
     // Standalone approval page (/a/:token): auto-mount from the embedded data,
-    // then land on the console shortly after a decision — the token is spent, so
-    // the page would only reload as 410. window.close() is a no-op for a window
-    // the script did not open (every notification and CLI-link arrival).
+    // then leave shortly after a decision — the token is spent, so the page
+    // would only reload as 410. Try closing the tab first; window.close() is a
+    // silent no-op for a window the script did not open (most notification and
+    // CLI-link arrivals, always an iOS Safari tab or home-screen app), so a page
+    // still open a moment later lands on the console instead.
     // The admin shell has no such root.
+    function leave() {
+        window.close();
+        setTimeout(function () { if (!window.closed) location.replace('/admin'); }, 300);
+    }
+
     var reload = document.getElementById('ap-reload');
     if (reload) reload.addEventListener('click', function () { location.reload(); });
 
@@ -543,7 +550,7 @@
                 data: data,
                 root: root,
                 showMeta: true,
-                onSettled: function () { setTimeout(function () { location.replace('/admin'); }, 800); },
+                onSettled: function () { setTimeout(leave, 800); },
             }); });
         } else {
             // The loading state would otherwise spin forever on a page that is

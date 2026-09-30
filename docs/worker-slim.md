@@ -119,8 +119,9 @@ the request in its detail sheet instead of navigating — the start page is the
 console, so a tap would otherwise load it and immediately replace it; it falls
 back to the standalone page when the request is no longer readable. A tap focuses that window, and opens one only when the
 app has none — an opened window is an auxiliary context that iOS presents as an
-in-app browser. Each hand-off fires once, and after a decision the page leaves
-for the admin console: the spent token would only render as 410.
+in-app browser. Each hand-off fires once, and after a decision the page closes
+its tab, or leaves for the admin console when the browser keeps it open: the
+spent token would only render as 410.
 
 Opening or returning to a visible PWA page checks this device's approval and
 enrollment notifications against the page API and closes those reported as
