@@ -78,7 +78,8 @@ vt.tabs.cache = function (panel) {
     return entries.filter(function (e) {
       if (!(e.expires_ms > t)) return false;
       if (host && e.host !== host) return false;
-      if (project && (e.project || '').indexOf(project) === -1) return false;
+      // A host-wide entry hits every project, so it passes any project filter.
+      if (project && !hostWide(e) && (e.project || '').indexOf(project) === -1) return false;
       return true;
     });
   }

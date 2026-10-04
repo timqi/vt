@@ -289,8 +289,9 @@ struct DekCacheReq<'a> {
     timestamp_ms: u64,
     /// Full display meta (host/user/command/ppid/…), same shape as the challenge
     /// request — so a cache HIT is audited with the same context as a ceremony
-    /// decrypt. The cache key is the host token plus `meta.project`; the rest
-    /// is forensic only.
+    /// decrypt. Entries are keyed on the host token, plus `meta.project` only
+    /// when the approver restricted them (docs/dek-cache.md); the rest is
+    /// forensic only.
     meta: &'a ChallengeMeta,
 }
 
@@ -586,7 +587,8 @@ pub async fn get_deks(
 
 /// Fast path: try the opt-in server-side DEK cache before running a full phone
 /// approval. Returns `Some(deks)` on a full cache hit (all `salts` present,
-/// unexpired, armed by this host token for the same `meta.project` — see
+/// unexpired, armed by this host token — host-wide, or for the same
+/// `meta.project` when the approver restricted the entry; see
 /// docs/dek-cache.md), or `None` on any miss / disabled cache / recoverable
 /// transport error (the caller then falls back to `get_deks`).
 ///
