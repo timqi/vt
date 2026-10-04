@@ -182,6 +182,19 @@ describe('cache-clear-entries — exact keys', () => {
     expect(await inDO(h => present(h, keep))).toBe(4);
   });
 
+  // A host-wide entry is addressed by a null project; the same salt under the
+  // test project is another key and stays.
+  it('clears a host-wide entry by its null project and only that one', async () => {
+    const [hostKey] = await inDO(h => seedEntries(h, 1, { expires_ms: Date.now() + HOUR }, 'host'));
+    const listed = (await list()).body.entries;
+    expect(listed.map(e => e.project)).toEqual([null]);
+    const salt = listed[0]!.salt_b64u;
+    const projectKey = `dek:${await testCtx()}:${salt}`;
+    await inDO(async h => h.state.storage.put(projectKey, await makeEntry({ expires_ms: Date.now() + HOUR })));
+    expect((await doPost('cache-clear-entries', { entries: [refOf(hostKey!, null)] })).json).toEqual({ cleared: 1 });
+    expect(await inDO(allDekKeys)).toEqual([projectKey]);
+  });
+
   it('reports only what it actually removed', async () => {
     const keep = await inDO(h => seedEntries(h, 2, { expires_ms: Date.now() + HOUR }));
     const res = await doPost('cache-clear-entries', { entries: [{ ...refOf(keep[0]!), salt_b64u: nextSalt() }] });

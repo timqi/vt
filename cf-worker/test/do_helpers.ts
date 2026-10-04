@@ -142,8 +142,8 @@ export function adminHeaders(): Record<string, string> {
 export const TEST_TOKEN_ID = 'testtoken0000000';
 export const TEST_PROJECT = '/home/tester/repo/.git';
 /** The ctx half of every seeded key: `dek:{ctx}:{salt}` under the test token
- *  and project, derived by the same seam production uses. */
-export const testCtx = (project = TEST_PROJECT): Promise<string> => cacheCtx(TEST_TOKEN_ID, project);
+ *  and project (null = host-wide), derived by the same seam production uses. */
+export const testCtx = (project: string | null = TEST_PROJECT): Promise<string> => cacheCtx(TEST_TOKEN_ID, project);
 /** A v4-shaped ctx (no token half): such keys stay listable and clearable
  *  through Clear all but can never be addressed by the console. */
 export const FAKE_CTX = 'testctx0000000000000000000000000000000000';
@@ -180,16 +180,19 @@ export async function makeEntry(over: Partial<CacheEntry> = {}): Promise<CacheEn
   };
 }
 
-/** Write `n` entries straight into storage under the test token + project —
- *  the shortest path to "an entry in state X exists", without an approval.
- *  One template for every key, as one writeCache batch would produce. */
+/** Write `n` entries straight into storage under the test token + project
+ *  (or host-wide, storing no project, as writeCache does) — the shortest path
+ *  to "an entry in state X exists", without an approval. One template for
+ *  every key, as one writeCache batch would produce. */
 export async function seedEntries(
   h: DoHandle,
   n: number,
   over: Partial<CacheEntry> = {},
+  scope: 'project' | 'host' = 'project',
 ): Promise<string[]> {
   const entry = await makeEntry(over);
-  const ctx = await testCtx(entry.project);
+  if (scope === 'host') delete entry.project;
+  const ctx = await testCtx(scope === 'host' ? null : entry.project);
   const keys: string[] = [];
   for (let i = 0; i < n; i++) {
     const key = `dek:${ctx}:${nextSalt()}`;
@@ -201,7 +204,7 @@ export async function seedEntries(
 
 /** The console's address of a seeded key: how cache-clear-entries and
  *  cache-extend-create name it. */
-export function refOf(key: string, project = TEST_PROJECT): CacheEntryRef {
+export function refOf(key: string, project: string | null = TEST_PROJECT): CacheEntryRef {
   return { token_id: key.split(':')[1]!, project, salt_b64u: key.slice(key.lastIndexOf(':') + 1) };
 }
 

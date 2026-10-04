@@ -5,7 +5,8 @@
 // Storage keys:
 //   ch:{approve_token}        →  Challenge JSON
 //   pt:{poll_token}           →  approve_token (WS tag routing)
-//   dek:{token_id}:{project_h}:{salt_b64u}  →  CacheEntry (approval-time DEK cache)
+//   dek:{token_id}:{scope}:{salt_b64u}  →  CacheEntry (approval-time DEK cache;
+//                                          scope = `host` or project_h)
 //   SQL: audit, host_token, names (record display names, account_names.ts)
 //
 // WebSocket hibernation: WS clients connect via Worker GET /api/dek, which
@@ -31,7 +32,7 @@ import { AccountAudit, auditKey } from './account_audit';
 import { checkAdopt, isName, nameLabel } from './account_names';
 import { AccountNotifications } from './account_notifications';
 import { AccountAdmin, notConfigured } from './account_admin';
-import { AccountCache } from './account_cache';
+import { AccountCache, isHostScopedKey } from './account_cache';
 import { deleteKeysBatched, listPrefixPages } from './storage_batch';
 
 const TTL_MS = 5 * 60 * 1000;
@@ -82,6 +83,13 @@ function fmtTime(ms: number): string {
   return new Date(ms).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
 }
 
+// What a cache scope reaches, in the words the approval, extension and audit
+// surfaces share: a null project is host-wide.
+function cacheScopeLabel(project: string | null): string {
+  if (project === null) return 'any project (host-wide)';
+  return project ? `project ${project} only` : 'requests reporting no project only';
+}
+
 // The text an approver actually reads before touching their Passkey (it lands in
 // ChallengeMeta.command, which the ceremony UI renders verbatim). It must name
 // every dimension of the authority being granted: which host and project, which
@@ -91,7 +99,7 @@ function extendSummary(intent: CacheExtendIntent): string {
   const more = intent.records.length > 8 ? ` … ${intent.records.length} total` : '';
   return [
     'op: extend DEK cache expiry',
-    `scope: ${intent.host || '?'} · ${intent.project || '?'} · ${intent.salts_b64u.length} entries`,
+    `scope: ${intent.host || '?'} · ${cacheScopeLabel(intent.project)} · ${intent.salts_b64u.length} entries`,
     `records: ${shown}${more}`,
     `ttl: ${ttlLabel(intent.ttl_s)} (from approval time, replaces the current expiry)`,
     `until: currently expires by ${fmtTime(intent.expires_ms)}`,
@@ -588,6 +596,9 @@ export class AccountDO extends DurableObject<Env> {
       AccountDO.checkDecisionBody(body);
       if (!isB64uString(body.sealed_deks_b64u)) throw new Error('sealed_deks_b64u');
       if (!isB64uString(body.binding_tag_b64u)) throw new Error('binding_tag_b64u');
+      if (body.cache_bind_project !== undefined && typeof body.cache_bind_project !== 'boolean') {
+        throw new Error('cache_bind_project');
+      }
       pwaPkBytes = decodeB64uExact(body.pwa_pk_b64u, 32, 'pwa_pk_b64u');
     } catch (e) {
       return badRequest(`bad request: ${(e as Error).message}`);
@@ -655,9 +666,10 @@ export class AccountDO extends DurableObject<Env> {
 
     // Opt-in DEK cache write. Best-effort: a failure here must never break the
     // approval (the daemon already has its sealed DEKs via the WS path below).
+    // Host-wide unless the approver restricted it to the ceremony's project.
     const ttlS = typeof body.cache_ttl_s === 'number' ? body.cache_ttl_s : 0;
     if (ttlS > 0) {
-      try { await this.writeCache(ch, ttlS, body.cache_sealed_deks_b64u); }
+      try { await this.writeCache(ch, ttlS, body.cache_sealed_deks_b64u, body.cache_bind_project === true); }
       catch (e) { logErr('cache.write_failed', e, { at: tokenPrefix(ch.approve_token) }); }
     }
 
@@ -837,7 +849,8 @@ export class AccountDO extends DurableObject<Env> {
     return Response.json({ revoked });
   }
 
-  // Fast path: look up cached DEKs for (token, project, salts). All-or-nothing — any
+  // Fast path: look up cached DEKs for (token, salts), each host-wide or
+  // restricted to the reported project. All-or-nothing — any
   // missing/expired/undecryptable salt yields a uniform miss (no oracle for
   // which salts are cached). On a full hit, re-seal each DEK to the requester's
   // ephemeral daemon pubkey so only this caller can open the response. Skips the
@@ -927,7 +940,7 @@ export class AccountDO extends DurableObject<Env> {
 
   // Admin: every entry that is live right now. Read-only. Returns NO secret
   // material (no sealed blob, no storage key); the console addresses an entry
-  // by (token_id, project, salt) and the DO re-derives the key.
+  // by (token_id, project | null, salt) and the DO re-derives the key.
   private async opCacheList(): Promise<Response> {
     const now = Date.now();
     let scan;
@@ -941,7 +954,7 @@ export class AccountDO extends DurableObject<Env> {
     const records = this.audit.names.resolve(salts, scan.live.map(([, e]) => e.name ?? ''));
     const entries: CacheEntrySummary[] = scan.live.map(([key, e], i) => ({
       token_id: key.split(':')[1] ?? '',
-      project: e.project ?? '',
+      project: isHostScopedKey(key) ? null : e.project ?? '',
       salt_b64u: salts[i]!,
       record: records[i]!,
       host: e.host ?? '',
@@ -961,16 +974,18 @@ export class AccountDO extends DurableObject<Env> {
     return Response.json(resp);
   }
 
-  // `entries: [{token_id, project, salt_b64u}]` bodies: well-formed refs only,
-  // deduplicated, capped. A ref the key derivation would refuse is refused here.
+  // `entries: [{token_id, project, salt_b64u}]` bodies (project null = host-wide):
+  // well-formed refs only, deduplicated, capped. A ref the key derivation would
+  // refuse is refused here.
   private static entryRefs(raw: unknown, max: number): CacheEntryRef[] {
     if (!Array.isArray(raw) || raw.length === 0 || raw.length > max) throw new Error('entries');
     const seen = new Set<string>();
     const out: CacheEntryRef[] = [];
     for (const r of raw as Array<Record<string, unknown>>) {
-      if (!r || !isTokenId(r.token_id) || typeof r.project !== 'string' || r.project.length > 4096
+      if (!r || !isTokenId(r.token_id)
+          || (r.project !== null && (typeof r.project !== 'string' || r.project.length > 4096))
           || !isB64uString(r.salt_b64u) || r.salt_b64u.length !== 22) throw new Error('entries');
-      const id = `${r.token_id}:${r.project}:${r.salt_b64u}`;
+      const id = JSON.stringify([r.token_id, r.project, r.salt_b64u]);
       if (seen.has(id)) continue;
       seen.add(id);
       out.push({ token_id: r.token_id, project: r.project, salt_b64u: r.salt_b64u });
@@ -996,7 +1011,8 @@ export class AccountDO extends DurableObject<Env> {
   // else — no expiry moves here. The intent (entries + TTL) is written onto the
   // challenge and never mutated, so the approval finalizes exactly what was
   // proposed, and the 5-minute challenge TTL bounds how long it stays approvable.
-  // One scope (token + project) per ceremony: the approver reads one host · project.
+  // One scope (token + project, or token alone) per ceremony: the approver reads
+  // one host · project.
   private async opCacheExtendCreate(request: Request): Promise<Response> {
     let op: DoCacheExtendCreateOp;
     let refs: CacheEntryRef[];
@@ -1043,7 +1059,7 @@ export class AccountDO extends DurableObject<Env> {
     };
     const summary = extendSummary(intent);
     const ch = await this.buildAdminCeremony(now, {
-      op_kind: 'cache-extend', command: summary, host: 'admin', user: '', pwd: '', project, ppid_cmd: '',
+      op_kind: 'cache-extend', command: summary, host: 'admin', user: '', pwd: '', project: project ?? '', ppid_cmd: '',
       ip: request.headers.get('CF-Connecting-IP') ?? '', reason: 'extend the expiry of granted DEK caches',
     }, { extend: intent });
     await this.storeAndAnnounce(ch);
@@ -1060,15 +1076,17 @@ export class AccountDO extends DurableObject<Env> {
 
   // Storage owns validation and writes; the DO records their effect only after
   // the verified approval above. A rejected write explains the later re-prompt.
-  private async writeCache(ch: Challenge, ttlS: number, sealedList: string[] | undefined): Promise<void> {
-    const result = await this.cache.writeCache(ch, ttlS, sealedList, auditKey(ch.approve_token));
+  private async writeCache(ch: Challenge, ttlS: number, sealedList: string[] | undefined, projectBound: boolean): Promise<void> {
+    const result = await this.cache.writeCache(ch, ttlS, sealedList, auditKey(ch.approve_token), projectBound);
     if (!result.ok) {
       logErr('cache.write_rejected', new Error(result.reason));
       this.audit.cacheEvent(ch.meta, ch.salts_b64u.length, 'write_failed', ch.salts_b64u);
       return;
     }
-    this.audit.setCacheTtl(ch.approve_token, ttlS, result.expires_ms);
-    log('cache.written', { at: tokenPrefix(ch.approve_token), ttl_s: ttlS, n: ch.salts_b64u.length });
+    const project = projectBound ? ch.meta.project ?? '' : null;
+    this.audit.setCacheTtl(ch.approve_token, ttlS, result.expires_ms,
+      projectBound ? 'project' : 'host', cacheScopeLabel(project));
+    log('cache.written', { at: tokenPrefix(ch.approve_token), ttl_s: ttlS, n: ch.salts_b64u.length, project_bound: projectBound });
   }
 
   // ONLY opApprove calls this, after verification and single-use consumption.

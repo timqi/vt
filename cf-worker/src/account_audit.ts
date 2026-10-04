@@ -243,16 +243,19 @@ export class AccountAudit {
     }
   }
 
-  // Record the cache TTL the approver chose (0 / null = not cached) together with
-  // the absolute expiry it produced. cache_ttl_s is the DECISION and is never
-  // rewritten afterwards; cache_expires_ms is the live state and IS updated by an
-  // approved extension (bumpCacheExpiry).
-  setCacheTtl(approveToken: string, ttlS: number, expiresMs: number): void {
+  // Record the cache TTL and scope the approver chose (0 / null = not cached)
+  // together with the absolute expiry it produced. cache_ttl_s and the scope are
+  // the DECISION and are never rewritten afterwards; cache_expires_ms is the
+  // live state and IS updated by an approved extension (bumpCacheExpiry). The
+  // scope reuses the agent rows' scope_family / scope_label columns.
+  setCacheTtl(approveToken: string, ttlS: number, expiresMs: number, scopeFamily: 'host' | 'project', scopeLabel: string): void {
     try {
       this.sql.exec(
-        `UPDATE audit SET cache_ttl_s = ?, cache_expires_ms = ?, seq = ? WHERE token_id = ?`,
+        `UPDATE audit SET cache_ttl_s = ?, cache_expires_ms = ?, scope_family = ?, scope_label = ?, seq = ? WHERE token_id = ?`,
         ttlS,
         expiresMs,
+        scopeFamily,
+        scopeLabel,
         this.nextSeq(),
         auditKey(approveToken),
       );

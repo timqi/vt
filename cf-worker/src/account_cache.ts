@@ -14,27 +14,36 @@ import { STORAGE_BATCH, deleteKeysBatched, listPrefixPages } from './storage_bat
 // the view is partial rather than imply completeness.
 const CACHE_LIST_SCAN_MAX = 20000;
 
-// DEK cache entry key: `dek:{token_id}:{project_h}:{salt_b64u}`.
+// DEK cache entry key: `dek:{token_id}:{scope}:{salt_b64u}`.
 //
 // token_id is the hard boundary: the host token the edge verified on THIS
 // request (host_token.ts), so a cached grant serves only the host that earned
 // it, wherever its egress IP goes. `meta.ip` stays on the entry as audit
-// metadata only. project_h is the client-reported `project` (the repository's
-// common git dir, else the cwd — src/cf.rs), hashed under the ctx tag and
-// truncated to 16 bytes. It is advisory, as `pwd` was: a compromised host can
-// spoof it, so it never widens the token boundary; it narrows it so one
-// project's grant does not serve an unrelated tree on the same host, while
-// every worktree of one repository shares the grant.
+// metadata only.
+//
+// scope is HOST_SCOPE for a host-wide entry (the approval default: any cwd or
+// project on that host token hits), else project_h: the client-reported
+// `project` (the repository's common git dir, else the cwd — src/cf.rs),
+// hashed under the ctx tag and truncated to 16 bytes, for an entry the approver
+// restricted to that project. The project is advisory, as `pwd` was: a
+// compromised host can spoof it, so it never widens the token boundary; it
+// narrows it so one project's grant does not serve an unrelated tree on the
+// same host, while every worktree of one repository shares the grant.
+// HOST_SCOPE is not 22 b64u characters, so it never collides with a project_h.
 //
 // The tag names the derivation, so a bumped derivation can never share a
 // storage key with the old one; v4 (`dek:{ctx}:{salt}`) entries are unreachable
 // and lapse or are cleared from the admin tab. Derived HERE for reads and
-// writes alike, so no caller can key the two on different rules.
-export async function cacheCtx(tokenId: string, project: string): Promise<string> {
+// writes alike, so no caller can key the two on different rules. A null
+// project names the host-wide scope.
+const HOST_SCOPE = 'host';
+
+export async function cacheCtx(tokenId: string, project: string | null): Promise<string> {
   // Fail closed: a key with an empty token half would be one every host could
   // reach. opCreate/opDekCache already refuse such bodies; this is the seam's
   // own guard, so a throw here is a DO bug surfacing as a 500, never a hit.
   if (!isTokenId(tokenId)) throw new Error('cache ctx without token_id');
+  if (project === null) return `${tokenId}:${HOST_SCOPE}`;
   const enc = new TextEncoder();
   const tag = enc.encode('vt-dek-ctx-v5');
   const projectBytes = enc.encode(project);
@@ -43,6 +52,12 @@ export async function cacheCtx(tokenId: string, project: string): Promise<string
   buf.set(projectBytes, tag.length);
   const projectH = b64uEnc((await sha256(buf)).slice(0, 16));
   return `${tokenId}:${projectH}`;
+}
+
+/** True when a stored `dek:` key is a host-wide entry. The key, not the entry
+ *  value, is the authority: it is what a read matches on. */
+export function isHostScopedKey(key: string): boolean {
+  return key.split(':')[2] === HOST_SCOPE;
 }
 
 function cacheKey(ctx: string, saltB64u: string): string {
@@ -131,7 +146,7 @@ export class AccountCache {
     return this.sweepCacheEntries(() => true);
   }
 
-  // The console names entries by (token_id, project, salt); the key is derived
+  // The console names entries by (token_id, project | null, salt); the key is derived
   // here, so a clear can only ever address what a read would. Exact keys, no
   // scan: the count is what storage removed.
   async clearEntries(refs: CacheEntryRef[]): Promise<number> {
@@ -140,13 +155,15 @@ export class AccountCache {
     return deleteKeysBatched(this.storage, keys);
   }
 
-  // Write one cache entry per salt, keyed by ctx(token_id, project)+salt. Caller
-  // has already verified the WebAuthn assertion, so this is authorized. INVARIANT
-  // (M1): we only reach here because the PHONE sent cache material (the PWA
-  // produces it solely when the human picks TTL > 0) — the Worker cannot
-  // fabricate a cache entry the user did not authorize.
+  // Write one cache entry per salt, keyed by ctx(token_id, scope)+salt: the
+  // host-wide scope unless the approver restricted the entry to the ceremony's
+  // project. Caller has already verified the WebAuthn assertion, so this is
+  // authorized. INVARIANT (M1): we only reach here because the PHONE sent cache
+  // material (the PWA produces it solely when the human picks TTL > 0) — the
+  // Worker cannot fabricate a cache entry the user did not authorize.
   async writeCache(
     ch: Challenge, ttlS: number, sealedList: string[] | undefined, originTokenId: string,
+    projectBound: boolean,
   ): Promise<CacheWriteResult> {
     const reject = (reason: string): CacheWriteResult => ({ ok: false, reason });
 
@@ -179,11 +196,13 @@ export class AccountCache {
     // were rejected above; a salted ceremony without one is a Worker bug.
     if (!isTokenId(ch.token_id)) return reject('missing token_id');
     const ip = ch.meta.ip ?? '';
-    const ctx = await cacheCtx(ch.token_id, ch.meta.project ?? '');
+    const project = projectBound ? ch.meta.project ?? '' : null;
+    const ctx = await cacheCtx(ch.token_id, project);
     const createdMs = Date.now();
     const expires = createdMs + ttlS * 1000;
     // created_ms is forensic only (extension measures from the approval) and is
     // never rewritten afterwards. host/user are the token record's (opCreate).
+    // A host-wide entry stores no project: none was bound.
     const writes: Record<string, CacheEntry> = {};
     for (let i = 0; i < salts.length; i++) {
       writes[cacheKey(ctx, salts[i]!)] = {
@@ -192,7 +211,7 @@ export class AccountCache {
         origin_token_id: originTokenId,
         ip,
         ppid_cmd: ch.meta.ppid_cmd ?? '',
-        project: ch.meta.project ?? '',
+        ...(project === null ? {} : { project }),
         name: ch.meta.names?.[i] ?? '',
         host: ch.meta.host,
         user: ch.meta.user,
@@ -217,13 +236,16 @@ export class AccountCache {
     // storage-key error surfacing as a 500.
     for (const s of salts) { if (!isB64uString(s) || s.length !== 22) return null; }
 
-    const ctx = await cacheCtx(tokenId, meta.project ?? '');
+    // Each salt hits under either scope: its host-wide entry, or its entry
+    // restricted to the reported project.
+    const hostCtx = await cacheCtx(tokenId, null);
+    const projectCtx = await cacheCtx(tokenId, meta.project ?? '');
     // Batch the lookups (M2): the whole key set is read before anything is
     // decided, so response timing does not leak the position of the first miss.
-    // Batched via getKeysBatched because salts may run to 256, twice the
-    // STORAGE_BATCH cap a single get() accepts.
-    const keys = salts.map(s => cacheKey(ctx, s));
-    const map = await this.getKeysBatched(keys);
+    // Batched via getKeysBatched because salts may run to 256 (512 keys over
+    // both scopes), past the STORAGE_BATCH cap a single get() accepts.
+    const candidates = salts.map(s => [cacheKey(hostCtx, s), cacheKey(projectCtx, s)]);
+    const map = await this.getKeysBatched(candidates.flat());
 
     const now = Date.now();
     const orphaned: string[] = [];
@@ -231,19 +253,22 @@ export class AccountCache {
     let flat: Uint8Array | undefined;
     let sealedB64u: string;
     try {
-      for (const key of keys) {
-        const entry = map.get(key);
-        if (!isLive(entry, now)) continue;
-        const dek = await openToCache(entry.sealed_to_cache_b64u, sk);
-        if (!dek || dek.length !== 32) {
-          dek?.fill(0);
-          // Undecryptable (a previous root key, M3, or the pre-v1 libsodium
-          // format): uniformly miss and drop the dead entry — never a 500,
-          // never a second algorithm (docs/sealed-box-v1.md, Rollout).
-          orphaned.push(key);
-          continue;
+      for (const keys of candidates) {
+        for (const key of keys) {
+          const entry = map.get(key);
+          if (!isLive(entry, now)) continue;
+          const dek = await openToCache(entry.sealed_to_cache_b64u, sk);
+          if (!dek || dek.length !== 32) {
+            dek?.fill(0);
+            // Undecryptable (a previous root key, M3, or the pre-v1 libsodium
+            // format): uniformly miss and drop the dead entry — never a 500,
+            // never a second algorithm (docs/sealed-box-v1.md, Rollout).
+            orphaned.push(key);
+            continue;
+          }
+          dekParts.push(dek);
+          break;
         }
-        dekParts.push(dek);
       }
       if (orphaned.length) { try { await deleteKeysBatched(this.storage, orphaned); } catch {} }
 
@@ -285,7 +310,7 @@ export class AccountCache {
   }
 
   // The named entries of one scope as stored right now, by salt (absent = gone).
-  async getEntries(tokenId: string, project: string, salts: string[]): Promise<Map<string, CacheEntry>> {
+  async getEntries(tokenId: string, project: string | null, salts: string[]): Promise<Map<string, CacheEntry>> {
     const ctx = await cacheCtx(tokenId, project);
     const map = await this.getKeysBatched(salts.map(s => cacheKey(ctx, s)));
     const out = new Map<string, CacheEntry>();

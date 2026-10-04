@@ -469,6 +469,9 @@ main.approve .vt-ap-bar { position: sticky; bottom: calc(12px + env(safe-area-in
 .vt-ap-cache-label { color: var(--fg); font-weight: 600; }
 .vt-ap-cache .cache-scope strong { color: var(--err); }
 .vt-ap-cache .cache-scope .cache-path { color: var(--fg); font-family: var(--mono); }
+/* Restrict to this project: shown only while a duration is picked. */
+.vt-ap-cache-bind { margin: 0 2px 6px; font-size: var(--cap); }
+.vt-ap-cache-bind[hidden] { display: none; }
 .vt-ap-actions { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; }
 .vt-ap-actions button { min-height: 50px; margin: 0; border-radius: var(--r-ctl); }
 .vt-ap-approve { background: var(--accent); color: #fff; }

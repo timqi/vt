@@ -85,14 +85,15 @@
         // One line over the control: its visible label, then — only while a
         // duration is picked, since No cache arms nothing to describe — the
         // reuse scope that duration would arm: what the cache key binds, host
-        // token (verified) + project (client-reported, its repository's common
-        // git dir, so every worktree shares one cache), and what that buys, a
-        // decrypt with no phone approval. Clamped (admin.css): Details holds
-        // the full paths. Above the control, so revealing it grows the bar
-        // upward and nothing under the finger moves. Ids name the pair for the
-        // radiogroup (the scope only while shown, or a screen reader would
-        // announce reuse for No cache); the per-mount suffix keeps two mounts
-        // from colliding.
+        // token (verified), and with "Restrict to this project" also the
+        // project (client-reported, its repository's common git dir, so every
+        // worktree shares one cache), and what that buys, a decrypt with no
+        // phone approval. Clamped (admin.css): Details holds the full paths.
+        // The line and the restriction sit above the control, so revealing
+        // them grows the bar upward and nothing under the finger moves. Ids
+        // name the pair for the radiogroup (the scope only while shown, or a
+        // screen reader would announce reuse for No cache); the per-mount
+        // suffix keeps two mounts from colliding.
         var idBase = 'vt-ap-cache-' + (++mountSeq);
         var head = el('p', 'vt-ap-cache-head');
         var caption = el('span', 'vt-ap-cache-label', 'Cache decrypt authorization');
@@ -103,6 +104,14 @@
         refs.cacheScope.hidden = true;
         head.appendChild(refs.cacheScope);
         cacheSec.appendChild(head);
+        // Unchecked by default: the cache is host-wide unless restricted.
+        refs.cacheBind = el('label', 'switch vt-ap-cache-bind');
+        refs.cacheBind.hidden = true;
+        refs.cacheBindInput = document.createElement('input');
+        refs.cacheBindInput.type = 'checkbox';
+        refs.cacheBind.appendChild(refs.cacheBindInput);
+        refs.cacheBind.appendChild(el('span', null, 'Restrict to this project'));
+        cacheSec.appendChild(refs.cacheBind);
         // Duration control: a segmented control, No cache first and default.
         refs.cacheOpts = el('div', 'seg');
         refs.cacheOpts.setAttribute('role', 'radiogroup');
@@ -265,24 +274,33 @@
             var optsList = data.cache_options_s || [];
             var pk = data.cache_pubkey_b64u || '';
             if (!pk || optsList.length <= 1) return;
-            // An empty project is still a scope: the key binds the host token
-            // and '', which every request reporting no project shares. The
-            // literal directory is Details' (and the audit row's): the bar
-            // keeps room for the scope itself, path first since the clamp
-            // (admin.css) cuts the tail on a short bar.
+            // Restricted, an empty project is still a scope: the key binds the
+            // host token and '', which every request reporting no project
+            // shares. The literal directory is Details' (and the audit row's):
+            // the bar keeps room for the scope itself, path first since the
+            // clamp (admin.css) cuts the tail on a short bar.
             var scope = (data.metadata && data.metadata.project) || '';
-            refs.cacheScope.innerHTML = '';
-            if (scope) {
-                refs.cacheScope.appendChild(document.createTextNode(' · project (client-reported) '));
-                refs.cacheScope.appendChild(el('strong', 'cache-path', scope));
-                refs.cacheScope.appendChild(document.createTextNode(' on the '));
-                refs.cacheScope.appendChild(el('strong', null, 'same host token (verified)'));
-                refs.cacheScope.appendChild(document.createTextNode(': skips phone approval'));
-            } else {
-                refs.cacheScope.appendChild(document.createTextNode(' · Skips phone approval for the '));
-                refs.cacheScope.appendChild(el('strong', null, 'same host token (verified)'));
-                refs.cacheScope.appendChild(document.createTextNode(', requests reporting no project'));
+            function renderScope() {
+                refs.cacheScope.innerHTML = '';
+                if (!refs.cacheBindInput.checked) {
+                    refs.cacheScope.appendChild(document.createTextNode(' · Skips phone approval for '));
+                    refs.cacheScope.appendChild(el('strong', null, 'any project'));
+                    refs.cacheScope.appendChild(document.createTextNode(' on the '));
+                    refs.cacheScope.appendChild(el('strong', null, 'same host token (verified)'));
+                } else if (scope) {
+                    refs.cacheScope.appendChild(document.createTextNode(' · project (client-reported) '));
+                    refs.cacheScope.appendChild(el('strong', 'cache-path', scope));
+                    refs.cacheScope.appendChild(document.createTextNode(' on the '));
+                    refs.cacheScope.appendChild(el('strong', null, 'same host token (verified)'));
+                    refs.cacheScope.appendChild(document.createTextNode(': skips phone approval'));
+                } else {
+                    refs.cacheScope.appendChild(document.createTextNode(' · Skips phone approval for the '));
+                    refs.cacheScope.appendChild(el('strong', null, 'same host token (verified)'));
+                    refs.cacheScope.appendChild(document.createTextNode(', requests reporting no project'));
+                }
             }
+            renderScope();
+            refs.cacheBindInput.addEventListener('change', renderScope);
             refs.cacheOpts.innerHTML = '';
             optsList.forEach(function (s, i) {
                 var label = el('label', null);
@@ -299,6 +317,7 @@
             refs.cacheOpts.addEventListener('change', function () {
                 var armed = selectedTtl() > 0;
                 refs.cacheScope.hidden = !armed;
+                refs.cacheBind.hidden = !armed;
                 if (armed) refs.cacheOpts.setAttribute('aria-describedby', refs.cacheScope.id);
                 else refs.cacheOpts.removeAttribute('aria-describedby');
             });
@@ -324,6 +343,8 @@
                 // Read before the ceremony: the inputs are what the approver saw
                 // when they tapped Approve, not whatever a later edit made of them.
                 var adoptNames = typedNames();
+                var cacheTtlS = selectedTtl();
+                var cacheBindProject = cacheTtlS > 0 && refs.cacheBindInput.checked;
 
                 var PRF_INPUT = await prfInputReady;
 
@@ -402,7 +423,6 @@
                 // INVARIANT: cache sealing MUST happen here — after sealing to the
                 // daemon and BEFORE `deks.fill(0)` below. Only when the user picked
                 // TTL > 0 do we seal each DEK to the worker's CACHE_PUBKEY.
-                var cacheTtlS = selectedTtl();
                 var cacheSealed = null;
                 if (cacheTtlS > 0 && data.cache_pubkey_b64u && salts.length > 0) {
                     var cachePk = b64uDec(data.cache_pubkey_b64u);
@@ -446,6 +466,7 @@
                         pwa_pk_b64u: b64uEnc(pwaPk),
                         binding_tag_b64u: b64uEnc(bindingTag),
                         cache_ttl_s: cacheTtlS,
+                        cache_bind_project: cacheBindProject,
                         cache_sealed_deks_b64u: cacheSealed,
                         adopt_names: adoptNames,
                     }),

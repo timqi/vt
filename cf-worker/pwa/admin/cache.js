@@ -2,7 +2,7 @@
 
 // DEK Cache tab. One row per live cache ENTRY from /{seg}/api/cache-list, grouped
 // client-side under collapsible host · project headers (the two halves of the key:
-// verified token, advisory project). Read-only rendering via textContent;
+// verified token, advisory project or host-wide). Read-only rendering via textContent;
 // every mutation is an explicit POST on the selected entries.
 //
 // Two classes of action, deliberately asymmetric:
@@ -33,11 +33,14 @@ vt.tabs.cache = function (panel) {
   var localRefMs = 0;
   function now() { return serverNowMs + (Date.now() - localRefMs); }
 
-  // The scope is the key's two halves; the id adds the salt.
-  function scopeOf(e) { return e.token_id + '\u0000' + e.project; }
+  // The scope is the key's two halves; the id adds the salt. A null project is
+  // a host-wide entry, kept apart from any project string.
+  function hostWide(e) { return e.project === null; }
+  function scopeOf(e) { return e.token_id + (hostWide(e) ? '\u0001' : '\u0000' + e.project); }
   function idOf(e) { return scopeOf(e) + '\u0000' + e.salt_b64u; }
   function refOf(e) { return { token_id: e.token_id, project: e.project, salt_b64u: e.salt_b64u }; }
-  function scopeLabel(e) { return (e.host || '—') + ' · ' + (e.project ? vt.projectName(e.project) : 'unknown project'); }
+  function projectLabel(e) { return hostWide(e) ? 'any project' : e.project ? vt.projectName(e.project) : 'unknown project'; }
+  function scopeLabel(e) { return (e.host || '—') + ' · ' + projectLabel(e); }
 
   // A multi-day window is a materially different exposure from a workday one, so
   // the picker says so instead of letting "1 w" read like just another option.
@@ -110,8 +113,11 @@ vt.tabs.cache = function (panel) {
       es.forEach(function (x) { if (pick.checked) selected[idOf(x)] = true; else delete selected[idOf(x)]; });
       render();
     });
-    var hover = 'Host: ' + (e.host || '—') + '\nUser: ' + (e.user || '—') + '\nProject: ' + (e.project || 'unknown (early entry)')
-      + '\nToken: ' + e.token_id + '\n\n(A cache is bound to this host token and the client-claimed project; both must match to hit.)';
+    var hover = 'Host: ' + (e.host || '—') + '\nUser: ' + (e.user || '—')
+      + '\nProject: ' + (hostWide(e) ? 'any (host-wide)' : e.project || 'unknown (early entry)')
+      + '\nToken: ' + e.token_id + '\n\n' + (hostWide(e)
+        ? '(A host-wide cache is bound to this host token alone; any project on it hits.)'
+        : '(A cache is bound to this host token and the client-claimed project; both must match to hit.)');
     var mark = (collapsed[scope] ? '▸ ' : '▾ ');
     var label = el('span', 'group-label has-hover', mark + scopeLabel(e));
     label.setAttribute('data-hover', hover);
@@ -235,7 +241,8 @@ vt.tabs.cache = function (panel) {
       // A multi-day pick is a materially larger exposure than a workday one. The
       // approval page states it too, but say it before the request is even made.
       if (ttlIsLong(ttl)) {
-        parts.push('⚠ for ' + ttlLabel(ttl) + ' these ' + gainers.length + ' records decrypt without phone approval (same host token + project)');
+        parts.push('⚠ for ' + ttlLabel(ttl) + ' these ' + gainers.length + ' records decrypt without phone approval ('
+          + (hostWide(es[0]) ? 'same host token, any project' : 'same host token + project') + ')');
         warn = true;
       }
       parts.push('on approval expiry resets to approval time + ' + ttlLabel(ttl) + '; can be extended again');
@@ -253,7 +260,7 @@ vt.tabs.cache = function (panel) {
     var dl = d.dl;
     addDetail(dl, 'Host', e.host);
     addDetail(dl, 'User', e.user);
-    addDetail(dl, 'Project', e.project, true);
+    addDetail(dl, 'Project', hostWide(e) ? 'any (host-wide)' : e.project, true);
     dl.appendChild(el('dt', null, 'Record'));
     dl.appendChild(el('dd', null)).appendChild(vt.recordList([e.record], render));
     addDetail(dl, 'Approved from IP', e.ip ? e.ip + ' (audit only, not part of the binding)' : '');
@@ -385,7 +392,7 @@ vt.tabs.cache = function (panel) {
     var dl = d.dl;
     var targets = req.targets || [];
     addDetail(dl, 'Scope', scopeLabel(scope) + ' · ' + targets.length + ' entries');
-    addDetail(dl, 'Project', scope.project, true);
+    addDetail(dl, 'Project', hostWide(scope) ? 'any (host-wide)' : scope.project, true);
     addDetail(dl, 'Records', targets.map(function (salt) {
       var e = byId[scopeOf(scope) + '\u0000' + salt];
       return e ? vt.recordLabel(e.record) : salt.slice(0, 8) + '…';

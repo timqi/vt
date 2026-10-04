@@ -26,7 +26,7 @@ const TTL_PERMANENT = 100 * 365 * 24 * 3600;
 
 beforeEach(bootstrap);
 
-function requestExtend(keys: string[], ttlS: number, project = TEST_PROJECT): Promise<DoResult> {
+function requestExtend(keys: string[], ttlS: number, project: string | null = TEST_PROJECT): Promise<DoResult> {
   return doPost('cache-extend-create', { entries: keys.map(k => refOf(k, project)), ttl_s: ttlS },
     { ...adminHeaders(), 'CF-Connecting-IP': '198.51.100.7' });
 }
@@ -85,7 +85,7 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
       salts_b64u: keys.map(k => refOf(k).salt_b64u),
     });
     // What the approver reads names the scope and the records.
-    expect(ch.meta.command).toMatch(/testbox · \/home\/tester\/repo\/\.git · 2 entries/);
+    expect(ch.meta.command).toMatch(/testbox · project \/home\/tester\/repo\/\.git only · 2 entries/);
     expect(ch.meta.command).toMatch(/records: /);
   });
 
@@ -150,6 +150,30 @@ describe('opCacheExtendCreate — request only, no mutation', () => {
     expect((await doPost('cache-extend-create', { entries: [refOf(a[0]!), other], ttl_s: TTL_1D })).status).toBe(400);
     const chs = await inDO(async h => [...(await h.state.storage.list({ prefix: 'ch:' })).keys()]);
     expect(chs).toEqual([]);
+  });
+
+  it('refuses host-wide and project entries in one ceremony', async () => {
+    const a = await inDO(h => seedEntries(h, 1, { expires_ms: Date.now() + HOUR }));
+    const b = await inDO(h => seedEntries(h, 1, { expires_ms: Date.now() + HOUR }, 'host'));
+    const res = await doPost('cache-extend-create', {
+      entries: [refOf(a[0]!), refOf(b[0]!, null)], ttl_s: TTL_1D,
+    });
+    expect(res.status).toBe(400);
+    expect(res.text).toMatch(/one project per ceremony/);
+  });
+
+  // The approver reads that the extended entries serve any project.
+  it('extends host-wide entries, stating the host-wide scope', async () => {
+    const keys = await inDO(h => seedEntries(h, 2, { expires_ms: Date.now() + HOUR }, 'host'));
+    const res = await requestExtend(keys, TTL_1D, null);
+    expect(res.status).toBe(200);
+    const ch = await inDO(h => storedChallenge(h, res.json.approve_token));
+    expect(ch.extend).toMatchObject({ token_id: TEST_TOKEN_ID, project: null });
+    expect(ch.meta.project).toBe('');
+    expect(ch.meta.command).toMatch(/testbox · any project \(host-wide\) · 2 entries/);
+    const before = Date.now();
+    expect((await approve(ch)).status).toBe(200);
+    for (const e of await inDO(h => readEntries(h, keys))) expect(e.expires_ms).toBeGreaterThanOrEqual(before + DAY);
   });
 
   it('refuses a malformed or oversize address list', async () => {

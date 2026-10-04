@@ -70,9 +70,11 @@ export interface AuditRow {
   key_fp: string | null;
   /** Verified non-forwarding session-bind destination label. */
   dest: string | null;
-  /** connection | destination | workspace | cwd-fallback | parent-app. */
+  /** connection | destination | workspace | cwd-fallback | parent-app; on a
+   *  ceremony row that armed a DEK cache, host | project. */
   scope_family: string | null;
-  /** The exact label the Touch ID reuse line displayed. */
+  /** The exact label the Touch ID reuse line displayed; on a ceremony row
+   *  that armed a DEK cache, the cache scope it armed. */
   scope_label: string | null;
   /** Effective TTL of the reusable scope (seconds); 0 = fresh. */
   grant_ttl_s: number | null;
@@ -256,19 +258,21 @@ export interface HostTokenListResponse {
 /** One cache entry as the console addresses it: the two halves of the key the
  *  DO re-derives (`cacheCtx`) plus the salt. The storage key itself never
  *  leaves the DO — its project hash would be an offline oracle for the
- *  client-reported `project` path. */
+ *  client-reported `project` path. `project` is null for a host-wide entry. */
 export interface CacheEntryRef {
   token_id: string;
-  project: string;
+  project: string | null;
   salt_b64u: string;
 }
 
 /** What one cache-extension ceremony proposes. Stored on the Challenge, so it
  *  cannot be swapped between the request and the approval. One scope
- *  (token + project) per ceremony, so the approver reads one host · project. */
+ *  (token + project, or token alone) per ceremony, so the approver reads one
+ *  host · project. */
 export interface CacheExtendIntent {
   token_id: string;
-  project: string;
+  /** null = host-wide entries. */
+  project: string | null;
   salts_b64u: string[];
   /** Requested TTL in seconds; must be an EXTEND_TTL_WHITELIST member. Absolute
    *  from the moment of approval, not additive. */
@@ -410,6 +414,10 @@ export interface ApproveRequest {
   pwa_pk_b64u: string;
   /** HMAC-SHA256 tag over the binding transcript (see do_account.ts opApprove) */
   binding_tag_b64u: string;
+  /** The approver restricted the cache entries to the ceremony's project;
+   *  absent or false → host-wide. Applied only with cache_ttl_s > 0, after
+   *  the assertion verifies. */
+  cache_bind_project?: boolean;
   /**
    * DEK-cache TTL in seconds, chosen by the approver. Absent or 0 → DO NOT
    * cache (historical behaviour). When > 0, `cache_sealed_deks_b64u` MUST be
@@ -479,7 +487,7 @@ export interface ApprovePageData {
   host_verified: boolean;
 }
 
-// ── DEK cache (opt-in, token+project-scoped) ───────────────────────────────
+// ── DEK cache (opt-in, token-scoped, optionally project-restricted) ─────────
 
 /** Inbound from daemon via POST /api/dek-cache — the fast path tried before a
  *  ceremony. Host-token HMAC-gated like /api/challenge. */
@@ -489,8 +497,8 @@ export interface DekCacheRequest {
   salts_b64u: string[];
   timestamp_ms: number;
   /** Display meta (same shape as the challenge request). `meta.project` is the
-   *  client-reported, advisory half of the cache key; the host token that
-   *  authenticated the request is the hard half. The rest is stored on the hit
+   *  client-reported, advisory half of a project-restricted entry's key; the
+   *  host token that authenticated the request is the hard half. The rest is stored on the hit
    *  audit row so a cache hit carries the same context as a ceremony decrypt. */
   meta?: Partial<ChallengeMeta>;
 }
@@ -502,9 +510,9 @@ export type DekCacheResponse =
   | { source: 'cache'; sealed_deks_b64u: string }
   | { miss: true };
 
-/** A single cached DEK in DO storage, keyed `dek:{token_id}:{project_h}:{salt_b64u}`
- *  where project_h = b64u(SHA-256("vt-dek-ctx-v5" || project)[0..16]); see
- *  docs/dek-cache.md. */
+/** A single cached DEK in DO storage, keyed `dek:{token_id}:{scope}:{salt_b64u}`
+ *  where scope is `host` (host-wide) or project_h =
+ *  b64u(SHA-256("vt-dek-ctx-v5" || project)[0..16]); see account_cache.ts. */
 export interface CacheEntry {
   /** sealed_box(DEK_raw, cache public key) — the Worker opens it with the root-key scalar. */
   sealed_to_cache_b64u: string;
@@ -514,8 +522,9 @@ export interface CacheEntry {
   /** Worker-derived source IP at approval; audit/forensics only, not bound. */
   ip: string;
   ppid_cmd: string;
-  /** Client-reported project (for the listing) and name claim at approval;
-   *  absent on entries written before they were stored. */
+  /** Client-reported project of a project-restricted entry (for the listing;
+   *  absent on host-wide entries) and name claim at approval; absent on
+   *  entries written before they were stored. */
   project?: string;
   name?: string;
   /** The token record's host/user at approval and the TTL chosen; absent on
@@ -643,13 +652,14 @@ export interface DoApproveOp {
   pwa_pk_b64u: string;
   binding_tag_b64u: string;
   cache_ttl_s?: number;
+  cache_bind_project?: unknown;
   cache_sealed_deks_b64u?: string[];
   adopt_names?: unknown;
 }
 
 /** Internal DO op for POST /api/dek-cache. The Worker builds `meta` (capping the
  *  client-supplied fields and overwriting `meta.ip` from CF-Connecting-IP, never
- *  trusting the body's IP). `token_id` + `meta.project` form the cache key. */
+ *  trusting the body's IP). `token_id` + `meta.project` select the cache keys. */
 export interface DoDekCacheOp {
   daemon_pubkey_b64u: string;
   salts_b64u: string[];

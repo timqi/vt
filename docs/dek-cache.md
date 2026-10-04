@@ -7,10 +7,16 @@ records. A live entry lets its enrolled host decrypt without another phone tap.
 
 - The host token is the hard boundary; client-reported project is advisory.
   Another enrolled host cannot reuse the entry, regardless of egress IP.
+- An entry is host-wide by default: any request on its host token hits,
+  whatever project or cwd it reports. The approver's "Restrict to this project"
+  option narrows a new entry to the request's project as well.
 - A project is the common Git directory when available, otherwise cwd; worktrees
   of one repository share a Worker project. This differs from local agent scopes.
-- Possession of the token and matching project is sufficient to obtain live
-  cached DEKs. A compromised Worker can also read them; at-rest encryption does
+- The restriction is part of the approve request that carries the verified
+  assertion, alongside the duration; the client cannot set it.
+- Entries written before host-wide scope keep their project rule until they expire.
+- Possession of the token (and, for a restricted entry, the matching project)
+  is sufficient to obtain live cached DEKs. A compromised Worker can also read them; at-rest encryption does
   not protect against a compromised running service.
 - Token revocation prevents further authenticated reads; cache clear removes
   entries. Neither can erase DEKs or plaintext already delivered to a caller.
@@ -33,8 +39,9 @@ are defined once in [cache_policy.ts](../cf-worker/src/cache_policy.ts).
 | Create entries | Verified approval of the decrypt ceremony |
 | Extend entries | Admin session plus verified Passkey approval |
 
-- Extension approves an immutable intent for one host token and one project;
-  a mixed scope must not become one ceremony.
+- Extension approves an immutable intent for one host token and one scope
+  (host-wide or one project); a mixed scope must not become one ceremony.
+  Extension never changes an entry's scope.
 - New expiry is approval time plus duration, not creation time or remaining
   time plus duration. Total lifetime can grow through repeated approvals.
 - Expired entries never revive; entries that would not gain time are unchanged.
@@ -74,14 +81,16 @@ not change which record was authorized.
 - Extension records both the authorization and actual effects, including partial
   writes and skipped entries; intended changes are not reported as completed.
 - The original approved TTL remains immutable in audit; actual expiry tracks
-  extension separately.
+  extension separately. The approval row records the armed scope (host-wide or
+  the project).
 - Hit notifications are optional and off by default; delivery never blocks
   key release. Audit is retention-managed, with no clear-audit action.
 
 ## Use
 
-Choose a duration on a record's approval page. In the admin cache tab, select
-entries from one host/project to request an extension, then approve the Passkey
+Choose a duration on a record's approval page, and check "Restrict to this
+project" to keep the entry from serving other projects. In the admin cache tab,
+select entries from one host and scope to request an extension, then approve the Passkey
 ceremony. Clear selected entries or the entire cache to require approval again.
 
 Implementation and tests: [account_cache.ts](../cf-worker/src/account_cache.ts)

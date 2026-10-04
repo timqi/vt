@@ -199,7 +199,13 @@ describe('approval ceremony layout', () => {
       group.listeners.change.forEach(fn => fn());
     };
     const text = (n: Node_) => n.all().map(c => c.textContent).join('');
-    return { root, radios, group, pick, text };
+    const bindRow = root.find('vt-ap-cache-bind');
+    const bindBox = bindRow.all().find(n => n.tag === 'input')!;
+    const bind = (on: boolean) => {
+      bindBox.checked = on;
+      bindBox.listeners.change.forEach(fn => fn());
+    };
+    return { root, radios, group, pick, text, bindRow, bindBox, bind };
   }
 
   it('puts the labelled duration control in the action bar, above Approve / Reject', () => {
@@ -217,23 +223,41 @@ describe('approval ceremony layout', () => {
   });
 
   it('states and describes the reuse scope only while a duration is picked', () => {
-    const { root, group, pick, text } = mount();
+    const { root, group, pick, text, bindRow } = mount();
     const scope = root.find('cache-scope');
     expect(scope.hidden).toBe(true);
+    expect(bindRow.hidden).toBe(true);
     expect(group.attrs['aria-describedby']).toBeUndefined();
-    expect(text(scope)).toContain('/srv/app/.git');
+    expect(text(scope)).toContain('any project');
     pick(1);
     expect(scope.hidden).toBe(false);
+    expect(bindRow.hidden).toBe(false);
     expect(group.attrs['aria-describedby']).toBe(scope.id);
     pick(0);
     expect(scope.hidden).toBe(true);
+    expect(bindRow.hidden).toBe(true);
     expect(group.attrs['aria-describedby']).toBeUndefined();
   });
 
-  it('states the host-token scope a picked duration arms without a project', () => {
-    const { root, pick, text } = mount({ project: '' });
+  it('arms host-wide by default and names the project only once restricted', () => {
+    const { root, pick, text, bindRow, bindBox, bind } = mount();
+    const scope = root.find('cache-scope');
+    pick(1);
+    expect(text(bindRow)).toContain('Restrict to this project');
+    expect(bindBox.checked).toBe(false);
+    expect(text(scope)).toContain('any project on the same host token (verified)');
+    expect(text(scope)).not.toContain('/srv/app/.git');
+    bind(true);
+    expect(text(scope)).toContain('project (client-reported) /srv/app/.git on the same host token (verified)');
+    bind(false);
+    expect(text(scope)).not.toContain('/srv/app/.git');
+  });
+
+  it('states the host-token scope a restricted duration arms without a project', () => {
+    const { root, pick, text, bind } = mount({ project: '' });
     const scope = root.find('cache-scope');
     pick(2);
+    bind(true);
     expect(scope.hidden).toBe(false);
     expect(text(scope)).toContain('same host token (verified), requests reporting no project');
   });

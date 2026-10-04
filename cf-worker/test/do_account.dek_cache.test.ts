@@ -35,22 +35,25 @@ beforeEach(async () => {
   tokenId = await liveTokenId();
 });
 
-/** Run a real ceremony over `n` salts and approve it with an 8h cache. */
-async function armCache(n: number, meta = makeMeta()): Promise<string[]> {
+/** Run a real ceremony over `n` salts and approve it with an 8h cache,
+ *  host-wide unless `bindProject` (the approver's "Restrict to this project"). */
+async function armCache(n: number, meta = makeMeta(), bindProject?: boolean): Promise<string[]> {
   const salts = Array.from({ length: n }, () => nextSalt());
   const ch = makeChallenge({ salts_b64u: salts, meta });
   expect((await doPost('create', { challenge: ch, auth: await daemonAuth(tokenId) })).status).toBe(200);
+  const before = (await inDO(allDekKeys)).length;
   const res = await approve(ch, {
     cache_ttl_s: TTL_8H,
     cache_sealed_deks_b64u: await Promise.all(salts.map((_, i) => sealFakeDek((i % 251) + 1))),
+    ...(bindProject === undefined ? {} : { cache_bind_project: bindProject }),
   });
   expect(res.status).toBe(200);
-  expect(await inDO(allDekKeys)).toHaveLength(n);
+  expect(await inDO(allDekKeys)).toHaveLength(before + n);
   return salts;
 }
 
-/** The read the Rust client performs. `meta.project` must match the ceremony's
- *  — it is the advisory half of the key; the token is the hard half. */
+/** The read the Rust client performs. The token is the key's hard half; a
+ *  project-restricted entry also needs `meta.project` to match the ceremony's. */
 async function read(salts: string[], over = {}, token = tokenId) {
   return doPost('dek-cache', {
     daemon_pubkey_b64u: DAEMON_PK_B64U,
@@ -115,11 +118,69 @@ describe('opDekCache — batched reads', () => {
   });
 
   // Binding is per-key, not per-chunk, so these need no large salt set.
-  it('misses when the reported project differs, even for armed salts', async () => {
-    const salts = await armCache(4);
+  it('misses when the reported project differs from a restricted entry, even for armed salts', async () => {
+    const salts = await armCache(4, makeMeta(), true);
     const res = await read(salts, { project: '/home/tester/elsewhere/.git' });
     expect(res.status).toBe(200);
     expect(res.json).toEqual({ miss: true });
+    expect((await read(salts)).json).toMatchObject({ source: 'cache' });
+  });
+
+  it('hits a host-wide entry (the default) from any project and cwd on the same token', async () => {
+    const salts = await armCache(4, makeMeta(), false);
+    for (const over of [{ project: '/home/tester/elsewhere/.git', pwd: '/tmp' }, { project: '' }, {}]) {
+      expect((await read(salts, over)).json).toMatchObject({ source: 'cache' });
+    }
+    expect((await read(salts, {}, await liveTokenId())).json).toEqual({ miss: true });
+  });
+
+  // Entries written before host-wide scope all carry a project: same key, same
+  // rule, until they expire.
+  it('keeps serving an existing project entry only for its project', async () => {
+    const salts = [nextSalt(), nextSalt()];
+    await inDO(async h => {
+      const entry = await makeEntry({ project: makeMeta().project });
+      const ctx = await cacheCtx(tokenId, makeMeta().project);
+      for (const s of salts) await h.state.storage.put(`dek:${ctx}:${s}`, entry);
+    });
+    expect((await read(salts, { project: '/home/tester/elsewhere/.git' })).json).toEqual({ miss: true });
+    expect((await read(salts)).json).toMatchObject({ source: 'cache' });
+  });
+
+  // All-or-nothing is per salt across scopes: each salt may hit under either.
+  it('hits a set whose salts are armed under different scopes', async () => {
+    const hostWide = await armCache(1, makeMeta(), false);
+    const bound = await armCache(1, makeMeta(), true);
+    expect((await read([...hostWide, ...bound])).json).toMatchObject({ source: 'cache' });
+    expect((await read([...hostWide, ...bound], { project: '/elsewhere' })).json).toEqual({ miss: true });
+  });
+
+  it('refuses a non-boolean restriction instead of guessing a scope', async () => {
+    const salts = [nextSalt()];
+    const ch = makeChallenge({ salts_b64u: salts });
+    expect((await doPost('create', { challenge: ch, auth: await daemonAuth(tokenId) })).status).toBe(200);
+    const res = await approve(ch, {
+      cache_ttl_s: TTL_8H, cache_sealed_deks_b64u: [await sealFakeDek()], cache_bind_project: 'yes',
+    });
+    expect(res.status).toBe(400);
+    expect(await inDO(allDekKeys)).toEqual([]);
+  });
+
+  it('records the armed scope on the approval row and in the listing', async () => {
+    const meta = makeMeta();
+    await armCache(1, meta, false);
+    await armCache(1, meta, true);
+    const rows = await inDO(({ state }) => state.storage.sql
+      .exec(`SELECT scope_family, scope_label FROM audit WHERE cache_ttl_s > 0 ORDER BY id`).toArray());
+    expect(rows).toEqual([
+      { scope_family: 'host', scope_label: 'any project (host-wide)' },
+      { scope_family: 'project', scope_label: `project ${meta.project} only` },
+    ]);
+    const listing = (await doPost('cache-list', {})).json as { entries: Array<{ project: string | null }> };
+    expect(listing.entries.map(e => e.project).sort()).toEqual([meta.project, null].sort());
+    // Host-wide entries store no project.
+    const stored = await inDO(async h => Promise.all((await allDekKeys(h)).map(k => h.state.storage.get<{ project?: string }>(k))));
+    expect(stored.map(e => e!.project).sort()).toEqual([meta.project, undefined].sort());
   });
 
   it('misses for another live host token on the same project, IP and directory', async () => {
@@ -131,7 +192,7 @@ describe('opDekCache — batched reads', () => {
   it('hits across egress IP and cwd within one project; pwd/ip stay literal in audit, ip in the listing', async () => {
     const writtenPwd = '/home/tester/repo.feature';
     const readPwd = '/home/tester/repo.main';
-    const salts = await armCache(2, makeMeta({ pwd: writtenPwd }));
+    const salts = await armCache(2, makeMeta({ pwd: writtenPwd }), true);
     expect((await read(salts, { pwd: readPwd, ip: '198.51.100.4' })).json).toMatchObject({ source: 'cache' });
     await inDO(({ state }) => {
       expect(state.storage.sql.exec('SELECT pwd, ip FROM audit ORDER BY id').toArray())

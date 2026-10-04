@@ -23,8 +23,10 @@ trusted host/caller context. Enrollment makes the pairing code prominent enough
 to compare with the requesting terminal.
 
 A reusable approval states its scope and duration. A fresh approval must not
-suggest that reuse is granted. Worker approval shows both the literal directory
-and the broader project scope, with the project labeled as client-reported.
+suggest that reuse is granted. Worker approval shows the literal directory and
+the project, labeled as client-reported; a picked cache duration states whether
+reuse is host-wide (the default) or restricted to that project. Extension pages,
+the cache inventory, and the approval's audit row state the same scope.
 
 Operator-owned record names precede suggestions. A suggestion is not a trusted
 name until adopted by a verified approval; a later rename requires an admin
