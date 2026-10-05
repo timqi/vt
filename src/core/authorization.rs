@@ -430,6 +430,10 @@ pub enum ValidationError {
 
 /// `operation` lets a platform authenticator bind a master-needing approval
 /// to its key custody; the pending custody follows the approval guard.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait emits #[must_use] on the boxed-future method"
+)]
 #[async_trait]
 pub trait AuthorizationAuthenticator: Send + Sync {
     async fn authenticate(
